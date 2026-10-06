@@ -7,7 +7,7 @@ import { GalleryViewer } from './GalleryViewer'
 import { ProjectAccessPanel } from './ProjectAccessPanel'
 import { H3BridgePanel } from './H3BridgePanel'
 import { resolveH3BridgeSelection } from './h3BridgeSelection'
-import { H3GuidePanel, resolveH3GuideSelections } from './H3GuidePanel'
+import { H3GuidePanel, resolveH3GuideSelections, resolveH3AVGuideSelections } from './H3GuidePanel'
 import { LlmChat } from '../LlmChat'
 import { H3PromptRewriteComparison } from '../H3PromptRewriteComparison'
 import { H3DeliveryRecoveryStatus, OPEN_GALLERY_EVENT } from '../H3DeliveryRecoveryStatus'
@@ -2551,6 +2551,7 @@ function GalleryBulkToolbar() {
     && (accountProjectAccessActive || activeProject?.unlocked !== false)
   const bridgeCandidates = resolveH3BridgeSelection(outputs, selected, activeWorkspace, canGenerateBridge)
   const guideStills = resolveH3GuideSelections(outputs, selected, activeWorkspace, canGenerateBridge)
+    ?? resolveH3AVGuideSelections(outputs, selected, activeWorkspace, canGenerateBridge, models, enabledModels, modelsLoaded)
   const guideStill = guideStills?.[0]
   const bridgeSelectionIdentity = JSON.stringify(
     (bridgeCandidates || []).map(output => output.workspace + '\0' + output.name).sort(),
@@ -2640,12 +2641,12 @@ function GalleryBulkToolbar() {
             enabledModels={enabledModels}
             modelsLoaded={modelsLoaded}
             isCurrentSelection={isCurrentGuideSelection}
-            onQueued={async () => {
-              if (!isCurrentGuideSelection()) return
+            onQueued={async isCurrent => {
+              if (!isCurrent()) return
               // Reconnect the accepted guide job before opening Queue so its
               // normal generation status is visible without a page reload.
               await useStore.getState().reconnectJobs()
-              if (!isCurrentGuideSelection()) return
+              if (!isCurrent()) return
               requestQueueView()
               window.dispatchEvent(new CustomEvent(QUEUE_REFRESH_EVENT))
             }}

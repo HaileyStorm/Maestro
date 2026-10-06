@@ -91,7 +91,7 @@ class GalleryAVDispatchTests(unittest.TestCase):
                      and any(isinstance(target, ast.Name) and target.id == "_GENERATION_MEDIA_INPUTS"
                              for target in node.targets))
         exec(compile(ast.Module(body=[media], type_ignores=[]), "launch.py", "exec"), self.ns)
-        load_launch_functions(self.ns, "_h3_gallery_av_source_state", "h3_gallery_av_guide_endpoint",
+        load_launch_functions(self.ns, "_h3_gallery_av_guides_available", "_h3_gallery_av_source_state", "h3_gallery_av_guide_endpoint",
                               "_validate_h3_gallery_av_guide_job", "_decode_h3_gallery_av_guide_job",
                               "_validate_h3_gallery_still_guide_job", "_reject_client_h3_internal_state",
                               "_h3_estimate_for_context")
@@ -161,8 +161,13 @@ class GalleryAVDispatchTests(unittest.TestCase):
         self.assertEqual(len(verified["paths"]), 3)
 
     def test_disabled_or_unauthorized_route_cannot_probe_or_queue(self):
+        available = self.ns["_h3_gallery_av_guides_available"]
+        self.assertTrue(available("minimax_h3"))
+        for model in ("minimax_h3_ref2va", "minimax_h3_turbo", "ltx2_22B"):
+            self.assertFalse(available(model))
         with patch.dict(os.environ, {"MAESTRO_H3_TIMELINE_GUIDES_EXPERIMENTAL": "0"}), \
                 patch.object(av, "probe_gallery_av", side_effect=AssertionError("probed")):
+            self.assertFalse(available("minimax_h3"))
             with self.assertRaises(HTTPException) as raised:
                 asyncio.run(self.ns["h3_gallery_av_guide_endpoint"](self.request()))
             self.assertEqual(raised.exception.status_code, 409)

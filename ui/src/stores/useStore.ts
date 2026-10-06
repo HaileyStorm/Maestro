@@ -7916,6 +7916,7 @@ export const useStore = create<AppState>((set, get) => ({
         family: m.family,
         architecture: m.architecture,
         retake_engines: m.retake_engines ?? [],
+        h3_gallery_av_guides: m.h3_gallery_av_guides === true,
         is_i2v: m.is_i2v,
         is_t2v: m.is_t2v,
         guidance_max_phases: m.guidance_max_phases ?? 1,

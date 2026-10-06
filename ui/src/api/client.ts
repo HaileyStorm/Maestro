@@ -98,6 +98,7 @@ export interface ApiModel {
   family: string
   architecture: string
   retake_engines?: string[]
+  h3_gallery_av_guides?: boolean
   is_i2v: boolean
   is_t2v: boolean
   guidance_max_phases: number
@@ -1401,6 +1402,54 @@ export async function submitH3Bridge(params: H3BridgeRequest): Promise<H3BridgeS
 }
 
 export type H3GalleryStillGuideModel = 'minimax_h3'
+
+export interface H3GalleryAVGuideRequest {
+  workspace: string
+  model_type: 'minimax_h3'
+  prompt: string
+  guides: { name: string; revision: string; kind: 'video' | 'audio'; frame_index: number }[]
+  settings: {
+    video_length: number
+    attention_engine?: 'sdpa' | 'sol_attn'
+    resolution?: string
+    num_inference_steps?: number
+    guidance_scale?: number
+    seed?: number
+    override_profile?: string | null
+  }
+  private_output?: boolean
+  explicit_output?: boolean
+}
+
+export async function submitH3GalleryAVGuide(params: H3GalleryAVGuideRequest): Promise<H3GalleryStillGuideSubmission> {
+  let res: Response
+  try {
+    res = await fetch(`${BASE}/api/v1/h3/gallery-av-guide`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(params),
+    })
+  } catch {
+    throw new Error('The Guide queue acknowledgement is unavailable. Check Queue before trying again.')
+  }
+  if (!res.ok) {
+    const payload = await res.json().catch(() => ({})) as { detail?: unknown }
+    const detail = typeof payload.detail === 'string' ? payload.detail : ''
+    if (res.status === 401 || res.status === 403) throw new Error('You do not have permission to generate in this project.')
+    if (res.status === 423) throw new Error('Unlock this project before creating a guided clip.')
+    if (res.status === 404 || res.status === 405 || /not available yet/i.test(detail)) {
+      throw new Error('Video and audio Guides are unavailable on this installation. Refresh Gallery or use still-image Guides.')
+    }
+    if (res.status === 409) throw new Error('A selected Gallery guide changed or cannot be used. Refresh Gallery and select current media.')
+    if (res.status === 451) throw new Error('MiniMax H3 is unavailable under its current license. Check model access in Settings.')
+    throw new Error(detail ? `H3 Guide could not be queued: ${detail}` : 'H3 Guide could not be queued. Check the selected media and clip settings.')
+  }
+  const result = await res.json().catch(() => ({})) as Partial<H3GalleryStillGuideSubmission>
+  if (typeof result.job_id !== 'string' || !result.job_id || typeof result.status !== 'string') {
+    throw new Error('H3 Guide returned an invalid queue response. Check Queue before trying again.')
+  }
+  return result as H3GalleryStillGuideSubmission
+}
 
 export interface H3GalleryStillGuideRequest {
   workspace: string

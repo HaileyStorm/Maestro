@@ -15,7 +15,7 @@ function loadGuideModule() {
   if (guideModulePromise) return guideModulePromise
   guideModulePromise = build({
     stdin: {
-      contents: "export { H3GuidePanel, H3_GUIDE_TARGET_FRAMES, isInteriorH3GuideFrame, resolveH3GuideModels, resolveH3GuideSelection, resolveH3GuideSelections } from './src/components/MainContent/H3GuidePanel.tsx'; export { submitH3GalleryStillGuide } from './src/api/client'",
+      contents: "export { H3GuidePanel, H3_GUIDE_TARGET_FRAMES, isInteriorH3GuideFrame, isIntervalH3GuideFrame, resolveH3AVGuideSelections, resolveH3GuideModels, resolveH3GuideSelection, resolveH3GuideSelections } from './src/components/MainContent/H3GuidePanel.tsx'; export { submitH3GalleryStillGuide, submitH3GalleryAVGuide } from './src/api/client'",
       resolveDir: UI_ROOT,
       loader: 'js',
     },
@@ -33,6 +33,8 @@ function loadGuideModule() {
         bundle.onLoad({ filter: /.*/, namespace: 'h3-guide-test' }, args => {
           if (args.path === 'react') {
             return { contents: [
+              'export const useRef = initial => { const [ref] = useState(() => ({ current: initial })); return ref }',
+              'export const useEffect = effect => { const [done, setDone] = useState(false); if (!done) { const cleanup = effect(); (globalThis.__h3GuideCleanups ||= []).push(cleanup); setDone(true) } }',
               'export const useState = initial => {',
               '  const states = globalThis.__h3GuideHookStates',
               '  const index = globalThis.__h3GuideHookIndex++',
@@ -124,7 +126,7 @@ function renderPanel(Component, props) {
 function openPanel(Component, props) {
   const firstRender = renderPanel(Component, props)
   const openButton = flatten(firstRender).find(element => (
-    element.type === 'button' && /^Use stills? as guides?$/.test(elementText(element))
+    element.type === 'button' && /^Use (stills?|media) as guides?$/.test(elementText(element))
   ))
   assert.ok(openButton)
   openButton.props.onClick()
@@ -630,5 +632,176 @@ test('eight-guide panel binds every selected revision and unsorted frame without
     globalThis.fetch = originalFetch
     delete globalThis.__h3GuideHookStates
     delete globalThis.__h3GuideHookIndex
+  }
+})
+
+
+test('interval Guides require host admission and ordered current-project video/audio sources', async () => {
+  const { resolveH3AVGuideSelections, isIntervalH3GuideFrame } = await loadGuideModule()
+  const video = output('motion.mp4', { type: 'video' }), audio = output('sound.wav', { type: 'audio' })
+  const sources = [video, audio], keys = [key(audio), key(video)], enabled = new Set(['minimax_h3'])
+  const admitted = [model('minimax_h3', { h3_gallery_av_guides: true })]
+  const select = (files = sources, selection = keys, models = admitted, project = 'project-a', permission = true) =>
+    resolveH3AVGuideSelections(files, selection, project, permission, models, enabled, true)
+  assert.deepEqual(select(), [audio, video])
+  assert.equal(select(sources, keys, GUIDE_MODELS), null)
+  assert.equal(select(sources, keys, [model('minimax_h3', { h3_gallery_av_guides: false })]), null)
+  assert.equal(select(sources, keys, admitted, 'project-b'), null)
+  assert.equal(select(sources, keys, admitted, 'project-a', false), null)
+  assert.equal(select(sources, [key(video), key(video)]), null)
+  assert.equal(select([video, output('picture.png')], [key(video), key(output('picture.png'))]), null)
+  assert.equal(select([video, { ...audio, revision: '' }]), null)
+  for (const value of ['0', '123', '-1', '-124']) assert.equal(isIntervalH3GuideFrame(value, 124), true)
+  for (const value of ['', '124', '-125', '0.5', '1e2']) assert.equal(isIntervalH3GuideFrame(value, 124), false)
+})
+
+test('mixed interval Guides submit exact ordered revisions, overlapping positions, privacy and Dense default', async () => {
+  const { H3GuidePanel } = await loadGuideModule()
+  const originalFetch = globalThis.fetch, requests = []
+  let queued = 0
+  globalThis.__h3GuideHookStates = []
+  globalThis.fetch = async (url, options) => {
+    requests.push({ url: String(url), body: JSON.parse(options.body) })
+    return Response.json({ job_id: 'av-job', status: 'preparing' })
+  }
+  try {
+    const props = panelProps({
+      stills: [output('sound.wav', { type: 'audio', private: true }), output('motion.mp4', { type: 'video', explicit: true })],
+      models: [model('minimax_h3', { h3_gallery_av_guides: true })], onQueued: async () => { queued++ },
+    })
+    let tree = openPanel(H3GuidePanel, props)
+    assert.match(elementText(tree), /Video contributes picture only; audio contributes sound only/)
+    findLabel(tree, 'Guide frame index, 0-based').props.onChange({ target: { value: '0' } })
+    findLabel(tree, 'Second guide frame index, 0-based').props.onChange({ target: { value: '0' } })
+    findLabel(tree, 'Describe the clip').props.onChange({ target: { value: 'An adult character in a violent fictional battle.' } })
+    tree = renderPanel(H3GuidePanel, props)
+    await flatten(tree).find(element => element.type === 'form').props.onSubmit({ preventDefault() {} })
+    assert.equal(queued, 1)
+    assert.deepEqual(requests, [{ url: '/api/v1/h3/gallery-av-guide', body: {
+      workspace: 'project-a', model_type: 'minimax_h3', prompt: 'An adult character in a violent fictional battle.',
+      guides: [
+        { name: 'sound.wav', revision: 'revision-sound.wav', kind: 'audio', frame_index: 0 },
+        { name: 'motion.mp4', revision: 'revision-motion.mp4', kind: 'video', frame_index: 0 },
+      ], settings: { video_length: 124, attention_engine: 'sdpa' }, private_output: true, explicit_output: true,
+    } }])
+  } finally {
+    globalThis.fetch = originalFetch
+    delete globalThis.__h3GuideHookStates
+    delete globalThis.__h3GuideHookIndex
+  }
+})
+
+test('interval panel rechecks capability and selection before dispatch and ignores departed replies', async () => {
+  const { H3GuidePanel } = await loadGuideModule()
+  const originalFetch = globalThis.fetch
+  let current = true, queued = 0, calls = 0, finish
+  globalThis.__h3GuideHookStates = []
+  globalThis.fetch = () => { calls++; return new Promise(resolve => { finish = resolve }) }
+  try {
+    const props = panelProps({ stills: [output('motion.mp4', { type: 'video' })],
+      models: [model('minimax_h3', { h3_gallery_av_guides: true })],
+      isCurrentSelection: () => current, onQueued: async () => { queued++ } })
+    let tree = openPanel(H3GuidePanel, props)
+    fillGuide(tree, { frame: '-1' })
+    tree = renderPanel(H3GuidePanel, { ...props, models: GUIDE_MODELS })
+    await flatten(tree).find(element => element.type === 'form').props.onSubmit({ preventDefault() {} })
+    assert.equal(calls, 0)
+    tree = renderPanel(H3GuidePanel, props)
+    const pending = flatten(tree).find(element => element.type === 'form').props.onSubmit({ preventDefault() {} })
+    current = false
+    finish(Response.json({ job_id: 'av-job', status: 'queued' }))
+    await pending
+    assert.equal(calls, 1); assert.equal(queued, 0)
+    tree = renderPanel(H3GuidePanel, props)
+    await flatten(tree).find(element => element.type === 'form').props.onSubmit({ preventDefault() {} })
+    assert.equal(calls, 1)
+  } finally {
+    globalThis.fetch = originalFetch
+    delete globalThis.__h3GuideHookStates
+    delete globalThis.__h3GuideHookIndex
+  }
+})
+
+test('interval API reports unavailable and stale media and never repeats an uncertain request', async () => {
+  const { submitH3GalleryAVGuide } = await loadGuideModule()
+  const originalFetch = globalThis.fetch
+  const request = { workspace: 'project-a', model_type: 'minimax_h3', prompt: 'A scene', guides: [], settings: { video_length: 124 } }
+  let calls = 0
+  try {
+    for (const [status, detail, message] of [
+      [409, 'H3 video/audio guides are not available yet', /unavailable on this installation/],
+      [409, 'Selected Gallery guide is invalid or changed', /selected Gallery guide changed/],
+      [403, 'denied', /permission/],
+    ]) {
+      globalThis.fetch = async () => Response.json({ detail }, { status })
+      await assert.rejects(submitH3GalleryAVGuide(request), message)
+    }
+    globalThis.fetch = async () => { calls++; throw new TypeError('network lost') }
+    await assert.rejects(submitH3GalleryAVGuide(request), /Check Queue before trying again/)
+    assert.equal(calls, 1)
+    globalThis.fetch = async () => Response.json({ status: 'queued' })
+    await assert.rejects(submitH3GalleryAVGuide(request), /Check Queue before trying again/)
+  } finally { globalThis.fetch = originalFetch }
+})
+
+
+test('unmounted interval submission cannot regain authority after identical selection returns', async () => {
+  const { H3GuidePanel } = await loadGuideModule()
+  const originalFetch = globalThis.fetch
+  let queued = 0, finish
+  globalThis.__h3GuideHookStates = []
+  globalThis.__h3GuideCleanups = []
+  globalThis.fetch = () => new Promise(resolve => { finish = resolve })
+  try {
+    const props = panelProps({ stills: [output('motion.mp4', { type: 'video' })],
+      models: [model('minimax_h3', { h3_gallery_av_guides: true })],
+      isCurrentSelection: () => true, onQueued: async () => { queued++ } })
+    let tree = openPanel(H3GuidePanel, props)
+    fillGuide(tree, { frame: '0' })
+    tree = renderPanel(H3GuidePanel, props)
+    const pending = flatten(tree).find(element => element.type === 'form').props.onSubmit({ preventDefault() {} })
+    for (const cleanup of globalThis.__h3GuideCleanups) cleanup?.()
+    // Project departure unmounted the old panel; returning mounts a fresh
+    // panel with the same names/revisions and makes its source predicate true.
+    globalThis.__h3GuideHookStates = []
+    openPanel(H3GuidePanel, props)
+    finish(Response.json({ job_id: 'departed-job', status: 'queued' }))
+    await pending
+    assert.equal(queued, 0)
+  } finally {
+    globalThis.fetch = originalFetch
+    delete globalThis.__h3GuideHookStates
+    delete globalThis.__h3GuideHookIndex
+    delete globalThis.__h3GuideCleanups
+  }
+})
+
+
+test('departure during accepted Guide reconnection invalidates the parent navigation guard', async () => {
+  const { H3GuidePanel } = await loadGuideModule()
+  const originalFetch = globalThis.fetch
+  let guard, finish, navigated = false
+  globalThis.__h3GuideHookStates = []
+  globalThis.__h3GuideCleanups = []
+  globalThis.fetch = async () => Response.json({ job_id: 'accepted', status: 'queued' })
+  try {
+    const props = panelProps({ onQueued: async isCurrent => {
+      guard = isCurrent
+      await new Promise(resolve => { finish = resolve })
+      if (isCurrent()) navigated = true
+    } })
+    let tree = openPanel(H3GuidePanel, props); fillGuide(tree)
+    tree = renderPanel(H3GuidePanel, props)
+    const pending = flatten(tree).find(element => element.type === 'form').props.onSubmit({ preventDefault() {} })
+    await new Promise(resolve => setImmediate(resolve))
+    assert.equal(guard(), true)
+    for (const cleanup of globalThis.__h3GuideCleanups) cleanup?.()
+    globalThis.__h3GuideHookStates = []; openPanel(H3GuidePanel, props)
+    assert.equal(guard(), false)
+    finish(); await pending
+    assert.equal(navigated, false)
+  } finally {
+    globalThis.fetch = originalFetch
+    delete globalThis.__h3GuideHookStates; delete globalThis.__h3GuideHookIndex; delete globalThis.__h3GuideCleanups
   }
 })

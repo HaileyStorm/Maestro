@@ -51,6 +51,8 @@ export interface ModelDef {
   architecture: string
   /** Engines whose generators actually consume a Retake source and range. */
   retake_engines?: string[]
+  /** Host-owned admission for experimental Gallery video/audio Guides. */
+  h3_gallery_av_guides?: boolean
   is_i2v: boolean
   is_t2v: boolean
   guidance_max_phases: number

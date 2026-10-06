@@ -14908,6 +14908,7 @@ def list_models(request: Request):
             "family": family,
             "architecture": architecture,
             "retake_engines": _retake_engines_for_architecture(architecture),
+            "h3_gallery_av_guides": mt == "minimax_h3" and os.environ.get("MAESTRO_H3_TIMELINE_GUIDES_EXPERIMENTAL") == "1",
             "is_i2v": wgp.test_class_i2v(mt),
             "is_t2v": wgp.test_class_t2v(mt),
             "guidance_max_phases": md.get("guidance_max_phases", 1),
@@ -49618,6 +49619,10 @@ def _decode_h3_gallery_av_guide_job(job, *, resolution, cancel_check):
     )
 
 
+def _h3_gallery_av_guides_available(model_type):
+    return model_type == "minimax_h3" and os.environ.get("MAESTRO_H3_TIMELINE_GUIDES_EXPERIMENTAL") == "1"
+
+
 @api.post("/api/v1/h3/gallery-av-guide")
 async def h3_gallery_av_guide_endpoint(request: Request):
     """Seal ordered current-project video/audio guides for one Base clip."""
@@ -49626,7 +49631,7 @@ async def h3_gallery_av_guide_endpoint(request: Request):
         H3GalleryAVGuideError, build_gallery_av_guide_plan,
         make_gallery_av_guide_sources, probe_gallery_av,
     )
-    if os.environ.get("MAESTRO_H3_TIMELINE_GUIDES_EXPERIMENTAL") != "1":
+    if not _h3_gallery_av_guides_available("minimax_h3"):
         raise HTTPException(status_code=409, detail="H3 video/audio guides are not available yet")
     try:
         body = await request.json()
