@@ -6869,7 +6869,7 @@ def load_models(
         )
     )
     if h3_control_residency_identity is not None:
-        # Request admission does not yet carry Control assets. Never present
+        # Ordinary request admission does not carry Control assets. Never present
         # this heavier graph as the ordinary base for subsequent job reuse.
         _loaded_residency_base_key = None
         _loaded_residency_affinity_key = None
@@ -11273,6 +11273,7 @@ def generate_video(*args, **kwargs):
     profile_observer = _bound_value("_h3_profile_observer")
     cumulative_dispatch = _bound_value("_h3_cumulative_dispatch")
     interval_guides = _bound_value("_h3_timeline_guides")
+    control_dispatch = _bound_value("_h3_control_dispatch")
     cumulative_started = False
     try:
         if cumulative_dispatch is not None:
@@ -11282,7 +11283,7 @@ def generate_video(*args, **kwargs):
                 for name, parameter in inspect.signature(_generate_video_impl).parameters.items()
             })
             cumulative_started = True
-        if is_h3_model(model_type):
+        if is_h3_model(model_type) and control_dispatch is None:
             current_profile = _bound_value("override_profile", -1)
             if current_profile in (None, -1):
                 current_profile = get_default_profile(
@@ -11311,7 +11312,7 @@ def generate_video(*args, **kwargs):
                     _release_failed_generation_resources()
                 except Exception as error:
                     print(f"[Memory] Failed-generation cleanup: {type(error).__name__}")
-            if result and interval_guides is None:
+            if result and interval_guides is None and control_dispatch is None:
                 try:
                     from services.h3_host_limits import record_denoise_success
                     record_denoise_success(
@@ -11332,7 +11333,7 @@ def generate_video(*args, **kwargs):
                     pass
             return result
         except H3OomReliefRetry as retry:
-            if interval_guides is not None:
+            if interval_guides is not None or control_dispatch is not None:
                 # Decoded guide geometry is immutable. Never retry it after
                 # changing the canvas, steps or profile behind the owner.
                 try:
@@ -11797,7 +11798,34 @@ def _generate_video_impl(
     _h3_cumulative_dispatch=None,
     # Worker-created decoded interval media; never persisted or client-bound.
     _h3_timeline_guides=None,
+    # Host-selected acquired assets and CPU decoded Control media, worker-only.
+    _h3_control_dispatch=None,
 ):
+    if _h3_control_dispatch is not None:
+        from services.h3_gallery_control import validate_gallery_control_dispatch
+        try:
+            control_width, control_height = (int(part) for part in resolution.lower().split("x"))
+        except (AttributeError, TypeError, ValueError):
+            raise ValueError("H3 Control canvas is invalid") from None
+        validate_gallery_control_dispatch(
+            _h3_control_dispatch, frame_num=video_length,
+            height=control_height, width=control_width,
+        )
+        if (
+            model_type != "minimax_h3" or not isinstance(mode, str) or mode.startswith("edit_")
+            or _h3_timeline_guides is not None or _h3_cumulative_dispatch is not None
+            or _h3_native_boundary is not None or h3_native_boundary_conditioning
+            or type(repeat_generation) is not int or repeat_generation != 1
+            or type(batch_size) is not int or batch_size != 1
+            or activated_loras or skip_steps_cache_type
+            or video_source or audio_source or image_start is not None or image_end is not None
+            or image_refs or video_guide or video_guide2 or video_guide3 or image_guide
+            or audio_guide or audio_guide2 or audio_guide3 or audio_guide4 or audio_guide5 or audio_guide6
+            or audio_conditioning_guide or image_prompt_type or video_prompt_type or audio_prompt_type
+            or guidance_scale != 1 or trim_tail_frames or multi_prompts_gen_type
+            or type(custom_settings) is not dict or custom_settings != {"h3_attention_engine": "sdpa"}
+        ):
+            raise ValueError("H3 Control requires an independent dense Base worker handoff")
     if _h3_timeline_guides is not None:
         from models.minimax_h3.timeline_guides import H3TimelineGuidePayload
         if (
@@ -11807,7 +11835,7 @@ def _generate_video_impl(
             or _h3_cumulative_dispatch is not None or _h3_native_boundary is not None
             or type(repeat_generation) is not int or repeat_generation != 1
             or type(batch_size) is not int or batch_size != 1
-            or activated_loras or tea_cache or skip_steps_cache_type
+            or activated_loras or skip_steps_cache_type
             or video_source or audio_source or image_start is not None or image_end is not None
             or image_refs or video_guide or video_guide2 or video_guide3
             or audio_guide or audio_guide2 or audio_guide3 or audio_guide4 or audio_guide5 or audio_guide6
@@ -11897,7 +11925,7 @@ def _generate_video_impl(
 
     _notify_h3_profile_observer(_h3_profile_observer, "execution", model_type)
     _h3_observation_request = (resolution, video_length, num_inference_steps)
-    if str(model_type or "").startswith("minimax_h3"):
+    if str(model_type or "").startswith("minimax_h3") and _h3_control_dispatch is None:
         try:
             from services.h3_host_limits import reason_if_blocked
             _h3_attention = None
@@ -12243,7 +12271,7 @@ def _generate_video_impl(
             model_kwargs["VAE_upsampling"] = new_vae_upsampling
     output_type = get_output_type_for_model(model_type, image_mode)
     profile = compute_profile(override_profile, output_type)
-    if str(model_type or "").startswith("minimax_h3"):
+    if str(model_type or "").startswith("minimax_h3") and _h3_control_dispatch is None:
         from services.h3_oom_relief import apply_h3_baseline_offload_profile
         profile = apply_h3_baseline_offload_profile(
             profile, model_type, resolution,
@@ -12332,6 +12360,10 @@ def _generate_video_impl(
         requested_model_configuration,
         release_model,
     )
+    if _h3_control_dispatch is not None:
+        # The ordinary cached Base does not contain the acquired Control child.
+        # Private Control always receives its own fresh eager residency graph.
+        reload_needed = True
     # MMGP budgets are established by offload.profile. Reusing the same model
     # after a coefficient/profile/VAE change would retain the stale budget, so
     # the helper above goes through the existing safe release path exactly once.
@@ -12401,6 +12433,10 @@ def _generate_video_impl(
             residency_context=requested_residency_evidence_context,
             h3_dasiwa_admission=dasiwa_checkpoint_admission,
             resolution=resolution,
+            **({
+                "_h3_control_base_checkpoint": _h3_control_dispatch.base_checkpoint,
+                "_h3_control_checkpoint": _h3_control_dispatch.control_checkpoint,
+            } if _h3_control_dispatch is not None else {}),
             **model_kwargs,
         )
         send_cmd("status", "Model loaded")
@@ -12838,10 +12874,12 @@ def _generate_video_impl(
 
     seed = None if seed == -1 else seed
     # negative_prompt = "" # not applicable in the inference
-    model_filename = get_model_filename(base_model_type)  
+    model_filename = ("MiniMax-H3-original-FL2VA-13-shard-BF16" if _h3_control_dispatch is not None
+                      else get_model_filename(base_model_type))
 
     _, _, latent_size = get_model_min_frames_and_step(model_type)
-    video_length = (align_model_frame_count(video_length, model_def) if _h3_cumulative_dispatch is None
+    video_length = (video_length if _h3_control_dispatch is not None else
+                    align_model_frame_count(video_length, model_def) if _h3_cumulative_dispatch is None
                     else _h3_cumulative_dispatch.sampling_frames(video_length))
     published_video_length = video_length
     h3_native_boundary_video = None
@@ -14207,10 +14245,16 @@ def _generate_video_impl(
                             container=server_config.get("video_container", "mp4"),
                             abort_check=lambda: gen.get("abort", False), timeout=600,
                         )
+                sampling_frame_num = (
+                    current_video_length if _h3_control_dispatch is not None else
+                    (align_model_frame_count(current_video_length, model_def, for_generation=True)
+                     if _h3_cumulative_dispatch is None else
+                     _h3_cumulative_dispatch.sampling_frames(current_video_length))
+                )
                 if base_model_type in {"minimax_h3", "minimax_h3_ref2va"}:
                     begin_decode_capture(_h3_decode_observer, {
                         "repeat_index": max(0, repeat_no - 1), "window_index": window_no,
-                        "seed": seed, "frames": (align_model_frame_count(current_video_length, model_def, for_generation=True) if _h3_cumulative_dispatch is None else _h3_cumulative_dispatch.sampling_frames(current_video_length)),
+                        "seed": seed, "frames": sampling_frame_num,
                         "height": image_size[0], "width": image_size[1], "fps": fps,
                         "model_filename": model_filename,
                     })
@@ -14230,6 +14274,12 @@ def _generate_video_impl(
                        if h3_timeline_still_guide_requested else {}),
                     **({"_h3_timeline_guides": _h3_timeline_guides}
                        if _h3_timeline_guides is not None else {}),
+                    **({"_h3_control": {
+                        "video": _h3_control_dispatch.video,
+                        "mask": None, "inpaint": None,
+                        "strength": _h3_control_dispatch.plan["control"]["strength"],
+                        "residency_identity": wan_model.get_h3_control_residency_identity(),
+                    }} if _h3_control_dispatch is not None else {}),
                     input_frames = src_video,
                     input_frames2 = src_video2,
                     input_frames3 = src_video3,
@@ -14243,7 +14293,7 @@ def _generate_video_impl(
                     denoising_strength=denoising_strength,
                     masking_strength=masking_strength,
                     prefix_frames_count = prefix_frames_count,
-                    frame_num=(align_model_frame_count(current_video_length, model_def, for_generation=True) if _h3_cumulative_dispatch is None else _h3_cumulative_dispatch.sampling_frames(current_video_length)),
+                    frame_num=sampling_frame_num,
                     batch_size = batch_size,
                     height = image_size[0],
                     width = image_size[1],
@@ -14817,6 +14867,7 @@ def _generate_video_impl(
                 inputs.pop("_h3_decode_observer", None)
                 inputs.pop("_h3_cumulative_dispatch", None)
                 inputs.pop("_h3_timeline_guides", None)
+                inputs.pop("_h3_control_dispatch", None)
                 durable_file_stem = None
                 if durable_output_dir is not None:
                     durable_repeat = (
@@ -15148,8 +15199,10 @@ def _generate_video_impl(
                 inputs.pop("after_segment_output", None)
                 inputs.pop("_h3_cumulative_dispatch", None)
                 inputs.pop("_h3_timeline_guides", None)
+                inputs.pop("_h3_control_dispatch", None)
                 inputs["model_type"] = model_type
-                inputs["model_filename"] = get_model_filename(model_type, transformer_quantization, transformer_dtype_policy)
+                inputs["model_filename"] = (model_filename if _h3_control_dispatch is not None
+                                             else get_model_filename(model_type, transformer_quantization, transformer_dtype_policy))
                 if is_image:
                     inputs["image_quality"] = server_config.get("image_output_codec", None)
                 else:

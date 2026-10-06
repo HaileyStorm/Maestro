@@ -126,6 +126,37 @@ checks exercise row reuse, paired sampling and zero-strength equivalence.
 They do not qualify full acquired weights, actual text/media decoding, native
 CUDA residency, or visual/listening quality. Public execution remains closed.
 
+The private `/api/v1/h3/gallery-control` route connects one explicitly selected
+**precomputed** canny/depth/hed/mlsd/pose Gallery video to that sampler. It does
+not produce or infer a control map from an ordinary video, and the first route
+does not accept inpaint masks. Both `MAESTRO_H3_CONTROL_EXPERIMENTAL=1` and
+`MAESTRO_H3_CONTROL_GALLERY_EXPERIMENTAL=1` are required. The host also selects
+already acquired files through `MAESTRO_H3_CONTROL_BASE_CHECKPOINT` (the first
+original Base shard) and `MAESTRO_H3_CONTROL_CHECKPOINT`; HTTP settings cannot
+select checkpoint paths. These controls stay off by default pending native
+full-weight, memory/device and media qualification.
+
+The request contains `workspace`, `model_type: "minimax_h3"`, `prompt`,
+`settings` (`resolution` bounds, optional `num_inference_steps`, `seed` and
+integer `override_profile`), and `control` (`name`, current Gallery `revision`,
+`kind`, and `strength` from zero through one). It seals a path-free source and
+15-file asset selection commitment, inherits the source's actual access policy,
+and enters the ordinary authorized queue. The worker rechecks source/privacy
+and asset selection, decodes the committed legal frame prefix as bounded CPU
+unit-range BCTHW pixels, and loads a fresh paired Base/Control graph. The native
+loader still verifies every checkpoint byte. File metadata admission alone
+does not prove checkpoint integrity or device readiness.
+
+Control keeps its legal `17*n+5` clock and fitted 32-pixel canvas rather than
+adopting the ordinary Base minimum. It uses dense SDPA and CFG 1, excludes all
+other media/LoRA/acceleration conditioning, and refuses automatic OOM retries
+that alter sampling or geometry. Ordinary-to-Control and Control-to-ordinary
+transitions reload separate graphs. Source/privacy changes before publication
+withhold the output; private transports and selections are stripped from saved
+metadata. Control success is excluded from ordinary H3 timing/allocation
+calibration. Actual CPU FFmpeg/worker and model-free load/retry checks cover
+these boundaries, without qualifying native weights, CUDA or output quality.
+
 The original Control loader also uses the held-descriptor safetensors reader
 and hands MMGP an explicit tensor tuple. It does not reopen an unsealed path
 or permit implicit sidecars during MMGP loading. File resolution, cancellation

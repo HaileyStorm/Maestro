@@ -630,23 +630,29 @@ class TestMiniMaxH3Definition(unittest.TestCase):
             node.value for node in ast.walk(tree) if isinstance(node, ast.Assign)
             and any(isinstance(target, ast.Name) and target.id == "video_length"
                     for target in node.targets)
-            and isinstance(node.value, ast.IfExp) and isinstance(node.value.body, ast.Call)
-            and isinstance(node.value.body.func, ast.Name)
-            and node.value.body.func.id == "align_model_frame_count"
+            and isinstance(node.value, ast.IfExp)
+            and any(isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+                    and call.func.id == "align_model_frame_count" for call in ast.walk(node.value))
         )
-        frame_counts = [
-            keyword.value for node in ast.walk(tree) if isinstance(node, ast.Call)
+        sampling = next(node.value for node in ast.walk(tree) if isinstance(node, ast.Assign)
+                        and any(isinstance(target, ast.Name) and target.id == "sampling_frame_num"
+                                for target in node.targets))
+        frame_counts = [sampling if isinstance(keyword.value, ast.Name)
+                       and keyword.value.id == "sampling_frame_num" else keyword.value
+            for node in ast.walk(tree) if isinstance(node, ast.Call)
             for keyword in node.keywords if keyword.arg == "frame_num"
-            and isinstance(keyword.value, ast.IfExp) and isinstance(keyword.value.body, ast.Call)
-            and isinstance(keyword.value.body.func, ast.Name)
-            and keyword.value.body.func.id == "align_model_frame_count"
+            and (isinstance(keyword.value, ast.Name) and keyword.value.id == "sampling_frame_num"
+                 or isinstance(keyword.value, ast.IfExp)
+                 and any(isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+                         and call.func.id == "align_model_frame_count" for call in ast.walk(keyword.value)))
         ]
         self.assertTrue(frame_counts)
         definition = {"frame_alignment_modulus": 17, "frame_alignment_remainder": 5,
                       "frames_minimum": 124, "frames_maximum": 345, "frame_alignment_mode": "ceil"}
         align = mock.Mock(wraps=_load_frame_aligner())
         scope = {"video_length": 125, "current_video_length": 125, "model_def": definition,
-                 "align_model_frame_count": align, "_h3_cumulative_dispatch": None}
+                 "align_model_frame_count": align, "_h3_cumulative_dispatch": None,
+                 "_h3_control_dispatch": None}
         self.assertEqual(eval(compile(ast.Expression(video_length), str(_WGP_PATH), "eval"), scope), 141)
         align.assert_called_once_with(125, definition)
         for expression in frame_counts:
@@ -2148,14 +2154,17 @@ class TestMiniMaxH3TimelineStillGuide(unittest.TestCase):
         frame_expression = next(
             keyword.value for call in ast.walk(generate_video) if isinstance(call, ast.Call)
             for keyword in call.keywords if keyword.arg == "frame_num"
-            and isinstance(keyword.value, ast.IfExp)
-            and isinstance(keyword.value.body, ast.Call)
-            and isinstance(keyword.value.body.func, ast.Name)
-            and keyword.value.body.func.id == "align_model_frame_count"
+            and isinstance(keyword.value, ast.Name)
+            and keyword.value.id == "sampling_frame_num"
         )
+        sampling = next(node for node in ast.walk(generate_video) if isinstance(node, ast.Assign)
+                        and any(isinstance(target, ast.Name) and target.id == "sampling_frame_num"
+                                for target in node.targets))
         align = _load_frame_aligner()
         frame_namespace = {"current_video_length": 124, "model_def": {"frame_alignment_modulus": 17, "frame_alignment_remainder": 5, "frames_minimum": 124},
-                           "align_model_frame_count": align, "_h3_cumulative_dispatch": None}
+                           "align_model_frame_count": align, "_h3_cumulative_dispatch": None,
+                           "_h3_control_dispatch": None}
+        exec(compile(ast.Module(body=[sampling], type_ignores=[]), str(_WGP_PATH), "exec"), frame_namespace)
         self.assertEqual(eval(compile(ast.Expression(frame_expression), str(_WGP_PATH), "eval"),
                               frame_namespace), 124)
 

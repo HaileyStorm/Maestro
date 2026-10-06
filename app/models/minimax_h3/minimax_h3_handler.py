@@ -626,6 +626,11 @@ class family_handler:
         custom_for_timeline = (
             custom_settings if isinstance(custom_settings, dict) else {}
         )
+        if (any(isinstance(key, str) and key.startswith("_h3_control")
+                and (key != "_h3_control_dispatch" or value is not None)
+                for key, value in inputs.items())
+                or any(isinstance(key, str) and key.startswith("_h3_control") for key in custom_for_timeline)):
+            return "MiniMax H3 Control is a private worker handoff, not a saved input."
         if inputs.get("_h3_timeline_guides") is not None or "_h3_timeline_guides" in custom_for_timeline:
             return "MiniMax H3 interval media is a private worker handoff, not a saved input."
         from services.h3_pdd import H3PDDError, enforce_pdd_runtime

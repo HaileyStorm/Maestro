@@ -11722,6 +11722,7 @@ def _h3_ordinary_restart_allowed(job: dict) -> bool:
         or any(params.get(key) for key in (
             "_h3_longform", "_h3_cumulative_append", "_director_pipeline_id",
             "_h3_timeline_av_guide_source", "_h3_timeline_av_guide_plan",
+            "_h3_control_gallery_source", "_h3_control_gallery_plan",
             "_director_request_id", "_h3_source_prefix", "h3_source_prefix",
             "_director_final_video_postprocess", "_director_image_role",
             "h3_native_boundary_conditioning", "video_source",
@@ -17519,6 +17520,7 @@ def _reject_client_h3_internal_state(
             "_h3_timeline_still_guide_plan",
             "_h3_timeline_av_guide_source",
             "_h3_timeline_av_guide_plan",
+            "_h3_control_gallery_source", "_h3_control_gallery_plan",
         }
         if allow_gallery_still_guide else set()
     )
@@ -45812,7 +45814,8 @@ def _require_h3_offload_plan_parity(
 
 def _h3_peak_recovery_identity(params: dict, *, frame_count: int) -> dict:
     """Build the path/content-free identity used by calibrated H3 recovery."""
-    if any(key in params for key in ("_h3_timeline_av_guide_source", "_h3_timeline_av_guide_plan")):
+    if any(key in params for key in ("_h3_timeline_av_guide_source", "_h3_timeline_av_guide_plan",
+                                   "_h3_control_gallery_source", "_h3_control_gallery_plan")):
         raise QueueRecoveryRuntimeError("H3 interval guides have no native allocation calibration yet.")
     custom = params.get("custom_settings")
     custom = custom if isinstance(custom, dict) else {}
@@ -46014,7 +46017,8 @@ def _record_h3_benchmark_observation(
     model_load_state: str = "unknown",
     observed_profile: int | float | None = None,
 ) -> None:
-    if any(key in params for key in ("_h3_timeline_av_guide_source", "_h3_timeline_av_guide_plan")):
+    if any(key in params for key in ("_h3_timeline_av_guide_source", "_h3_timeline_av_guide_plan",
+                                   "_h3_control_gallery_source", "_h3_control_gallery_plan")):
         return  # Interval conditions have no ordinary/still timing identity.
     observed_profile = _h3_observed_offload_profile(observed_profile)
     if observed_profile is None or any(
@@ -46293,6 +46297,7 @@ def _h3_estimate_context(body: dict, plan: dict | None = None) -> dict:
         "model_type": model_type,
         "_uncalibrated_interval_guides": any(key in body for key in (
             "_h3_timeline_av_guide_source", "_h3_timeline_av_guide_plan",
+            "_h3_control_gallery_source", "_h3_control_gallery_plan",
         )),
         "duration_seconds": duration,
         "window_seconds": window_seconds,
@@ -47940,6 +47945,7 @@ def _run_generation_preparation(
                 "_h3_timeline_still_guide_plan",
                 "_h3_timeline_av_guide_source",
                 "_h3_timeline_av_guide_plan",
+                "_h3_control_gallery_source", "_h3_control_gallery_plan",
             )
         )
         if has_gallery_still_guide:
@@ -48100,6 +48106,7 @@ def _run_generation_preparation(
                 "_h3_timeline_still_guide_plan",
                 "_h3_timeline_av_guide_source",
                 "_h3_timeline_av_guide_plan",
+                "_h3_control_gallery_source", "_h3_control_gallery_plan",
             )
         )
         if has_prepared_gallery_guide:
@@ -49477,6 +49484,13 @@ def _validate_h3_gallery_still_guide_job(job: Mapping[str, Any], *, cancel_check
     params = job.get("params") if isinstance(job, Mapping) else None
     if not isinstance(params, Mapping):
         return None
+    if any(key in params for key in ("_h3_control_gallery_source", "_h3_control_gallery_plan")):
+        if any(key in params for key in (
+            H3_GALLERY_STILL_GUIDE_SOURCE_KEY, H3_GALLERY_STILL_GUIDE_PLAN_KEY,
+            "_h3_timeline_av_guide_source", "_h3_timeline_av_guide_plan",
+        )):
+            raise ValueError("H3 Control and Gallery guides cannot be combined")
+        return _validate_h3_gallery_control_job(job, cancel_check=cancel_check)
     if any(key in params for key in (
         "_h3_timeline_av_guide_source", "_h3_timeline_av_guide_plan",
     )):
@@ -49621,6 +49635,187 @@ def _decode_h3_gallery_av_guide_job(job, *, resolution, cancel_check):
 
 def _h3_gallery_av_guides_available(model_type):
     return model_type == "minimax_h3" and os.environ.get("MAESTRO_H3_TIMELINE_GUIDES_EXPERIMENTAL") == "1"
+
+
+def _h3_gallery_control_available():
+    return (os.environ.get("MAESTRO_H3_CONTROL_EXPERIMENTAL") == "1"
+            and os.environ.get("MAESTRO_H3_CONTROL_GALLERY_EXPERIMENTAL") == "1")
+
+
+def _validate_h3_gallery_control_job(job: Mapping[str, Any], *, cancel_check=None) -> dict:
+    """Recheck the authorized prepared video and server-selected acquired assets."""
+    from dataclasses import asdict
+    from services.h3_gallery_av_guide import probe_gallery_av, H3GalleryAVGuideCancelled
+    from services.h3_gallery_control import control_assets_from_environment, make_gallery_control_source
+    from services.h3_control_plan import validate_h3_control_plan
+    params = job.get("params")
+    if type(params) is not dict or not _h3_gallery_control_available():
+        raise ValueError("H3 Control request is unavailable")
+    plan = validate_h3_control_plan(params.get("_h3_control_gallery_plan"))
+    binding = params.get("_h3_control_gallery_source")
+    if type(binding) is not dict or set(binding) != {"source", "plan_sha256", "assets"}:
+        raise ValueError("H3 Control source binding is invalid")
+    assets = control_assets_from_environment()
+    if binding != make_gallery_control_source(binding["source"], plan, assets["binding"]):
+        raise ValueError("H3 Control acquired assets or source plan changed")
+    geometry = plan["geometry"]
+    if (
+        params.get("model_type") != "minimax_h3"
+        or params.get("resolution") != f'{geometry["width"]}x{geometry["height"]}'
+        or params.get("video_length") != geometry["frame_count"]
+        or params.get("sliding_window_size") != geometry["frame_count"]
+        or params.get("guidance_scale") != 1
+        or params.get("generation_mode") != "video" or params.get("image_mode") != 0
+        or any(params.get(key) for key in _GENERATION_MEDIA_INPUTS)
+        or any(params.get(key) for key in (
+            "activated_loras", "tea_cache", "skip_steps_cache_type", "video_prompt_type",
+            "audio_prompt_type", "image_prompt_type", "trim_tail_frames", "multi_prompts_gen_type",
+            "h3_native_boundary_conditioning", "voice_clone_enabled", "voice_clone_refs",
+        ))
+        or any(type(params.get(key)) is not int or params[key] != 1
+               for key in ("repeat_generation", "batch_size"))
+        or params.get("custom_settings") != {"h3_attention_engine": "sdpa"}
+    ):
+        raise ValueError("H3 Control requires one independent dense Base clip")
+    source = binding["source"]
+    workspace, out_dir = str(job.get("workspace") or ""), str(job.get("out_dir") or "")
+    if source["workspace"] != workspace:
+        raise ValueError("H3 Control belongs to another project")
+    path, metadata = _h3_gallery_av_source_state(workspace, out_dir, source["name"], source["revision"])
+    for key in ("private", "explicit"):
+        if (metadata.get(key, False) != source["source_" + key]
+                or (source["source_" + key] and job.get(key) is not True)):
+            raise ValueError("H3 Control source privacy changed")
+    try:
+        facts = asdict(probe_gallery_av(path, "video", cancel_check=cancel_check))
+    except H3GalleryAVGuideCancelled:
+        raise InterruptedError("H3 Control validation cancelled") from None
+    if any(source.get(key) != value for key, value in facts.items()):
+        raise ValueError("H3 Control source bytes or geometry changed")
+    _, current = _h3_gallery_av_source_state(workspace, out_dir, source["name"], source["revision"])
+    if any(current.get(key, False) != source["source_" + key] for key in ("private", "explicit")):
+        raise ValueError("H3 Control source privacy changed")
+    return {"path": path, "source_binding": binding, "plan": plan}
+
+
+def _decode_h3_gallery_control_job(job, *, cancel_check):
+    from services.h3_gallery_control import make_gallery_control_dispatch
+    verified = _validate_h3_gallery_control_job(job, cancel_check=cancel_check)
+    return make_gallery_control_dispatch(
+        verified["path"], verified["source_binding"], verified["plan"], cancel_check=cancel_check,
+    )
+
+
+@api.post("/api/v1/h3/gallery-control")
+async def h3_gallery_control_endpoint(request: Request):
+    """Queue one selected precomputed Control video; never infer a control map."""
+    from dataclasses import asdict
+    from services.h3_gallery_av_guide import probe_gallery_av
+    from services.h3_gallery_control import control_assets_from_environment, make_gallery_control_source
+    from services.h3_control_plan import plan_h3_control_request
+    if not _h3_gallery_control_available():
+        raise HTTPException(status_code=409, detail="H3 Control is not available yet")
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="H3 Control request must be an object") from None
+    required = {"workspace", "model_type", "prompt", "settings", "control"}
+    if (
+        type(body) is not dict or not required <= set(body)
+        or set(body) - required - {"private_output", "explicit_output"}
+        or type(body["workspace"]) is not str or not body["workspace"]
+        or body["model_type"] != "minimax_h3"
+        or type(body["prompt"]) is not str or not body["prompt"].strip() or len(body["prompt"]) > 16_384
+        or type(body["settings"]) is not dict
+        or set(body["settings"]) - {"resolution", "num_inference_steps", "seed", "override_profile"}
+        or any(key in body and type(body[key]) is not bool for key in ("private_output", "explicit_output"))
+        or type(body["control"]) is not dict or set(body["control"]) != {"name", "revision", "kind", "strength"}
+    ):
+        raise HTTPException(status_code=400, detail="H3 Control request fields are invalid")
+    control, settings = body["control"], body["settings"]
+    if (
+        any(type(control[key]) is not str or not 0 < len(control[key]) <= 255 for key in ("name", "revision"))
+        or type(control["kind"]) is not str or control["kind"] not in {"canny", "depth", "hed", "mlsd", "pose"}
+        or type(control["strength"]) not in (int, float)
+        or not math.isfinite(control["strength"]) or not 0 <= control["strength"] <= 1
+        or any(key in settings and (type(settings[key]) is not int or not low <= settings[key] <= high)
+               for key, low, high in (("num_inference_steps", 1, 100), ("seed", -1, 2**63-1), ("override_profile", 1, 5)))
+    ):
+        raise HTTPException(status_code=400, detail="Select one precomputed Control video and valid sampling settings")
+    try:
+        width, height = (int(part) for part in settings["resolution"].lower().split("x"))
+        if any(size < 32 or size > 4096 or size % 32 for size in (width, height)):
+            raise ValueError()
+    except (KeyError, AttributeError, TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="H3 Control bounds must be multiples of 32, up to 4096") from None
+    workspace = _request_project_workspace(request, body["workspace"])
+    out_dir = _require_project_access(request, workspace, permission="project.generate")
+    _require_remote_visible_models(request, ["minimax_h3"])
+    _require_h3_legal_execution(["minimax_h3"])
+    _require_model_recipe_terms(["minimax_h3"])
+    source_dir, source_path, _ = _require_authorized_output(request, workspace, control["name"])
+    try:
+        if os.path.realpath(source_dir) != os.path.realpath(out_dir):
+            raise ValueError()
+        path, sidecar = _h3_gallery_av_source_state(workspace, out_dir, control["name"], control["revision"])
+        if os.path.realpath(path) != os.path.realpath(source_path):
+            raise ValueError()
+        probe = await upload_usage.to_thread(probe_gallery_av, path, "video")
+        _, current = _h3_gallery_av_source_state(workspace, out_dir, control["name"], control["revision"])
+        if any(current.get(key, False) != sidecar.get(key, False) for key in ("private", "explicit")):
+            raise ValueError()
+        assets = control_assets_from_environment()
+        plan = plan_h3_control_request(
+            control_kind=control["kind"], strength=control["strength"], source_sha256=probe.sha256,
+            source_width=probe.width, source_height=probe.height, source_frame_count=probe.frame_count,
+            target_width=width, target_height=height,
+        )
+        source = {"workspace": workspace, "name": control["name"], "revision": control["revision"],
+                  **asdict(probe), "source_private": sidecar.get("private", False),
+                  "source_explicit": sidecar.get("explicit", False)}
+        binding = make_gallery_control_source(source, plan, assets["binding"])
+    except (ValueError, OSError):
+        raise HTTPException(status_code=409, detail="Selected Control video or acquired model assets changed; refresh and select again") from None
+    defaults = wgp.get_default_settings("minimax_h3")
+    if type(defaults) is not dict:
+        raise HTTPException(status_code=503, detail="H3 Control model settings are unavailable")
+    params = copy.deepcopy(defaults)
+    for key in tuple(params):
+        if key.startswith("_h3_"):
+            params.pop(key)
+    params.update(settings)
+    for key in _GENERATION_MEDIA_INPUTS:
+        params[key] = [] if key == "image_refs" else None
+    frames = plan["geometry"]["frame_count"]
+    params.update({
+        "workspace": workspace, "model_type": "minimax_h3", "prompt": body["prompt"],
+        "generation_mode": "video", "image_mode": 0, "trim_tail_frames": 0,
+        "image_prompt_type": "", "video_prompt_type": "", "audio_prompt_type": "",
+        "resolution": f'{plan["geometry"]["width"]}x{plan["geometry"]["height"]}',
+        "video_length": frames, "duration_seconds": frames / 24, "sliding_window_size": frames,
+        "multi_prompts_gen_type": 0, "repeat_generation": 1, "batch_size": 1, "guidance_scale": 1.0,
+        "activated_loras": [], "loras_multipliers": "", "tea_cache": 0, "skip_steps_cache_type": "",
+        "h3_adaptive_conditioning": False, "voice_clone_enabled": False, "voice_clone_refs": [],
+        "h3_native_boundary_conditioning": False, "custom_settings": {"h3_attention_engine": "sdpa"},
+        "input_waveform": None, "audio_path": None,
+        "_h3_control_gallery_source": binding, "_h3_control_gallery_plan": plan,
+    })
+    inherited = _inherit_media_access_policy([path], workspace, str(request.state.maestro_session_id))
+    for key in ("private", "explicit"):
+        params[key + "_output"] = bool(body.get(key + "_output", False) or inherited.get(key, False)
+                                      or source["source_" + key])
+    prepared = _GenerationPreparationRequest(request, params, admission_account_session=True)
+    prepared.state._maestro_h3_gallery_still_guide_token = _H3_GALLERY_STILL_GUIDE_REQUEST_TOKEN
+    try:
+        result = await generate(prepared)
+    finally:
+        prepared.state.maestro_account_session_id = ""
+    if not isinstance(result, dict):
+        raise HTTPException(status_code=503, detail="H3 Control could not be queued")
+    return {**result, "h3_control_execution": {
+        "capability": "gallery_control_fl2va_experimental", "kind": control["kind"],
+        "target_frames": frames, "resolution": params["resolution"],
+    }}
 
 
 @api.post("/api/v1/h3/gallery-av-guide")
@@ -70204,6 +70399,7 @@ def _run_generation(
                 "_h3_timeline_still_guide_plan",
                 "_h3_timeline_av_guide_source",
                 "_h3_timeline_av_guide_plan",
+                "_h3_control_gallery_source", "_h3_control_gallery_plan",
             )
         )
     )
@@ -70391,6 +70587,9 @@ def _run_generation(
             raw_params.pop("_h3_timeline_still_guide_plan", None)
             raw_params.pop("_h3_timeline_av_guide_source", None)
             raw_params.pop("_h3_timeline_av_guide_plan", None)
+            raw_params.pop("_h3_control_gallery_source", None)
+            raw_params.pop("_h3_control_gallery_plan", None)
+            raw_params.pop("_h3_control_dispatch", None)
             raw_reference_pack = raw_params.get("reference_pack")
             if (
                 isinstance(raw_reference_pack, dict)
@@ -71542,6 +71741,7 @@ def _run_generation(
                 isinstance(job.get("params"), dict)
                 and any(key in job["params"] for key in (
                     "_h3_timeline_still_guide_source", "_h3_timeline_av_guide_source",
+                    "_h3_control_gallery_source",
                 ))
             ):
                 try:
@@ -71840,7 +72040,8 @@ def _run_generation(
                         return False
                 guide_source = (
                     ((job.get("params") or {}).get("_h3_timeline_still_guide_source")
-                     or (job.get("params") or {}).get("_h3_timeline_av_guide_source"))
+                     or (job.get("params") or {}).get("_h3_timeline_av_guide_source")
+                     or (job.get("params") or {}).get("_h3_control_gallery_source"))
                     if isinstance(job.get("params"), dict) else None
                 )
                 if isinstance(guide_source, dict):
@@ -71882,7 +72083,8 @@ def _run_generation(
                         "_h3_timeline_still_guide_source",
                         "_h3_timeline_still_guide_plan",
                         "_h3_timeline_av_guide_source", "_h3_timeline_av_guide_plan",
-                        "_h3_timeline_guides", "image_start", "image_end",
+                        "_h3_control_gallery_source", "_h3_control_gallery_plan",
+                        "_h3_timeline_guides", "_h3_control_dispatch", "image_start", "image_end",
                     ):
                         sidecar_params.pop(key, None)
                     guide_custom = sidecar_params.get("custom_settings")
@@ -71940,7 +72142,8 @@ def _run_generation(
                     "created_at": time.time(),
                 }
                 if isinstance(guide_source, dict):
-                    guide_records = guide_source.get("sources")
+                    guide_records = ([guide_source["source"]] if "source" in guide_source
+                                     else guide_source.get("sources"))
                     if not isinstance(guide_records, list):
                         guide_records = [guide_source] + [
                             guide_source[key] for key in ("second_source", "third_source")
@@ -71965,6 +72168,16 @@ def _run_generation(
                             "guide_count": len(guide_records),
                             "audio_guides": sum(record["kind"] == "audio" for record in guide_records),
                             "video_guides": sum(record["kind"] == "video" for record in guide_records),
+                        }
+                    if set(guide_source) == {"source", "plan_sha256", "assets"}:
+                        control_plan = job["params"]["_h3_control_gallery_plan"]
+                        sidecar.pop("h3_guide_execution", None)
+                        sidecar["h3_control_execution"] = {
+                            "capability": "gallery_control_fl2va_experimental",
+                            "kind": control_plan["control"]["kind"],
+                            "strength": control_plan["control"]["strength"],
+                            "target_frames": control_plan["geometry"]["frame_count"],
+                            "precomputed_control": True,
                         }
                 sidecar_policy = dict(job.get("access_policy") or {})
                 # A copy-on-write parent keeps its final producer seal for
@@ -73469,6 +73682,13 @@ def _run_generation(
                             # Only this worker creates the decoded handoff. It is
                             # absent from the durable manifest and HTTP inputs.
                             filtered_params.pop("_h3_timeline_guides", None)
+                            filtered_params.pop("_h3_control_dispatch", None)
+                            if "_h3_control_gallery_source" in (job.get("params") or {}):
+                                if len(queue) != 1 or cumulative_dispatch is not None:
+                                    raise ValueError("H3 Control requires one independent output")
+                                filtered_params["_h3_control_dispatch"] = _decode_h3_gallery_control_job(
+                                    job, cancel_check=lambda: bool(gen.get("abort") or is_cancel_requested(job)),
+                                )
                             if "_h3_timeline_av_guide_source" in (job.get("params") or {}):
                                 if len(queue) != 1 or cumulative_dispatch is not None:
                                     raise ValueError("H3 interval guides require one independent output")
@@ -73895,6 +74115,7 @@ def _run_generation(
                     and str(task_params.get("model_type") or "") in _H3_LONG_STUDIO_MODELS
                     and task_media_names
                     and "_h3_timeline_av_guide_source" not in (job.get("params") or {})
+                    and "_h3_control_gallery_source" not in (job.get("params") or {})
                 ):
                     try:
                         _record_h3_benchmark_observation(
