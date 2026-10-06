@@ -11198,6 +11198,7 @@ def generate_video(*args, **kwargs):
     model_type = _bound_value("model_type")
     profile_observer = _bound_value("_h3_profile_observer")
     cumulative_dispatch = _bound_value("_h3_cumulative_dispatch")
+    interval_guides = _bound_value("_h3_timeline_guides")
     cumulative_started = False
     try:
         if cumulative_dispatch is not None:
@@ -11236,7 +11237,7 @@ def generate_video(*args, **kwargs):
                     _release_failed_generation_resources()
                 except Exception as error:
                     print(f"[Memory] Failed-generation cleanup: {type(error).__name__}")
-            if result:
+            if result and interval_guides is None:
                 try:
                     from services.h3_host_limits import record_denoise_success
                     record_denoise_success(
@@ -11257,6 +11258,18 @@ def generate_video(*args, **kwargs):
                     pass
             return result
         except H3OomReliefRetry as retry:
+            if interval_guides is not None:
+                # Decoded guide geometry is immutable. Never retry it after
+                # changing the canvas, steps or profile behind the owner.
+                try:
+                    traceback.clear_frames(retry.__traceback__)
+                except Exception as cleanup_error:
+                    print(f"[Memory] H3 interval traceback cleanup: {type(cleanup_error).__name__}")
+                try:
+                    _release_failed_generation_resources()
+                except Exception as cleanup_error:
+                    print(f"[Memory] H3 interval cleanup: {type(cleanup_error).__name__}")
+                raise
             if cumulative_dispatch is not None:
                 # A retained-state retry needs an explicit recovery decision;
                 # do not mutate its canvas/steps or consume another window.
@@ -11708,7 +11721,27 @@ def _generate_video_impl(
     _h3_decode_observer=None,
     # Private single-output retained AV transport. Never saved in settings.
     _h3_cumulative_dispatch=None,
+    # Worker-created decoded interval media; never persisted or client-bound.
+    _h3_timeline_guides=None,
 ):
+    if _h3_timeline_guides is not None:
+        from models.minimax_h3.timeline_guides import H3TimelineGuidePayload
+        if (
+            type(_h3_timeline_guides) is not H3TimelineGuidePayload
+            or os.environ.get("MAESTRO_H3_TIMELINE_GUIDES_EXPERIMENTAL") != "1"
+            or model_type != "minimax_h3" or not isinstance(mode, str) or mode.startswith("edit_")
+            or _h3_cumulative_dispatch is not None or _h3_native_boundary is not None
+            or type(repeat_generation) is not int or repeat_generation != 1
+            or type(batch_size) is not int or batch_size != 1
+            or activated_loras or tea_cache or skip_steps_cache_type
+            or video_source or audio_source or image_start is not None or image_end is not None
+            or image_refs or video_guide or video_guide2 or video_guide3
+            or audio_guide or audio_guide2 or audio_guide3 or audio_guide4 or audio_guide5 or audio_guide6
+            or audio_conditioning_guide
+            or image_prompt_type or video_prompt_type or audio_prompt_type
+            or _h3_timeline_guides.plan.get("target_frames") != video_length
+        ):
+            raise ValueError("H3 interval media requires an independent Base FL2VA worker handoff")
 
     # API scheduling needs a model-safe boundary between independent outputs.
     # Split an ordinary repeat request into complete one-output invocations so
@@ -14115,6 +14148,8 @@ def _generate_video_impl(
                     **({"_h3_timeline_third_still": timeline_third_still,
                         "_h3_timeline_additional_stills": timeline_additional_stills}
                        if h3_timeline_still_guide_requested else {}),
+                    **({"_h3_timeline_guides": _h3_timeline_guides}
+                       if _h3_timeline_guides is not None else {}),
                     input_frames = src_video,
                     input_frames2 = src_video2,
                     input_frames3 = src_video3,
@@ -14690,6 +14725,7 @@ def _generate_video_impl(
                 inputs.pop("_h3_profile_observer", None)
                 inputs.pop("_h3_decode_observer", None)
                 inputs.pop("_h3_cumulative_dispatch", None)
+                inputs.pop("_h3_timeline_guides", None)
                 durable_file_stem = None
                 if durable_output_dir is not None:
                     durable_repeat = (
@@ -15020,6 +15056,7 @@ def _generate_video_impl(
                 inputs.pop("after_repeat_output", None)
                 inputs.pop("after_segment_output", None)
                 inputs.pop("_h3_cumulative_dispatch", None)
+                inputs.pop("_h3_timeline_guides", None)
                 inputs["model_type"] = model_type
                 inputs["model_filename"] = get_model_filename(model_type, transformer_quantization, transformer_dtype_policy)
                 if is_image:

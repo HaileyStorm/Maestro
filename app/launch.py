@@ -11696,6 +11696,7 @@ def _h3_ordinary_restart_allowed(job: dict) -> bool:
         ))
         or any(params.get(key) for key in (
             "_h3_longform", "_h3_cumulative_append", "_director_pipeline_id",
+            "_h3_timeline_av_guide_source", "_h3_timeline_av_guide_plan",
             "_director_request_id", "_h3_source_prefix", "h3_source_prefix",
             "_director_final_video_postprocess", "_director_image_role",
             "h3_native_boundary_conditioning", "video_source",
@@ -17483,6 +17484,8 @@ def _reject_client_h3_internal_state(
         {
             "_h3_timeline_still_guide_source",
             "_h3_timeline_still_guide_plan",
+            "_h3_timeline_av_guide_source",
+            "_h3_timeline_av_guide_plan",
         }
         if allow_gallery_still_guide else set()
     )
@@ -45497,6 +45500,8 @@ def _require_h3_offload_plan_parity(
 
 def _h3_peak_recovery_identity(params: dict, *, frame_count: int) -> dict:
     """Build the path/content-free identity used by calibrated H3 recovery."""
+    if any(key in params for key in ("_h3_timeline_av_guide_source", "_h3_timeline_av_guide_plan")):
+        raise QueueRecoveryRuntimeError("H3 interval guides have no native allocation calibration yet.")
     custom = params.get("custom_settings")
     custom = custom if isinstance(custom, dict) else {}
     resolution = str(params.get("resolution") or "").casefold()
@@ -45697,6 +45702,8 @@ def _record_h3_benchmark_observation(
     model_load_state: str = "unknown",
     observed_profile: int | float | None = None,
 ) -> None:
+    if any(key in params for key in ("_h3_timeline_av_guide_source", "_h3_timeline_av_guide_plan")):
+        return  # Interval conditions have no ordinary/still timing identity.
     observed_profile = _h3_observed_offload_profile(observed_profile)
     if observed_profile is None or any(
         type(params.get(key)) is not int or params[key] != 1
@@ -45972,6 +45979,9 @@ def _h3_estimate_context(body: dict, plan: dict | None = None) -> dict:
     selected_loras, selected_weights = h3_request_loras_for_model(body, model_type)
     context = {
         "model_type": model_type,
+        "_uncalibrated_interval_guides": any(key in body for key in (
+            "_h3_timeline_av_guide_source", "_h3_timeline_av_guide_plan",
+        )),
         "duration_seconds": duration,
         "window_seconds": window_seconds,
         "window_overlap": (
@@ -46295,7 +46305,11 @@ def _h3_estimate_for_context(
     context: dict,
     *,
     include_residency: bool = True,
-) -> dict:
+) -> dict | None:
+    if context.get("_uncalibrated_interval_guides") is True:
+        # Unknown is preferable to reusing an ordinary/still timing estimate.
+        # Public interval availability still awaits its native calibration.
+        return None
     from services.h3_benchmark import (
         add_h3_postprocess_estimate, aggregate_h3_estimates, estimate_h3_output,
     )
@@ -47612,6 +47626,8 @@ def _run_generation_preparation(
             for key in (
                 "_h3_timeline_still_guide_source",
                 "_h3_timeline_still_guide_plan",
+                "_h3_timeline_av_guide_source",
+                "_h3_timeline_av_guide_plan",
             )
         )
         if has_gallery_still_guide:
@@ -47621,11 +47637,13 @@ def _run_generation_preparation(
                 )
                 if not callable(validate_guide):
                     raise RuntimeError("H3 Guide source validation is unavailable")
-                validate_guide(job)
+                validate_guide(job, cancel_check=lambda: is_cancel_requested(job))
+            except InterruptedError:
+                return
             except Exception as error:
                 terminalize_failure(
                     error,
-                    "The selected Gallery still changed; select it again and submit a new guide.",
+                    "The selected Gallery guide changed; select it again and submit a new guide.",
                 )
                 return
         prepared_params = copy.deepcopy(dict(raw_params))
@@ -47768,6 +47786,8 @@ def _run_generation_preparation(
             for key in (
                 "_h3_timeline_still_guide_source",
                 "_h3_timeline_still_guide_plan",
+                "_h3_timeline_av_guide_source",
+                "_h3_timeline_av_guide_plan",
             )
         )
         if has_prepared_gallery_guide:
@@ -47780,10 +47800,12 @@ def _run_generation_preparation(
                 validate_guide({
                     **job,
                     "params": prepared_params,
-                })
+                }, cancel_check=lambda: is_cancel_requested(job))
+            except InterruptedError:
+                return
             except Exception as error:
                 raise QueueRecoveryRuntimeError(
-                    "The selected Gallery still changed during generation planning."
+                    "The selected Gallery guide changed during generation planning."
                 ) from error
         if waiting:
             # Approval derives only from this private immutable enhanced
@@ -49132,7 +49154,7 @@ _H3_GALLERY_STILL_GUIDE_SETTINGS = frozenset({
 })
 
 
-def _validate_h3_gallery_still_guide_job(job: Mapping[str, Any]) -> dict | None:
+def _validate_h3_gallery_still_guide_job(job: Mapping[str, Any], *, cancel_check=None) -> dict | None:
     """Recheck the exact authorized still before preparation, execution, or replay."""
     from services.h3_gallery_still_guide import (
         H3_GALLERY_STILL_GUIDE_CUSTOM_KEY,
@@ -49143,6 +49165,18 @@ def _validate_h3_gallery_still_guide_job(job: Mapping[str, Any]) -> dict | None:
     params = job.get("params") if isinstance(job, Mapping) else None
     if not isinstance(params, Mapping):
         return None
+    if any(key in params for key in (
+        "_h3_timeline_av_guide_source", "_h3_timeline_av_guide_plan",
+    )):
+        if any(key in params for key in (
+            H3_GALLERY_STILL_GUIDE_SOURCE_KEY, H3_GALLERY_STILL_GUIDE_PLAN_KEY,
+        )):
+            raise ValueError("H3 interval and still guide transports cannot be combined")
+        from services.h3_gallery_av_guide import H3GalleryAVGuideCancelled
+        try:
+            return _validate_h3_gallery_av_guide_job(job, cancel_check=cancel_check)
+        except H3GalleryAVGuideCancelled:
+            raise InterruptedError("Gallery guide validation cancelled") from None
     custom = params.get("custom_settings")
     has_private_setting = (
         isinstance(custom, Mapping)
@@ -49172,6 +49206,227 @@ def _validate_h3_gallery_still_guide_job(job: Mapping[str, Any]) -> dict | None:
         job_private=job.get("private") is True,
         job_explicit=job.get("explicit") is True,
     )
+
+
+def _h3_gallery_av_source_state(workspace, out_dir, name, revision):
+    """Resolve one already-authorized final source without accepting a path."""
+    from services.search_index import (
+        classify_gallery_artifacts, h3_integrity_is_pending, load_media_sidecars,
+    )
+    from services.win_safe_files import safe_direct_file_under
+    path = safe_direct_file_under(out_dir, name)
+    if not path or h3_integrity_is_pending(out_dir, name):
+        raise ValueError("Selected Gallery guide is unavailable or unfinished")
+    sidecar = load_media_sidecars(out_dir, {name}).get(name)
+    if (
+        not isinstance(sidecar, dict) or sidecar.get("workspace") != workspace
+        or any(type(sidecar.get(key, False)) is not bool for key in ("private", "explicit"))
+        or revision != _output_revision(path, out_dir, name)
+    ):
+        raise ValueError("Selected Gallery guide changed")
+    info = os.stat(path, follow_symlinks=False)
+    if classify_gallery_artifacts([{
+        "name": name, "meta": sidecar, "size": info.st_size, "created_at": info.st_mtime,
+    }]).get(name) != "final":
+        raise ValueError("Select a final Gallery guide")
+    return path, sidecar
+
+
+def _validate_h3_gallery_av_guide_job(job: Mapping[str, Any], *, cancel_check=None) -> dict:
+    """Revalidate the path-free source commitment before replay/publication."""
+    from dataclasses import asdict
+    from services.h3_gallery_av_guide import (
+        make_gallery_av_guide_sources, probe_gallery_av,
+    )
+    params = job.get("params")
+    if not isinstance(params, dict):
+        raise ValueError("H3 interval guide request is invalid")
+    binding = params.get("_h3_timeline_av_guide_source")
+    plan = params.get("_h3_timeline_av_guide_plan")
+    if type(binding) is not dict or set(binding) != {"sources", "target_frames", "plan_sha256"}:
+        raise ValueError("H3 interval guide source binding is invalid")
+    if make_gallery_av_guide_sources(binding["sources"], plan) != binding:
+        raise ValueError("H3 interval guide plan changed")
+    custom = params.get("custom_settings") or {}
+    if (
+        os.environ.get("MAESTRO_H3_TIMELINE_GUIDES_EXPERIMENTAL") != "1"
+        or params.get("model_type") != "minimax_h3"
+        or params.get("video_length") != binding["target_frames"]
+        or params.get("sliding_window_size") != binding["target_frames"]
+        or params.get("generation_mode") != "video" or params.get("image_mode") != 0
+        or any(params.get(key) for key in _GENERATION_MEDIA_INPUTS)
+        or any(params.get(key) for key in (
+            "activated_loras", "tea_cache", "skip_steps_cache_type", "video_prompt_type",
+            "audio_prompt_type", "image_prompt_type", "trim_tail_frames", "multi_prompts_gen_type",
+            "h3_native_boundary_conditioning", "voice_clone_enabled", "voice_clone_refs",
+        ))
+        or any(type(params.get(key)) is not int or params[key] != 1
+               for key in ("repeat_generation", "batch_size"))
+        or type(custom) is not dict or set(custom) - {"h3_attention_engine"}
+        or custom.get("h3_attention_engine", "sdpa") not in {"sdpa", "sol_attn"}
+    ):
+        raise ValueError("H3 interval guides require an independent Base FL2VA clip")
+    paths = []
+    workspace, out_dir = str(job.get("workspace") or ""), str(job.get("out_dir") or "")
+    for source in binding["sources"]:
+        if source["workspace"] != workspace:
+            raise ValueError("H3 interval guide belongs to another project")
+        path, metadata = _h3_gallery_av_source_state(
+            workspace, out_dir, source["name"], source["revision"],
+        )
+        if any(
+            metadata.get(key, False) != source["source_" + key]
+            or (source["source_" + key] and job.get(key) is not True)
+            for key in ("private", "explicit")
+        ):
+            raise ValueError("H3 interval guide privacy changed")
+        facts = asdict(probe_gallery_av(path, source["kind"], cancel_check=cancel_check))
+        if any(source.get(key) != value for key, value in facts.items()):
+            raise ValueError("H3 interval guide source bytes or geometry changed")
+        _, current_metadata = _h3_gallery_av_source_state(
+            workspace, out_dir, source["name"], source["revision"],
+        )
+        if any(current_metadata.get(key, False) != source["source_" + key]
+               for key in ("private", "explicit")):
+            raise ValueError("H3 interval guide privacy changed")
+        paths.append(path)
+    return {"paths": paths, "source_binding": binding, "plan": plan}
+
+
+def _decode_h3_gallery_av_guide_job(job, *, resolution, cancel_check):
+    """Make the ephemeral media handoff on the actual generation worker."""
+    from services.h3_gallery_av_guide import decode_gallery_av_guide_sources
+    verified = _validate_h3_gallery_av_guide_job(job, cancel_check=cancel_check)
+    try:
+        width, height = (int(part) for part in resolution.lower().split("x"))
+    except (AttributeError, TypeError, ValueError):
+        raise ValueError("H3 interval guide canvas is invalid") from None
+    return decode_gallery_av_guide_sources(
+        verified["paths"], verified["source_binding"], verified["plan"],
+        height=height, width=width, cancel_check=cancel_check,
+    )
+
+
+@api.post("/api/v1/h3/gallery-av-guide")
+async def h3_gallery_av_guide_endpoint(request: Request):
+    """Seal ordered current-project video/audio guides for one Base clip."""
+    from dataclasses import asdict
+    from services.h3_gallery_av_guide import (
+        H3GalleryAVGuideError, build_gallery_av_guide_plan,
+        make_gallery_av_guide_sources, probe_gallery_av,
+    )
+    if os.environ.get("MAESTRO_H3_TIMELINE_GUIDES_EXPERIMENTAL") != "1":
+        raise HTTPException(status_code=409, detail="H3 video/audio guides are not available yet")
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="H3 Guide request must be an object") from None
+    required = {"workspace", "model_type", "prompt", "settings", "guides"}
+    if (
+        type(body) is not dict or not required <= set(body)
+        or set(body) - required - {"private_output", "explicit_output"}
+        or type(body["workspace"]) is not str or not body["workspace"]
+        or body["model_type"] != "minimax_h3"
+        or type(body["prompt"]) is not str or not body["prompt"].strip()
+        or len(body["prompt"]) > 16_384
+        or type(body["settings"]) is not dict
+        or set(body["settings"]) - {
+            "video_length", "resolution", "num_inference_steps", "guidance_scale",
+            "seed", "override_profile", "attention_engine",
+        }
+        or type(body["settings"].get("video_length")) is not int
+        or not 124 <= body["settings"]["video_length"] <= 345
+        or type(body["guides"]) is not list or not 1 <= len(body["guides"]) <= 8
+        or any(key in body and type(body[key]) is not bool for key in ("private_output", "explicit_output"))
+    ):
+        raise HTTPException(status_code=400, detail="H3 Guide request fields are invalid")
+    for guide in body["guides"]:
+        if (
+            type(guide) is not dict or set(guide) != {"name", "revision", "kind", "frame_index"}
+            or type(guide["name"]) is not str or not 0 < len(guide["name"]) <= 255
+            or type(guide["revision"]) is not str or not 0 < len(guide["revision"]) <= 256
+            or guide["kind"] not in ("video", "audio") or type(guide["frame_index"]) is not int
+        ):
+            raise HTTPException(status_code=400, detail="Selected H3 Guide fields are invalid")
+    attention = body["settings"].get("attention_engine", "sdpa")
+    if attention not in ("sdpa", "sol_attn"):
+        raise HTTPException(status_code=400, detail="H3 Guide attention must be Dense SDPA or Sol")
+    workspace = _request_project_workspace(request, body["workspace"])
+    out_dir = _require_project_access(request, workspace, permission="project.generate")
+    model_def = wgp.get_model_def("minimax_h3")
+    if model_def is None:
+        raise HTTPException(status_code=400, detail="H3 Guide model is unavailable")
+    _require_remote_visible_models(request, ["minimax_h3"])
+    _require_h3_legal_execution(["minimax_h3"])
+    _require_model_recipe_terms(["minimax_h3"])
+    try:
+        target_frames = int(wgp.align_model_frame_count(body["settings"]["video_length"], model_def))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="H3 Guide duration is invalid") from None
+    records, paths = [], []
+    try:
+        for guide in body["guides"]:
+            source_dir, source_path, _ = _require_authorized_output(request, workspace, guide["name"])
+            if os.path.realpath(source_dir) != os.path.realpath(out_dir):
+                raise ValueError("Selected Gallery guide belongs to another project")
+            path, sidecar = _h3_gallery_av_source_state(workspace, out_dir, guide["name"], guide["revision"])
+            if os.path.realpath(path) != os.path.realpath(source_path):
+                raise ValueError("Selected Gallery guide changed")
+            probe = await upload_usage.to_thread(probe_gallery_av, path, guide["kind"])
+            verified = await upload_usage.to_thread(probe_gallery_av, path, guide["kind"])
+            _, current_meta = _h3_gallery_av_source_state(workspace, out_dir, guide["name"], guide["revision"])
+            if probe != verified or any(current_meta.get(key, False) != sidecar.get(key, False) for key in ("private", "explicit")):
+                raise ValueError("Selected Gallery guide changed")
+            records.append({
+                "workspace": workspace, "name": guide["name"], "revision": guide["revision"],
+                **asdict(probe), "frame_index": guide["frame_index"],
+                "source_private": sidecar.get("private", False), "source_explicit": sidecar.get("explicit", False),
+            })
+            paths.append(path)
+        plan = build_gallery_av_guide_plan(records, target_frames)
+        binding = make_gallery_av_guide_sources(records, plan)
+    except (H3GalleryAVGuideError, ValueError, OSError):
+        raise HTTPException(status_code=409, detail="Selected Gallery guide is invalid or changed; refresh Gallery and select it again") from None
+    defaults = wgp.get_default_settings("minimax_h3")
+    if type(defaults) is not dict:
+        raise HTTPException(status_code=503, detail="H3 Guide model settings are unavailable")
+    params = copy.deepcopy(defaults)
+    for key in tuple(params):
+        if key.startswith("_h3_"):
+            params.pop(key)
+    params.update({key: value for key, value in body["settings"].items() if key != "attention_engine"})
+    for key in _GENERATION_MEDIA_INPUTS:
+        params[key] = [] if key == "image_refs" else None
+    params.update({
+        "workspace": workspace, "model_type": "minimax_h3", "prompt": body["prompt"],
+        "generation_mode": "video", "image_mode": 0, "trim_tail_frames": 0,
+        "image_prompt_type": "", "video_prompt_type": "", "audio_prompt_type": "",
+        "video_length": target_frames, "sliding_window_size": target_frames,
+        "multi_prompts_gen_type": 0, "repeat_generation": 1, "batch_size": 1,
+        "activated_loras": [], "loras_multipliers": "", "tea_cache": 0, "skip_steps_cache_type": "",
+        "h3_adaptive_conditioning": False, "voice_clone_enabled": False, "voice_clone_refs": [],
+        "h3_native_boundary_conditioning": False, "custom_settings": {"h3_attention_engine": attention},
+        "input_waveform": None, "audio_path": None,
+        "_h3_timeline_av_guide_source": binding, "_h3_timeline_av_guide_plan": plan,
+    })
+    inherited = _inherit_media_access_policy(paths, workspace, str(request.state.maestro_session_id))
+    for key in ("private", "explicit"):
+        params[key + "_output"] = bool(
+            body.get(key + "_output", False) or inherited.get(key, False)
+            or any(source["source_" + key] for source in records)
+        )
+    prepared = _GenerationPreparationRequest(request, params, admission_account_session=True)
+    prepared.state._maestro_h3_gallery_still_guide_token = _H3_GALLERY_STILL_GUIDE_REQUEST_TOKEN
+    try:
+        result = await generate(prepared)
+    finally:
+        prepared.state.maestro_account_session_id = ""
+    if not isinstance(result, dict):
+        raise HTTPException(status_code=503, detail="H3 Guide could not be queued")
+    return {**result, "h3_guide_execution": {
+        "capability": "gallery_av_fl2va_experimental", "target_frames": target_frames,
+        "guide_count": len(records), "frame_indices": [guide["resolved_frame_idx"] for guide in plan["guides"]],
+    }}
 
 
 def _withhold_failed_h3_gallery_still_outputs(
@@ -68830,6 +69085,8 @@ def _run_generation(
             for key in (
                 "_h3_timeline_still_guide_source",
                 "_h3_timeline_still_guide_plan",
+                "_h3_timeline_av_guide_source",
+                "_h3_timeline_av_guide_plan",
             )
         )
     )
@@ -68840,16 +69097,18 @@ def _run_generation(
             )
             if not callable(validate_guide):
                 raise RuntimeError("H3 Guide source validation is unavailable")
-            validate_guide(job)
+            validate_guide(job, cancel_check=lambda: is_cancel_requested(job))
+        except InterruptedError:
+            return False
         except Exception:
             finish_job(
                 job,
                 "failed",
                 error=(
-                    "The selected Gallery still changed; select it again and "
+                    "The selected Gallery guide changed; select it again and "
                     "submit a new guide."
                 ),
-                message="Selected Gallery still changed",
+                message="Selected Gallery guide changed",
             )
             return False
 
@@ -69013,6 +69272,8 @@ def _run_generation(
                     raw_params.pop(bridge_key, None)
             raw_params.pop("_h3_timeline_still_guide_source", None)
             raw_params.pop("_h3_timeline_still_guide_plan", None)
+            raw_params.pop("_h3_timeline_av_guide_source", None)
+            raw_params.pop("_h3_timeline_av_guide_plan", None)
             raw_reference_pack = raw_params.get("reference_pack")
             if (
                 isinstance(raw_reference_pack, dict)
@@ -70162,21 +70423,25 @@ def _run_generation(
 
             if (
                 isinstance(job.get("params"), dict)
-                and "_h3_timeline_still_guide_source" in job["params"]
+                and any(key in job["params"] for key in (
+                    "_h3_timeline_still_guide_source", "_h3_timeline_av_guide_source",
+                ))
             ):
                 try:
                     # Rehash immediately before WGP parses/decodes its media
                     # inputs, after model admission and task construction.
-                    _validate_h3_gallery_still_guide_job(job)
+                    _validate_h3_gallery_still_guide_job(job, cancel_check=lambda: is_cancel_requested(job))
+                except InterruptedError:
+                    raise
                 except Exception:
                     finish_job(
                         job,
                         "failed",
                         error=(
-                            "The selected Gallery still changed; select it "
+                            "The selected Gallery guide changed; select it "
                             "again and submit a new guide."
                         ),
-                        message="Selected Gallery still changed",
+                        message="Selected Gallery guide changed",
                     )
                     return False
             queue, error = wgp._parse_task_manifest(manifest, state, os.getcwd())
@@ -70328,15 +70593,14 @@ def _run_generation(
                     except (OSError, ValueError, TypeError, QueueRecoveryRuntimeError):
                         return False
                 guide_source = (
-                    (job.get("params") or {}).get(
-                        "_h3_timeline_still_guide_source"
-                    )
+                    ((job.get("params") or {}).get("_h3_timeline_still_guide_source")
+                     or (job.get("params") or {}).get("_h3_timeline_av_guide_source"))
                     if isinstance(job.get("params"), dict) else None
                 )
                 if isinstance(guide_source, dict):
                     try:
-                        _validate_h3_gallery_still_guide_job(job)
-                    except Exception:
+                        _validate_h3_gallery_still_guide_job(job, cancel_check=lambda: is_cancel_requested(job))
+                    except Exception as guide_error:
                         # A changed source must not leave sidecarless media at
                         # its public basename, where Gallery treats it as a
                         # legacy final. Cover every fresh file in this batch,
@@ -70352,8 +70616,10 @@ def _run_generation(
                             logging.getLogger(__name__).warning(
                                 "Could not fully withhold stale H3 Guide output",
                             )
+                        if isinstance(guide_error, InterruptedError):
+                            raise
                         raise _GenerationStageFailure(
-                            "The selected Gallery still changed; select it again and submit a new guide.",
+                            "The selected Gallery guide changed; select it again and submit a new guide.",
                             stage="publication",
                             code="publication_failed",
                         ) from None
@@ -70369,7 +70635,8 @@ def _run_generation(
                     for key in (
                         "_h3_timeline_still_guide_source",
                         "_h3_timeline_still_guide_plan",
-                        "image_start", "image_end",
+                        "_h3_timeline_av_guide_source", "_h3_timeline_av_guide_plan",
+                        "_h3_timeline_guides", "image_start", "image_end",
                     ):
                         sidecar_params.pop(key, None)
                     guide_custom = sidecar_params.get("custom_settings")
@@ -70442,6 +70709,17 @@ def _run_generation(
                         "audio_guides": 0,
                         "video_guides": 0,
                     }
+                    if set(guide_source) == {"sources", "target_frames", "plan_sha256"}:
+                        av_plan = job["params"]["_h3_timeline_av_guide_plan"]
+                        resolved = [guide["resolved_frame_idx"] for guide in av_plan["guides"]]
+                        sidecar["h3_guide_execution"] = {
+                            "capability": "gallery_av_fl2va_experimental",
+                            "frame_index": resolved[0], "frame_indices": resolved,
+                            "target_frames": av_plan["target_frames"],
+                            "guide_count": len(guide_records),
+                            "audio_guides": sum(record["kind"] == "audio" for record in guide_records),
+                            "video_guides": sum(record["kind"] == "video" for record in guide_records),
+                        }
                 sidecar_policy = dict(job.get("access_policy") or {})
                 # A copy-on-write parent keeps its final producer seal for
                 # recovery, but remains private until its delivery child is
@@ -71878,6 +72156,16 @@ def _run_generation(
                             call_model = str(filtered_params.get("model_type") or "")
                             filtered_params.pop("_h3_profile_observer", None)
                             filtered_params.pop("_h3_decode_observer", None)
+                            # Only this worker creates the decoded handoff. It is
+                            # absent from the durable manifest and HTTP inputs.
+                            filtered_params.pop("_h3_timeline_guides", None)
+                            if "_h3_timeline_av_guide_source" in (job.get("params") or {}):
+                                if len(queue) != 1 or cumulative_dispatch is not None:
+                                    raise ValueError("H3 interval guides require one independent output")
+                                filtered_params["_h3_timeline_guides"] = _decode_h3_gallery_av_guide_job(
+                                    job, resolution=filtered_params.get("resolution"),
+                                    cancel_check=lambda: bool(gen.get("abort") or is_cancel_requested(job)),
+                                )
                             if cumulative_dispatch is not None:
                                 filtered_params["_h3_cumulative_dispatch"] = cumulative_dispatch
                             if call_model in _H3_LONG_STUDIO_MODELS:
@@ -72296,6 +72584,7 @@ def _run_generation(
                     not task_error
                     and str(task_params.get("model_type") or "") in _H3_LONG_STUDIO_MODELS
                     and task_media_names
+                    and "_h3_timeline_av_guide_source" not in (job.get("params") or {})
                 ):
                     try:
                         _record_h3_benchmark_observation(
