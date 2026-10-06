@@ -23,6 +23,7 @@ import unittest
 from unittest import mock
 import uuid
 
+from services import upload_usage
 from services.queue_recovery_runtime import (
     QueueRecoveryRuntimeError,
     artifact_descriptor,
@@ -123,10 +124,31 @@ def _isolated_functions(tree: ast.Module, names: tuple[str, ...], namespace: dic
         dependencies.update({"_public_h3_cumulative_plan", "_public_job_h3_cumulative_plan"})
         namespace.setdefault("Mapping", dict)
         namespace.setdefault("Any", object)
+    upload_helpers = {
+        reference.id
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name in set(names) | dependencies
+        for reference in ast.walk(node)
+        if isinstance(reference, ast.Name)
+        and reference.id in {"_upload_registration_guard", "_upload_job_reader"}
+    }
+    dependencies.update(upload_helpers)
+    if upload_helpers:
+        namespace.setdefault("upload_usage", upload_usage)
+    if "_upload_registration_guard" in upload_helpers:
+        namespace.setdefault("_workspace_lifecycle_lock", threading.RLock())
+    if "_upload_job_reader" in upload_helpers:
+        dependencies.add("_queue_recovery_file_values")
+        namespace.setdefault("os", os)
+        namespace.setdefault("wgp", types.SimpleNamespace(ATTACHMENT_KEYS=()))
     selected = [
         node for node in tree.body
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and (node.name in names or node.name in dependencies)
+        if (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and (node.name in names or node.name in dependencies))
+        or ("_upload_job_reader" in upload_helpers and isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id == "_RECOVERABLE_INPUT_KEYS"
+                    for target in node.targets))
     ]
     module = ast.Module(body=selected, type_ignores=[])
     ast.fix_missing_locations(module)
