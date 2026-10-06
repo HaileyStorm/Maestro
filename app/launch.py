@@ -28654,6 +28654,9 @@ async def open_output_editor_project(project: str, request: Request):
             if any(source.get(key) != timeline["assets"]["source-video"].get(key)
                    for key in ("output_id", "output_revision", "workspace", "origin", "type")):
                 raise EditorProjectError("Editor source changed")
+            with _output_lineage_mutation_guard(out_dir):
+                for asset in saved["assets"].values():
+                    _editor_require_current_source(request, project, asset)
         except EditorProjectError as error:
             raise HTTPException(status_code=409, detail="Editor draft changed; reopen the video") from error
     return {"project": saved}
@@ -28759,6 +28762,105 @@ async def append_output_editor_clip(project: str, editor_id: str, request: Reque
                 saved = save_editor_project(_editor_save_root(), project, updated, expected_revision=expected)
             except EditorProjectError as error:
                 raise HTTPException(status_code=409, detail="Editor draft changed; reload before adding a clip") from error
+            except OSError as error:
+                raise HTTPException(status_code=503, detail="Editor draft could not be saved") from error
+    return {"project": saved}
+
+
+@api.post("/api/v1/projects/{project}/editor/projects/{editor_id}/clips/{clip_id}/takes")
+async def add_output_editor_take(project: str, editor_id: str, clip_id: str, request: Request):
+    """Import an inactive take from the current authorized Gallery."""
+    from services.editor_projects import (
+        EditorProjectError, add_output_video_take, editor_sequence_clips,
+        load_editor_project, probe_media, save_editor_project,
+    )
+    body = await _editor_request_body(request)
+    expected, name, revision = body.get("expected_revision"), body.get("output_name"), body.get("output_revision")
+    if (set(body) != {"expected_revision", "output_name", "output_revision"}
+            or type(expected) is not int or expected < 1
+            or not isinstance(name, str) or not 0 < len(name) <= 255
+            or not isinstance(revision, str) or not 0 < len(revision) <= 128):
+        raise HTTPException(status_code=400, detail="Choose a current Gallery video")
+    with _reserve_workspace_operations(project):
+        _require_project_access(request, project, existing_only=True, permission="project.mutate")
+        try:
+            current = load_editor_project(_editor_save_root(), project, editor_id)
+        except FileNotFoundError:
+            raise HTTPException(status_code=404, detail="Editor draft not found") from None
+        except (EditorProjectError, OSError, ValueError) as error:
+            raise HTTPException(status_code=503, detail="Editor draft is unavailable") from error
+        if current["revision"] != expected:
+            raise HTTPException(status_code=409, detail="Editor draft changed; reload before adding a take")
+        try:
+            clips = editor_sequence_clips(current)
+            target = next((item for _, item in clips if item["id"] == clip_id), None)
+            if target is None or len(target["take_asset_ids"]) >= 8:
+                raise EditorProjectError("A clip can contain up to eight takes")
+        except EditorProjectError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        out_dir, filepath, _ = _require_authorized_output(request, project, name)
+        try:
+            if not hmac.compare_digest(revision, _output_revision(filepath, out_dir, name)):
+                raise HTTPException(status_code=409, detail="Video changed; refresh Gallery")
+            content_revision = _output_share_revision(filepath, out_dir, name)
+            media = probe_media(filepath)
+        except HTTPException:
+            raise
+        except (EditorProjectError, OSError, ValueError, subprocess.SubprocessError) as error:
+            raise HTTPException(status_code=422, detail="This video could not be inspected for editing") from error
+        with _output_lineage_mutation_guard(out_dir):
+            for asset in current["assets"].values():
+                _editor_require_current_source(request, project, asset)
+            current_dir, current_path, sidecar = _require_authorized_output(request, project, name)
+            try:
+                if (current_path != filepath or current_dir != out_dir
+                        or not hmac.compare_digest(content_revision, _output_share_revision(current_path, current_dir, name))):
+                    raise HTTPException(status_code=409, detail="Video changed while adding a take; refresh Gallery")
+                media["private"] = public_output_policy(sidecar)["private"]
+                updated = add_output_video_take(current, clip_id=clip_id, output_name=name, output_revision=content_revision, media=media)
+            except HTTPException:
+                raise
+            except (EditorProjectError, OSError, ValueError) as error:
+                raise HTTPException(status_code=422, detail="Choose an available project video") from error
+            try:
+                saved = save_editor_project(_editor_save_root(), project, updated, expected_revision=expected)
+            except EditorProjectError as error:
+                raise HTTPException(status_code=409, detail="Editor draft changed; reload before adding a take") from error
+            except OSError as error:
+                raise HTTPException(status_code=503, detail="Editor draft could not be saved") from error
+    return {"project": saved}
+
+
+@api.post("/api/v1/projects/{project}/editor/projects/{editor_id}/clips/{clip_id}/take")
+async def switch_output_editor_take(project: str, editor_id: str, clip_id: str, request: Request):
+    from services.editor_projects import (EditorProjectError, load_editor_project,
+        save_editor_project, switch_output_video_take)
+    body = await _editor_request_body(request)
+    expected, asset_id = body.get("expected_revision"), body.get("asset_id")
+    if (set(body) != {"expected_revision", "asset_id"} or type(expected) is not int or expected < 1
+            or not isinstance(asset_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", asset_id)):
+        raise HTTPException(status_code=400, detail="Choose a take for this clip")
+    with _reserve_workspace_operations(project):
+        out_dir = _require_project_access(request, project, existing_only=True, permission="project.mutate")
+        try:
+            current = load_editor_project(_editor_save_root(), project, editor_id)
+        except FileNotFoundError:
+            raise HTTPException(status_code=404, detail="Editor draft not found") from None
+        except (EditorProjectError, OSError, ValueError) as error:
+            raise HTTPException(status_code=503, detail="Editor draft is unavailable") from error
+        if current["revision"] != expected:
+            raise HTTPException(status_code=409, detail="Editor draft changed; reload before switching takes")
+        with _output_lineage_mutation_guard(out_dir):
+            for asset in current["assets"].values():
+                _editor_require_current_source(request, project, asset)
+            try:
+                updated = switch_output_video_take(current, clip_id=clip_id, asset_id=asset_id)
+            except EditorProjectError as error:
+                raise HTTPException(status_code=422, detail=str(error)) from error
+            try:
+                saved = save_editor_project(_editor_save_root(), project, updated, expected_revision=expected)
+            except EditorProjectError as error:
+                raise HTTPException(status_code=409, detail="Editor draft changed; reload before switching takes") from error
             except OSError as error:
                 raise HTTPException(status_code=503, detail="Editor draft could not be saved") from error
     return {"project": saved}
@@ -28911,7 +29013,7 @@ async def export_output_editor_project(project: str, editor_id: str, request: Re
             raise HTTPException(status_code=503, detail="Editor draft is unavailable") from error
         if timeline["revision"] != expected:
             raise HTTPException(status_code=409, detail="Editor draft changed; reload before exporting")
-        from services.editor_projects import editor_sequence_clips, editor_text_layers, editor_audio_layer, editor_image_layers
+        from services.editor_projects import editor_uses_sequence_clock, editor_sequence_clips, editor_text_layers, editor_audio_layer, editor_image_layers
         try:
             clips = editor_sequence_clips(timeline)
             text_layers = editor_text_layers(timeline, require_fit=True)
@@ -28920,6 +29022,8 @@ async def export_output_editor_project(project: str, editor_id: str, request: Re
         except EditorProjectError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
         with _output_lineage_mutation_guard(out_dir):
+            for retained_asset in timeline["assets"].values():
+                _editor_require_current_source(request, project, retained_asset)
             sources = []
             for asset, clip in clips:
                 _editor_require_current_source(request, project, asset)
@@ -28960,8 +29064,11 @@ async def export_output_editor_project(project: str, editor_id: str, request: Re
                          "private": bool(image_policy["private"]), "explicit": bool(image_policy["explicit"])})
             first = sources[0]
             name, source = first["name"], first["path"]
-            canvas = timeline["canvas"]
-            multiple = len(sources) > 1
+            canvas = copy.deepcopy(timeline["canvas"])
+            multiple = editor_uses_sequence_clock(timeline)
+            if multiple:
+                for dimension in ("width", "height"):
+                    canvas[dimension] += canvas[dimension] % 2
             fit_canvas = not multiple and (clips[0][0]["width"] != canvas["width"]
                                           or clips[0][0]["height"] != canvas["height"])
             duration = (sum(editor_clip_frames(item["duration"], canvas["fps"]) for item in sources) / canvas["fps"]
@@ -67052,7 +67159,7 @@ def _editor_export_source(job: dict) -> tuple[str, dict]:
     out_dir = _existing_workspace_dir(job["workspace"])
     sequence = params.get("editor_sources")
     if sequence is not None:
-        if (not isinstance(sequence, list) or not 2 <= len(sequence) <= 8
+        if (not isinstance(sequence, list) or not 1 <= len(sequence) <= 8
                 or [item.get("path") for item in sequence if isinstance(item, dict)] != params["editor_source_path"]):
             raise ValueError("The Editor source sequence changed.")
         entries = sequence

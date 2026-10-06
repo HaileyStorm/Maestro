@@ -59,6 +59,48 @@ class Request:
 
 
 class EditorExportRouteTests(unittest.TestCase):
+    def test_single_alternate_uses_project_clock_and_revalidates_unused_take_without_rendering_it(self):
+        from services.editor_projects import (add_output_video_take, switch_output_video_take,
+            add_output_image_layer, editor_text_layers, editor_image_layers, editor_uses_sequence_clock)
+        second = self.project / "second.mp4"; second.write_bytes(b"alternate-video")
+        second.with_suffix(".meta.json").write_text(json.dumps({"workspace":"scene","private":False,"explicit":False}))
+        logo = self.project / "logo.png"; logo.write_bytes(b"static-image")
+        logo.with_suffix(".meta.json").write_text(json.dumps({"workspace":"scene","private":False,"explicit":False}))
+        current = copy.deepcopy(self.timeline)
+        current["canvas"].update(fps=60, width=129, height=73)
+        current["assets"]["source-video"]["fps"] = 60
+        clip_id = current["tracks"][0]["items"][0]["id"]
+        current = add_output_video_take(current, clip_id=clip_id, output_name=second.name,
+            output_revision=self.source_revision(second), media={"type":"video","duration":3,"width":128,"height":72,"fps":24,"private":False})
+        alt = current["tracks"][0]["items"][0]["take_asset_ids"][-1]
+        current = add_output_image_layer(current,output_name=logo.name,output_revision=self.source_revision(logo),media={"type":"image","width":16,"height":8,"private":False})
+        proposed = copy.deepcopy(current)
+        next(track for track in proposed["tracks"] if track["id"] == "titles-main")["items"] = [{
+            "id":"first-frame","text":"One project frame","start":0,"duration":1/60,"position":"bottom"}]
+        next(track for track in proposed["tracks"] if track["id"] == "images-main")["items"][0]["duration"] = 1/60
+        current = apply_output_video_trim(current,proposed)
+        current = switch_output_video_take(current,clip_id=clip_id,asset_id=alt)
+        self.assertTrue(editor_uses_sequence_clock(current))
+        self.assertEqual(editor_text_layers(current,require_fit=True)[0]["duration"],1/60)
+        self.assertEqual(editor_image_layers(current,require_fit=True)[0]["duration"],1/60)
+        self.timeline = save_editor_project(str(self.outputs),"scene",current,expected_revision=1)
+        self.submit()
+        job = self.registered[0][0]; params = job["params"]
+        self.assertEqual(params["editor_source_fps"],60)
+        self.assertEqual(params["editor_canvas"], {**self.timeline["canvas"],"width":130,"height":74})
+        self.assertEqual((self.timeline["canvas"]["width"],self.timeline["canvas"]["height"]),(129,73))
+        self.assertEqual([item["path"] for item in params["editor_sources"]],[str(second)])
+        self.assertEqual(params["editor_source_path"],[str(second)])
+        self.assertFalse(params["private_output"])
+        self.ns.update(_existing_workspace_dir=lambda _workspace:str(self.project),
+            load_media_sidecars=lambda directory,names:{name:json.loads((Path(directory)/name).with_suffix(".meta.json").read_text()) for name in names})
+        load_functions(self.ns,"_editor_export_source")
+        self.assertEqual(self.ns["_editor_export_source"](job)[0],str(second))
+        self.source.write_bytes(b"changed inactive source")
+        with self.assertRaises(HTTPException) as changed: self.submit()
+        self.assertEqual(changed.exception.status_code,409)
+        self.assertEqual(len(self.registered),1)
+
     def test_fractional_repeated_clip_registration_and_layers_follow_encoded_clock(self):
         from services.editor_projects import add_output_audio_layer, add_output_image_layer, editor_audio_layer, editor_image_layers, editor_text_layers
         current = append_output_video_clip(self.timeline, output_name=self.source.name,

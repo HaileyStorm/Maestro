@@ -401,7 +401,10 @@ def render_video_sequence(
         concat.append(f"[v{index}][a{index}]")
     if total_frames / fps > 86400:
         raise ValueError("Editor sequence exceeds the supported duration")
-    filters.append("".join(concat) + f"concat=n={len(clips)}:v=1:a=1[v][a]")
+    filters.append("".join(concat) + f"concat=n={len(clips)}:v=1:a=1[v_joined][a]")
+    # Concat uses a microsecond timebase. Restore exact frame timestamps before
+    # overlays so a single layer on the final project frame is not rounded away.
+    filters.append(f"[v_joined]settb=expr=1/{fps},setpts=N[v]")
     descriptor, temporary_name = tempfile.mkstemp(prefix=".editor-sequence-", suffix=".mp4", dir=destination_path.parent)
     os.close(descriptor)
     temporary = Path(temporary_name)

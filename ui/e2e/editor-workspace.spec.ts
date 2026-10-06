@@ -440,3 +440,91 @@ for (const viewport of [{ name: 'desktop', width: 1440, height: 900 }, { name: '
     await expect(panel.getByRole('combobox', { name: 'Image from this project’s Gallery' })).toBeFocused()
   })
 }
+
+for (const viewport of [{ name: 'desktop', width: 1440, height: 900 }, { name: 'mobile', width: 390, height: 844 }]) {
+  test(`${viewport.name} takes save before import, stay inactive and switch explicitly`, async ({ page }) => {
+    await page.setViewportSize(viewport)
+    await skipWelcome(page)
+    api!.setAccountScenario('remote-user')
+    const alternate = { ...VIDEO, name:'alternate.mp4',revision:'gallery-alt-v1',url:'/api/v1/file/alternate.mp4' }
+    const base = editorProject(1)
+    type TakeClip = typeof base.tracks[0]['items'][0] & {take_asset_ids:string[];take_states:Record<string,{source_in:number;speed:number}>}
+    let saved = { ...base,assets:{...base.assets} as Record<string,typeof base.assets['source-video']>,tracks:[{...base.tracks[0],items:[{
+      ...base.tracks[0].items[0],take_asset_ids:['source-video'],take_states:{'source-video':{source_in:0,speed:1}},
+    } as TakeClip]}] }
+    const imports: unknown[] = [], switches: unknown[] = [], saves: unknown[] = [], previews: string[] = []
+    let releaseSave!: () => void
+    const saveGate = new Promise<void>(resolve => {releaseSave=resolve})
+    let blockSwitch = false
+    let releaseSwitch!: () => void
+    const switchGate = new Promise<void>(resolve => {releaseSwitch=resolve})
+    await page.route('**/editor-fonts/DejaVuSans.ttf',route => route.fulfill({path:new URL('../public/editor-fonts/DejaVuSans.ttf',import.meta.url).pathname,contentType:'font/ttf'}))
+    await page.route(/\/api\/v1\/outputs(?:\?.*)?$/,route => route.fulfill({contentType:'application/json',body:JSON.stringify({outputs:[VIDEO,alternate],total:2})}))
+    await page.route('**/api/v1/outputs/*/metadata*',route => route.fulfill({contentType:'application/json',body:JSON.stringify({params:null,source:'none'})}))
+    await page.route(/\/api\/v1\/file\/(?:sidecarless-clip|alternate)\.mp4(?:\?.*)?$/,route => {
+      const url=new URL(route.request().url()); if(url.searchParams.has('content_revision')) previews.push(url.pathname)
+      return route.fulfill({status:404,body:'Synthetic media unavailable'})
+    })
+    await page.route(/\/api\/v1\/projects\/[^/]+\/editor\/projects(?:\/[^/?]+)?(?:\?.*)?$/,async route => {
+      if(route.request().method()==='PUT') {
+        const body=route.request().postDataJSON(); saves.push(body); await saveGate
+        saved={...body.project,revision:saved.revision+1}
+      }
+      return route.fulfill({contentType:'application/json',body:JSON.stringify({project:saved})})
+    })
+    await page.route('**/editor/projects/synthetic-cut/clips/source-clip/takes',route => {
+      const body=route.request().postDataJSON(); imports.push(body)
+      expect(body).toEqual({expected_revision:2,output_name:alternate.name,output_revision:alternate.revision})
+      saved=structuredClone(saved); saved.revision++
+      saved.assets.alternate={...base.assets['source-video'],id:'alternate',name:alternate.name,output_id:alternate.name,output_revision:`sha256:${'b'.repeat(64)}`,duration:12}
+      saved.tracks[0].items[0].take_asset_ids.push('alternate'); saved.tracks[0].items[0].take_states.alternate={source_in:0,speed:1}
+      return route.fulfill({contentType:'application/json',body:JSON.stringify({project:saved})})
+    })
+    await page.route('**/editor/projects/synthetic-cut/clips/source-clip/take',async route => {
+      const body=route.request().postDataJSON(); switches.push(body); expect(body.expected_revision).toBe(saved.revision)
+      saved=structuredClone(saved); saved.revision++
+      saved.tracks[0].items[0].asset_id=body.asset_id; saved.tracks[0].items[0].source_in=saved.tracks[0].items[0].take_states[body.asset_id].source_in
+      if (blockSwitch) await switchGate
+      return route.fulfill({contentType:'application/json',body:JSON.stringify({project:saved})})
+    })
+    await page.goto('/'); await page.getByRole('tab',{name:'Gallery'}).click()
+    await page.getByRole('button',{name:`Open ${VIDEO.name} in Editor`}).click()
+    const editor=page.getByRole('main',{name:'Video Editor'})
+    await editor.getByRole('button',{name:'Reveal private preview',exact:true}).click()
+    await expect.poll(() => previews.length).toBeGreaterThan(0)
+    const start=editor.getByRole('slider',{name:/^Start/}); await start.focus(); await start.press('ArrowRight')
+    await editor.getByRole('combobox',{name:'Add a take from this project’s Gallery'}).selectOption(alternate.name)
+    await editor.getByRole('button',{name:'Add take',exact:true}).click()
+    await expect.poll(() => saves.length).toBe(1); expect(imports).toEqual([])
+    await expect(editor.getByRole('button',{name:'Add take',exact:true})).toBeDisabled(); releaseSave()
+    await expect.poll(() => imports.length).toBe(1)
+    await expect(editor.getByRole('button',{name:`${VIDEO.name} (selected)`,exact:true})).toHaveAttribute('aria-pressed','true')
+    expect(switches).toEqual([]); const duration=saved.tracks[0].items[0].duration
+    await editor.getByRole('button',{name:alternate.name,exact:true}).click(); await expect.poll(() => switches.length).toBe(1)
+    expect(saved.tracks[0].items[0].duration).toBe(duration)
+    await expect(start).toHaveValue('0'); await expect(editor.getByRole('button',{name:'Reveal private preview',exact:true})).toBeVisible()
+    expect(previews.some(path => path.endsWith('/alternate.mp4'))).toBe(false)
+    await editor.getByRole('button',{name:'Reveal private preview',exact:true}).click()
+    await expect.poll(() => previews.some(path => path.endsWith('/alternate.mp4'))).toBe(true)
+    await editor.getByRole('button',{name:VIDEO.name,exact:true}).click(); await expect.poll(() => switches.length).toBe(2)
+    await expect(start).toHaveValue('0.1'); expect(saved.tracks[0].items[0].duration).toBe(duration)
+    await expect(editor.getByRole('button',{name:'Reveal private preview',exact:true})).toBeVisible()
+    await editor.getByRole('button',{name:'Gallery',exact:true}).click()
+    await page.getByRole('button',{name:`Open ${VIDEO.name} in Editor`}).click()
+    await expect(editor.getByRole('button',{name:`${VIDEO.name} (selected)`,exact:true})).toHaveAttribute('aria-pressed','true')
+    expect(imports.length).toBe(1); expect(switches.length).toBe(2)
+    blockSwitch = true
+    await editor.getByRole('button',{name:alternate.name,exact:true}).click()
+    await expect.poll(() => switches.length).toBe(3)
+    api!.setAccountScenario('owner')
+    await page.evaluate(async () => {
+      const path = '/src/stores/useStore.ts'
+      const { useStore } = await import(path)
+      await useStore.getState().loadAccountContext()
+    })
+    releaseSwitch()
+    await expect(editor).toHaveCount(0)
+    expect(imports.length).toBe(1); expect(switches.length).toBe(3)
+    expect(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth + 1)).toBe(false)
+  })
+}

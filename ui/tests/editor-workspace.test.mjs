@@ -3,7 +3,7 @@ import test, { after } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { createServer } from 'vite'
 
-import { addEditorAudio, addEditorImage, appendEditorClip, exportEditorProject, isBackendJobId, openOutputInEditor, saveEditorProject } from '../src/api/client.ts'
+import { addEditorAudio, addEditorImage, addEditorTake, switchEditorTake, appendEditorClip, exportEditorProject, isBackendJobId, openOutputInEditor, saveEditorProject } from '../src/api/client.ts'
 
 // Expose the component's actual draft transformations only in this test loader.
 // Production exports remain the component, and no duplicate implementation is tested.
@@ -377,4 +377,59 @@ test('image row edit and removal retain ordered overlapping neighbors', () => {
   assert.equal(imageLayers(changed)[1].asset_id, 'still-b')
   assert.deepEqual(imageLayers(changeImage(changed, 'a', null)), [imageLayers(changed)[1]])
   assert.deepEqual(imageLayers(moveClip(changed, 'clip-c', -1)), imageLayers(changed))
+})
+
+
+test('alternate take trims and removal preserve per-clip state and shared retained sources', () => {
+  const project = sequenceProject()
+  const first = project.tracks[0].items[0]
+  first.take_asset_ids = ['a', 'b']
+  first.take_states = { a: { source_in: 1, speed: 1 }, b: { source_in: 0.5, speed: 1 } }
+  const second = project.tracks[0].items[1]
+  second.take_asset_ids = ['b', 'a']
+  second.take_states = { b: { source_in: 2, speed: 1 }, a: { source_in: 0, speed: 1 } }
+  const trimmed = changeTrim(project, first.id, 2, 4)
+  assert.deepEqual(trimmed.tracks[0].items[0].take_states, { a: { source_in: 2, speed: 1 }, b: { source_in: 0.5, speed: 1 } })
+  assert.equal(trimmed.tracks[0].items[1].take_states, second.take_states)
+  assert.equal(trimmed.tracks[0].items[1].source_in, second.source_in)
+  assert.deepEqual(first.take_states.a, { source_in: 1, speed: 1 })
+  const removed = removeClip(trimmed, first.id)
+  assert.equal(removed.assets.a, project.assets.a)
+  assert.equal(removed.assets.b, project.assets.b)
+  const last = removeClip(removed, second.id)
+  assert.equal(last.assets.a, undefined)
+  assert.equal(last.assets.b, undefined)
+  assert.equal(last.assets.c, project.assets.c)
+})
+
+test('take clients pin clip and CAS identity and explain saved-range failures', async () => {
+  const project = sequenceProject()
+  const previous = globalThis.fetch
+  const calls = []
+  globalThis.fetch = async (url, init) => { calls.push({ url, init }); return { ok: true, json: async () => ({ project }) } }
+  try {
+    assert.equal(await addEditorTake('scene', project, 'clip-a', 'b.mp4', 'current'), project)
+    assert.equal(await switchEditorTake('scene', project, 'clip-a', 'b'), project)
+    assert.match(calls[0].url, /\/clips\/clip-a\/takes$/)
+    assert.deepEqual(JSON.parse(calls[0].init.body), { expected_revision: 5, output_name: 'b.mp4', output_revision: 'current' })
+    assert.match(calls[1].url, /\/clips\/clip-a\/take$/)
+    assert.deepEqual(JSON.parse(calls[1].init.body), { expected_revision: 5, asset_id: 'b' })
+    globalThis.fetch = async () => ({ ok: false, status: 422 })
+    await assert.rejects(switchEditorTake('scene', project, 'clip-a', 'b'), /Shorten the clip before switching/)
+    assert.equal(calls.length, 2)
+  } finally { globalThis.fetch = previous }
+})
+
+
+test('one alternate clip keeps its project frame clock rather than the selected source cadence', () => {
+  const project = sequenceProject()
+  project.tracks[0].items = project.tracks[0].items.slice(0,1)
+  project.canvas.fps = 60
+  const clip = project.tracks[0].items[0]
+  clip.asset_id = 'b'; clip.duration = 1.01
+  project.assets.b.fps = 24
+  assert.equal(renderedDuration(project),1.01)
+  clip.take_asset_ids = ['a','b']
+  clip.take_states = {a:{source_in:1,speed:1},b:{source_in:0,speed:1}}
+  assert.equal(renderedDuration(project),61/60)
 })

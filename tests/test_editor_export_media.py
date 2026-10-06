@@ -25,6 +25,132 @@ FFPROBE = shutil.which("ffprobe")
 
 @unittest.skipUnless(FFMPEG and FFPROBE, "ffmpeg and ffprobe are required")
 class EditorExportMediaTests(unittest.TestCase):
+    def test_alternate_take_exports_only_selected_pixels_audio_and_restores_original_trim(self):
+        from services.editor_projects import (
+            add_output_video_take, append_output_video_clip, apply_output_video_trim,
+            create_output_video_timeline, editor_sequence_clips, switch_output_video_take,
+        )
+        original = self.root / "original-take.mp4"
+        alternate = self.root / "alternate-take.mp4"
+        for path, video, sound in (
+            (original, "color=red:s=128x72:r=24:d=2,drawbox=x=0:y=0:w=iw:h=ih:color=blue:t=fill:enable='gte(t,1)'",
+             "aevalsrc=0.1*sin(2*PI*if(lt(t\\,1)\\,440\\,880)*t):s=48000:d=2"),
+            (alternate, "color=green:s=128x72:r=24:d=2", "sine=frequency=1320:sample_rate=48000:duration=2"),
+        ):
+            self.run_media([FFMPEG, "-v", "error", "-nostdin", "-f", "lavfi", "-i", video,
+                "-f", "lavfi", "-i", sound, "-c:v", "libx264", "-threads", "2",
+                "-preset", "ultrafast", "-c:a", "aac", str(path)])
+        hashes = {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in (original, alternate)}
+        media = {"type": "video", "duration": 2, "width": 128, "height": 72, "fps": 24, "has_audio": True}
+        current = create_output_video_timeline(workspace="scene", output_name=original.name,
+            output_revision=hashes[original.name], media=media)
+        current = append_output_video_clip(current, output_name=original.name,
+            output_revision=hashes[original.name], media=media)
+        proposed = json.loads(json.dumps(current))
+        proposed["tracks"][0]["items"][0].update(source_in=0.25, duration=0.5)
+        proposed["tracks"][0]["items"][1].update(source_in=1.25, duration=0.5)
+        current = apply_output_video_trim(current, proposed)
+        clip_id = current["tracks"][0]["items"][0]["id"]
+        added = add_output_video_take(current, clip_id=clip_id, output_name=alternate.name,
+            output_revision=hashes[alternate.name], media=media)
+        alternate_id = next(key for key, asset in added["assets"].items() if asset["output_id"] == alternate.name)
+        selected = switch_output_video_take(added, clip_id=clip_id, asset_id=alternate_id)
+        proposed = json.loads(json.dumps(selected))
+        proposed["tracks"][0]["items"][0]["source_in"] = 0.75
+        selected = apply_output_video_trim(selected, proposed)
+        restored = switch_output_video_take(selected, clip_id=clip_id, asset_id="source-video")
+        self.assertEqual(restored["tracks"][0]["items"][0]["source_in"], 0.25)
+        self.assertEqual(restored["tracks"][0]["items"][0]["take_states"][alternate_id]["source_in"], 0.75)
+        for label, project, frequency in (("original", added, 440), ("alternate", selected, 1320), ("restored", restored, 440)):
+            with self.subTest(take=label):
+                clips = [{"path": str(self.root / asset["output_id"]), "source_in": clip["source_in"],
+                          "duration": clip["duration"], "has_audio": asset["has_audio"]}
+                         for asset, clip in editor_sequence_clips(project)]
+                self.assertEqual([clip["duration"] for clip in clips], [0.5, 0.5])
+                output = self.root / f"{label}-cut.mp4"
+                render_video_sequence(clips, output, width=128, height=72, fps=24, timeout=30)
+                pixels = self.run_media([FFMPEG, "-v", "error", "-i", str(output), "-map", "0:v:0",
+                    "-pix_fmt", "rgb24", "-f", "rawvideo", "-"])
+                stride = 128 * 72 * 3
+                self.assertEqual(len(pixels), 24 * stride)
+                for index in range(24):
+                    red, green, blue = pixels[index * stride + (36 * 128 + 64) * 3: index * stride + (36 * 128 + 64) * 3 + 3]
+                    if index >= 12:
+                        self.assertGreater(blue, 200); self.assertLess(red, 30)
+                    elif label == "alternate":
+                        self.assertGreater(green, 100); self.assertLess(max(red, blue), 30)
+                    else:
+                        self.assertGreater(red, 200); self.assertLess(blue, 30)
+                samples = array.array("f", self.run_media([FFMPEG, "-v", "error", "-i", str(output),
+                    "-map", "0:a:0", "-ac", "1", "-ar", "48000", "-f", "f32le", "-"]))
+                for start, expected in ((0.1, frequency), (0.6, 880)):
+                    chunk = samples[int(start * 48000):int((start + 0.2) * 48000)]
+                    crossings = sum(left <= 0 < right for left, right in zip(chunk, chunk[1:]))
+                    self.assertAlmostEqual(crossings / 0.2, expected, delta=15)
+                    self.assertGreater(max(abs(value) for value in chunk), 0.05)
+                self.assertAlmostEqual(float(self.probe(output)["format"]["duration"]), 1, delta=0.025)
+        self.assertEqual(hashes, {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in (original, alternate)})
+
+    def test_single_mixed_fps_take_keeps_project_clock_and_last_frame_layers(self):
+        from PIL import Image
+        from services.editor_projects import (
+            add_output_image_layer, add_output_video_take, apply_output_video_trim,
+            create_output_video_timeline, editor_image_layers, editor_sequence_clips,
+            editor_text_layers, editor_uses_sequence_clock, switch_output_video_take,
+        )
+        original, alternate = self.root / "sixty.mp4", self.root / "twenty-four.mp4"
+        for path, color, fps in ((original, "red", 60), (alternate, "blue", 24)):
+            self.run_media([FFMPEG, "-v", "error", "-nostdin", "-f", "lavfi", "-i",
+                f"color={color}:s=256x144:r={fps}:d=1", "-an", "-c:v", "libx264",
+                "-threads", "2", "-preset", "ultrafast", str(path)])
+        overlay = self.root / "white.png"
+        Image.new("RGB", (8, 8), "white").save(overlay)
+        hashes = {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in (original, alternate, overlay)}
+        media = {"type": "video", "duration": 1, "width": 256, "height": 144, "fps": 60, "has_audio": False}
+        project = create_output_video_timeline(workspace="scene", output_name=original.name,
+            output_revision=hashes[original.name], media=media)
+        proposed = json.loads(json.dumps(project))
+        proposed["tracks"][0]["items"][0]["duration"] = 0.5
+        project = apply_output_video_trim(project, proposed)
+        project = add_output_image_layer(project, output_name=overlay.name,
+            output_revision=hashes[overlay.name], media={"type": "image", "width": 8, "height": 8})
+        proposed = json.loads(json.dumps(project))
+        next(track for track in proposed["tracks"] if track["id"] == "images-main")["items"][0].update(
+            start=0.5 - 1 / 60, duration=1 / 60, size=0.2, position="top")
+        next(track for track in proposed["tracks"] if track["id"] == "titles-main")["items"] = [
+            {"id": "last-frame", "text": "X", "start": 0.5 - 1 / 60, "duration": 1 / 60, "position": "bottom"}]
+        project = apply_output_video_trim(project, proposed)
+        clip_id = project["tracks"][0]["items"][0]["id"]
+        project = add_output_video_take(project, clip_id=clip_id, output_name=alternate.name,
+            output_revision=hashes[alternate.name], media={**media, "fps": 24})
+        alternate_id = next(key for key, asset in project["assets"].items() if asset["output_id"] == alternate.name)
+        project = switch_output_video_take(project, clip_id=clip_id, asset_id=alternate_id)
+        self.assertTrue(editor_uses_sequence_clock(project))
+        images = [{**item, "path": str(overlay), "width": 8, "height": 8} for item in editor_image_layers(project, require_fit=True)]
+        titles = editor_text_layers(project, require_fit=True)
+        clips = [{"path": str(self.root / asset["output_id"]), "source_in": clip["source_in"],
+                  "duration": clip["duration"], "has_audio": False} for asset, clip in editor_sequence_clips(project)]
+        output = self.root / "mixed-fps-take.mp4"
+        render_video_sequence(clips, output, width=256, height=144, fps=project["canvas"]["fps"],
+            image_layer=images, text_layers=titles, timeout=30)
+        probe = json.loads(self.run_media([FFPROBE, "-v", "error", "-show_entries",
+            "stream=codec_type,avg_frame_rate,nb_frames:format=duration", "-of", "json", str(output)]))
+        video = next(stream for stream in probe["streams"] if stream["codec_type"] == "video")
+        self.assertEqual((video["avg_frame_rate"], int(video["nb_frames"])), ("60/1", 30))
+        self.assertAlmostEqual(float(probe["format"]["duration"]), 0.5, delta=0.025)
+        pixels = self.run_media([FFMPEG, "-v", "error", "-i", str(output), "-map", "0:v:0", "-pix_fmt", "rgb24", "-f", "rawvideo", "-"])
+        stride = 256 * 144 * 3
+        self.assertEqual(len(pixels), 30 * stride)
+        for index in range(30):
+            frame = pixels[index * stride:(index + 1) * stride]
+            for top, bottom in ((0, 40), (104, 144)):
+                red = frame[top * 256 * 3:bottom * 256 * 3:3]
+                if index == 29:
+                    self.assertGreater(max(red), 150)
+                else:
+                    self.assertLess(max(red), 20)
+        self.assertEqual(hashes, {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in (original, alternate, overlay)})
+
     def test_fractional_single_and_repeated_clip_encode_exact_frames_and_silence(self):
         source = self.root / "fractional.mp4"
         self.run_media([FFMPEG, "-v", "error", "-nostdin", "-f", "lavfi", "-i",

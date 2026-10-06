@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { ArrowLeft, ArrowRight, Download, Eye, Film, Loader2, Pause, Play, Plus, RotateCcw, Save, Trash2 } from 'lucide-react'
-import { addEditorAudio, addEditorImage, appendEditorClip, exportEditorProject, getEditorPreviewUrl, openOutputInEditor, projectReferenceSafeErrorMessage, saveEditorProject, type EditorProject } from '../api/client'
-import { privatePreviewIdentity, privatePreviewWasRevealed, revealPrivatePreview, subscribePrivatePreviewReveal } from '../lib/privatePreview'
-import { useStore } from '../stores/useStore'
+import { addEditorAudio, addEditorImage, addEditorTake, switchEditorTake, appendEditorClip, exportEditorProject, getEditorPreviewUrl, openOutputInEditor, projectReferenceSafeErrorMessage, saveEditorProject, type EditorProject } from '../api/client'
+import { hidePrivatePreview, privatePreviewIdentity, privatePreviewWasRevealed, revealPrivatePreview, subscribePrivatePreviewReveal } from '../lib/privatePreview'
+import { currentAccountIdentityEpoch, useStore } from '../stores/useStore'
 import type { OutputFile } from '../types'
 import { MixedAudioPreview } from './MixedAudioPreview'
 import { audioLayerGain as audioGain } from './audioPreviewClock'
@@ -51,9 +51,14 @@ function clipFrames(duration: number, fps: number) {
   return Math.max(1, value - floor === 0.5 ? floor + (floor % 2) : Math.round(value))
 }
 
+function usesSequenceClock(project: EditorProject) {
+  const clips = sequenceClips(project)
+  return clips.length > 1 || clips.some(item => (item.take_asset_ids?.length ?? 1) > 1)
+}
+
 function renderedDuration(project: EditorProject) {
   const clips = sequenceClips(project)
-  return clips.reduce((sum, item) => sum + (clips.length > 1
+  return clips.reduce((sum, item) => sum + (usesSequenceClock(project)
     ? clipFrames(item.duration, project.canvas.fps) / project.canvas.fps : item.duration), 0)
 }
 
@@ -135,8 +140,9 @@ function removeClip(project: EditorProject, clipId: string): EditorProject {
   const removed = items.find(item => item.id === clipId)
   if (!removed || items.length <= 1) return project
   const assets = { ...project.assets }
-  const retained = project.tracks.flatMap(track => track.items).some(item => item.id !== clipId && item.asset_id === removed.asset_id)
-  if (!retained) delete assets[removed.asset_id ?? '']
+  const retained = new Set(project.tracks.flatMap(track => track.items).filter(item => item.id !== clipId)
+    .flatMap(item => item.take_asset_ids ?? [item.asset_id ?? '']))
+  for (const id of removed.take_asset_ids ?? [removed.asset_id ?? '']) if (!retained.has(id)) delete assets[id]
   return { ...project, assets, tracks: project.tracks.map(track => track.id === 'video-main'
     ? { ...track, items: sequenceStarts(items.filter(item => item.id !== clipId)) } : track) }
 }
@@ -384,9 +390,10 @@ export function EditorWorkspace({ source }: { source: OutputFile }) {
   const addTextButton = useRef<HTMLButtonElement>(null)
   const textField = useRef<HTMLTextAreaElement>(null)
   const [appendName, setAppendName] = useState('')
+  const [takeName, setTakeName] = useState('')
   const [appendPending, setAppendPending] = useState(false)
   const [appendError, setAppendError] = useState('')
-  const [importKind, setImportKind] = useState<'video' | 'audio' | 'image'>('video')
+  const [importKind, setImportKind] = useState<'video' | 'audio' | 'image' | 'take'>('video')
   const [saveState, setSaveState] = useState<SaveState>('saved')
   const [savePending, setSavePending] = useState(false)
   const [error, setError] = useState('')
@@ -402,6 +409,7 @@ export function EditorWorkspace({ source }: { source: OutputFile }) {
   const appending = useRef(false)
   const projectRef = useRef<EditorProject | null>(null)
   const scope = useRef(0)
+  const accountEpoch = useRef(currentAccountIdentityEpoch())
   const editVersion = useRef(0)
   const savedVersion = useRef(0)
   const clips = project ? sequenceClips(project) : []
@@ -438,10 +446,19 @@ export function EditorWorkspace({ source }: { source: OutputFile }) {
 
   const isCurrent = useCallback((epoch: number) => {
     const state = useStore.getState()
-    return scope.current === epoch && state.activeWorkspace === source.workspace
+    return scope.current === epoch && currentAccountIdentityEpoch() === accountEpoch.current && state.activeWorkspace === source.workspace
       && state.editorSource?.workspace === source.workspace && state.editorSource.name === source.name
       && state.editorSource.revision === source.revision
   }, [source.workspace, source.name, source.revision])
+
+  useEffect(() => useStore.subscribe((state, previous) => {
+    if (state.activeWorkspace !== previous.activeWorkspace || state.editorSource !== previous.editorSource) scope.current += 1
+    if (currentAccountIdentityEpoch() !== accountEpoch.current && state.editorSource) {
+      scope.current += 1
+      preview.current?.pause()
+      closeEditor()
+    }
+  }), [closeEditor])
 
   useEffect(() => {
     void document.fonts.load('16px "Maestro Editor"').then(() => setFontReady(true))
@@ -462,6 +479,7 @@ export function EditorWorkspace({ source }: { source: OutputFile }) {
     setActiveTextId('')
     setPreviewTime(0)
     setAppendName('')
+    setTakeName('')
     setAppendPending(false)
     setAppendError('')
     appending.current = false
@@ -563,6 +581,7 @@ export function EditorWorkspace({ source }: { source: OutputFile }) {
     setPlaying(false)
     setPlaybackError(false)
     setActiveClipId(id)
+    setTakeName('')
     setPreviewTime(0)
   }
 
@@ -603,11 +622,13 @@ export function EditorWorkspace({ source }: { source: OutputFile }) {
     window.requestAnimationFrame(() => document.getElementById(`editor-clip-${selected.id}`)?.focus())
   }
 
-  const handleAppend = async (kind: 'video' | 'audio' | 'image' = 'video', requestedName = appendName) => {
+  const handleAppend = async (kind: 'video' | 'audio' | 'image' | 'take' = 'video', requestedName = appendName) => {
     const epoch = scope.current
     if (!projectRef.current || !isCurrent(epoch) || appending.current || exporting.current || saveState === 'error') return
+    const targetId = clip?.id
     const choices = kind === 'audio' ? availableAudio : kind === 'image' ? availableImages : availableVideos
     const output = choices(projectRef.current, useStore.getState().outputs).find(item => item.name === requestedName)
+    if (kind === 'take' && (!targetId || !clip || (clip.take_asset_ids ?? []).length >= 8 || (clip.take_asset_ids ?? []).some(id => projectRef.current?.assets[id]?.output_id === output?.name))) return
     if (!output || (kind === 'video' && sequenceClips(projectRef.current).length >= 8) || (kind === 'audio' && audioLayer(projectRef.current)) || (kind === 'image' && imageLayers(projectRef.current).length >= 8)) return
     appending.current = true
     setImportKind(kind)
@@ -632,7 +653,9 @@ export function EditorWorkspace({ source }: { source: OutputFile }) {
         setAppendName('')
         return
       }
-      const appended = await (kind === 'audio' ? addEditorAudio : kind === 'image' ? addEditorImage : appendEditorClip)(source.workspace, projectRef.current, output.name, output.revision)
+      const appended = kind === 'take'
+        ? await addEditorTake(source.workspace, projectRef.current, targetId!, output.name, output.revision)
+        : await (kind === 'audio' ? addEditorAudio : kind === 'image' ? addEditorImage : appendEditorClip)(source.workspace, projectRef.current, output.name, output.revision)
       if (!isCurrent(epoch)) return
       projectRef.current = appended
       setProject(appended)
@@ -640,6 +663,7 @@ export function EditorWorkspace({ source }: { source: OutputFile }) {
       if (kind === 'image') setActiveImageId(imageLayers(appended).at(-1)?.id ?? '')
       setSaveState('saved')
       setAppendName('')
+      setTakeName('')
       setExportState('idle')
       setExportError('')
     } catch (reason) {
@@ -649,6 +673,44 @@ export function EditorWorkspace({ source }: { source: OutputFile }) {
         appending.current = false
         setAppendPending(false)
       }
+    }
+  }
+
+  const handleSwitchTake = async (assetId: string) => {
+    const epoch = scope.current
+    const targetId = clip?.id
+    if (!targetId || !projectRef.current || !isCurrent(epoch) || appending.current || exporting.current || saveState === 'error') return
+    appending.current = true
+    setImportKind('take')
+    setAppendPending(true)
+    setAppendError('')
+    preview.current?.pause()
+    setPlaying(false)
+    setRevealedIdentity(null)
+    try {
+      if (savingPromise.current && !(await savingPromise.current)) return
+      if (!isCurrent(epoch)) return
+      if (savedVersion.current !== editVersion.current) {
+        const snapshot = projectRef.current
+        if (!snapshot || !(await save(snapshot))?.allEditsSaved) return
+      }
+      if (!isCurrent(epoch) || !projectRef.current) return
+      const changed = await switchEditorTake(source.workspace, projectRef.current, targetId, assetId)
+      if (!isCurrent(epoch)) return
+      const selected = sequenceClips(changed).find(item => item.id === targetId)
+      const asset = changed.assets[selected?.asset_id ?? '']
+      if (asset?.private !== false) hidePrivatePreview(privatePreviewIdentity(source.workspace, asset.output_id, asset.output_revision))
+      projectRef.current = changed
+      setProject(changed)
+      setPreviewTime(0)
+      setPlaybackError(false)
+      setSaveState('saved')
+      setExportState('idle')
+      setExportError('')
+    } catch (reason) {
+      if (isCurrent(epoch)) setAppendError(projectReferenceSafeErrorMessage(reason, 'This take could not be selected. Try again.'))
+    } finally {
+      if (isCurrent(epoch)) { appending.current = false; setAppendPending(false) }
     }
   }
 
@@ -662,7 +724,8 @@ export function EditorWorkspace({ source }: { source: OutputFile }) {
   const bed = project ? audioLayer(project) : undefined
   const audioOutOfRange = Boolean(bed && bed.start + bed.duration > sequenceDuration + 1e-6)
   const titlesOutOfRange = titles.some(item => item.start + item.duration > sequenceDuration + 1e-6)
-  const titleFps = clips.length > 1 ? project?.canvas.fps ?? 30 : sourceAsset?.fps || project?.canvas.fps || 30
+  const sequenceClock = project ? usesSequenceClock(project) : false
+  const titleFps = sequenceClock ? project?.canvas.fps ?? 30 : sourceAsset?.fps || project?.canvas.fps || 30
   const titlesTooShort = titles.some(item => item.duration < 1 / titleFps - 1e-9)
   const imageInvalidRange = overlays.some(item => item.start + item.duration > sequenceDuration + 1e-6 || item.duration < 1 / titleFps - 1e-9)
   const selectedIndex = clips.findIndex(item => item.id === clip?.id)
@@ -799,7 +862,7 @@ export function EditorWorkspace({ source }: { source: OutputFile }) {
               </div>
               {playbackError && <p className="px-4 pb-3 text-sm text-red-400" role="alert">Preview unavailable. The saved cut is still available.</p>}
               {clip && <MixedAudioPreview project={project} clip={clip} clipOffset={clipOffset}
-                clipDuration={clips.length > 1 ? clipFrames(clip.duration, project.canvas.fps) / project.canvas.fps : clip.duration}
+                clipDuration={sequenceClock ? clipFrames(clip.duration, project.canvas.fps) / project.canvas.fps : clip.duration}
                 video={preview} playing={playing} busy={busy || savePending || saveState === 'error' || !revealed || playbackError} />}
             </section>
 
@@ -811,10 +874,10 @@ export function EditorWorkspace({ source }: { source: OutputFile }) {
                 <div><dt className="text-text-muted">Selected clip</dt><dd className="tabular-nums">{displayTime(trimEnd - trimStart)}</dd></div>
                 <div className="col-span-2"><dt className="text-text-muted">Total sequence</dt><dd className="tabular-nums">{displayTime(sequenceDuration)} · {clips.length} {clips.length === 1 ? 'clip' : 'clips'}</dd></div>
               </dl>
-              <p className="mt-6 border-t border-border pt-5 text-sm leading-relaxed text-text-secondary">{clips.length === 1
+              <p className="mt-6 border-t border-border pt-5 text-sm leading-relaxed text-text-secondary">{!sequenceClock
                 ? 'Your original video stays intact. This cut is saved as an editable draft in the project.'
                 : 'Your original videos stay intact. Clips play one after another, in timeline order. The sequence is saved as an editable draft in the project.'}</p>
-              {clips.length > 1 && <p className="mt-3 text-xs leading-relaxed text-text-secondary">Export uses the sequence canvas set from the first video ({project.canvas.width} × {project.canvas.height}, {project.canvas.fps} fps). Odd source dimensions are rounded up to an even canvas. Other shapes receive black bars. Each clip uses its first audio track; clips without audio use silence.</p>}
+              {sequenceClock && <p className="mt-3 text-xs leading-relaxed text-text-secondary">Export uses the sequence canvas set from the first video ({project.canvas.width + project.canvas.width % 2} × {project.canvas.height + project.canvas.height % 2}, {project.canvas.fps} fps). Other shapes receive black bars. Each clip uses its first audio track; clips without audio use silence.</p>}
               <button type="button" onClick={() => { void handleExport() }}
                 disabled={!canTrim || titlesOutOfRange || titlesTooShort || audioOutOfRange || imageInvalidRange || saveState !== 'saved' || exportState !== 'idle' || appendPending}
                 className="mt-5 flex min-h-11 w-full items-center justify-center gap-2 rounded-lg border border-border bg-bg-primary px-4 text-sm font-medium text-text-primary hover:bg-bg-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:opacity-50">
@@ -879,6 +942,33 @@ export function EditorWorkspace({ source }: { source: OutputFile }) {
                 : 'Add another clip from any listed video, including one already in this edit. Each clip has its own trim. Pending edits save first.'}</p>
               {appendPending && importKind === 'video' && <p className="mt-2 text-xs text-text-secondary" role="status">Saving pending edits and adding the selected video…</p>}
               {appendError && importKind === 'video' && <p className="mt-3 text-sm text-red-400" role="alert">{appendError}</p>}
+            </div>
+            <div className="mb-6 border-b border-border pb-4">
+              <h3 className="mb-3 text-sm font-medium">Takes for clip {selectedIndex + 1}</h3>
+              <p className="mb-3 text-xs text-text-secondary">Adding a take keeps the current video selected. Switching keeps this clip’s length and restores that take’s saved start. Pending edits save first.</p>
+              <div className="mb-3 flex flex-wrap gap-2">
+                {(clip?.take_asset_ids ?? [clip?.asset_id ?? '']).map(id => <button type="button" key={id}
+                  aria-pressed={id === clip?.asset_id} disabled={busy || savePending || saveState === 'error' || id === clip?.asset_id}
+                  onClick={() => { void handleSwitchTake(id) }}
+                  className="min-h-11 max-w-full break-all rounded-lg border border-border px-3 text-left text-sm hover:bg-bg-hover aria-pressed:border-accent-blue aria-pressed:bg-accent-blue/15 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:opacity-50">
+                  {project.assets[id]?.name ?? 'Video'}{id === clip?.asset_id ? ' (selected)' : ''}
+                </button>)}
+              </div>
+              <div className="flex flex-wrap items-end gap-3">
+                <label className="min-w-0 flex-1 text-sm"><span className="mb-2 block">Add a take from this project’s Gallery</span>
+                  <select value={takeName} disabled={busy || (clip?.take_asset_ids?.length ?? 1) >= 8 || saveState === 'error'}
+                    onChange={event => { setTakeName(event.target.value); setAppendError('') }} className={audioInputClass}>
+                    <option value="">Choose a video…</option>
+                    {candidates.filter(output => !(clip?.take_asset_ids ?? []).some(id => project.assets[id]?.output_id === output.name))
+                      .map(output => <option key={output.name} value={output.name}>{output.name}</option>)}
+                  </select>
+                </label>
+                <button type="button" disabled={busy || savePending || saveState === 'error' || !takeName || (clip?.take_asset_ids?.length ?? 1) >= 8}
+                  onClick={() => { void handleAppend('take', takeName) }} className={audioButtonClass}><Plus size={14} aria-hidden="true" />Add take</button>
+              </div>
+              {(clip?.take_asset_ids?.length ?? 1) >= 8 && <p className="mt-2 text-xs text-text-muted">This clip has reached its 8-take limit.</p>}
+              {appendPending && importKind === 'take' && <p role="status" className="mt-2 text-xs text-text-secondary">Saving edits and updating takes…</p>}
+              {appendError && importKind === 'take' && <p role="alert" className="mt-3 text-sm text-red-400">{appendError}</p>}
             </div>
             <h3 className="mb-3 text-sm font-medium">Trim clip {selectedIndex + 1}</h3>
             <div className="relative mb-6 h-16 overflow-hidden rounded-lg bg-bg-primary" aria-hidden="true">

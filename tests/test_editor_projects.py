@@ -33,6 +33,8 @@ from services.editor_projects import (  # noqa: E402
     EditorProjectError,
     apply_output_video_trim,
     append_output_video_clip,
+    add_output_video_take,
+    switch_output_video_take,
     editor_sequence_clips,
     create_editor_project,
     create_output_video_timeline,
@@ -284,6 +286,93 @@ class TestEditorProjectFoundation(unittest.TestCase):
                 "id": "video-main", "items": [{"source_in": 19.0, "duration": 4.0}],
             }]))
 
+    def test_alternate_takes_persist_independent_trims_and_keep_sequence_clocks(self):
+        self._workspace("takes")
+        media = {"type": "video", "duration": 6, "width": 128, "height": 72, "fps": 24}
+        project = create_output_video_timeline(workspace="takes", output_name="a.mp4", output_revision="a", media=media)
+        project = append_output_video_clip(project, output_name="a.mp4", output_revision="a", media=media)
+        proposed = copy.deepcopy(project)
+        for clip, start in zip(proposed["tracks"][0]["items"], (1, 2)):
+            clip.update(source_in=start, duration=2)
+        project = apply_output_video_trim(project, proposed)
+        clip_id = project["tracks"][0]["items"][0]["id"]
+        project = add_output_video_take(project, clip_id=clip_id, output_name="b.mp4", output_revision="b", media=media)
+        alt_id = project["tracks"][0]["items"][0]["take_asset_ids"][-1]
+        self.assertEqual(project["tracks"][0]["items"][0]["asset_id"], "source-video")
+        clocks = [(clip["id"], clip["start"], clip["duration"]) for _, clip in editor_sequence_clips(project)]
+        selected = switch_output_video_take(project, clip_id=clip_id, asset_id=alt_id)
+        proposed = copy.deepcopy(selected); proposed["tracks"][0]["items"][0]["source_in"] = 0.5
+        selected = apply_output_video_trim(selected, proposed)
+        selected = save_editor_project(self.outputs, "takes", selected, expected_revision=0)
+        selected = load_editor_project(self.outputs, "takes", selected["id"])
+        restored = switch_output_video_take(selected, clip_id=clip_id, asset_id="source-video")
+        self.assertEqual([(clip["id"], clip["start"], clip["duration"]) for _, clip in editor_sequence_clips(restored)], clocks)
+        self.assertEqual([clip["source_in"] for _, clip in editor_sequence_clips(restored)], [1, 2])
+        self.assertEqual(switch_output_video_take(restored, clip_id=clip_id, asset_id=alt_id)["tracks"][0]["items"][0]["source_in"], 0.5)
+        proposed = copy.deepcopy(restored); proposed["tracks"][0]["items"].pop(0)
+        removed = apply_output_video_trim(restored, proposed)
+        self.assertEqual(set(removed["assets"]), {"source-video"})
+        self.assertEqual(removed["tracks"][0]["items"][0]["source_in"], 2)
+
+    def test_general_legacy_take_normalization_remains_distinct_from_native_cuts(self):
+        from services.editor_projects import normalize_editor_project
+        media = {"type":"video","duration":6,"width":128,"height":72,"fps":24}
+        project = create_output_video_timeline(workspace="takes",output_name="a.mp4",output_revision="a",media=media)
+        clip_id = project["tracks"][0]["items"][0]["id"]
+        project = add_output_video_take(project,clip_id=clip_id,output_name="b.mp4",output_revision="b",media=media)
+        clip = project["tracks"][0]["items"][0]
+        alt_id = clip["take_asset_ids"][-1]
+        clip["take_states"][alt_id]["source_in"] = 99
+        legacy = copy.deepcopy(project); legacy.pop("opening_source")
+        self.assertLess(normalize_editor_project(legacy)["tracks"][0]["items"][0]["take_states"][alt_id]["source_in"],6)
+        self.assertEqual(normalize_editor_project(project)["tracks"][0]["items"][0]["take_states"][alt_id]["source_in"],99)
+        clip["take_states"][alt_id]["speed"] = 2
+        with self.assertRaises(EditorProjectError): normalize_editor_project(project)
+        self.assertEqual(normalize_editor_project(legacy)["tracks"][0]["items"][0]["asset_id"],"source-video")
+
+    def test_take_bounds_and_invalid_states_reject_without_normalization_or_clock_changes(self):
+        self._workspace("takes")
+        media = {"type": "video", "duration": 6, "width": 128, "height": 72, "fps": 24}
+        project = create_output_video_timeline(workspace="takes", output_name="a.mp4", output_revision="a", media=media)
+        clip_id = project["tracks"][0]["items"][0]["id"]
+        project = add_output_video_take(project, clip_id=clip_id, output_name="short.mp4", output_revision="short", media={**media,"duration":2})
+        alt_id = project["tracks"][0]["items"][0]["take_asset_ids"][-1]
+        with self.assertRaisesRegex(EditorProjectError, "too short"):
+            switch_output_video_take(project, clip_id=clip_id, asset_id=alt_id)
+        for mutation in ("duplicate", "state", "active", "foreign", "speed", "range"):
+            broken = copy.deepcopy(project); clip = broken["tracks"][0]["items"][0]
+            if mutation == "duplicate": clip["take_asset_ids"].append(alt_id)
+            elif mutation == "state": clip["take_states"][alt_id]["source_in"] = float("nan")
+            elif mutation == "active": clip["take_states"]["source-video"]["source_in"] = 1
+            elif mutation == "foreign": broken["assets"][alt_id]["workspace"] = "other"
+            elif mutation == "speed": clip["take_states"][alt_id]["speed"] = True
+            else: clip["duration"] = 7
+            with self.subTest(mutation=mutation), self.assertRaises(EditorProjectError):
+                save_editor_project(self.outputs, "takes", broken, expected_revision=0)
+        shortened = copy.deepcopy(project); shortened["tracks"][0]["items"][0]["duration"] = 1
+        shortened = apply_output_video_trim(project, shortened)
+        shortened = switch_output_video_take(shortened, clip_id=clip_id, asset_id=alt_id)
+        trim = copy.deepcopy(shortened); trim["tracks"][0]["items"][0]["source_in"] = 0.5
+        shortened = apply_output_video_trim(shortened, trim)
+        longer = switch_output_video_take(shortened, clip_id=clip_id, asset_id="source-video")
+        trim = copy.deepcopy(longer); trim["tracks"][0]["items"][0]["duration"] = 4
+        longer = apply_output_video_trim(longer, trim)
+        longer = save_editor_project(self.outputs,"takes",longer,expected_revision=0)
+        longer = load_editor_project(self.outputs,"takes",longer["id"])
+        self.assertEqual(longer["tracks"][0]["items"][0]["take_states"][alt_id]["source_in"],0.5)
+        with self.assertRaisesRegex(EditorProjectError,"too short"):
+            switch_output_video_take(longer,clip_id=clip_id,asset_id=alt_id)
+        for number in range(6):
+            project = add_output_video_take(project, clip_id=clip_id, output_name=f"alt{number}.mp4", output_revision=f"alt{number}", media=media)
+        with self.assertRaises(EditorProjectError):
+            add_output_video_take(project, clip_id=clip_id, output_name="ninth.mp4", output_revision="ninth", media=media)
+        with self.assertRaises(EditorProjectError):
+            switch_output_video_take(project, clip_id=clip_id, asset_id="foreign")
+        for key, value in (("asset_id", alt_id), ("take_asset_ids", ["source-video"]),
+                           ("take_states", {"source-video":{"source_in":0,"speed":1}, alt_id:{"source_in":1,"speed":1}})):
+            proposed = copy.deepcopy(project); proposed["tracks"][0]["items"][0][key] = value
+            with self.subTest(key=key), self.assertRaises(EditorProjectError): apply_output_video_trim(project, proposed)
+
     def test_sequence_reorder_trim_keeps_server_assets_and_rejects_identity_changes(self):
         self._workspace("scene")
         media = {"type": "video", "duration": 3.0, "width": 127, "height": 71, "fps": 24}
@@ -292,7 +381,7 @@ class TestEditorProjectFoundation(unittest.TestCase):
         self.assertEqual((sequence["canvas"]["width"], sequence["canvas"]["height"]), (128, 72))
         proposed = copy.deepcopy(sequence)
         proposed["tracks"][0]["items"].reverse()
-        proposed["tracks"][0]["items"][0].update(source_in=0.5, duration=1.25, start=999, asset_id="forged")
+        proposed["tracks"][0]["items"][0].update(source_in=0.5, duration=1.25, start=999)
         updated = apply_output_video_trim(sequence, proposed)
         pairs = editor_sequence_clips(updated)
         self.assertEqual([asset["output_id"] for asset, _ in pairs], ["second.mp4", "first.mp4"])
@@ -300,13 +389,15 @@ class TestEditorProjectFoundation(unittest.TestCase):
         self.assertEqual(updated["assets"], sequence["assets"])
         saved = save_editor_project(self.outputs, "scene", updated, expected_revision=0)
         self.assertEqual(len(editor_sequence_clips(load_editor_project(self.outputs, "scene", saved["id"]))), 2)
-        for mode in ("duplicate", "empty", "unknown"):
+        for mode in ("duplicate", "empty", "unknown", "asset"):
             invalid = copy.deepcopy(proposed)
             items = invalid["tracks"][0]["items"]
             if mode == "duplicate":
                 items[1]["id"] = items[0]["id"]
             elif mode == "empty":
                 items.clear()
+            elif mode == "asset":
+                items[0]["asset_id"] = "forged"
             else:
                 items[0]["id"] = "unknown"
             with self.subTest(mode=mode), self.assertRaises(EditorProjectError):
@@ -620,7 +711,7 @@ class TestEditorProjectRoutes(unittest.TestCase):
         wanted = {
             "_editor_request_body", "_editor_save_root",
             "_editor_require_current_source", "open_output_editor_project",
-            "save_output_editor_project", "serve_file",
+            "save_output_editor_project", "serve_file", "add_output_editor_take", "switch_output_editor_take",
         }
         selected = []
         for node in ast.parse(launch_path.read_text(encoding="utf-8")).body:
@@ -653,6 +744,7 @@ class TestEditorProjectRoutes(unittest.TestCase):
             "subprocess": subprocess,
             "wgp": types.SimpleNamespace(server_config={"save_path": self.outputs}),
             "_reserve_workspace_operations": lambda _project: nullcontext(),
+            "_output_lineage_mutation_guard": lambda _directory: nullcontext(),
             "_require_project_access": authorize,
             "_require_authorized_output": output,
             "_output_revision": lambda *_args: self.revision,
@@ -665,6 +757,56 @@ class TestEditorProjectRoutes(unittest.TestCase):
         }
         exec(compile(module, str(launch_path), "exec"), namespace)
         self.routes = namespace
+
+    def test_take_route_pins_private_sources_rejects_stale_and_restores_original(self):
+        media = {"type":"video", "duration":3, "width":128, "height":72, "fps":24}
+        with mock.patch("services.editor_projects.probe_media", return_value=media):
+            opened = asyncio.run(self.routes["open_output_editor_project"]("scene", _EditorRequest({"output_name":"clip.mp4", "output_revision":self.revision})))["project"]
+        alternate = Path(self.scene)/"alternate.mp4"; alternate.write_bytes(b"alternate")
+        self.routes["_require_authorized_output"] = lambda _r, _p, name: (self.scene, str(Path(self.scene)/name), {"private":name == alternate.name})
+        self.routes["_output_share_revision"] = lambda path, *_a: "sha256:" + hashlib.sha256(Path(path).read_bytes()).hexdigest()
+        clip_id = opened["tracks"][0]["items"][0]["id"]
+        body = {"expected_revision":1,"output_name":alternate.name,"output_revision":self.revision}
+        with mock.patch("services.editor_projects.probe_media", return_value=media):
+            added = asyncio.run(self.routes["add_output_editor_take"]("scene",opened["id"],clip_id,_EditorRequest(body)))["project"]
+        alt = added["tracks"][0]["items"][0]["take_asset_ids"][-1]
+        self.assertTrue(added["assets"][alt]["private"])
+        self.assertEqual(added["tracks"][0]["items"][0]["asset_id"],"source-video")
+        selected = asyncio.run(self.routes["switch_output_editor_take"]("scene",added["id"],clip_id,_EditorRequest({"expected_revision":2,"asset_id":alt})))["project"]
+        restored = asyncio.run(self.routes["switch_output_editor_take"]("scene",added["id"],clip_id,_EditorRequest({"expected_revision":3,"asset_id":"source-video"})))["project"]
+        self.assertEqual(restored["tracks"][0]["items"][0]["duration"],opened["tracks"][0]["items"][0]["duration"])
+        self.assertEqual(restored["tracks"][0]["items"][0]["asset_id"],"source-video")
+        self.assertEqual(selected["canvas"], opened["canvas"])
+        with self.assertRaises(HTTPException) as stale:
+            asyncio.run(self.routes["switch_output_editor_take"]("scene",added["id"],clip_id,_EditorRequest({"expected_revision":2,"asset_id":alt})))
+        self.assertEqual(stale.exception.status_code,409)
+        alternate.write_bytes(b"changed inactive")
+        with self.assertRaises(HTTPException) as changed:
+            asyncio.run(self.routes["switch_output_editor_take"]("scene",added["id"],clip_id,_EditorRequest({"expected_revision":4,"asset_id":"source-video"})))
+        self.assertEqual(changed.exception.status_code,409)
+        self.assertEqual(load_editor_project(self.outputs,"scene",added["id"])["revision"],4)
+        with mock.patch("services.editor_projects.probe_media", return_value=media), self.assertRaises(HTTPException) as reopen:
+            asyncio.run(self.routes["open_output_editor_project"]("scene",_EditorRequest({"output_name":"clip.mp4","output_revision":self.revision})))
+        self.assertEqual(reopen.exception.status_code,409)
+
+    def test_take_import_replacement_during_probe_never_saves_and_foreign_project_denied(self):
+        media = {"type":"video", "duration":3, "width":128, "height":72, "fps":24}
+        with mock.patch("services.editor_projects.probe_media", return_value=media):
+            opened = asyncio.run(self.routes["open_output_editor_project"]("scene", _EditorRequest({"output_name":"clip.mp4", "output_revision":self.revision})))["project"]
+        alternate = Path(self.scene)/"alternate.mp4"; alternate.write_bytes(b"alternate")
+        self.routes["_require_authorized_output"] = lambda _r, _p, name: (self.scene,str(Path(self.scene)/name),{"private":False})
+        self.routes["_output_share_revision"] = lambda path,*_a: "sha256:"+hashlib.sha256(Path(path).read_bytes()).hexdigest()
+        def replace(path):
+            Path(path).write_bytes(b"replaced")
+            return media
+        args = ("scene",opened["id"],opened["tracks"][0]["items"][0]["id"],_EditorRequest({"expected_revision":1,"output_name":alternate.name,"output_revision":self.revision}))
+        with mock.patch("services.editor_projects.probe_media",side_effect=replace), self.assertRaises(HTTPException) as changed:
+            asyncio.run(self.routes["add_output_editor_take"](*args))
+        self.assertEqual(changed.exception.status_code,409)
+        self.assertEqual(load_editor_project(self.outputs,"scene",opened["id"])["assets"],opened["assets"])
+        with self.assertRaises(HTTPException) as foreign:
+            asyncio.run(self.routes["add_output_editor_take"]("other",*args[1:]))
+        self.assertEqual(foreign.exception.status_code,403)
 
     def test_reopen_original_gallery_video_after_its_clip_is_removed(self):
         media = {"type":"video", "duration":3, "width":128, "height":72, "fps":24}

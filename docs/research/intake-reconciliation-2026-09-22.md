@@ -763,3 +763,26 @@ cannot identify melody, count performed bars or resolve metrical ambiguity;
 accompaniment could maintain this rhythm while melody timing differs.
 Phrase alignment, ending behavior and owner listening remain open. No model
 was loaded, accepted media regenerated, or audio trimmed or time-scaled.
+
+## October 6 follow-on: Editor alternate takes
+
+The Editor's manual return path can retain up to eight authorized Gallery
+video takes for each clip, including its original. Import preserves the
+selected take. An explicit switch restores that take's saved source start
+without changing the clip's duration, timeline position, or layer clocks;
+an insufficient saved range is rejected. Shared video assets keep independent
+trim states per clip, and removing a clip retains assets referenced by another
+clip or take. Dedicated revision-checked routes own take membership and source
+identity; ordinary trim saves cannot substitute another asset.
+
+Export admission checks every retained source. The render plan and output
+lineage include only selected takes and active layers, so unused takes do not
+become hidden export inputs. A real CPU FFmpeg regression renders distinct
+original and alternate colors and audio tones, then restores the original
+trim. It checks the unchanged sequence duration and frame count, selected
+sound, and unchanged Gallery source bytes. A separate mixed-frame-rate check
+keeps a single-clip draft at its original 60 fps when selecting a 24 fps take,
+including title and image layers on exactly the final frame. The joined video
+uses exact frame timestamps; its audio timing stays unchanged. Runtime/browser acceptance remains
+separate from this CPU evidence. This slice adopts existing results; automatic
+AI dispatch and broader round-trip recovery and human acceptance remain open.

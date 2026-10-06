@@ -185,6 +185,24 @@ eight clips, including multiple uses of the same video. Each clip has its own
 trim and position; removing one use keeps the other uses and the original video.
 Save the draft, then export a separate finished video to the same project.
 
+Each clip can keep up to eight takes from the same project's Gallery. Use
+**Add take** to retain another video, then select it under **Takes**. Adding a
+take keeps the current take selected. Switching restores that take's saved
+source start and keeps the clip's length and position; shorten the clip first
+if the saved range does not fit. Trims are independent for each clip and take.
+Export uses the selected takes, and the original Gallery files stay unchanged.
+Drafts with alternate takes export at the first video’s saved canvas and frame
+rate, so switching sources keeps titles, images, and audio on the same clock.
+
+API clients can add a take with
+`POST /api/v1/projects/{project}/editor/projects/{editor_id}/clips/{clip_id}/takes`
+and `{expected_revision, output_name, output_revision}`. Select a retained take
+with `POST /api/v1/projects/{project}/editor/projects/{editor_id}/clips/{clip_id}/take`
+and `{expected_revision, asset_id}`. Both return the saved `project`; use its
+new revision for the next mutation. Source changes or competing saves require
+reopening the draft. These actions adopt existing Gallery videos; they do not
+start generation.
+
 ### 🛠️ Edit Mode
 - **Retake** — re-roll a section of an existing video with a new prompt
 - **Edit Anything** — modify, add, or remove elements from existing videos using text prompts and In-Context LoRA models

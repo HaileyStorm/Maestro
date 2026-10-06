@@ -382,6 +382,19 @@ def apply_output_video_trim(
             used.add(clip_id)
             asset, original = by_id[clip_id]
             start, length = incoming["source_in"], incoming["duration"]
+            expected_states = copy.deepcopy(original["take_states"])
+            for key, expected in (("asset_id", original["asset_id"]),
+                                  ("take_asset_ids", original["take_asset_ids"]),
+                                  ("take_states", expected_states)):
+                if key == "take_states" and isinstance(incoming.get(key), Mapping):
+                    supplied = copy.deepcopy(dict(incoming[key]))
+                    if isinstance(supplied.get(original["asset_id"]), Mapping):
+                        supplied[original["asset_id"]] = {"source_in": original["source_in"], "speed": supplied[original["asset_id"]].get("speed")}
+                    if supplied != expected:
+                        raise ValueError("take identity changed")
+                    continue
+                if key in incoming and incoming[key] != expected:
+                    raise ValueError("take identity changed")
             if (type(start) not in (int, float) or type(length) not in (int, float)
                     or not math.isfinite(start) or not math.isfinite(length)
                     or start < 0 or length < 1 / 240
@@ -395,10 +408,6 @@ def apply_output_video_trim(
         if position > 86400:
             raise ValueError("sequence too long")
         track["items"] = items
-        retained_assets = {item.get("asset_id") for row in updated["tracks"] for item in row.get("items", [])}
-        for asset, _ in originals:
-            if asset["id"] not in retained_assets:
-                updated["assets"].pop(asset["id"], None)
     except (KeyError, IndexError, StopIteration, TypeError, ValueError):
         raise EditorProjectError("Select a valid source range") from None
     incoming_titles = [track for track in proposed.get("tracks", []) if track.get("id") == "titles-main"]
@@ -416,8 +425,6 @@ def apply_output_video_trim(
             raise EditorProjectError("Add audio from this project's Gallery")
         audio = next(track for track in updated["tracks"] if track["id"] == "audio-main")
         audio["items"] = [_editor_audio_item(candidate)] if candidate else []
-        if original_bed and not candidate:
-            del updated["assets"][original_bed["asset_id"]]
     incoming_images = [track for track in proposed["tracks"] if track.get("id") == "images-main"]
     if incoming_images:
         original = {item["id"]: item for item in editor_image_layers(current)}
@@ -428,10 +435,10 @@ def apply_output_video_trim(
         if track is None:
             raise EditorProjectError("Add images from this project's Gallery")
         track["items"] = [_editor_image_item(item) for item in candidates]
-        retained = {item["asset_id"] for item in candidates}
-        for item in original.values():
-            if item["asset_id"] not in retained:
-                del updated["assets"][item["asset_id"]]
+    retained = {asset_id for row in updated["tracks"] for item in row.get("items", [])
+                for asset_id in item.get("take_asset_ids", [item.get("asset_id")])}
+    updated["assets"] = {key: value for key, value in updated["assets"].items() if key in retained}
+    editor_sequence_clips(updated)
     return updated
 
 
@@ -446,6 +453,12 @@ def _editor_audio_item(plan: Mapping[str, Any]) -> dict[str, Any]:
         "transform": {"x": 0.0, "y": 0.0, "scale": 1.0, "rotation": 0.0},
         "fit": "contain", "disabled": False,
     }
+
+
+def editor_uses_sequence_clock(project: Mapping[str, Any]) -> bool:
+    clips = next((track.get("items", []) for track in project.get("tracks", [])
+                  if track.get("id") == "video-main"), [])
+    return len(clips) > 1 or any(len(clip.get("take_asset_ids", [])) > 1 for clip in clips)
 
 
 def editor_audio_layer(project: Mapping[str, Any], *, require_fit: bool = False) -> dict | None:
@@ -490,7 +503,7 @@ def editor_audio_layer(project: Mapping[str, Any], *, require_fit: bool = False)
         if require_fit:
             clips = next(track["items"] for track in project["tracks"] if track["id"] == "video-main")
             fps = project["canvas"]["fps"]
-            end = sum(editor_clip_frames(clip["duration"], fps) for clip in clips) / fps if len(clips) > 1 else clips[0]["duration"]
+            end = sum(editor_clip_frames(clip["duration"], fps) for clip in clips) / fps if editor_uses_sequence_clock(project) else clips[0]["duration"]
             if plan["start"] + plan["duration"] > end + 1e-6:
                 raise ValueError()
         return plan
@@ -520,7 +533,7 @@ def add_output_audio_layer(current: Mapping[str, Any], *, output_name: str,
         "width": 0, "height": 0, "fps": 0.0, "has_audio": True,
     }
     fps = current["canvas"]["fps"]
-    end = sum(editor_clip_frames(clip["duration"], fps) for _, clip in clips) / fps if len(clips) > 1 else clips[0][1]["duration"]
+    end = sum(editor_clip_frames(clip["duration"], fps) for _, clip in clips) / fps if editor_uses_sequence_clock(current) else clips[0][1]["duration"]
     plan = {"id": "audio-layer", "asset_id": asset_id, "source_in": 0.0, "start": 0.0,
             "duration": min(duration, end), "volume": 1.0, "muted": False}
     next(track for track in updated["tracks"] if track["id"] == "audio-main")["items"] = [_editor_audio_item(plan)]
@@ -591,8 +604,8 @@ def editor_image_layers(project: Mapping[str, Any], *, require_fit: bool = False
                 raise ValueError()
             if require_fit:
                 clips = next(track["items"] for track in project["tracks"] if track["id"] == "video-main")
-                fps = project["canvas"]["fps"] if len(clips) > 1 else (project["assets"][clips[0]["asset_id"]].get("fps") or project["canvas"]["fps"])
-                end = sum(editor_clip_frames(clip["duration"], fps) for clip in clips) / fps if len(clips) > 1 else clips[0]["duration"]
+                fps = project["canvas"]["fps"] if editor_uses_sequence_clock(project) else (project["assets"][clips[0]["asset_id"]].get("fps") or project["canvas"]["fps"])
+                end = sum(editor_clip_frames(clip["duration"], fps) for clip in clips) / fps if editor_uses_sequence_clock(project) else clips[0]["duration"]
                 if plan["start"] + plan["duration"] > end + 1e-6 or plan["duration"] < 1 / max(1, fps) - 1e-9:
                     raise ValueError()
             if plan["id"] in ids or plan["asset_id"] in asset_ids:
@@ -630,7 +643,7 @@ def add_output_image_layer(current: Mapping[str, Any], *, output_name: str,
         "private": bool(media.get("private", True)), "duration": 0.0, "fps": 0.0, "has_audio": False,
         "width": media.get("width"), "height": media.get("height")}
     fps = current["canvas"]["fps"]
-    end = sum(editor_clip_frames(clip["duration"], fps) for _, clip in clips) / fps if len(clips) > 1 else clips[0][1]["duration"]
+    end = sum(editor_clip_frames(clip["duration"], fps) for _, clip in clips) / fps if editor_uses_sequence_clock(current) else clips[0][1]["duration"]
     plan = {"id": "image-layer" if asset_id == "source-image" else f"image-{uuid.uuid4().hex}", "asset_id": asset_id, "start": 0.0, "duration": end,
             "size": 0.25, "opacity": 1.0, "position": "center"}
     track = next((track for track in updated["tracks"] if track["id"] == "images-main"), None)
@@ -692,9 +705,9 @@ def editor_text_layers(project: Mapping[str, Any], *, require_fit: bool = False)
         if require_fit:
             clips = next(track["items"] for track in project["tracks"] if track["id"] == "video-main")
             fps = project["canvas"]["fps"]
-            title_fps = fps if len(clips) > 1 else project["assets"][clips[0]["asset_id"]].get("fps", fps) or fps
+            title_fps = fps if editor_uses_sequence_clock(project) else project["assets"][clips[0]["asset_id"]].get("fps", fps) or fps
             end = (sum(editor_clip_frames(clip["duration"], fps) for clip in clips) / fps
-                   if len(clips) > 1 else clips[0]["duration"])
+                   if editor_uses_sequence_clock(project) else clips[0]["duration"])
             if any(item["start"] + item["duration"] > end + 1e-6
                    or item["duration"] < 1 / title_fps - 1e-9 for item in result):
                 raise ValueError()
@@ -727,14 +740,38 @@ def editor_sequence_clips(project: Mapping[str, Any]) -> list[tuple[dict, dict]]
             asset_id, clip_id = clip["asset_id"], clip["id"]
             asset = assets[asset_id]
             start, length = clip["source_in"], clip["duration"]
+            take_ids, states = clip["take_asset_ids"], clip["take_states"]
+            if (not isinstance(take_ids, list) or not 1 <= len(take_ids) <= 8
+                    or any(not isinstance(key, str) for key in take_ids)
+                    or len(set(take_ids)) != len(take_ids) or asset_id not in take_ids
+                    or not isinstance(states, dict) or set(states) != set(take_ids)):
+                raise ValueError()
+            for take_id in take_ids:
+                take, state = assets[take_id], states[take_id]
+                if (take.get("id") != take_id or take.get("type") != "video"
+                        or take.get("origin") != "output" or take.get("workspace") != project["workspace"]
+                        or not take.get("output_id") or take.get("name") != take["output_id"]
+                        or os.path.basename(take["output_id"]) != take["output_id"]
+                        or "\\" in take["output_id"] or "\0" in take["output_id"]
+                        or os.path.splitext(take["output_id"])[1].lower() not in _VIDEO_EXTENSIONS
+                        or type(take.get("duration")) not in (int, float)
+                        or not math.isfinite(take["duration"]) or take["duration"] < 1 / 240
+                        or not re.fullmatch(r"[A-Za-z0-9:._-]{1,128}", take.get("output_revision", ""))
+                        or not isinstance(state, dict) or set(state) != {"source_in", "speed"}
+                        or type(state["source_in"]) not in (int, float)
+                        or not math.isfinite(state["source_in"]) or state["source_in"] < 0
+                        or type(state["speed"]) not in (int, float) or state["speed"] != 1.0):
+                    raise ValueError()
+            if states[asset_id] != {"source_in": start, "speed": 1.0}:
+                raise ValueError()
             expected = {
                 "id": clip_id, "asset_id": asset_id, "start": position,
                 "source_in": start, "duration": length,
                 "speed": 1.0, "volume": 1.0, "opacity": 1.0,
                 "fade_in": 0.0, "fade_out": 0.0,
                 "transition_in": "none", "transition_out": "none",
-                "take_asset_ids": [asset_id],
-                "take_states": {asset_id: {"source_in": start, "speed": 1.0}},
+                "take_asset_ids": take_ids,
+                "take_states": states,
                 "transform": {"x": 0.0, "y": 0.0, "scale": 1.0, "rotation": 0.0},
                 "fit": "contain", "muted": False, "disabled": False,
             }
@@ -746,7 +783,7 @@ def editor_sequence_clips(project: Mapping[str, Any]) -> list[tuple[dict, dict]]
                     or start < 0 or length < 1 / 240
                     or start + length > asset["duration"] + 1e-6):
                 raise ValueError()
-            ids.add(clip_id); asset_ids.add(asset_id)
+            ids.add(clip_id); asset_ids.update(take_ids)
             position += length
             result.append((asset, clip))
         referenced_assets = asset_ids | {item["asset_id"] for item in images}
@@ -790,9 +827,67 @@ def append_output_video_clip(current: Mapping[str, Any], *, output_name: str,
     return updated
 
 
+def add_output_video_take(current: Mapping[str, Any], *, clip_id: str, output_name: str,
+                          output_revision: str, media: Mapping[str, Any]) -> dict[str, Any]:
+    clips = editor_sequence_clips(current)
+    clip = next((item for _, item in clips if item["id"] == clip_id), None)
+    if clip is None or len(clip["take_asset_ids"]) >= 8:
+        raise EditorProjectError("A clip can contain up to eight takes")
+    candidate = create_output_video_timeline(workspace=current["workspace"], output_name=output_name,
+        output_revision=output_revision, media=media)
+    source = candidate["assets"]["source-video"]
+    matches = [asset for asset in current["assets"].values() if asset.get("output_id") == output_name]
+    if matches and (len(matches) != 1 or matches[0] != {**source, "id": matches[0]["id"]}):
+        raise EditorProjectError("This video's source changed. Reopen the edit from Gallery")
+    asset_id = matches[0]["id"] if matches else f"source-video-{uuid.uuid4().hex[:16]}"
+    if asset_id in clip["take_asset_ids"]:
+        raise EditorProjectError("This video is already a take for this clip")
+    updated = copy.deepcopy(dict(current))
+    if "opening_source" not in updated:
+        original = current["assets"]["source-video"]
+        updated["opening_source"] = {key: original[key]
+            for key in ("output_id", "output_revision", "workspace", "origin", "type")}
+    updated["assets"][asset_id] = {**source, "id": asset_id}
+    target = next(item for row in updated["tracks"] for item in row["items"] if item["id"] == clip_id)
+    target["take_asset_ids"].append(asset_id)
+    target["take_states"][asset_id] = {"source_in": 0.0, "speed": 1.0}
+    editor_sequence_clips(updated)
+    return updated
+
+
+def switch_output_video_take(current: Mapping[str, Any], *, clip_id: str, asset_id: str) -> dict[str, Any]:
+    clips = editor_sequence_clips(current)
+    clip = next((item for _, item in clips if item["id"] == clip_id), None)
+    if clip is None or asset_id not in clip["take_asset_ids"]:
+        raise EditorProjectError("Choose a take belonging to this clip")
+    start = clip["take_states"][asset_id]["source_in"]
+    if start + clip["duration"] > current["assets"][asset_id]["duration"] + 1e-6:
+        raise EditorProjectError("This take is too short for the saved range. Shorten the clip before switching")
+    updated = copy.deepcopy(dict(current))
+    target = next(item for row in updated["tracks"] for item in row["items"] if item["id"] == clip_id)
+    target.update(asset_id=asset_id, source_in=start)
+    editor_sequence_clips(updated)
+    return updated
+
+
+def _validate_alternate_video_takes(project: Mapping[str, Any]) -> bool:
+    # Legacy general-purpose drafts retain their normalization behavior. New
+    # alternate cuts must validate before normalization can clamp any range.
+    if not isinstance(project.get("opening_source"), Mapping):
+        return False
+    alternate = any((isinstance(item.get("take_asset_ids"), list) and len(item["take_asset_ids"]) > 1)
+        or (isinstance(item.get("take_states"), Mapping) and len(item["take_states"]) > 1)
+        for track in project.get("tracks", []) if isinstance(track, Mapping) and track.get("id") == "video-main"
+        for item in track.get("items", []) if isinstance(item, Mapping))
+    if alternate:
+        editor_sequence_clips(project)
+    return alternate
+
+
 def normalize_editor_project(project: Mapping[str, Any], *, workspace: str | None = None) -> dict[str, Any]:
     if not isinstance(project, Mapping):
         raise EditorProjectError("Editor project must be an object")
+    alternate = _validate_alternate_video_takes(project)
     normalized = copy.deepcopy(dict(project))
     if workspace is not None and _safe_workspace_name(project.get("workspace")) != _safe_workspace_name(workspace):
         raise EditorProjectError("Editor project belongs to a different workspace")
@@ -964,7 +1059,7 @@ def normalize_editor_project(project: Mapping[str, Any], *, workspace: str | Non
                                     0.0,
                                 )
                             )
-                            if take_duration > 0:
+                            if take_duration > 0 and not alternate:
                                 take_source_in = min(
                                     take_source_in,
                                     max(0.0, take_duration - (1 / 240) * take_speed),

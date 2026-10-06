@@ -5000,7 +5000,8 @@ export interface EditorProject {
     id: string; name: string; type: 'video' | 'audio' | 'text';
     items: Array<{ id: string; asset_id?: string; start: number; duration: number; source_in: number; speed: number;
       text?: string; position?: 'top' | 'center' | 'bottom'; size?: number; opacity?: number; volume?: number; muted?: boolean;
-      fade_in?: number; fade_out?: number }>
+      fade_in?: number; fade_out?: number; take_asset_ids?: string[];
+      take_states?: Record<string, { source_in: number; speed: number }> }>
   }>
 }
 
@@ -5049,6 +5050,30 @@ export async function appendEditorClip(project: string, timeline: EditorProject,
   if (!res.ok) {
     if (res.status === 422) throw new ProjectAssetRequestError(422, 'Choose another video from this project. A sequence can contain up to 8 clips (HTTP 422)')
     throw editorRequestError(res.status, 'Unable to add this video to the sequence')
+  }
+  return (await res.json()).project as EditorProject
+}
+
+export async function addEditorTake(project: string, timeline: EditorProject, clipId: string, name: string, revision: string): Promise<EditorProject> {
+  const res = await fetch(`${BASE}/api/v1/projects/${encodeURIComponent(project)}/editor/projects/${encodeURIComponent(timeline.id)}/clips/${encodeURIComponent(clipId)}/takes`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ expected_revision: timeline.revision, output_name: name, output_revision: revision }),
+  })
+  if (!res.ok) {
+    if (res.status === 422) throw new ProjectAssetRequestError(422, 'Choose another current Gallery video. Each clip can retain up to 8 different takes (HTTP 422)')
+    throw editorRequestError(res.status, 'Unable to add this take')
+  }
+  return (await res.json()).project as EditorProject
+}
+
+export async function switchEditorTake(project: string, timeline: EditorProject, clipId: string, assetId: string): Promise<EditorProject> {
+  const res = await fetch(`${BASE}/api/v1/projects/${encodeURIComponent(project)}/editor/projects/${encodeURIComponent(timeline.id)}/clips/${encodeURIComponent(clipId)}/take`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ expected_revision: timeline.revision, asset_id: assetId }),
+  })
+  if (!res.ok) {
+    if (res.status === 422) throw new ProjectAssetRequestError(422, 'This take cannot fit the saved range. Shorten the clip before switching (HTTP 422)')
+    throw editorRequestError(res.status, 'Unable to switch this take')
   }
   return (await res.json()).project as EditorProject
 }
