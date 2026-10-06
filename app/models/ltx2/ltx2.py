@@ -200,6 +200,25 @@ def _prepare_ltx_audio_waveform(input_waveform, target_channels):
     return waveform.unsqueeze(0).contiguous()
 
 
+def _retake_frame_bounds(start_frame, end_frame, source_frames, source_fps,
+                         target_frames, target_fps):
+    """Map the selected source interval into the processed video's clock."""
+    if (source_frames <= 0 or target_frames <= 0
+            or not math.isfinite(source_fps) or source_fps <= 0
+            or not math.isfinite(target_fps) or target_fps <= 0):
+        raise ValueError("Retake requires a non-empty video with a valid frame rate.")
+    source_start = max(0, int(start_frame))
+    source_end = min(int(end_frame), source_frames) if end_frame > 0 else source_frames
+    if source_start >= source_end:
+        raise ValueError("Retake requires a non-empty selected interval.")
+    ratio = target_fps / source_fps
+    start = min(round(source_start * ratio), target_frames - 1)
+    # An explicit end at the original final frame also means the full tail.
+    end = (target_frames if source_end == source_frames
+           else min(round(source_end * ratio), target_frames))
+    return start, max(start + 1, end)
+
+
 def _resolve_retake_pipeline_models(pipeline):
     """Return the model container used by the native Retake pipeline.
 
@@ -1838,6 +1857,7 @@ class LTX2:
             vr = decord.VideoReader(retake_video)
             total_frames = len(vr)
             retake_fps = vr.get_avg_fps()
+            original_frames, original_fps = total_frames, retake_fps
             src_h, src_w = vr[0].shape[:2]
 
             # Determine target resolution while preserving source aspect ratio
@@ -1869,9 +1889,10 @@ class LTX2:
                 target_fps = 25.0
                 needs_fps_change = True
 
-            end_f = retake_end_frame if retake_end_frame > 0 else total_frames
-            end_f = min(end_f, total_frames)
-            start_f = max(0, retake_start_frame)
+            start_f, end_f = _retake_frame_bounds(
+                retake_start_frame, retake_end_frame, original_frames,
+                original_fps, total_frames, retake_fps,
+            )
             clip_frames = end_f - start_f
 
             import tempfile
@@ -1898,10 +1919,11 @@ class LTX2:
                 vr_aligned = decord.VideoReader(scaled_source)
                 total_frames = len(vr_aligned)
                 del vr_aligned
-                # Recompute retake region for new frame count
-                end_f = retake_end_frame if retake_end_frame > 0 else total_frames
-                end_f = min(end_f, total_frames)
-                start_f = max(0, retake_start_frame)
+                # Preserve selected times when FPS conversion changes frame indices.
+                start_f, end_f = _retake_frame_bounds(
+                    retake_start_frame, retake_end_frame, original_frames,
+                    original_fps, total_frames, target_fps,
+                )
                 clip_frames = end_f - start_f
                 retake_fps = target_fps
                 print(f"[Retake Native] Pre-processed source: {src_w}x{src_h} → {aligned_w}x{aligned_h}@{target_fps}fps ({total_frames} frames)")
@@ -1911,9 +1933,12 @@ class LTX2:
             # Step 2: Extract retake clip from the (possibly rescaled) source
             retake_clip_path = os.path.join(_retake_temp_dir, "clip.mp4")
             import av
+            from fractions import Fraction
             vr_source = decord.VideoReader(source_for_stitch)
             out_container = av.open(retake_clip_path, mode='w')
-            stream = out_container.add_stream('h264', rate=int(retake_fps))
+            stream = out_container.add_stream(
+                'h264', rate=Fraction(str(retake_fps)).limit_denominator(100_000),
+            )
             stream.width = aligned_w
             stream.height = aligned_h
             stream.pix_fmt = 'yuv420p'
@@ -2103,8 +2128,11 @@ class LTX2:
 
                 # Write retake clip
                 import av
+                from fractions import Fraction
                 out_container = av.open(retake_clip_path, mode='w')
-                stream = out_container.add_stream('h264', rate=int(retake_fps))
+                stream = out_container.add_stream(
+                    'h264', rate=Fraction(str(retake_fps)).limit_denominator(100_000),
+                )
                 stream.width = src_w
                 stream.height = src_h
                 stream.pix_fmt = 'yuv420p'

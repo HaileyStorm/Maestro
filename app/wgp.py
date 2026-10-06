@@ -14468,6 +14468,18 @@ def _generate_video_impl(
                     _h3_cumulative_dispatch.capture(samples)
                     h3_encoded_video = _h3_cumulative_dispatch.encoded_video
                 if isinstance(samples, dict):
+                    _retake_stitch_info = samples.get("retake_stitch_info", None)
+                    if _retake_stitch_info is not None:
+                        # Audio, completeness checks and encoding use the
+                        # selected segment's processed source clock.
+                        retake_fps = float(_retake_stitch_info["fps"])
+                        retake_start = _retake_stitch_info["start_frame"]
+                        retake_end = _retake_stitch_info["end_frame"]
+                        if (not math.isfinite(retake_fps) or retake_fps <= 0
+                                or not 0 <= retake_start < retake_end <= _retake_stitch_info["total_frames"]):
+                            raise ValueError("Retake returned invalid segment timing.")
+                        fps = retake_fps
+                        current_video_length = retake_end - retake_start
                     overlapped_latents = samples.get("latent_slice", None)
                     BGRA_frames = samples.get("BGRA_frames", None)
                     generated_audio = samples.get("audio", generated_audio)
@@ -14501,7 +14513,6 @@ def _generate_video_impl(
                         elif input_fills_window:
                             output_new_audio_filepath = None
                     post_decode_pre_trim = samples.get("post_decode_pre_trim", 0)
-                    _retake_stitch_info = samples.get("retake_stitch_info", None)
                     samples = samples.get("x", None)
 
                 if samples is not None:
@@ -15171,7 +15182,7 @@ def _generate_video_impl(
                                         "-filter_complex", filter_str,
                                         "-map", "[outv]",
                                         "-c:v", "libx264", "-crf", "18", "-preset", "fast",
-                                        "-r", str(int(stitch_fps)),
+                                        "-r", str(stitch_fps),
                                         stitched_path
                                     ]
                                     result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)

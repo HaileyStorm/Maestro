@@ -2,8 +2,11 @@
 from __future__ import annotations
 
 import ast
+from fractions import Fraction
+import math
 import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 from types import ModuleType, SimpleNamespace
@@ -302,6 +305,153 @@ class TestLtxAudioRuntimeContracts(unittest.TestCase):
         self.assertIn("reload_needed = _apply_ltx25_video_vae_request(", source)
         self.assertIn('model_kwargs["VAE_upsampling"]', source)
         self.assertNotIn('model_kwargs = {"VAE_upsampling"', source)
+
+
+class TestRetakeFrameRate(unittest.TestCase):
+    def setUp(self):
+        self.model_path = _APP / "models/ltx2/ltx2.py"
+        self.tree = ast.parse(self.model_path.read_text(encoding="utf-8"))
+        helper = next(node for node in self.tree.body
+                      if isinstance(node, ast.FunctionDef)
+                      and node.name == "_retake_frame_bounds")
+        namespace = {"math": math}
+        exec(compile(ast.Module(body=[helper], type_ignores=[]),
+                     str(self.model_path), "exec"), namespace)
+        self.bounds = namespace["_retake_frame_bounds"]
+
+    def test_time_selection_and_full_tail_survive_frame_rate_conversion(self):
+        self.assertEqual(self.bounds(60, 120, 300, 30, 250, 25), (50, 100))
+        for end in (-1, 0, 300, 400):
+            self.assertEqual(self.bounds(60, end, 300, 30, 251, 25), (50, 251))
+        self.assertEqual(self.bounds(0, 124, 124, 24, 124, 24), (0, 124))
+        self.assertEqual(self.bounds(59, 60, 60, 60, 25, 25), (24, 25))
+        for start, end in ((300, 300), (120, 60)):
+            with self.assertRaises(ValueError):
+                self.bounds(start, end, 300, 30, 250, 25)
+
+    def _write_video(self, path, frames, fps, *, engine_index=0):
+        import av
+
+        # Execute the native extraction's actual stream setup without loading models.
+        stream_setup = [node for node in ast.walk(self.tree)
+                        if isinstance(node, ast.Assign)
+                        and isinstance(node.value, ast.Call)
+                        and isinstance(node.value.func, ast.Attribute)
+                        and node.value.func.attr == "add_stream"
+                        and "retake_fps" in ast.unparse(node.value)][engine_index]
+        with av.open(str(path), mode="w") as container:
+            namespace = {"out_container": container, "retake_fps": fps,
+                         "Fraction": Fraction}
+            exec(compile(ast.Module(body=[stream_setup], type_ignores=[]),
+                         str(self.model_path), "exec"), namespace)
+            stream = namespace["stream"]
+            stream.width = stream.height = 32
+            stream.pix_fmt = "yuv420p"
+            stream.options = {"threads": "1"}
+            for _ in range(frames):
+                frame = av.VideoFrame.from_ndarray(
+                    np.zeros((32, 32, 3), dtype=np.uint8), format="rgb24")
+                for packet in stream.encode(frame):
+                    container.mux(packet)
+            for packet in stream.encode():
+                container.mux(packet)
+
+    def test_real_conversion_preserves_selected_seconds(self):
+        import av
+
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source.mp4"
+            converted = Path(directory) / "converted.mp4"
+            self._write_video(source, 300, 30)
+            subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(source),
+                            "-vf", "fps=25", "-c:v", "libx264", "-threads", "1",
+                            str(converted)], check=True, capture_output=True, timeout=30)
+            with av.open(str(converted)) as container:
+                frame_count = sum(1 for _ in container.decode(video=0))
+            self.assertEqual(frame_count, 250)
+            start, end = self.bounds(60, 120, 300, 30, frame_count, 25)
+            self.assertEqual((start / 25, end / 25), (2, 4))
+
+    def test_real_fractional_partial_stitch_preserves_frames_and_duration(self):
+        import av
+        import gc
+        import time
+
+        stitch = next(node for node in ast.walk(_wgp_tree())
+                      if isinstance(node, ast.If)
+                      and ast.unparse(node.test) == "sf > 0 or ef < tf")
+        fps = float(Fraction(24_000, 1_001))
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source.mp4"
+            retake = Path(directory) / "retake.mp4"
+            self._write_video(source, 240, fps)
+            for engine_index in (0, 1):
+                self._write_video(retake, 48, fps, engine_index=engine_index)
+                with av.open(str(retake)) as container:
+                    self.assertEqual(container.streams.video[0].average_rate,
+                                     Fraction(24_000, 1_001))
+            namespace = {"sf": 48, "ef": 96, "tf": 240, "stitch_fps": fps,
+                         "src": str(source), "retake_path": str(retake),
+                         "path": str(retake), "subprocess": subprocess,
+                         "os": os, "gc": gc, "time": time}
+            with mock.patch("builtins.print"):
+                exec(compile(ast.Module(body=[stitch], type_ignores=[]),
+                             str(_WGP_PATH), "exec"), namespace)
+            self.assertEqual(namespace["result"].returncode, 0,
+                             namespace["result"].stderr)
+            with av.open(str(retake)) as container:
+                stream = container.streams.video[0]
+                self.assertEqual(stream.average_rate, Fraction(24_000, 1_001))
+                duration = float(stream.duration * stream.time_base)
+                frame_count = sum(1 for _ in container.decode(video=0))
+            self.assertEqual(frame_count, 240)
+            self.assertAlmostEqual(duration, 240 / fps, places=3)
+
+    def test_partial_result_uses_segment_clock_for_encoding_and_completeness(self):
+        tree = _wgp_tree()
+        binding = next(node for node in ast.walk(tree)
+                       if isinstance(node, ast.If)
+                       and ast.unparse(node.test) == "_retake_stitch_info is not None"
+                       and any(isinstance(child, ast.Name) and child.id == "current_video_length"
+                               for child in ast.walk(node)))
+        abort = next(node for node in ast.walk(tree)
+                     if isinstance(node, ast.Assign)
+                     and any(isinstance(target, ast.Name) and target.id == "abort"
+                             for target in node.targets)
+                     and "sample.shape[1] < current_video_length" in ast.unparse(node))
+        output_rate = next(node for node in ast.walk(tree)
+                           if isinstance(node, ast.Assign)
+                           and ast.unparse(node) == "output_fps = fps")
+        namespace = {"fps": 25, "current_video_length": 300,
+                     "math": math,
+                     "_retake_stitch_info": {"fps": 24, "start_frame": 48, "end_frame": 96,
+                                              "total_frames": 300},
+                     "sample": SimpleNamespace(shape=(3, 48, 32, 32)),
+                     "abort_scheduled": False, "is_image": False, "audio_only": False}
+        code = compile(ast.Module(body=[binding, abort, output_rate], type_ignores=[]),
+                       str(_WGP_PATH), "exec")
+        exec(code, namespace)
+        self.assertEqual(namespace["fps"], 24)
+        self.assertEqual(namespace["output_fps"], 24)
+        self.assertFalse(namespace["abort"])
+        namespace["sample"] = SimpleNamespace(shape=(3, 47, 32, 32))
+        exec(code, namespace)
+        self.assertTrue(namespace["abort"])
+        namespace["abort_scheduled"] = False
+        namespace["sample"] = SimpleNamespace(shape=(3, 124, 32, 32))
+        namespace["_retake_stitch_info"] = {
+            "fps": 24, "start_frame": 0, "end_frame": 124, "total_frames": 124,
+        }
+        exec(code, namespace)
+        self.assertFalse(namespace["abort"])
+        self.assertEqual(namespace["output_fps"], 24)
+        namespace["_retake_stitch_info"]["fps"] = 0
+        with self.assertRaises(ValueError):
+            exec(code, namespace)
+        namespace["_retake_stitch_info"]["fps"] = 24
+        namespace["abort_scheduled"] = True
+        exec(code, namespace)
+        self.assertTrue(namespace["abort"])
 
 
 class TestNativeRetakeFrameBoundary(unittest.TestCase):
