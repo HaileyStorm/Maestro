@@ -182,7 +182,9 @@ class LogicalReferenceRecoveryTests(unittest.TestCase):
             coordinator = QueueRecoveryCoordinator(QueueRecoveryJournal(Path(directory) / 'queue.jsonl'))
             pending = {'id': 'pending-tool', 'kind': 'tool_hflip', 'status': 'cancelled',
                        'recovery_cursor': {'processed_tool_publication': {'schema_version': 1}}}
-            jobs = [pending,
+            legacy = {'id':'legacy-tool','kind':'tool_hflip','status':'cancelled',
+                      'recovery_cursor':{'processed_tool_legacy_cleanup':{'schema_version':1}}}
+            jobs = [pending, legacy,
                     {'id': 'pending-editor', 'kind': 'tool_editor_export', 'status': 'cancelled',
                      'recovery_cursor': {'editor_export_publication': {'schema_version': 1}}},
                     {'id': 'composition-cancel', 'kind': 'tool_editor_export', 'status': 'cancelled',
@@ -193,8 +195,8 @@ class LogicalReferenceRecoveryTests(unittest.TestCase):
                      'recovery_cursor': pending['recovery_cursor']}]
             for job in jobs:
                 coordinator.register_job(job, owner_digest=OWNER, project_digest=PROJECT, request_manifest={'kind': 'test'})
-            self.assertEqual(set(coordinator.compact().jobs), {'pending-tool', 'pending-editor'})
-            for job_id in ('pending-tool', 'pending-editor'):
+            self.assertEqual(set(coordinator.compact().jobs), {'pending-tool', 'pending-editor', 'legacy-tool'})
+            for job_id in ('pending-tool', 'pending-editor', 'legacy-tool'):
                 with self.assertRaisesRegex(QueueRecoveryAdapterError, 'cleanup is pending'):
                     coordinator.tombstone_terminal(job_id)
             fresh = QueueRecoveryCoordinator(coordinator.journal)
@@ -204,6 +206,8 @@ class LogicalReferenceRecoveryTests(unittest.TestCase):
             editor = next(job for job in jobs if job['id'] == 'pending-editor')
             editor['recovery_cursor'] = {}
             fresh.prospective_transition(types.SimpleNamespace(jobs=(editor,), tombstones=(), global_state=None))
+            legacy['recovery_cursor'] = {}
+            fresh.prospective_transition(types.SimpleNamespace(jobs=(legacy,), tombstones=(), global_state=None))
             self.assertEqual(fresh.compact().jobs, {})
 
     def test_composition_confirmation_receipts_survive_terminal_compaction_bounded_and_scoped(self):

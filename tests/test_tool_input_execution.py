@@ -80,7 +80,10 @@ class ToolInputExecutionTests(unittest.TestCase):
             stamp_sidecar_policy=stamp_sidecar_policy, traceback=types.SimpleNamespace(print_exc=lambda: None))
         load(self.ns, '_ToolInputChanged', '_safe_failure_updates', '_job_failure_positions', '_queue_recovery_file_values', '_queue_recovery_input_descriptors',
              '_queue_recovery_manifest_validator', '_validated_tool_input_paths',
-             '_processed_tool_settings', '_cleanup_cancelled_processed_tool_output', '_resume_processed_tool_output',
+             '_processed_tool_settings', '_processed_tool_publication_members', '_retract_processed_tool_publication',
+             '_prepare_processed_tool_completion_retry', '_materialize_processed_tool_publication', '_hold_processed_tool_publication',
+             '_processed_tool_legacy_cleanup_record', '_settle_processed_tool_legacy_cleanup',
+             '_cleanup_cancelled_processed_tool_output', '_resume_processed_tool_output',
              '_h3_dependency_closed_recovery_units', '_queue_recovery_units', '_queue_recovery_unit_matches', '_queue_recovery_reconcile_cursor',
              '_publish_processed_tool_output', '_write_tool_sidecar', '_queue_recovery_worker',
              '_output_revision', '_hflip_source', '_browser_copy_source', '_run_tool_hflip',
@@ -201,6 +204,24 @@ class ToolInputExecutionTests(unittest.TestCase):
                 self.assertEqual(job['recovery_state'], 'cleanup_blocked')
                 self.assertIn('processed_tool_publication', job['recovery_cursor'])
                 media.unlink(); sidecar.unlink()
+
+    def test_legacy_byte_only_publication_cannot_delete_present_files_but_settles_absence(self):
+        job = self.job('tool_hflip')
+        staged = self.project / 'staged.mp4'; staged.write_bytes(b'processed')
+        self.assertTrue(self.ns['_publish_processed_tool_output'](job, str(staged), source=str(self.video),
+            tool='hflip', params={}, elapsed=1))
+        media = self.project / job['output_files'][0]; sidecar = media.with_suffix('.meta.json')
+        intent = job['recovery_cursor']['processed_tool_publication']
+        intent['schema_version'] = 1
+        for key in ('media','sidecar'): intent[key].pop('file_id')
+        before = media.read_bytes(), sidecar.read_bytes()
+        job.update(status='cancelled', cancel_requested=True)
+        self.assertFalse(self.ns['_cleanup_cancelled_processed_tool_output'](job))
+        self.assertEqual((media.read_bytes(), sidecar.read_bytes()), before)
+        media.unlink(); sidecar.unlink()
+        self.assertTrue(self.ns['_cleanup_cancelled_processed_tool_output'](job))
+        self.assertEqual(job['status'], 'cancelled'); self.assertFalse(job['queue_held'])
+        self.assertNotIn('processed_tool_publication', job['recovery_cursor'])
 
     def test_cancel_cleanup_preserves_same_inode_replacement_after_hash_with_restored_mtime(self):
         job = self.job('tool_hflip')
@@ -685,7 +706,7 @@ class ToolInputExecutionTests(unittest.TestCase):
         self.assertEqual(output.read_bytes(), original_media)
         self.assertEqual(sidecar.read_bytes(), original_metadata)
 
-    def test_post_rename_durability_failures_remove_only_owned_output(self):
+    def test_post_rename_durability_failure_retracts_partial_or_adopts_complete_pair(self):
         from services.atomic_file_publish import publish_file_no_replace, PublishedFileDurabilityError
         for boundary in ('metadata', 'media'):
             with self.subTest(boundary=boundary):
@@ -699,8 +720,48 @@ class ToolInputExecutionTests(unittest.TestCase):
                     with self.assertRaises((RuntimeError, PublishedFileDurabilityError)):
                         self.ns['_publish_processed_tool_output'](job, str(staged), source=str(self.video),
                             tool='upscale', params={}, elapsed=1)
-                self.assertEqual(list(self.project.glob('*_upscale_*')), [])
+                if boundary == 'metadata':
+                    self.assertEqual(list(self.project.glob('*_upscale_*')), [])
+                    self.assertNotIn('processed_tool_publication', job['recovery_cursor'])
+                else:
+                    pair = list(self.project.glob('*_upscale_*'))
+                    self.assertEqual(len(pair), 2)
+                    before = {path.name: path.read_bytes() for path in pair}
+                    job.update(status='queued', output_files=[])
+                    self.assertTrue(self.ns['_resume_processed_tool_output'](job))
+                    self.assertEqual({path.name:path.read_bytes() for path in pair}, before)
+                    for path in pair: path.unlink()
                 self.assertEqual(self.video.read_bytes(), b'original')
+
+    def test_publication_failure_preserves_same_bytes_foreign_inode_and_its_own_marker(self):
+        from services.atomic_file_publish import publish_file_no_replace, PublishedFileDurabilityError
+        for boundary in ('publication','completion'):
+            with self.subTest(boundary=boundary):
+                job = self.job('tool_hflip')
+                staged = self.project/'staged.mp4'; staged.write_bytes(b'processed')
+                output = self.project/f"clip_hflip_{job['id']}.mp4"
+                marker = output.with_suffix('.meta.json')
+                def replace():
+                    foreign = self.project/'foreign.mp4'
+                    foreign.write_bytes(output.read_bytes()); os.replace(foreign,output)
+                def publish(source,destination):
+                    publish_file_no_replace(source,destination)
+                    if str(destination) == str(output) and boundary == 'publication':
+                        replace(); raise PublishedFileDurabilityError(5,'io')
+                def finish(current,*args,**kwargs):
+                    replace(); raise OSError('completion persistence failed')
+                with patch('services.atomic_file_publish.publish_file_no_replace',side_effect=publish), \
+                        patch.dict(self.ns,finish_job=finish):
+                    with self.assertRaisesRegex(ValueError,'ownership'):
+                        self.ns['_publish_processed_tool_output'](job,str(staged),source=str(self.video),
+                            tool='hflip',params={},elapsed=1)
+                before = output.read_bytes(),marker.read_bytes(),output.stat().st_ino
+                job.update(status='cancelled',cancel_requested=True)
+                self.assertFalse(self.ns['_cleanup_cancelled_processed_tool_output'](job))
+                self.assertEqual((output.read_bytes(),marker.read_bytes(),output.stat().st_ino),before)
+                self.assertEqual(job['recovery_state'],'cleanup_blocked')
+                self.assertEqual(self.video.read_bytes(),b'original')
+                output.unlink(); marker.unlink()
 
     def test_cancellation_during_recovery_adoption_removes_exact_owned_result(self):
         job = self.job('tool_upscale')
@@ -726,7 +787,8 @@ class ToolInputExecutionTests(unittest.TestCase):
         output = self.project/job['output_files'][0]
         output.write_bytes(b'changed')
         job.update(status='queued', output_files=[])
-        self.assertIsNone(self.ns['_resume_processed_tool_output'](job))
+        with self.assertRaisesRegex(ValueError, 'bytes changed'):
+            self.ns['_resume_processed_tool_output'](job)
         self.assertEqual(job['output_files'], [])
         self.assertEqual(output.read_bytes(), b'changed')
 
@@ -746,7 +808,8 @@ class ToolInputExecutionTests(unittest.TestCase):
         original = marker.read_text()
         meta = json.loads(original); meta['job_id'] = 'foreign'
         marker.write_text(json.dumps(meta))
-        self.assertIsNone(self.ns['_resume_processed_tool_output'](job))
+        with self.assertRaisesRegex(ValueError, 'bytes changed'):
+            self.ns['_resume_processed_tool_output'](job)
         self.assertTrue(marker.exists())
         marker.write_text(original)
         self.assertIsNone(self.ns['_resume_processed_tool_output'](job))

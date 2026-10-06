@@ -7410,8 +7410,10 @@ def _queue_recovery_materialize_job(
     if (snapshot.get("kind") in {"tool_upscale", "tool_revoice", "tool_hflip", "tool_browser_copy", "tool_editor_export"}
             and (str(snapshot.get("status") or "").casefold() in {"cancelled", "canceled"}
                  or snapshot.get("cancel_requested"))
-            and ("editor_export_publication" if snapshot.get("kind") == "tool_editor_export"
+            and (("editor_export_publication" if snapshot.get("kind") == "tool_editor_export"
                  else "processed_tool_publication") in (snapshot.get("recovery_cursor") or {})
+                 or (snapshot.get("kind") != "tool_editor_export"
+                     and "processed_tool_legacy_cleanup" in (snapshot.get("recovery_cursor") or {})))
             and "composition" not in (snapshot.get("recovery_cursor") or {})):
         current = projects.get(workspace)
         if current is not None and hmac.compare_digest(current[1], expected_project):
@@ -7424,6 +7426,12 @@ def _queue_recovery_materialize_job(
             except (KeyError, TypeError, ValueError, OSError, QueueRecoveryRuntimeError):
                 pass
         return runtime, False
+    if (snapshot.get("kind") in {"tool_upscale", "tool_revoice", "tool_hflip", "tool_browser_copy"}
+            and ("processed_tool_publication" in (snapshot.get("recovery_cursor") or {})
+                 or "processed_tool_legacy_cleanup" in (snapshot.get("recovery_cursor") or {})
+                 or any(isinstance(unit, dict) and unit.get("kind") == "ordinary_repeat"
+                        for unit in (snapshot.get("recovery_cursor") or {}).get("completed_units", [])))):
+        return _materialize_processed_tool_publication(runtime, snapshot, projects)
     if (snapshot.get("kind") == "tool_editor_export"
             and "editor_export_publication" in (snapshot.get("recovery_cursor") or {})
             and "composition" not in (snapshot.get("recovery_cursor") or {})):
@@ -66789,6 +66797,8 @@ def _run_tool_hflip(job_id: str):
     start_time = time.time()
     with generation_slot(_gen_lock, job) as acquired:
         if not acquired:
+            if is_cancel_requested(job) and processed_tool_publication_pending(job):
+                _cleanup_cancelled_processed_tool_output(job)
             return False
         try:
             if not try_start(job, generation_lock=_gen_lock,
@@ -66897,6 +66907,8 @@ def _run_tool_browser_copy(job_id: str):
     start_time = time.time()
     with generation_slot(_gen_lock, job) as acquired:
         if not acquired:
+            if is_cancel_requested(job) and processed_tool_publication_pending(job):
+                _cleanup_cancelled_processed_tool_output(job)
             return False
         try:
             if not try_start(
@@ -68390,11 +68402,298 @@ def _processed_tool_settings(job):
             "request_manifest": dict(job["_recovery_manifest_pointer"])}
 
 
-def _cleanup_cancelled_processed_tool_output(job):
-    """Retract only the independent exact bytes sealed before publication."""
+def _processed_tool_publication_members(job):
+    """Legacy byte-only evidence can settle absence, but cannot authorize deletion."""
+    import stat
+
+    project_dir = _existing_workspace_dir(job["workspace"])
+    intent = job["recovery_cursor"]["processed_tool_publication"]
+    settings = _processed_tool_settings(job)
+    unit_id = recovery_unit_id(job["id"], "ordinary_repeat", variant=0, index=0, settings=settings)
+    producing_attempt = job.get("execution_attempt", 1)
+    if type(producing_attempt) is not int or producing_attempt < 1:
+        raise ValueError("Tool execution attempt changed")
+    completion = job["recovery_cursor"].get("processed_tool_completion_retry")
+    if completion is not None:
+        if (type(completion) is not dict
+                or set(completion) != {"producing_execution_attempt", "execution_attempt", "producer_unit_id"}
+                or type(completion.get("producing_execution_attempt")) is not int
+                or type(completion.get("execution_attempt")) is not int
+                or completion["execution_attempt"] != producing_attempt
+                or not 1 <= completion["producing_execution_attempt"] <= producing_attempt
+                or completion.get("producer_unit_id") != unit_id):
+            raise ValueError("Tool completion retry identity changed")
+        producing_attempt = completion["producing_execution_attempt"]
+    if (not isinstance(intent, dict) or type(intent.get("schema_version")) is not int or intent["schema_version"] not in {1, 2}
+            or set(intent) != {"schema_version", "job_id", "kind", "workspace", "owner_principal", "project_instance",
+                               "execution_attempt", "request_manifest", "producer_unit_id", "settings", "media", "sidecar"}
+            or intent.get("job_id") != job["id"] or intent.get("kind") != job["kind"]
+            or intent.get("workspace") != job["workspace"]
+            or not job.get("_recovery_owner_digest") or not job.get("_recovery_project_digest")
+            or intent.get("owner_principal") != job["_recovery_owner_digest"]
+            or intent.get("project_instance") != job["_recovery_project_digest"]
+            or intent.get("project_instance") != _queue_recovery_existing_project_identity(project_dir)
+            or type(intent.get("execution_attempt")) is not int
+            or intent["execution_attempt"] != producing_attempt
+            or intent["execution_attempt"] < 1
+            or intent.get("request_manifest") != job["_recovery_manifest_pointer"]
+            or intent.get("producer_unit_id") != unit_id
+            or intent.get("settings") != settings):
+        raise ValueError("Tool publication identity changed")
+    # The registration/request seal is required; consumed inputs are not.
+    manifest = load_request_manifest(project_dir, intent["request_manifest"], expected_job_id=job["id"])
+    if manifest.get("params") != job.get("params"):
+        raise ValueError("Tool publication request changed")
+    media, sidecar = intent.get("media"), intent.get("sidecar")
+    if (not isinstance(media, dict) or not isinstance(sidecar, dict)
+            or not isinstance(media.get("basename"), str)
+            or sidecar.get("basename") != os.path.splitext(media["basename"])[0] + ".meta.json"):
+        raise ValueError("Tool publication names changed")
+    source_field = {"tool_hflip": "hflip_source_path", "tool_browser_copy": "browser_copy_source_path"}.get(job["kind"], "video_path")
+    source = manifest.get("params", {}).get(source_field)
+    expected_stem = f"{os.path.splitext(os.path.basename(source or ''))[0]}_{job['kind'][5:]}_{job['id']}"
+    if not source or os.path.splitext(media["basename"])[0] != expected_stem:
+        raise ValueError("Tool publication request changed")
+    survivors = []
+    for key, descriptor in (("media", media), ("sidecar", sidecar)):
+        name = descriptor.get("basename")
+        size, digest = descriptor.get("size"), descriptor.get("sha256")
+        if (not isinstance(name, str) or name in {"", ".", ".."}
+                or os.path.basename(name) != name or "/" in name or "\\" in name
+                or type(size) is not int or size < 1
+                or not isinstance(digest, str) or len(digest) != 64
+                or any(character not in "0123456789abcdef" for character in digest)
+                or (descriptor is sidecar and size > 1024 * 1024)):
+            raise ValueError("Tool publication descriptor changed")
+        file_id = descriptor.get("file_id")
+        if (set(descriptor) != {"basename", "size", "sha256"} | ({"file_id"} if intent["schema_version"] == 2 else set())
+                or (intent["schema_version"] == 2 and (
+                    not isinstance(file_id, list) or len(file_id) != 2
+                    or any(type(value) is not int or value < 0 for value in file_id) or file_id[1] == 0))):
+            raise ValueError("Tool publication file identity changed")
+        path = os.path.join(project_dir, name)
+        if not os.path.lexists(path):
+            continue
+        before = os.lstat(path)
+        file_id = descriptor.get("file_id")
+        if (intent["schema_version"] != 2
+                or set(descriptor) != {"basename", "size", "sha256", "file_id"}
+                or not isinstance(file_id, list) or len(file_id) != 2
+                or any(type(value) is not int or value < 0 for value in file_id)
+                or file_id[1] == 0
+                or not stat.S_ISREG(before.st_mode) or before.st_nlink != 1
+                or [before.st_dev, before.st_ino] != file_id):
+            raise ValueError("Tool publication member has no exact file ownership")
+        actual_size, actual_digest = _recovery_sha256_file(path)
+        if actual_size != size or not hmac.compare_digest(actual_digest, digest):
+            raise ValueError("Tool publication bytes changed")
+        identity = lambda item: (item.st_dev, item.st_ino, item.st_size, item.st_mtime_ns, item.st_ctime_ns, item.st_nlink)
+        if identity(os.lstat(path)) != identity(before):
+            raise ValueError("Tool publication member changed")
+        survivors.append((key, path, identity(before)))
+    return project_dir, intent, survivors
+
+
+def _retract_processed_tool_publication(job):
     from pathlib import Path
     from services.queue_recovery_runtime import _fsync_directory
 
+    project_dir, intent, survivors = _processed_tool_publication_members(job)
+    completion = job["recovery_cursor"].get("processed_tool_completion_retry")
+    retraction = job["recovery_cursor"].get("processed_tool_retraction")
+    if retraction is not None and (type(retraction) is not dict
+            or type(retraction.get("execution_attempt")) is not int
+            or type(retraction.get("producing_execution_attempt")) is not int
+            or not is_cancel_requested(job) or retraction != {
+            "producing_execution_attempt": intent["execution_attempt"],
+            "execution_attempt": job.get("execution_attempt", 1),
+            "producer_unit_id": intent["producer_unit_id"]}):
+        raise ValueError("Tool retraction identity changed")
+    if completion is not None and len(survivors) == 1 and retraction is None:
+        raise ValueError("Tool completion pair became partial")
+    if completion is not None and len(survivors) == 2 and retraction is None:
+        if not is_cancel_requested(job):
+            raise ValueError("Tool completion retry cannot retract a complete pair")
+        cursor = dict(job["recovery_cursor"], processed_tool_retraction={
+            "producing_execution_attempt": intent["execution_attempt"],
+            "execution_attempt": job.get("execution_attempt", 1),
+            "producer_unit_id": intent["producer_unit_id"]})
+        if not _queue_recovery_checkpoint(job, recovery_cursor=cursor):
+            raise QueueRecoveryRuntimeError("Tool retraction intent was not committed")
+    for _key, path, identity in survivors:
+        current = os.lstat(path)
+        if (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns, current.st_ctime_ns, current.st_nlink) != identity:
+            raise ValueError("Tool publication member changed before cleanup")
+        os.remove(path)
+    _fsync_directory(Path(project_dir))
+    if any(os.path.lexists(os.path.join(project_dir, intent[key]["basename"])) for key in ("media", "sidecar")):
+        raise ValueError("Tool publication names reappeared")
+    cursor = dict(job["recovery_cursor"])
+    cursor.pop("processed_tool_publication")
+    cursor.pop("processed_tool_completion_retry", None)
+    cursor.pop("processed_tool_retraction", None)
+    cursor["completed_units"] = [unit for unit in cursor.get("completed_units", [])
+                                 if unit.get("unit_id") != intent["producer_unit_id"]]
+    updates = ({"status": "cancelled", "recovery_state": "cancelled", "queue_held": False,
+                "_recovery_reason_code": None} if is_cancel_requested(job) else {})
+    if not _queue_recovery_checkpoint(job, recovery_cursor=cursor, **updates):
+        raise QueueRecoveryRuntimeError("Tool publication cleanup was not committed")
+
+
+def _prepare_processed_tool_completion_retry(job):
+    with _reserve_workspace_operations(job["workspace"]):
+        project_dir = _existing_workspace_dir(job["workspace"])
+        with _output_lineage_mutation_guard(project_dir):
+            _validated_tool_input_paths(job)
+            _directory, intent, members = _processed_tool_publication_members(job)
+            cursor = dict(job["recovery_cursor"])
+            if len(members) == 2:
+                current = job.get("execution_attempt", 1)
+                if type(current) is not int or current < 1:
+                    raise ValueError("Tool execution attempt changed")
+                cursor["processed_tool_completion_retry"] = {
+                    "producing_execution_attempt": intent["execution_attempt"],
+                    "execution_attempt": current + (job.get("status") == "failed"),
+                    "producer_unit_id": intent["producer_unit_id"],
+                }
+                return cursor
+            if "processed_tool_completion_retry" in cursor or any(key == "media" for key, _path, _identity in members):
+                raise ValueError("Tool completion pair changed")
+            _retract_processed_tool_publication(job)
+            return dict(job["recovery_cursor"])
+
+
+def _materialize_processed_tool_publication(runtime, snapshot, projects):
+    """Hold publication evidence without generic artifact quarantine."""
+    reason = "input_missing_or_changed"
+    reruns_processor = "processed_tool_completion_retry" not in (runtime.get("recovery_cursor") or {})
+    current = projects.get(runtime["workspace"])
+    try:
+        if current is None or current[1] != runtime["_recovery_project_digest"]:
+            raise ValueError("Tool project changed")
+        runtime["out_dir"] = current[0]
+        manifest = load_request_manifest(current[0], runtime["_recovery_manifest_pointer"], expected_job_id=runtime["id"])
+        runtime["params"] = dict(manifest["params"])
+        with _output_lineage_mutation_guard(current[0]):
+            _validated_tool_input_paths(runtime)
+            reason = "generation_failed"
+            if "processed_tool_publication" in (runtime.get("recovery_cursor") or {}):
+                _directory, _intent, members = _processed_tool_publication_members(runtime)
+                reruns_processor = len(members) != 2 and reruns_processor
+            else:
+                reruns_processor = not _queue_recovery_units(runtime)
+                unit = _queue_recovery_unit_matches(runtime, kind="ordinary_repeat", variant=0,
+                    index=0, project_dir=current[0], quarantine_invalid=False)
+                if unit is None:
+                    raise ValueError("Historical tool output requires owner review")
+        reason = "generation_failed"
+    except (KeyError, TypeError, ValueError, OSError, HTTPException, QueueRecoveryRuntimeError, QueueRecoveryAdapterError):
+        pass
+    if snapshot.get("status") == "completed":
+        return runtime, False
+    runtime.update(status="failed" if snapshot.get("status") == "failed" else "queued",
+        queue_held=True, recovery_state="blocked", reruns_denoise=reruns_processor,
+        _recovery_reason_code=reason, message="Tool output recovery needs review")
+    return runtime, False
+
+
+def _hold_processed_tool_publication(job, *, complete_pair=False):
+    if (job.get("status") != "completed" and not is_cancel_requested(job)
+            and "processed_tool_publication" in (job.get("recovery_cursor") or {})):
+        _queue_recovery_checkpoint(job, queue_held=True, recovery_state="blocked",
+            reruns_denoise=not (complete_pair or "processed_tool_completion_retry" in job["recovery_cursor"]),
+            _recovery_reason_code="generation_failed")
+
+
+def _processed_tool_legacy_cleanup_record(job, unit=None, *, orphan_names=None):
+    import copy
+
+    evidence = ({"orphan_names": list(orphan_names)} if orphan_names is not None else
+        {"unit": copy.deepcopy({key: unit[key] for key in (
+            "kind", "variant", "index", "state", "unit_id", "dependencies", "settings", "artifacts")})})
+    return {"schema_version": 1, "job_id": job["id"], "kind": job["kind"],
+        "workspace": job["workspace"], "owner_principal": job["_recovery_owner_digest"],
+        "project_instance": job["_recovery_project_digest"],
+        "request_manifest": dict(job["_recovery_manifest_pointer"]), **evidence}
+
+
+def _settle_processed_tool_legacy_cleanup(job, *, only_if_absent=False):
+    """Historical producer hashes bind review evidence, never deletion authority."""
+    from pathlib import Path
+    from services.queue_recovery_runtime import _fsync_directory, MAX_MANIFEST_BYTES
+
+    project_dir = _existing_workspace_dir(job["workspace"])
+    cursor = job["recovery_cursor"]
+    record = cursor["processed_tool_legacy_cleanup"]
+    settings = _processed_tool_settings(job)
+    unit_id = recovery_unit_id(job["id"], "ordinary_repeat", variant=0, index=0, settings=settings)
+    if ("processed_tool_publication" in cursor or type(record) is not dict
+            or type(record.get("schema_version")) is not int or record["schema_version"] != 1
+            or set(record) not in ({"schema_version", "job_id", "kind", "workspace", "owner_principal", "project_instance", "request_manifest", "unit"},
+                                  {"schema_version", "job_id", "kind", "workspace", "owner_principal", "project_instance", "request_manifest", "orphan_names"})
+            or record.get("job_id") != job["id"] or record.get("kind") != job["kind"]
+            or record.get("workspace") != job["workspace"]
+            or not job.get("_recovery_owner_digest") or not job.get("_recovery_project_digest")
+            or record.get("owner_principal") != job["_recovery_owner_digest"]
+            or record.get("project_instance") != job["_recovery_project_digest"]
+            or record.get("project_instance") != _queue_recovery_existing_project_identity(project_dir)
+            or record.get("request_manifest") != job["_recovery_manifest_pointer"]):
+        raise ValueError("Historical tool cleanup identity changed")
+    manifest = load_request_manifest(project_dir, record["request_manifest"], expected_job_id=job["id"])
+    if manifest.get("params") != job.get("params"):
+        raise ValueError("Historical tool request changed")
+    if "unit" in record:
+        unit = record.get("unit")
+        if (type(unit) is not dict or set(unit) != {"kind", "variant", "index", "state", "unit_id", "dependencies", "settings", "artifacts"}
+                or unit.get("kind") != "ordinary_repeat" or unit.get("state") != "completed"
+                or type(unit.get("variant")) is not int or unit["variant"] != 0
+                or type(unit.get("index")) is not int or unit["index"] != 0
+                or unit.get("unit_id") != unit_id or unit.get("settings") != settings
+                or unit.get("dependencies") != [] or type(unit.get("artifacts")) is not list or len(unit["artifacts"]) != 1):
+            raise ValueError("Historical tool producer changed")
+        artifact = unit["artifacts"][0]
+        if (type(artifact) is not dict or set(artifact) != {"basename", "producer_unit_id", "sha256", "size", "sidecar_basename", "sidecar_sha256", "sidecar_size"}
+                or artifact.get("producer_unit_id") != unit_id):
+            raise ValueError("Historical tool artifact changed")
+        for key in ("size", "sidecar_size"):
+            if type(artifact.get(key)) is not int or artifact[key] < 1:
+                raise ValueError("Historical tool artifact size changed")
+        if artifact["sidecar_size"] > MAX_MANIFEST_BYTES:
+            raise ValueError("Historical tool artifact exceeds its bound")
+        for key in ("sha256", "sidecar_sha256"):
+            digest = artifact.get(key)
+            if type(digest) is not str or len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+                raise ValueError("Historical tool artifact digest changed")
+        names = (artifact["basename"], artifact["sidecar_basename"])
+    else:
+        names = record["orphan_names"]
+        if type(names) is not list or len(names) != 2:
+            raise ValueError("Historical tool output names changed")
+    source_field = {"tool_hflip": "hflip_source_path", "tool_browser_copy": "browser_copy_source_path"}.get(job["kind"], "video_path")
+    source = manifest.get("params", {}).get(source_field)
+    stem = f"{os.path.splitext(os.path.basename(source or ''))[0]}_{job['kind'][5:]}_{job['id']}"
+    name = names[0]
+    if (not source or type(name) is not str or os.path.splitext(name)[0] != stem
+            or os.path.basename(name) != name or "/" in name or "\\" in name
+            or names[1] != os.path.splitext(name)[0] + ".meta.json"):
+        raise ValueError("Historical tool output names changed")
+    if any(os.path.lexists(os.path.join(project_dir, name)) for name in names):
+        if only_if_absent:
+            return False
+        raise ValueError("Historical tool files require owner review")
+    _fsync_directory(Path(project_dir))
+    if any(os.path.lexists(os.path.join(project_dir, name)) for name in names):
+        raise ValueError("Historical tool names reappeared")
+    cursor = dict(cursor)
+    cursor.pop("processed_tool_legacy_cleanup")
+    cursor["completed_units"] = [item for item in cursor.get("completed_units", []) if item.get("unit_id") != unit_id]
+    updates = ({"status": "cancelled", "recovery_state": "cancelled", "queue_held": False,
+                "_recovery_reason_code": None} if is_cancel_requested(job) else {})
+    if not _queue_recovery_checkpoint(job, recovery_cursor=cursor, **updates):
+        raise QueueRecoveryRuntimeError("Historical tool cleanup was not committed")
+
+
+def _cleanup_cancelled_processed_tool_output(job):
     if job.get("kind") == "tool_editor_export":
         return _cleanup_cancelled_editor_export_output(job)
     if not processed_tool_publication_pending(job):
@@ -68403,68 +68702,11 @@ def _cleanup_cancelled_processed_tool_output(job):
         with _reserve_workspace_operations(job["workspace"]):
             project_dir = _existing_workspace_dir(job["workspace"])
             with _output_lineage_mutation_guard(project_dir):
-                intent = job["recovery_cursor"]["processed_tool_publication"]
-                settings = _processed_tool_settings(job)
-                unit_id = recovery_unit_id(job["id"], "ordinary_repeat", variant=0, index=0, settings=settings)
-                if (not isinstance(intent, dict) or intent.get("schema_version") != 1
-                        or intent.get("job_id") != job["id"] or intent.get("kind") != job["kind"]
-                        or intent.get("workspace") != job["workspace"]
-                        or not job.get("_recovery_owner_digest") or not job.get("_recovery_project_digest")
-                        or intent.get("owner_principal") != job["_recovery_owner_digest"]
-                        or intent.get("project_instance") != job["_recovery_project_digest"]
-                        or intent.get("project_instance") != _queue_recovery_existing_project_identity(project_dir)
-                        or type(intent.get("execution_attempt")) is not int
-                        or intent["execution_attempt"] != job.get("execution_attempt", 1)
-                        or intent["execution_attempt"] < 1
-                        or intent.get("request_manifest") != job["_recovery_manifest_pointer"]
-                        or intent.get("producer_unit_id") != unit_id
-                        or intent.get("settings") != settings):
-                    raise ValueError("Tool publication identity changed")
-                # The registration/request seal is required; consumed inputs are not.
-                manifest = load_request_manifest(project_dir, intent["request_manifest"], expected_job_id=job["id"])
-                media, sidecar = intent.get("media"), intent.get("sidecar")
-                if (not isinstance(media, dict) or not isinstance(sidecar, dict)
-                        or not isinstance(media.get("basename"), str)
-                        or sidecar.get("basename") != os.path.splitext(media["basename"])[0] + ".meta.json"):
-                    raise ValueError("Tool publication names changed")
-                source_field = {"tool_hflip": "hflip_source_path", "tool_browser_copy": "browser_copy_source_path"}.get(job["kind"], "video_path")
-                source = manifest.get("params", {}).get(source_field)
-                expected_stem = f"{os.path.splitext(os.path.basename(source or ''))[0]}_{job['kind'][5:]}_{job['id']}"
-                if not source or os.path.splitext(media["basename"])[0] != expected_stem:
-                    raise ValueError("Tool publication request changed")
-                survivors = []
-                for descriptor in (media, sidecar):
-                    name = descriptor.get("basename")
-                    size, digest = descriptor.get("size"), descriptor.get("sha256")
-                    if (not isinstance(name, str) or name in {"", ".", ".."}
-                            or os.path.basename(name) != name or "/" in name or "\\" in name
-                            or type(size) is not int or size < 1
-                            or not isinstance(digest, str) or len(digest) != 64
-                            or any(character not in "0123456789abcdef" for character in digest)
-                            or (descriptor is sidecar and size > 1024 * 1024)):
-                        raise ValueError("Tool publication descriptor changed")
-                    path = os.path.join(project_dir, name)
-                    if not os.path.lexists(path):
-                        continue
-                    before = os.stat(path, follow_symlinks=False)
-                    actual_size, actual_digest = _recovery_sha256_file(path)
-                    if actual_size != size or not hmac.compare_digest(actual_digest, digest):
-                        raise ValueError("Tool publication bytes changed")
-                    survivors.append((path, before))
-                for path, before in survivors:
-                    current = os.stat(path, follow_symlinks=False)
-                    if ((current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns, current.st_ctime_ns, current.st_nlink)
-                            != (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns, 1)):
-                        raise ValueError("Tool publication member changed")
-                    os.remove(path)
-                _fsync_directory(Path(project_dir))
-                if any(os.path.lexists(os.path.join(project_dir, item["basename"])) for item in (media, sidecar)):
-                    raise ValueError("Tool publication names reappeared")
-                cursor = dict(job["recovery_cursor"])
-                cursor.pop("processed_tool_publication")
-                if _queue_recovery_checkpoint(job, status="cancelled", recovery_cursor=cursor,
-                                              recovery_state="cancelled", queue_held=False):
-                    return True
+                if "processed_tool_legacy_cleanup" in (job.get("recovery_cursor") or {}):
+                    _settle_processed_tool_legacy_cleanup(job)
+                else:
+                    _retract_processed_tool_publication(job)
+                return True
     except (KeyError, TypeError, ValueError, OSError, HTTPException, QueueRecoveryRuntimeError, QueueRecoveryAdapterError) as error:
         if isinstance(error, HTTPException):
             job.pop("out_dir", None)
@@ -68484,51 +68726,110 @@ def _resume_processed_tool_output(job):
     unit_id = recovery_unit_id(job["id"], "ordinary_repeat", variant=0, index=0, settings=settings)
     with _output_lineage_mutation_guard(project_dir):
         _validated_tool_input_paths(job)
-        _queue_recovery_reconcile_cursor(job, project_dir)
+        legacy = (job.get("recovery_cursor") or {}).get("processed_tool_legacy_cleanup")
+        if isinstance(legacy, dict):
+            _settle_processed_tool_legacy_cleanup(job, only_if_absent="unit" in legacy)
+        if "processed_tool_publication" in (job.get("recovery_cursor") or {}):
+            complete_pair = False
+            try:
+                _directory, intent, survivors = _processed_tool_publication_members(job)
+                if len(survivors) == 2:
+                    complete_pair = True
+                    artifact = _recovery_artifact_descriptor(project_dir, basename=intent["media"]["basename"],
+                        sidecar_basename=intent["sidecar"]["basename"], producer_unit_id=unit_id)
+                    if not validate_artifact_descriptor(project_dir, artifact, producer_unit_id=unit_id):
+                        raise ValueError("Tool output producer changed")
+                    unit = {"kind": "ordinary_repeat", "variant": 0, "index": 0, "state": "completed",
+                        "unit_id": unit_id, "dependencies": [], "settings": settings, "artifacts": [artifact]}
+                    cursor = dict(job["recovery_cursor"], completed_units=[unit])
+                    if not _queue_recovery_checkpoint(job, recovery_cursor=cursor) or is_cancel_requested(job):
+                        if is_cancel_requested(job):
+                            _cleanup_cancelled_processed_tool_output(job)
+                        return False
+                    completed = finish_job(job, "completed", output_files=[intent["media"]["basename"]],
+                                           progress=100, phase="", message="Done")
+                    if not completed and is_cancel_requested(job):
+                        _cleanup_cancelled_processed_tool_output(job)
+                    return completed
+                if ("processed_tool_completion_retry" in job["recovery_cursor"]
+                        or any(key == "media" for key, _path, _identity in survivors)):
+                    raise ValueError("Tool completion pair changed")
+                _retract_processed_tool_publication(job)
+                return None
+            except Exception:
+                _hold_processed_tool_publication(job,
+                    complete_pair=complete_pair)
+                raise
+        legacy_units = _queue_recovery_units(job)
+        if not legacy_units:
+            _queue_recovery_reconcile_cursor(job, project_dir)
         unit = _queue_recovery_unit_matches(job, kind="ordinary_repeat", variant=0,
-                                           index=0, project_dir=project_dir)
+            index=0, project_dir=project_dir, quarantine_invalid=False)
+        if legacy_units and (unit is None or unit.get("unit_id") != unit_id or unit.get("settings") != settings):
+            if len(legacy_units) != 1:
+                raise ValueError("Historical tool output is ambiguous")
+            cursor = dict(job.get("recovery_cursor") or {},
+                processed_tool_legacy_cleanup=_processed_tool_legacy_cleanup_record(job,legacy_units[0]))
+            if not _queue_recovery_checkpoint(job,recovery_cursor=cursor,queue_held=True,
+                    recovery_state="blocked",reruns_denoise=False,_recovery_reason_code="generation_failed"):
+                raise QueueRecoveryRuntimeError("Historical tool review was not committed")
+            raise ValueError("Historical tool output requires owner review")
         if unit and unit.get("unit_id") == unit_id and unit.get("settings") == settings:
             names = [item["basename"] for item in unit["artifacts"]]
             if len(names) != 1:
                 raise ValueError("Tool recovery output is ambiguous.")
+            cursor = dict(job.get("recovery_cursor") or {},
+                processed_tool_legacy_cleanup=_processed_tool_legacy_cleanup_record(job, unit))
+            if not _queue_recovery_checkpoint(job, recovery_cursor=cursor):
+                return False
             completed = finish_job(job, "completed", output_files=names,
                                    progress=100, phase="", message="Done")
             if not completed and is_cancel_requested(job):
-                if processed_tool_publication_pending(job):
-                    _cleanup_cancelled_processed_tool_output(job)
-                    return False
-                for descriptor in unit["artifacts"]:
-                    # Re-check exact ownership after the cancellation transition;
-                    # never remove a file that changed while completion raced.
-                    if validate_artifact_descriptor(project_dir, descriptor,
-                                                    producer_unit_id=unit_id):
-                        os.remove(os.path.join(project_dir, descriptor["basename"]))
-                        os.remove(os.path.join(project_dir, descriptor["sidecar_basename"]))
+                _cleanup_cancelled_processed_tool_output(job)
             return completed
-        # A crash can also occur after metadata publication but before media.
-        # Remove only this request's exact, regular, single-link orphan marker.
-        for name in os.listdir(project_dir):
-            if not name.endswith(".meta.json") or job["id"] not in name:
-                continue
-            path = os.path.join(project_dir, name)
+        # Historical hashes cannot establish ownership of an orphan's inode.
+        import stat
+        source_field = {"tool_hflip": "hflip_source_path", "tool_browser_copy": "browser_copy_source_path"}.get(job["kind"], "video_path")
+        source = job["params"].get(source_field)
+        stem = f"{os.path.splitext(os.path.basename(source or ''))[0]}_{job['kind'][5:]}_{job['id']}"
+        name = stem + ".meta.json"
+        path = os.path.join(project_dir, name)
+        if os.path.lexists(path):
+            descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                                 | getattr(os, "O_NONBLOCK", 0))
             try:
-                size, _ = _recovery_sha256_file(path)
-                if size > 1024 * 1024:
-                    continue
-                with open(path, encoding="utf-8") as handle:
-                    meta = json.load(handle)
-                if not isinstance(meta, dict):
-                    continue
-                output = meta.get("output_filename")
-                if (meta.get("job_id") == job["id"]
-                        and meta.get("producer_unit_id") == unit_id
-                        and meta.get("producer_unit_settings") == settings
-                        and isinstance(output, str) and os.path.basename(output) == output
-                        and name == os.path.splitext(output)[0] + ".meta.json"
-                        and not os.path.lexists(os.path.join(project_dir, output))):
-                    os.remove(path)
-            except (OSError, ValueError, QueueRecoveryRuntimeError):
-                continue
+                before = os.fstat(descriptor)
+                if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or not 0 < before.st_size <= 1024 * 1024:
+                    raise ValueError("Historical tool output requires owner review")
+                raw = bytearray()
+                while len(raw) <= before.st_size:
+                    chunk = os.read(descriptor, min(65536, before.st_size + 1 - len(raw)))
+                    if not chunk:
+                        break
+                    raw.extend(chunk)
+                identity = lambda value: (value.st_dev, value.st_ino, value.st_size,
+                    value.st_mtime_ns, value.st_ctime_ns, value.st_nlink)
+                if (len(raw) != before.st_size or identity(before) != identity(os.fstat(descriptor))
+                        or identity(before) != identity(os.lstat(path))):
+                    raise ValueError("Historical tool output changed")
+                meta = json.loads(raw)
+            finally:
+                os.close(descriptor)
+            output = meta.get("output_filename") if type(meta) is dict else None
+            if (type(output) is not str or os.path.basename(output) != output
+                    or "/" in output or "\\" in output or os.path.splitext(output)[0] != stem
+                    or meta.get("job_id") != job["id"]
+                    or meta.get("producer_unit_id") != unit_id
+                    or meta.get("producer_unit_settings") != settings):
+                raise ValueError("Historical tool output requires owner review")
+            cursor = dict(job.get("recovery_cursor") or {},
+                processed_tool_legacy_cleanup=_processed_tool_legacy_cleanup_record(job,
+                    orphan_names=[output, name]))
+            if not _queue_recovery_checkpoint(job, recovery_cursor=cursor,
+                    queue_held=True, recovery_state="blocked", reruns_denoise=False,
+                    _recovery_reason_code="generation_failed"):
+                raise QueueRecoveryRuntimeError("Historical tool review was not committed")
+            raise ValueError("Historical tool output requires owner review")
     return None
 
 
@@ -68693,52 +68994,63 @@ def _publish_processed_tool_output(job, staged_path, *, source, tool, params, el
                 return False
         if os.path.lexists(destination) or os.path.lexists(meta_path):
             raise ValueError("The tool output already exists. Refresh the gallery.")
-        def seal_publication(payload):
+        def seal_publication(payload, temp_path):
             if len(payload) > 1024 * 1024:
                 raise QueueRecoveryRuntimeError("Tool publication metadata exceeds the recovery bound")
             intent = {
-                "schema_version": 1, "job_id": job["id"], "kind": job["kind"],
+                "schema_version": 2, "job_id": job["id"], "kind": job["kind"],
                 "workspace": job["workspace"], "owner_principal": job["_recovery_owner_digest"],
                 "project_instance": job["_recovery_project_digest"],
                 "execution_attempt": job.get("execution_attempt", 1),
                 "request_manifest": dict(job["_recovery_manifest_pointer"]),
                 "producer_unit_id": producer["producer_unit_id"], "settings": settings,
-                "media": {"basename": filename, "size": size, "sha256": digest},
+                "media": {"basename": filename, "size": size, "sha256": digest,
+                          "file_id": [os.lstat(staged_path).st_dev, os.lstat(staged_path).st_ino]},
                 "sidecar": {"basename": os.path.basename(meta_path), "size": len(payload),
-                            "sha256": hashlib.sha256(payload).hexdigest()},
+                            "sha256": hashlib.sha256(payload).hexdigest(),
+                            "file_id": [os.lstat(temp_path).st_dev, os.lstat(temp_path).st_ino]},
             }
             cursor = dict(job.get("recovery_cursor") or {}, processed_tool_publication=intent)
             if (not _queue_recovery_checkpoint(job, recovery_cursor=cursor)
                     or is_cancel_requested(job)):
                 raise QueueRecoveryRuntimeError("Tool publication intent was not committed")
-        _write_tool_sidecar(out_dir, filename, source_name=os.path.basename(source),
-                            source_revision=source_revision, tool=tool, params=params,
-                            elapsed=elapsed, job_id=job["id"], producer=producer,
-                            before_publish=seal_publication)
+        try:
+            _write_tool_sidecar(out_dir, filename, source_name=os.path.basename(source),
+                                source_revision=source_revision, tool=tool, params=params,
+                                elapsed=elapsed, job_id=job["id"], producer=producer,
+                                before_publish_file=seal_publication, preserve_published_on_error=True)
+        except Exception:
+            if "processed_tool_publication" in (job.get("recovery_cursor") or {}):
+                if is_cancel_requested(job):
+                    _cleanup_cancelled_processed_tool_output(job)
+                else:
+                    try:
+                        _retract_processed_tool_publication(job)
+                    finally:
+                        _hold_processed_tool_publication(job)
+            raise
         if is_cancel_requested(job):
             _cleanup_cancelled_processed_tool_output(job)
             return False
-        media_owned = False
-        def rollback():
-            if not (job.get("status") == "completed" and filename in (job.get("output_files") or [])):
-                if is_cancel_requested(job):
-                    _cleanup_cancelled_processed_tool_output(job)
-                    return
-                if media_owned:
-                    os.remove(destination)
-                os.remove(meta_path)
         try:
             publish_file_no_replace(staged_path, destination)
-            media_owned = True
             completed = finish_job(job, "completed", output_files=[filename],
                                    progress=100, phase="", message="Done")
-        except Exception as exc:
-            media_owned = media_owned or isinstance(exc, PublishedFileDurabilityError)
-            rollback()
+        except Exception:
+            if is_cancel_requested(job):
+                _cleanup_cancelled_processed_tool_output(job)
+            else:
+                complete_pair = False
+                try:
+                    _directory, _intent, survivors = _processed_tool_publication_members(job)
+                    complete_pair = len(survivors) == 2
+                    if not complete_pair:
+                        _retract_processed_tool_publication(job)
+                finally:
+                    _hold_processed_tool_publication(job, complete_pair=complete_pair)
             raise
-        # Restart adopts nonterminal results or retracts exact cancelled publication bytes.
-        if not completed:
-            rollback()
+        if not completed and is_cancel_requested(job):
+            _cleanup_cancelled_processed_tool_output(job)
         return completed
 
 
@@ -68758,6 +69070,8 @@ def _run_tool_upscale(job_id: str):
         _gen_lock, job,
     ) as acquired, _WgpNativeGpuExecutionSlot(acquired):
         if not acquired:
+            if is_cancel_requested(job) and processed_tool_publication_pending(job):
+                _cleanup_cancelled_processed_tool_output(job)
             return False
         try:
             if not try_start(
@@ -68935,6 +69249,8 @@ def _run_tool_revoice(job_id: str):
         _gen_lock, job,
     ) as acquired, _WgpNativeGpuExecutionSlot(acquired):
         if not acquired:
+            if is_cancel_requested(job) and processed_tool_publication_pending(job):
+                _cleanup_cancelled_processed_tool_output(job)
             return False
         try:
             if not try_start(
@@ -78847,6 +79163,15 @@ def _resume_recovered_job(
                 raise HTTPException(status_code=409, detail="The Editor publication cannot be recovered safely") from error
             reruns_denoise = False
             retry_updates["reruns_denoise"] = False
+        if (job.get("kind") in {"tool_upscale", "tool_revoice", "tool_hflip", "tool_browser_copy"}
+                and "processed_tool_publication" in (job.get("recovery_cursor") or {})):
+            try:
+                retry_updates["recovery_cursor"] = _prepare_processed_tool_completion_retry(job)
+            except (KeyError, TypeError, ValueError, OSError, HTTPException, QueueRecoveryRuntimeError, QueueRecoveryAdapterError) as error:
+                raise HTTPException(status_code=409, detail="The tool publication cannot be recovered safely") from error
+            if "processed_tool_completion_retry" in retry_updates["recovery_cursor"]:
+                reruns_denoise = False
+                retry_updates["reruns_denoise"] = False
         if str(job.get("status") or "") == "failed":
             committed = retry_failed_recovery_job(
                 job,

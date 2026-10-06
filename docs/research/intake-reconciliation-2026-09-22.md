@@ -844,3 +844,27 @@ shared attention state, and released the model. The guardian stopped its exact
 child, drained the unit and withdrew the lease; fresh negative authority and
 process-absence checks passed. This proves that specific cooperative
 cancellation boundary, not external cancellation or authority-loss recovery.
+
+## October 6 follow-on: processed-tool Retry and Stop recovery
+
+Upscale, Revoice, Flip and browser-compatible copy now seal the original
+producing attempt and exact media/metadata file identities before publication.
+An owner Retry can adopt a complete verified result without processing again;
+Stop can retract the original attempt's files after that Retry. Partial or
+foreign replacement pairs remain held for review. Safe rollback and verified
+absence permit fresh processing, with the retry status reporting that work
+truthfully. The Editor and Blender composition recovery contracts are preserved.
+
+Historical results without file ownership records retain validated adoption
+and explicit review evidence. Startup and Retry do not quarantine or delete
+unbound replacements. Cancellation preserves the review record, manifest and
+staging through journal compaction until the owner removes both canonical
+names; exact absence must be committed before retirement or fresh publication.
+
+The affected complete modules passed 369 CPU checks using fresh final crash and
+startup runs plus unchanged-module evidence, including real FFmpeg output,
+process-kill recovery, native Retry dispatch,
+foreign-file replacements and interrupted cleanup. A combined-module Torch
+reimport fixture failure also reproduces on the unchanged predecessor; its
+evidence is retained separately. These checks do not prove live GPU processing,
+Windows/LAN behavior, a live service crash or human quality acceptance.

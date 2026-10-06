@@ -266,6 +266,402 @@ class ToolProcessCrashTests(unittest.TestCase):
         self.assertEqual(self.persisted()['output_files'], [])
         self.assertEqual((self.snapshot(output), self.snapshot(sidecar)), before)
 
+    def failed_registered_publication(self, *, absent=False):
+        self.durable_registration()
+        self.crash_durable('adoption-ready')
+        coordinator = QueueRecoveryCoordinator(QueueRecoveryJournal(self.journal_path))
+        snapshot = coordinator.restore().jobs[self.job['id']]
+        job = copy.deepcopy(snapshot)
+        job.update(_recovery_owner_digest=snapshot['owner_principal'],
+            _recovery_project_digest=snapshot['project_instance'],
+            _recovery_manifest_pointer=snapshot['request_manifest'],
+            params=load_request_manifest(self.fixture.project, snapshot['request_manifest'],
+                expected_job_id=job['id'])['params'])
+        job_lifecycle._reset_queue_state_for_tests()
+        self.addCleanup(job_lifecycle._reset_queue_state_for_tests)
+        job_lifecycle.configure_durability_hook(coordinator.prospective_transition)
+        self.assertTrue(job_lifecycle.finish_job(job, 'failed', message='Interrupted publication'))
+        self.fixture.ns.update(_jobs={job['id']:job}, _queue_recovery_coordinator=coordinator,
+            _queue_recovery_checkpoint=job_lifecycle.checkpoint_recovery_job,
+            load_request_manifest=load_request_manifest)
+        if absent:
+            output = self.output()
+            output.unlink(); output.with_suffix('.meta.json').unlink()
+        return job
+
+    def native_retry(self, job, *, on_dispatch=None):
+        from services.queue_recovery_runtime import next_recovery_attempt, MAX_RECOVERY_ATTEMPTS
+        from fastapi import Response
+        ns = self.fixture.ns
+        ns['_h3_cow_manual_source_supported'] = lambda _: False
+        scheduled = []
+        class DeferredThread:
+            def __init__(self, *, target, args, daemon, name):
+                self.target, self.args = target, args
+            def start(self):
+                scheduled.append((self.target, self.args))
+                if on_dispatch is not None: on_dispatch()
+        ns.update(_queue_recovery_checkpoint_lock=threading.RLock(),
+            validate_manifest_inputs=validate_manifest_inputs,
+            try_start=job_lifecycle.try_start, finish_job=job_lifecycle.finish_job,
+            is_cancel_requested=job_lifecycle.is_cancel_requested,
+            _require_owned_job=lambda job_id, request: ns['_jobs'][job_id],
+            _require_project_access=lambda request, workspace, *, permission: str(self.fixture.project),
+            owner_principal_digest=lambda secret, session: self.fixture.owner, _session_secret=lambda: b'test',
+            _queue_recovery_worker=lambda job: ns['_run_tool_hflip'],
+            _queue_recovery_delivery_pending=lambda _: None, _require_job_runtime_model_admission=lambda _: None,
+            _h3_native_boundary_exact_retry_allowed=lambda _: False,
+            _QUEUE_RECOVERY_REASON_TEXT={'generation_failed':'Generation failed'},
+            _BLOCKED_QUEUE_RECOVERY_STATES={'blocked','blocked_remote_reauth','blocked_preparation'},
+            _h3_ordinary_oom_hold=lambda _: False,
+            next_recovery_attempt=next_recovery_attempt, MAX_RECOVERY_ATTEMPTS=MAX_RECOVERY_ATTEMPTS,
+            retry_failed_recovery_job=job_lifecycle.retry_failed_recovery_job,
+            update_queue_job=job_lifecycle.update_queue_job,
+            threading=types.SimpleNamespace(Thread=DeferredThread))
+        tool_fixture.load(ns, '_queue_recovery_revalidate_job', '_queue_recovery_reason_code',
+            '_queue_recovery_is_blocked', '_queue_recovery_attempt', '_resume_recovered_job',
+            '_set_recovery_no_store', 'retry_recovered_job')
+        request = types.SimpleNamespace(state=types.SimpleNamespace(maestro_session_id='owner-session'))
+        result = ns['retry_recovered_job'](job['id'], request, Response())
+        return result, scheduled, request
+
+    def test_native_retry_stop_before_dispatch_settles_exact_absence(self):
+        job = self.failed_registered_publication(absent=True)
+        def cancel():
+            self.assertTrue(job_lifecycle.request_cancel(job).changed)
+        result, scheduled, _request = self.native_retry(job, on_dispatch=cancel)
+        self.assertTrue(result['reruns_denoise'])
+        self.assertNotIn('processed_tool_publication', self.persisted()['recovery_cursor'])
+        self.assertEqual(self.persisted()['execution_attempt'], 2)
+        self.fixture.ns.update(generation_slot=job_lifecycle.generation_slot, _gen_lock=threading.Lock())
+        worker, args = scheduled[0]
+        self.assertFalse(worker(*args))
+        persisted = self.persisted()
+        self.assertEqual(persisted['status'], 'cancelled')
+        self.assertNotIn('processed_tool_publication', persisted['recovery_cursor'])
+        self.assertFalse(persisted.get('queue_held', False))
+        self.assertEqual(self.encodes(), ['encode'])
+        self.assertEqual(self.digest(self.fixture.video), self.source_hash)
+
+    def test_native_retry_adopts_original_pair_once_and_duplicate_retry_cannot_encode(self):
+        job = self.failed_registered_publication()
+        output = self.output(); sidecar = output.with_suffix('.meta.json')
+        before = self.snapshot(output), self.snapshot(sidecar)
+        result, scheduled, request = self.native_retry(job)
+        self.assertEqual(result['status'], 'queued')
+        self.assertFalse(result['reruns_denoise'])
+        self.assertEqual(self.persisted()['execution_attempt'], 2)
+        self.assertEqual(self.persisted()['recovery_cursor']['processed_tool_completion_retry'], {
+            'producing_execution_attempt':1, 'execution_attempt':2,
+            'producer_unit_id':self.persisted()['recovery_cursor']['processed_tool_publication']['producer_unit_id']})
+        with self.assertRaises(tool_fixture.HTTPException) as duplicate:
+            self.fixture.ns['retry_recovered_job'](job['id'], request, types.SimpleNamespace(headers={}))
+        self.assertEqual(duplicate.exception.status_code,409); self.assertEqual(len(scheduled),1)
+        self.fixture.ns.update(generation_slot=job_lifecycle.generation_slot, _gen_lock=threading.Lock())
+        worker, args = scheduled[0]
+        self.assertTrue(worker(*args))
+        self.assertEqual(self.persisted()['status'], 'completed')
+        self.assertEqual((self.snapshot(output),self.snapshot(sidecar)),before)
+        self.assertEqual(self.encodes(),['encode'])
+        self.assertEqual(self.digest(self.fixture.video),self.source_hash)
+
+    def test_completion_failure_retry_again_preserves_original_producer_attempt(self):
+        job = self.failed_registered_publication()
+        _result, scheduled, _request = self.native_retry(job)
+        finish = job_lifecycle.finish_job
+        def fail_completion(current,status,**updates):
+            if status == 'completed': raise OSError('lost completion acknowledgement')
+            return finish(current,status,**updates)
+        self.fixture.ns['finish_job'] = fail_completion
+        worker,args = scheduled[0]; self.assertFalse(worker(*args))
+        self.assertEqual(self.persisted()['status'],'failed')
+        _result, scheduled, _request = self.native_retry(job)
+        self.assertEqual(self.persisted()['execution_attempt'],3)
+        self.assertEqual(self.persisted()['recovery_cursor']['processed_tool_completion_retry']['producing_execution_attempt'],1)
+        worker,args = scheduled[0]; self.assertTrue(worker(*args))
+        self.assertEqual(self.encodes(),['encode'])
+
+    def test_cancel_at_actual_retry_dispatch_retracts_pair_without_consumed_inputs(self):
+        job = self.failed_registered_publication()
+        output = self.output()
+        _result, scheduled, _request = self.native_retry(job,
+            on_dispatch=lambda: self.assertTrue(job_lifecycle.request_cancel(job).changed))
+        self.fixture.video.unlink()
+        self.fixture.ns.update(generation_slot=job_lifecycle.generation_slot, _gen_lock=threading.Lock())
+        worker,args = scheduled[0]; self.assertFalse(worker(*args))
+        self.assertFalse(output.exists()); self.assertFalse(output.with_suffix('.meta.json').exists())
+        self.assertNotIn('processed_tool_publication', self.persisted()['recovery_cursor'])
+        self.assertEqual(self.persisted()['status'],'cancelled'); self.assertFalse(self.persisted()['queue_held'])
+        self.assertEqual(self.encodes(),['encode'])
+
+    def test_completion_only_partial_pair_cannot_encode_or_delete_survivor(self):
+        job = self.failed_registered_publication()
+        output = self.output(); sidecar = output.with_suffix('.meta.json')
+        _result, scheduled, _request = self.native_retry(job)
+        output.unlink(); before = self.snapshot(sidecar)
+        self.assertTrue(job_lifecycle.request_cancel(job).changed)
+        self.fixture.ns.update(generation_slot=job_lifecycle.generation_slot,_gen_lock=threading.Lock())
+        worker,args = scheduled[0]; self.assertFalse(worker(*args))
+        self.assertEqual(self.snapshot(sidecar),before); self.assertEqual(self.encodes(),['encode'])
+        coordinator,restored = self.startup()
+        self.assertEqual(self.snapshot(sidecar),before)
+        self.assertEqual(restored['recovery_state'],'cleanup_blocked')
+        self.assertIn(job['id'],coordinator.compact().jobs)
+        self.assertTrue(self.manifest.exists()); self.assertTrue(self.staged.exists())
+
+    def test_incomplete_completion_pair_fails_without_encoding_or_retiring_evidence(self):
+        job = self.failed_registered_publication()
+        output = self.output(); sidecar = output.with_suffix('.meta.json')
+        _result, scheduled, _request = self.native_retry(job)
+        output.unlink(); before = self.snapshot(sidecar)
+        worker,args = scheduled[0]; self.assertFalse(worker(*args))
+        self.assertEqual(self.snapshot(sidecar),before); self.assertEqual(self.encodes(),['encode'])
+        self.assertEqual(self.persisted()['status'],'failed')
+        self.assertEqual(self.persisted()['recovery_state'],'blocked')
+        with self.assertRaises(tool_fixture.HTTPException) as denied: self.native_retry(job)
+        self.assertEqual(denied.exception.status_code,409)
+        self.assertEqual(self.snapshot(sidecar),before)
+
+    def test_sidecar_only_native_retry_retracts_old_authority_and_reports_fresh_processing(self):
+        job = self.failed_registered_publication()
+        output = self.output(); sidecar = output.with_suffix('.meta.json')
+        output.unlink()
+        result, scheduled, _request = self.native_retry(job)
+        self.assertTrue(result['reruns_denoise'])
+        self.assertFalse(sidecar.exists())
+        self.assertNotIn('processed_tool_publication',self.persisted()['recovery_cursor'])
+        self.assertNotIn('processed_tool_completion_retry',self.persisted()['recovery_cursor'])
+        self.assertEqual(self.persisted()['execution_attempt'],2)
+        self.assertTrue(job_lifecycle.request_cancel(job).changed)
+        self.fixture.ns.update(generation_slot=job_lifecycle.generation_slot,_gen_lock=threading.Lock())
+        worker,args = scheduled[0]; self.assertFalse(worker(*args))
+        self.assertEqual(self.encodes(),['encode'])
+        self.assertNotIn('processed_tool_publication',self.persisted()['recovery_cursor'])
+
+    def test_same_bytes_new_inode_after_retry_is_foreign_and_survives_cancelled_startup(self):
+        job = self.failed_registered_publication()
+        output = self.output(); sidecar = output.with_suffix('.meta.json')
+        _result, scheduled, _request = self.native_retry(job)
+        original = output.stat(); replacement = output.with_name('foreign-copy.mp4')
+        replacement.write_bytes(output.read_bytes()); os.replace(replacement,output)
+        self.assertNotEqual(output.stat().st_ino,original.st_ino)
+        before = self.snapshot(output),self.snapshot(sidecar)
+        self.assertTrue(job_lifecycle.request_cancel(job).changed)
+        self.fixture.ns.update(generation_slot=job_lifecycle.generation_slot,_gen_lock=threading.Lock())
+        worker,args = scheduled[0]; self.assertFalse(worker(*args))
+        coordinator,restored = self.startup()
+        self.assertEqual((self.snapshot(output),self.snapshot(sidecar)),before)
+        self.assertEqual(restored['status'],'cancelled'); self.assertEqual(restored['recovery_state'],'cleanup_blocked')
+        self.assertIn(job['id'],coordinator.compact().jobs)
+        self.assertTrue(self.manifest.exists()); self.assertTrue(self.staged.exists())
+        self.assertEqual(self.encodes(),['encode'])
+
+    def test_completion_cancel_interrupted_unlink_is_durably_replayable_on_startup(self):
+        job = self.failed_registered_publication()
+        output = self.output()
+        _result, scheduled, _request = self.native_retry(job)
+        self.assertTrue(job_lifecycle.request_cancel(job).changed)
+        remove = os.remove
+        def interrupt(path):
+            remove(path)
+            if str(path) == str(output): raise OSError('interrupted after owned media unlink')
+        with patch('os.remove',interrupt):
+            coordinator,restored = self.startup()
+        self.assertFalse(output.exists()); self.assertTrue(output.with_suffix('.meta.json').exists())
+        self.assertEqual(restored['recovery_state'],'cleanup_blocked')
+        self.assertIn('processed_tool_retraction',self.persisted()['recovery_cursor'])
+        self.assertIn(job['id'],coordinator.compact().jobs)
+        self.fixture.video.unlink()
+        coordinator,restored = self.startup()
+        self.assertFalse(output.with_suffix('.meta.json').exists())
+        self.assertEqual(restored['status'],'cancelled'); self.assertFalse(restored['queue_held'])
+        self.assertNotIn(job['id'],coordinator.restore().jobs)
+        self.assertFalse(self.manifest.exists()); self.assertFalse(self.staged.exists())
+        self.assertEqual(self.encodes(),['encode'])
+
+    def test_non_cancelled_actual_startup_holds_foreign_pair_without_quarantine(self):
+        job = self.failed_registered_publication()
+        output = self.output(); sidecar = output.with_suffix('.meta.json'); sidecar.write_bytes(b'foreign marker')
+        before = self.snapshot(output),self.snapshot(sidecar)
+        coordinator,restored = self.startup(expected_status='failed')
+        self.assertEqual((self.snapshot(output),self.snapshot(sidecar)),before)
+        self.assertTrue(restored['queue_held']); self.assertEqual(restored['recovery_state'],'blocked')
+        self.assertIn(job['id'],coordinator.restore().jobs)
+        self.assertTrue(self.manifest.exists()); self.assertTrue(self.staged.exists())
+        self.assertEqual(self.encodes(),['encode'])
+
+    def legacy_registered_publication(self):
+        job = self.failed_registered_publication()
+        intent = job['recovery_cursor']['processed_tool_publication']
+        artifact = self.fixture.ns['_recovery_artifact_descriptor'](str(self.fixture.project),
+            basename=intent['media']['basename'],sidecar_basename=intent['sidecar']['basename'],
+            producer_unit_id=intent['producer_unit_id'])
+        unit = {'kind':'ordinary_repeat','variant':0,'index':0,'state':'completed',
+            'unit_id':intent['producer_unit_id'],'dependencies':[],
+            'settings':intent['settings'],'artifacts':[artifact]}
+        cursor = dict(job['recovery_cursor'],completed_units=[unit])
+        cursor.pop('processed_tool_publication')
+        self.assertTrue(job_lifecycle.checkpoint_recovery_job(job,recovery_cursor=cursor))
+        return job
+
+    def test_legacy_completed_unit_foreign_members_are_not_quarantined_on_startup_or_retry(self):
+        for changed in ('media','sidecar'):
+            with self.subTest(changed=changed):
+                if changed == 'sidecar':
+                    # A distinct durable fixture keeps each original source/receipt intact.
+                    self.doCleanups()
+                    self.setUp()
+                job = self.legacy_registered_publication()
+                output = self.output(); sidecar = output.with_suffix('.meta.json')
+                member = output if changed == 'media' else sidecar
+                replacement = member.with_name('foreign-member')
+                replacement.write_bytes(b'foreign replacement')
+                os.replace(replacement,member)
+                before = self.snapshot(output),self.snapshot(sidecar)
+                self.fixture.ns['_quarantine_recovery_artifact'] = lambda *args: self.fail('Unbound bytes must not be quarantined')
+                coordinator,restored = self.startup(expected_status='failed')
+                self.assertEqual((self.snapshot(output),self.snapshot(sidecar)),before)
+                self.assertTrue(restored['queue_held']); self.assertFalse(restored['reruns_denoise'])
+                _result,scheduled,_request = self.native_retry(restored)
+                worker,args = scheduled[0]; self.assertFalse(worker(*args))
+                self.assertEqual((self.snapshot(output),self.snapshot(sidecar)),before)
+                self.assertEqual(self.encodes(),['encode'])
+                self.assertIn('processed_tool_legacy_cleanup',self.persisted()['recovery_cursor'])
+                self.assertEqual(self.digest(self.fixture.video),self.source_hash)
+
+    def test_legacy_no_intent_native_retry_adopts_without_encoder_or_new_ownership_seal(self):
+        job = self.legacy_registered_publication()
+        output = self.output(); before = self.snapshot(output),self.snapshot(output.with_suffix('.meta.json'))
+        _result,scheduled,_request = self.native_retry(job)
+        worker,args = scheduled[0]; self.assertTrue(worker(*args))
+        self.assertEqual(self.persisted()['status'],'completed')
+        self.assertEqual((self.snapshot(output),self.snapshot(output.with_suffix('.meta.json'))),before)
+        self.assertEqual(self.encodes(),['encode'])
+        marker = self.persisted()['recovery_cursor']['processed_tool_legacy_cleanup']
+        self.assertNotIn('execution_attempt',marker)
+        self.assertNotIn('file_id',marker['unit']['artifacts'][0])
+
+    def test_legacy_adoption_cancel_retains_review_until_owner_removes_both_names(self):
+        job = self.legacy_registered_publication()
+        output = self.output(); sidecar = output.with_suffix('.meta.json')
+        before = self.snapshot(output),self.snapshot(sidecar)
+        _result,scheduled,_request = self.native_retry(job)
+        def cancel_completion(current,status,**updates):
+            if status == 'completed':
+                self.assertIn('processed_tool_legacy_cleanup',self.persisted()['recovery_cursor'])
+                self.assertTrue(job_lifecycle.request_cancel(current).changed)
+            return job_lifecycle.finish_job(current,status,**updates)
+        self.fixture.ns['finish_job'] = cancel_completion
+        worker,args = scheduled[0]; self.assertFalse(worker(*args))
+        self.assertEqual((self.snapshot(output),self.snapshot(sidecar)),before)
+        coordinator,restored = self.startup()
+        self.assertEqual((self.snapshot(output),self.snapshot(sidecar)),before)
+        self.assertEqual(restored['status'],'cancelled'); self.assertEqual(restored['recovery_state'],'cleanup_blocked')
+        self.assertIn(job['id'],coordinator.compact().jobs)
+        with self.assertRaisesRegex(tool_fixture.QueueRecoveryAdapterError,'cleanup is pending'): coordinator.tombstone_terminal(job['id'])
+        self.assertTrue(self.manifest.exists()); self.assertTrue(self.staged.exists())
+        self.fixture.video.unlink()
+        output.unlink()
+        coordinator,restored = self.startup()
+        self.assertEqual(self.snapshot(sidecar),before[1])
+        self.assertIn(job['id'],coordinator.compact().jobs)
+        sidecar.unlink()
+        coordinator,restored = self.startup()
+        self.assertNotIn(job['id'],coordinator.restore().jobs)
+        self.assertEqual(restored['status'],'cancelled'); self.assertFalse(restored['queue_held'])
+        self.assertFalse(self.manifest.exists()); self.assertFalse(self.staged.exists())
+        self.assertEqual(self.encodes(),['encode'])
+
+    def test_legacy_metadata_only_replacement_stays_held_without_encode_until_owner_removal(self):
+        job = self.failed_registered_publication()
+        output = self.output(); sidecar = output.with_suffix('.meta.json')
+        output.unlink()
+        before = sidecar.read_bytes()
+        replacement = sidecar.with_name('foreign-marker.json')
+        replacement.write_bytes(before)
+        old_inode = sidecar.stat().st_ino
+        os.replace(replacement,sidecar)
+        self.assertNotEqual(sidecar.stat().st_ino,old_inode)
+        cursor = dict(job['recovery_cursor'],completed_units=[])
+        cursor.pop('processed_tool_publication')
+        self.assertTrue(job_lifecycle.checkpoint_recovery_job(job,recovery_cursor=cursor))
+        _result,scheduled,_request = self.native_retry(job)
+        def cancel_after_review_committed(current,**updates):
+            committed = job_lifecycle.checkpoint_recovery_job(current,**updates)
+            if 'processed_tool_legacy_cleanup' in updates.get('recovery_cursor',{}):
+                self.assertTrue(job_lifecycle.request_cancel(current).changed)
+            return committed
+        self.fixture.ns['_queue_recovery_checkpoint'] = cancel_after_review_committed
+        worker,args = scheduled[0]; self.assertFalse(worker(*args))
+        self.assertEqual(sidecar.read_bytes(),before)
+        self.assertEqual(self.encodes(),['encode'])
+        record = self.persisted()['recovery_cursor']['processed_tool_legacy_cleanup']
+        self.assertEqual(record['orphan_names'],[output.name,sidecar.name])
+        self.assertNotIn('unit',record); self.assertNotIn('execution_attempt',record)
+        self.assertEqual(self.persisted()['status'],'cancelled')
+        coordinator,restored = self.startup()
+        self.assertEqual(sidecar.read_bytes(),before)
+        self.assertEqual(restored['status'],'cancelled'); self.assertTrue(restored['queue_held'])
+        self.assertIn(job['id'],coordinator.compact().jobs)
+        self.assertTrue(self.manifest.exists()); self.assertTrue(self.staged.exists())
+        self.fixture.video.unlink()
+        sidecar.unlink()
+        coordinator,restored = self.startup()
+        self.assertNotIn(job['id'],coordinator.restore().jobs)
+        self.assertFalse(restored['queue_held']); self.assertEqual(restored['status'],'cancelled')
+        self.assertFalse(self.manifest.exists()); self.assertFalse(self.staged.exists())
+        self.assertEqual(self.encodes(),['encode'])
+
+    def test_legacy_orphan_owner_removal_then_explicit_retry_starts_fresh_authority(self):
+        self.assert_legacy_owner_removal_then_retry_stop(unit_record=False)
+
+    def test_legacy_completed_unit_owner_removal_then_explicit_retry_starts_fresh_authority(self):
+        self.assert_legacy_owner_removal_then_retry_stop(unit_record=True)
+
+    def assert_legacy_owner_removal_then_retry_stop(self, *, unit_record):
+        job = self.legacy_registered_publication() if unit_record else self.failed_registered_publication()
+        output = self.output(); sidecar = output.with_suffix('.meta.json')
+        if unit_record:
+            sidecar.write_bytes(b'foreign replacement')
+        else:
+            output.unlink()
+            cursor = dict(job['recovery_cursor'],completed_units=[])
+            cursor.pop('processed_tool_publication')
+            self.assertTrue(job_lifecycle.checkpoint_recovery_job(job,recovery_cursor=cursor))
+        _result,scheduled,_request = self.native_retry(job)
+        worker,args = scheduled[0]; self.assertFalse(worker(*args))
+        record = self.persisted()['recovery_cursor']['processed_tool_legacy_cleanup']
+        self.assertIn('unit' if unit_record else 'orphan_names',record)
+        self.assertTrue(sidecar.exists()); self.assertEqual(self.encodes(),['encode'])
+        if unit_record:
+            output.unlink()
+        sidecar.unlink()
+        result,scheduled,_request = self.native_retry(job)
+        self.assertTrue(result['reruns_denoise'])
+        from services.video_transform import horizontal_flip
+        completion_evidence = []
+        def stop_new_publication(current,status,**updates):
+            if status == 'completed':
+                durable = self.persisted()
+                self.assertNotIn('processed_tool_legacy_cleanup',durable['recovery_cursor'])
+                self.assertEqual(durable['recovery_cursor']['processed_tool_publication']['execution_attempt'],3)
+                self.assertTrue(output.exists()); self.assertTrue(sidecar.exists())
+                completion_evidence.append(durable['execution_attempt'])
+                self.assertTrue(job_lifecycle.request_cancel(current).changed)
+            return job_lifecycle.finish_job(current,status,**updates)
+        self.fixture.ns['finish_job'] = stop_new_publication
+        worker,args = scheduled[0]
+        with patch('services.video_transform.horizontal_flip',wraps=horizontal_flip) as processor:
+            self.assertFalse(worker(*args))
+        self.assertEqual(processor.call_count,1); self.assertEqual(completion_evidence,[3])
+        current = self.persisted()
+        self.assertEqual(current['status'],'cancelled'); self.assertFalse(current['queue_held'])
+        self.assertNotIn('processed_tool_legacy_cleanup',current['recovery_cursor'])
+        self.assertNotIn('processed_tool_publication',current['recovery_cursor'])
+        self.assertFalse(output.exists()); self.assertFalse(sidecar.exists())
+        self.assertEqual(self.encodes(),['encode'])
+        self.assertEqual(self.digest(self.fixture.video),self.source_hash)
+
     def durable_registration(self):
         project_digest = project_instance_digest(b'tool-test-secret-value', 'a' * 32)
         self.job['_recovery_project_digest'] = project_digest
@@ -294,7 +690,7 @@ class ToolProcessCrashTests(unittest.TestCase):
         process.join(timeout=5)
         self.assertEqual(process.exitcode, -signal.SIGKILL)
 
-    def startup(self, *, restore_other=False, expect_params=True):
+    def startup(self, *, restore_other=False, expect_params=True, expected_status="cancelled"):
         class Registry(dict):
             def prepare(self, job): return job
             def publish_prepared(self, job_id, job): self[job_id] = job
@@ -334,7 +730,7 @@ class ToolProcessCrashTests(unittest.TestCase):
                           '_restore_queue_recovery_on_startup')
         self.assertTrue(ns['_restore_queue_recovery_on_startup']())
         self.assertEqual(workers, [])
-        self.assertEqual(ns['_jobs'][self.job['id']]['status'], 'cancelled')
+        self.assertEqual(ns['_jobs'][self.job['id']]['status'], expected_status)
         self.assertEqual(ns['_jobs'][self.job['id']]['params'], self.job['params'] if expect_params else {})
         if restore_other:
             self.assertEqual(ns['_jobs']['unrelated-tool']['status'], 'cancelled')

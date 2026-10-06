@@ -24,7 +24,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'app'))
 from fastapi import HTTPException
 from services.output_access import stamp_sidecar_policy
-from services.queue_recovery_runtime import recovery_unit_id, sha256_file, QueueRecoveryRuntimeError
+from services.queue_recovery_runtime import recovery_unit_id, sha256_file, QueueRecoveryRuntimeError, artifact_descriptor, validate_artifact_descriptor
 from services.queue_recovery_adapter import (QueueRecoveryAdapterError, owner_principal_digest,
     processed_tool_publication_pending)
 
@@ -150,7 +150,8 @@ class FlipRouteTests(unittest.TestCase):
         job['_recovery_manifest_pointer'] = {}
         load_functions(self.ns, '_run_tool_hflip', '_write_tool_sidecar',
                        '_processed_tool_settings', '_publish_processed_tool_output',
-                       '_cleanup_cancelled_processed_tool_output')
+                       '_processed_tool_publication_members', '_retract_processed_tool_publication',
+                       '_hold_processed_tool_publication', '_cleanup_cancelled_processed_tool_output')
         return job
 
     def test_worker_publishes_new_video_with_settings_and_provenance(self):
@@ -199,7 +200,7 @@ class FlipRouteTests(unittest.TestCase):
                 self.assertNotIn('/private/', job.get('error') or '')
                 self.registered.clear()
 
-    def test_late_cancel_or_failed_durable_finish_rolls_back_publication(self):
+    def test_late_cancel_retracts_but_failed_durable_finish_retains_exact_adoptable_pair(self):
         from services.job_lifecycle import finish_job as lifecycle_finish
         for mode in ('cancel', 'persistence'):
             with self.subTest(mode=mode):
@@ -222,13 +223,33 @@ class FlipRouteTests(unittest.TestCase):
                     return lifecycle_finish(j, status, **updates)
                 self.ns['finish_job'] = finish
                 self.ns['is_cancel_requested'] = lambda j: bool(j.get('cancel_requested'))
-                def encode(src, dst, **kw): Path(dst).write_bytes(b'flipped')
+                encoded = []
+                def encode(src, dst, **kw):
+                    encoded.append(src); Path(dst).write_bytes(b'flipped')
                 with patch('services.video_transform.horizontal_flip', side_effect=encode):
                     self.assertFalse(self.ns['_run_tool_hflip'](job['id']))
                 self.assertEqual(len(completion_attempts), 1)
                 self.assertEqual(job['status'], 'cancelled' if mode == 'cancel' else 'failed')
                 self.assertEqual(job['output_files'], [])
-                self.assertEqual(list(Path(self.root).glob('*_hflip_*')), [])
+                if mode == 'cancel':
+                    self.assertEqual(list(Path(self.root).glob('*_hflip_*')), [])
+                else:
+                    pair = list(Path(self.root).glob('*_hflip_*'))
+                    self.assertEqual(len(pair),2)
+                    before = {path.name:(path.read_bytes(),path.stat().st_ino) for path in pair}
+                    self.assertTrue(job['queue_held']); self.assertEqual(job['recovery_state'],'blocked')
+                    self.assertFalse(job['reruns_denoise'])
+                    self.ns.update(_recovery_artifact_descriptor=artifact_descriptor,
+                        validate_artifact_descriptor=validate_artifact_descriptor,
+                        finish_job=lambda j,status,**updates:j.update(status=status,**updates) or True)
+                    load_functions(self.ns,'_resume_processed_tool_output')
+                    job.update(status='queued',output_files=[])
+                    with patch('services.video_transform.horizontal_flip',side_effect=encode):
+                        self.assertTrue(self.ns['_run_tool_hflip'](job['id']))
+                    self.assertEqual(encoded,[str(self.source)])
+                    self.assertEqual(job['status'],'completed'); self.assertEqual(len(job['output_files']),1)
+                    self.assertEqual({path.name:(path.read_bytes(),path.stat().st_ino) for path in pair},before)
+                    for path in pair: path.unlink()
                 self.assertEqual(self.source.read_bytes(), b'original-video')
                 self.registered.clear()
 
@@ -252,10 +273,17 @@ class FlipRouteTests(unittest.TestCase):
                 self.assertEqual(job['output_files'], [])
                 self.assertEqual(self.source.read_bytes(), b'original-video')
                 winners = list(Path(self.root).glob('*_hflip_*'))
-                self.assertEqual(len(winners), 1)
-                self.assertEqual(winners, created_winners)
-                self.assertEqual(winners[0].read_bytes(), b'foreign-winner')
-                winners[0].unlink()
+                self.assertIn(created_winners[0],winners)
+                self.assertEqual(created_winners[0].read_bytes(),b'foreign-winner')
+                self.assertIn('processed_tool_publication',job['recovery_cursor'])
+                self.assertTrue(job['queue_held']); self.assertEqual(job['recovery_state'],'blocked')
+                self.assertEqual(len(winners),2 if target == 'media' else 1)
+                if target == 'media':
+                    owned_marker = created_winners[0].with_suffix('.meta.json')
+                    intent = job['recovery_cursor']['processed_tool_publication']['sidecar']
+                    self.assertEqual(hashlib.sha256(owned_marker.read_bytes()).hexdigest(),intent['sha256'])
+                    self.assertEqual([owned_marker.stat().st_dev,owned_marker.stat().st_ino],intent['file_id'])
+                for path in winners: path.unlink()
                 self.registered.clear()
 
     def test_source_descriptor_seals_managed_media_and_blocks_legacy_restart(self):

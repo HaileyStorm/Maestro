@@ -110,8 +110,9 @@ def processed_tool_publication_pending(job: Mapping[str, Any]) -> bool:
         and (str(job.get("status") or "").casefold() in {"cancelled", "canceled"}
              or job.get("cancel_requested"))
         and isinstance(cursor, Mapping)
-        and ("editor_export_publication" if job.get("kind") == "tool_editor_export"
-             else "processed_tool_publication") in cursor
+        and (("editor_export_publication" if job.get("kind") == "tool_editor_export"
+              else "processed_tool_publication") in cursor
+             or (job.get("kind") != "tool_editor_export" and "processed_tool_legacy_cleanup" in cursor))
     )
 
 
