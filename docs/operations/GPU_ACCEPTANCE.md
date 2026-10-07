@@ -2724,3 +2724,48 @@ unit drained before its exact grant was withdrawn; current terminal responses
 confirmed cancellation. The ordinary service remained healthy after the probe.
 A source with two distinct speaking voices, owner listening, and two-reference
 browser/queue publication acceptance remain outstanding.
+
+## 2026-10-07 Blender live Queue, native cancellation and terminal cards
+
+At source revision `dcd6d008`, the direct loopback UI submitted one private
+Blender **Queue planned repeats** job, held it, then used **Start next** once.
+The production worker rendered one 12-frame segment on the RTX 5090 and reused
+its sealed frames for three clip instances. The completed MP4 has 36 frames,
+three seconds at 1280 × 720 and 12 fps, with stereo 48 kHz audio. Full video
+and audio decode passed. Gallery playback ended at three seconds without a
+media error. Output SHA-256:
+`4d7c46654b265726c8e9afa41033e48cab1fc43c5f2eb34c95d47d8b50427ce8`.
+
+A distinct private job on that revision exercised **Stop** during an actual
+Cycles render. Cancellation became durable while Blender remained busy.
+Across 331 observations, the production native-admission gate rejected further
+work while the cancelled job's render was unresolved; its fence remained
+unchanged. The render lasted about 48.79 seconds and finished naturally; the
+fence settled before the independent guardian began drainage. No second MCP
+request or render was submitted, and the cancelled job published no output.
+An earlier cancellation attempt finished and published before Stop won; that
+retained timing miss is not evidence of cancellation during rendering.
+
+Both accepted checks used CUDA-only RTX 5090 configuration with CPU and OptiX
+render devices disabled. Exact native-process GPU-memory samples were positive
+during rendering. This establishes configuration and process residency, not
+kernel profiling. Each fresh exact grant was withdrawn only after the owned
+backend, native worker and SDK obligations drained. Original operator settings
+were restored; ordinary Pinokio service health and readiness passed locally and
+through the configured stable share, and the matching restart notice cleared.
+Previously accepted media and the saved Editor draft retained their hashes.
+
+Revision `10484c3d` makes public cancelled-job recovery metadata terminal.
+Revision `d3aab85c` gives a saved cancelled browser card precedence over older
+recovery notices. The respective affected checks passed 435 backend tests and
+57 UI tests, with independent review, publication checks and the production UI
+build. The direct browser showed both retained cancelled cards without Stop,
+Resume or Retry controls, preserving the unrelated held and failed cards.
+The older card's saved cancellation status does not establish a fresh backend
+status or undo the media published by the timing-miss attempt.
+
+These receipts establish one live queued composition and native busy-render
+cancellation with admission-gate exclusion. They do not establish an actual
+second queue dispatch, new LAN behavior, Windows/macOS execution, audible
+output or owner visual/listening acceptance. Those gates remain open; accepted
+renders were not repeated to gather this documentation.
