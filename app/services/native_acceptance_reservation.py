@@ -58,6 +58,12 @@ class Reservation:
         if type(release_action) is not str or release_action not in {"start-next", "resume"}:
             raise ValueError("Invalid native acceptance release action")
         self.target = json.loads(json.dumps(target)) if target is not None else None
+        if self.target is not None and "running_execution_attempt" in self.target:
+            baseline = self.target.get("execution_attempt")
+            running = self.target["running_execution_attempt"]
+            if (type(baseline) is not int or baseline < 1
+                    or type(running) is not int or running != baseline + 1):
+                raise ValueError("Invalid native acceptance running attempt")
         self.release_action = release_action
         self._permits = {}
         self._workers = {}
@@ -73,13 +79,17 @@ class Reservation:
             return False
 
     def eligible(self, job):
+        """Queue admission always uses the frozen pre-start attempt."""
         if self.target is None:
             return True
+        return self._matches_job(job, self.target.get("execution_attempt"))
+
+    def _matches_job(self, job, execution_attempt):
         try:
             return (job_identity(job) == self.target["identity"]
                 and type(job.get("execution_attempt")) is int
                 and type(job.get("recovery_attempt", 0)) is int
-                and job.get("execution_attempt") == self.target["execution_attempt"]
+                and job.get("execution_attempt") == execution_attempt
                 and job.get("recovery_attempt", 0) == self.target["recovery_attempt"])
         except (ValueError, TypeError, KeyError):
             return False
@@ -105,9 +115,18 @@ class Reservation:
     def _parent_valid(self, admission):
         thread, job, lock = admission
         parent = thread()
+        running = self.target.get("running_execution_attempt")
+        if running is None:
+            matches = self.eligible(job)
+        else:
+            # Composition starts advance the durable attempt after acquiring
+            # the generation slot. Only this original live admission may use
+            # the declared next attempt; it cannot enter queue admission again.
+            matches = (job.get("status") == "running"
+                and self._matches_job(job, running))
         return (self._permits.get(id(job)) is admission
             and parent is not None and parent.is_alive() and lock.locked()
-            and self.eligible(job)
+            and matches
             and job.get("status") in {"queued", "preparing", "running"})
 
     def capture_worker(self, job, generation_lock, native_slot):
@@ -252,6 +271,9 @@ def _load_startup_plan():
                 or not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", target["identity"]["id"])
                 or type(target["execution_attempt"]) is not int or target["execution_attempt"] < 1
                 or type(target["recovery_attempt"]) is not int or target["recovery_attempt"] < 0
+                or ("running_execution_attempt" in target and (
+                    type(target["running_execution_attempt"]) is not int
+                    or target["running_execution_attempt"] != target["execution_attempt"] + 1))
                 or type(plan.get("release_action", "start-next")) is not str
                 or plan.get("release_action", "start-next") not in {"start-next", "resume"}
                 or not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", plan["agent_id"])

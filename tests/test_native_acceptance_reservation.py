@@ -123,6 +123,41 @@ class NativeAcceptanceTests(unittest.TestCase):
                     self.job[key] = prior
                 self.assertFalse(lock.locked())
 
+    def test_declared_running_attempt_requires_same_live_scheduler_admission(self):
+        guard = Reservation(dict(self.guard.target, running_execution_attempt=2))
+        native_lock = guard.wrap_lock(threading.Lock())
+        generation_lock = threading.Lock()
+        with patch.object(lifecycle, "_native_acceptance", guard):
+            with lifecycle.generation_slot(generation_lock, self.job) as admitted:
+                self.assertTrue(admitted)
+                with self.assertRaises(NativeAcceptanceReserved):
+                    native_lock.acquire(False)
+                self.assertTrue(lifecycle.try_start(self.job,
+                    generation_lock=generation_lock, expected_execution_attempt=1,
+                    execution_attempt=2))
+                with native_lock:
+                    self.assertTrue(native_lock.locked())
+                self.assertFalse(guard.eligible(self.job))
+                for key, value in [("execution_attempt", 3), ("execution_attempt", 1),
+                        ("recovery_attempt", 3), ("status", "queued"),
+                        ("request_manifest", {"sealed": "changed"})]:
+                    original = self.job[key]
+                    try:
+                        self.job[key] = value
+                        with self.subTest(key=key, value=value), self.assertRaises(NativeAcceptanceReserved):
+                            native_lock.acquire(False)
+                    finally:
+                        self.job[key] = original
+                copied = dict(self.job)
+                self.assertFalse(guard.eligible(copied))
+            with self.assertRaises(NativeAcceptanceReserved):
+                native_lock.acquire(False)
+
+    def test_running_attempt_declaration_rejects_invalid_or_skipped_attempts(self):
+        for value in (True, None, "2", 1, 3):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                Reservation(dict(self.guard.target, running_execution_attempt=value))
+
     def test_target_terminal_does_not_release_reservation_to_other_jobs(self):
         foreign = dict(candidate(), id="other")
         entered = threading.Event(); ended = threading.Event()
@@ -170,7 +205,8 @@ class NativeAcceptanceTests(unittest.TestCase):
             attempt = root / ".artifacts-temp" / "attempt"; attempt.mkdir(parents=True, mode=0o700)
             path = attempt / "plan.json"
             plan = {"schema": "maestro/native-acceptance-reservation/v1", "workspace": str(root),
-                "agent_id": "cpu-proof", "generation": "cpu-proof07", "target": self.guard.target,
+                "agent_id": "cpu-proof", "generation": "cpu-proof07",
+                "target": dict(self.guard.target, running_execution_attempt=2),
                 "release_action": "resume",
                 "guardian_request": "cpu-proof", "guardian_unit": "cpu-proof.service",
                 "source_pins": {name: hashlib.sha256((root / name).read_bytes()).hexdigest() for name in names}}
@@ -192,7 +228,7 @@ class NativeAcceptanceTests(unittest.TestCase):
             self.assertEqual(ack["session_id"], identity["sid"])
             self.assertEqual(ack["plan_sha256"], environment["MAESTRO_NATIVE_ACCEPTANCE_PLAN_SHA256"])
             self.assertEqual(ack["boundaries"], ["http", "model", "queue"])
-            for fault in ["source_changed", "plan_changed", "unsafe_mode", "invalid_release", "duplicate_ack"]:
+            for fault in ["source_changed", "plan_changed", "unsafe_mode", "invalid_release", "invalid_running_attempt", "duplicate_ack"]:
                 with self.subTest(fault=fault):
                     source = root / "app/wgp.py"; original = source.read_bytes()
                     original_plan = path.read_bytes()
@@ -203,6 +239,11 @@ class NativeAcceptanceTests(unittest.TestCase):
                     if fault == "invalid_release":
                         changed_plan = json.loads(original_plan)
                         changed_plan["release_action"] = "recovery-retry"
+                        path.write_text(json.dumps(changed_plan))
+                        check_environment["MAESTRO_NATIVE_ACCEPTANCE_PLAN_SHA256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+                    if fault == "invalid_running_attempt":
+                        changed_plan = json.loads(original_plan)
+                        changed_plan["target"]["running_execution_attempt"] = 3
                         path.write_text(json.dumps(changed_plan))
                         check_environment["MAESTRO_NATIVE_ACCEPTANCE_PLAN_SHA256"] = hashlib.sha256(path.read_bytes()).hexdigest()
                     try:

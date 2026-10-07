@@ -796,6 +796,42 @@ class BlenderEditorCompositionPackageTests(unittest.TestCase):
 @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "CPU FFmpeg is required")
 class BlenderEditorCompositionQueueTests(unittest.TestCase):
 
+    def test_reserved_held_composition_advances_once_and_publishes(self):
+        from services.native_acceptance_reservation import Reservation, job_identity, NativeAcceptanceReserved
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            ns, coordinator, project, pdigest = environment(root)
+            job = new_job(ns)
+            self.assertEqual(lifecycle.set_job_hold(job, True), 'held')
+            restored, may_start = restore(ns, root, project, pdigest)
+            self.assertFalse(may_start)
+            guard = Reservation(dict(identity=job_identity(restored),
+                execution_attempt=1, running_execution_attempt=2, recovery_attempt=0))
+            native_lock = guard.wrap_lock(threading.Lock())
+            native_admissions = []
+
+            @contextmanager
+            def guarded_slot(**kwargs):
+                if kwargs.get('cancel_checkpoint'):
+                    kwargs['cancel_checkpoint']()
+                with native_lock:
+                    native_admissions.append(restored['execution_attempt'])
+                    yield True
+
+            ns['_WgpNativeGpuExecutionSlot'] = guarded_slot
+            with mock.patch.object(lifecycle, '_native_acceptance', guard):
+                self.assertTrue(lifecycle.promote_queued_job(restored))
+                self.assertTrue(ns['_run_tool_composition_export'](restored['id']))
+                self.assertEqual(restored['status'], 'completed')
+                self.assertEqual(restored['execution_attempt'], 2)
+                self.assertEqual(native_admissions, [2])
+                self.assertEqual(sum(tool == 'render_animation' for tool, _ in Boundary.invocations), 2)
+                final = project / restored['output_files'][0]
+                self.assertEqual(probe_media(str(final))['duration'], 2.25)
+                self.assertEqual(coordinator.restore().jobs[restored['id']]['status'], 'completed')
+                with self.assertRaises(NativeAcceptanceReserved):
+                    native_lock.acquire(False)
+
     def test_held_composition_restarts_then_resume_completes_once(self):
         from services.queue_recovery_runtime import validate_manifest_inputs
         with tempfile.TemporaryDirectory() as temporary:
