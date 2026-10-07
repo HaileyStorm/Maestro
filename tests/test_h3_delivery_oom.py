@@ -1909,6 +1909,87 @@ class H3ManualCOWChildTests(unittest.TestCase):
         self.assertEqual(duplicate.exception.status_code, 404)
         self.assertEqual(QueueRecoveryCoordinator(coordinator.journal).restore().jobs, restored)
 
+    def _restore_held_child(self):
+        from services import job_lifecycle as lifecycle
+        from services.queue_recovery_adapter import QueueRecoveryCoordinator, QueueRecoveryAdapterError
+        symbols, source, child, coordinator, passes = self._prepare()
+        class Denied(Exception):
+            def __init__(self, *, status_code, detail):
+                self.status_code = status_code
+                super().__init__(detail)
+        self.assertEqual(lifecycle.set_job_hold(child, True), "held")
+        lifecycle.configure_durability_hook(None)
+        restarted = QueueRecoveryCoordinator(coordinator.journal)
+        snapshots = restarted.restore().jobs
+        projects = {source["workspace"]: (str(self.root), source["_recovery_project_digest"])}
+        source, _ = symbols["_queue_recovery_materialize_job"](snapshots[source["id"]], projects)
+        child, may_start = symbols["_queue_recovery_materialize_job"](snapshots[child["id"]], projects)
+        self.assertFalse(may_start)
+        self.assertTrue(child["queue_held"])
+        self.assertEqual(passes, [])
+        symbols["_jobs"].update({source["id"]: source, child["id"]: child})
+        lifecycle.configure_durability_hook(restarted.prospective_transition)
+        symbols.update(_queue_recovery_checkpoint_lock=threading.RLock(),
+            _existing_workspace_dir=lambda _: str(self.root),
+            _queue_recovery_existing_project_identity=lambda _: source["_recovery_project_digest"],
+            _queue_recovery_is_blocked=lambda job: job.get("recovery_state") == "blocked",
+            QueueRecoveryAdapterError=QueueRecoveryAdapterError, HTTPException=Denied)
+        symbols = _load_launch_symbols("_queue_recovery_revalidate_job",
+            "_start_restored_held_generation_worker", namespace=symbols)
+        return symbols, source, child, restarted, passes
+
+    def test_held_delivery_child_restarts_then_resume_completes_once(self):
+        from services import job_lifecycle as lifecycle
+        symbols, source, child, restarted, passes = self._restore_held_child()
+        attached = []
+        def record_thread(**kwargs):
+            thread = threading.Thread(**kwargs)
+            attached.append(thread)
+            return thread
+        symbols["threading"] = SimpleNamespace(Thread=record_thread)
+        self.assertEqual(lifecycle.set_job_hold(child, False), "resumed")
+        symbols["_start_restored_held_generation_worker"](child)
+        symbols["_start_restored_held_generation_worker"](child)
+        for thread in attached:
+            thread.join(timeout=5)
+        self.assertEqual(len(attached), 1)
+        self.assertFalse(attached[0].is_alive())
+        self.assertEqual(child["status"], "completed", child.get("error"))
+        self.assertEqual(len(passes), 2)
+        self.assertEqual(source["h3_delivery_recovery_control"]["manual_retry_count"], 1)
+        self.assertTrue(source["h3_delivery_recovery_control"]["consumed"])
+        self.assertEqual((self.native.read_bytes(), self.meta.read_bytes()), self.original)
+
+    def test_delivery_child_release_start_crash_consumes_pending_on_automatic_restore(self):
+        from services import job_lifecycle as lifecycle
+        from services.queue_recovery_adapter import QueueRecoveryCoordinator
+        symbols, source, child, restarted, passes = self._restore_held_child()
+        self.assertTrue(child.get("_recovery_worker_pending"))
+        lifecycle.set_job_hold(child, False)
+        snapshot = QueueRecoveryCoordinator(restarted.journal).restore().jobs[child["id"]]
+        projects = {source["workspace"]: (str(self.root), source["_recovery_project_digest"])}
+        child, may_start = symbols["_queue_recovery_materialize_job"](snapshot, projects)
+        self.assertTrue(may_start)
+        self.assertNotIn("_recovery_worker_pending", child)
+        self.assertEqual(passes, [])
+
+    def test_held_delivery_resume_rechecks_native_before_worker_or_charge(self):
+        from services import job_lifecycle as lifecycle
+        symbols, source, child, restarted, passes = self._restore_held_child()
+        self.native.write_bytes(b"changed-native")
+        attached = Mock()
+        symbols["threading"] = SimpleNamespace(Thread=attached)
+        lifecycle.set_job_hold(child, False)
+        with self.assertRaises(symbols["HTTPException"]) as failure:
+            symbols["_start_restored_held_generation_worker"](child)
+        self.assertEqual(failure.exception.status_code, 409)
+        attached.assert_not_called()
+        self.assertTrue(child["queue_held"])
+        self.assertEqual(child["recovery_state"], "blocked")
+        self.assertEqual(source["h3_delivery_recovery_control"]["manual_retry_count"], 0)
+        self.assertFalse(source["h3_delivery_recovery_control"]["consumed"])
+        self.assertEqual(passes, [])
+
     def test_retained_cow_director_and_cumulative_sources_offer_no_manual_child(self):
         from services.job_lifecycle import configure_durability_hook
         for marker in ("_director_final_video_postprocess", "_h3_cumulative_append"):
@@ -1953,6 +2034,7 @@ class H3ManualCOWChildTests(unittest.TestCase):
         restored_child, child_resume = symbols["_queue_recovery_materialize_job"](snapshots[child["id"]], projects)
         self.assertFalse(source_resume)
         self.assertTrue(child_resume)
+        self.assertNotIn("_recovery_worker_pending", restored_child)
         self.assertEqual(serialize_job(restored_source, owner_digest=source["_recovery_owner_digest"],
             project_digest=source["_recovery_project_digest"], request_manifest=source["_recovery_manifest_pointer"]), snapshots[source["id"]])
         symbols["_jobs"].update({restored_source["id"]: restored_source, restored_child["id"]: restored_child})

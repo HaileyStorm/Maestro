@@ -796,6 +796,60 @@ class BlenderEditorCompositionPackageTests(unittest.TestCase):
 @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "CPU FFmpeg is required")
 class BlenderEditorCompositionQueueTests(unittest.TestCase):
 
+    def test_held_composition_restarts_then_resume_completes_once(self):
+        from services.queue_recovery_runtime import validate_manifest_inputs
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            ns, _, project, pdigest = environment(root)
+            job = new_job(ns)
+            self.assertEqual(lifecycle.set_job_hold(job, True), 'held')
+            restored, may_start = restore(ns, root, project, pdigest)
+            self.assertFalse(may_start)
+            self.assertTrue(restored['queue_held'])
+            self.assertEqual(Boundary.invocations, [])
+            self.assertEqual(NativeSlot.admissions, 0)
+            ns.update(validate_manifest_inputs=validate_manifest_inputs,
+                _queue_recovery_manifest_validator=lambda _: True,
+                _queue_recovery_is_blocked=lambda current: current.get('recovery_state') == 'blocked',
+                _require_job_runtime_model_admission=lambda _: None)
+            functions(ns, ['_queue_recovery_revalidate_job', '_start_restored_held_generation_worker'])
+            attached = []
+            real_thread = threading.Thread
+            def record_thread(**kwargs):
+                thread = real_thread(**kwargs)
+                attached.append(thread)
+                return thread
+            ns['threading'] = types.SimpleNamespace(Thread=record_thread)
+            self.assertEqual(lifecycle.set_job_hold(restored, False), 'resumed')
+            ns['_start_restored_held_generation_worker'](restored)
+            ns['_start_restored_held_generation_worker'](restored)
+            for thread in attached:
+                thread.join(timeout=15)
+            self.assertEqual(len(attached), 1)
+            self.assertFalse(attached[0].is_alive())
+            self.assertEqual(restored['status'], 'completed')
+            self.assertEqual(len(restored['output_files']), 1)
+            self.assertEqual(NativeSlot.admissions, 1)
+            self.assertEqual(sum(tool == 'render_animation' for tool, _ in Boundary.invocations), 2)
+
+    def test_composition_release_start_crash_consumes_pending_on_automatic_restore(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            ns, _, project, pdigest = environment(root)
+            job = new_job(ns)
+            lifecycle.set_job_hold(job, True)
+            restored, may_start = restore(ns, root, project, pdigest)
+            self.assertFalse(may_start)
+            self.assertTrue(restored.get('_recovery_worker_pending'))
+            lifecycle.set_job_hold(restored, False)
+            # Release is durable; the process dies before Thread.start.
+            fresh, may_start = restore(ns, root, project, pdigest)
+            self.assertTrue(may_start)
+            self.assertFalse(fresh['queue_held'])
+            self.assertNotIn('_recovery_worker_pending', fresh)
+            self.assertEqual(Boundary.invocations, [])
+            self.assertEqual(NativeSlot.admissions, 0)
+
     def test_prepared_delivery_rejects_changed_bytes_binding_and_signature_without_native_resend(self):
         from services.composition_worker import load_delivery
         with tempfile.TemporaryDirectory() as temporary:

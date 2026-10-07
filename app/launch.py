@@ -7476,7 +7476,13 @@ def _queue_recovery_materialize_job(
                                    queue_held=bool(snapshot.get("queue_held", False)), recovery_state="interrupted")
                 else:
                     runtime.update(queue_held=bool(snapshot.get("queue_held", False)), recovery_state="terminal")
-                return runtime, bool(final is not None or not runtime.get("queue_held"))
+                may_start = bool(final is not None or not runtime.get("queue_held"))
+                if not may_start and runtime.get("status") == "queued":
+                    runtime["_recovery_worker_pending"] = True
+                else:
+                    # Sealed adoption and automatic recovery attach at startup.
+                    runtime.pop("_recovery_worker_pending", None)
+                return runtime, may_start
         except (ValueError, QueueRecoveryRuntimeError):
             if snapshot.get("kind") == "studio_h3_delivery_recovery":
                 runtime.update(queue_held=True, reruns_denoise=False, recovery_state="blocked",
@@ -68224,6 +68230,13 @@ def _composition_materialize_job(snapshot, projects):
             recovery_state="interrupted",
             reruns_denoise=False,
         )
+        # Validated manual holds suppress startup attachment. Resume needs the
+        # editor worker obligation; automatic recovery must not retain a second
+        # attachment path from an earlier durable release receipt.
+        if runtime.get("queue_held", False):
+            runtime["_recovery_worker_pending"] = True
+        else:
+            runtime.pop("_recovery_worker_pending", None)
         return runtime, not runtime.get("queue_held", False)
     except Exception:
         terminal = snapshot.get("status") in {"completed", "failed", "cancelled"}
