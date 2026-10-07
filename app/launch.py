@@ -77412,6 +77412,15 @@ def _public_queue_recovery_metadata(job: dict) -> dict:
                 "missing_count": counts["missing"],
                 "quarantined_count": counts["quarantined"],
             }
+    if job.get("status") == "cancelled":
+        # Cancellation is terminal even when an earlier recovery cursor survives
+        # restart. Keep its durable evidence, without offering another execution.
+        public.update(
+            recovery_state="cancelled", recovery_interrupted=False,
+            recovery_blocked=False, recovery_actionable=False,
+            recovery_reruns_denoise=False, recovery_actions=[],
+            recovery_input_roles=[], recovery_reason=None, recovery_reason_text=None,
+        )
     return public
 
 

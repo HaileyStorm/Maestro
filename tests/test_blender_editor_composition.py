@@ -1062,6 +1062,20 @@ class BlenderEditorCompositionQueueTests(unittest.TestCase):
                     assert len(Boundary.invocations) == before
                 reopened, resume = restore(ns, root, project, pdigest)
                 assert reopened['status'] == 'cancelled' and (not resume)
+                functions(ns, ['_public_queue_recovery_metadata'])
+                ns.update(_queue_recovery_reason_code=lambda current: current.get('_recovery_reason_code'),
+                    _queue_recovery_attempt=lambda current: current.get('recovery_attempt', 0),
+                    MAX_RECOVERY_ATTEMPTS=3, _QUEUE_RECOVERY_REASON_TEXT={})
+                durable = copy.deepcopy(reopened)
+                public = ns['_public_queue_recovery_metadata'](reopened)
+                self.assertEqual(public['recovery_state'], 'cancelled')
+                for flag in ('recovery_interrupted', 'recovery_blocked',
+                             'recovery_actionable', 'recovery_reruns_denoise'):
+                    self.assertFalse(public[flag])
+                self.assertEqual(public['recovery_actions'], [])
+                self.assertIsNone(public['recovery_reason'])
+                self.assertIsNone(public['recovery_reason_text'])
+                self.assertEqual(reopened, durable)
 
     def test_scene_owner_can_acquire_generation_lock_while_worker_waits(self):
         with tempfile.TemporaryDirectory() as temp:
