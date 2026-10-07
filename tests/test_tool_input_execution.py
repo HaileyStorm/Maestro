@@ -118,6 +118,149 @@ class ToolInputExecutionTests(unittest.TestCase):
         self.assertIs(self.ns['_queue_recovery_worker'](job), self.ns['_run_tool_revoice'])
         self.assertIs(self.ns['_queue_recovery_worker']({'kind':'tool_upscale'}), self.ns['_run_tool_upscale'])
 
+    def _restore_held_tool(self, kind='tool_revoice', **changes):
+        from services.queue_recovery import QueueRecoveryJournal
+        from services.queue_recovery_adapter import QueueRecoveryCoordinator
+        from services.queue_recovery_runtime import (atomic_write_request_manifest,
+            load_request_manifest, validate_manifest_inputs, next_recovery_attempt)
+        from services.h3_offload_plan import H3_OFFLOAD_PLAN_PARAM_KEY
+
+        project_digest = 'project:v1:' + 'b' * 64
+        self.ns['_queue_recovery_existing_project_identity'] = lambda _: project_digest
+        job = self.job(kind)
+        job['_recovery_project_digest'] = project_digest
+        job.update(queue_held=True, recovery_attempt=0, execution_attempt=1)
+        job.update(changes)
+        pointer = atomic_write_request_manifest(self.project, job_id=job['id'],
+            params=job['params'], inputs=self.manifests[job['id']]['inputs'])
+        coordinator = QueueRecoveryCoordinator(QueueRecoveryJournal(self.root / (uuid.uuid4().hex + '.jsonl')))
+        coordinator.register_job(job, owner_digest=self.owner,
+            project_digest=project_digest, request_manifest=pointer)
+        self.ns.update(load_request_manifest=load_request_manifest,
+            validate_manifest_inputs=validate_manifest_inputs,
+            next_recovery_attempt=next_recovery_attempt,
+            H3_OFFLOAD_PLAN_PARAM_KEY=H3_OFFLOAD_PLAN_PARAM_KEY,
+            _job_uses_registered_h3=lambda _: False,
+            _h3_incomplete_recovery_prefix=lambda _: None,
+            _queue_recovery_checkpoint_lock=threading.RLock(),
+            _queue_recovery_is_blocked=lambda j: str(j.get('recovery_state', '')).startswith('blocked'),
+            _require_job_runtime_model_admission=Mock(),
+            _start_generation_worker=Mock(side_effect=AssertionError('Wrong generation worker')),
+            threading=threading)
+        load(self.ns, '_h3_cow_manual_source_supported', '_require_h3_offload_plan_parity', '_queue_recovery_materialize_job',
+             '_queue_recovery_revalidate_job', '_start_restored_held_generation_worker')
+        snapshot = coordinator.restore().jobs[job['id']]
+        restored, may_start = self.ns['_queue_recovery_materialize_job'](snapshot,
+            {'project-a': (str(self.project), project_digest)})
+        self.assertFalse(may_start)
+        self.jobs[job['id']] = restored
+        return coordinator, restored
+
+    def test_held_tools_restore_then_release_exact_worker_once(self):
+        for kind in ('tool_revoice', 'tool_upscale', 'tool_hflip'):
+            with self.subTest(kind=kind):
+                coordinator, job = self._restore_held_tool(kind)
+                self.assertTrue(job['queue_held'])
+                self.assertEqual(job['recovery_attempt'], 0)
+                starts = []
+                class DeferredThread:
+                    def __init__(self, *, target, args, **_kwargs):
+                        self.target, self.args = target, args
+                    def start(self):
+                        starts.append((self.target, self.args))
+                with patch.object(threading, 'Thread', DeferredThread):
+                    start = self.ns['_start_restored_held_generation_worker']
+                    start(job)
+                    self.assertEqual(starts, [])
+                    job['queue_held'] = False
+                    start(job)
+                    start(job)
+                self.assertEqual(starts, [(self.ns['_run_' + kind], (job['id'],))])
+                self.assertNotIn('_recovery_worker_pending', job)
+                self.assertEqual(job['recovery_attempt'], 0)
+
+    def test_changed_input_after_held_restore_reblocks_without_worker(self):
+        _, job = self._restore_held_tool()
+        self.voice.write_bytes(b'changed voice reference')
+        job['queue_held'] = False
+        with patch.object(threading, 'Thread') as thread, self.assertRaises(HTTPException) as error:
+            self.ns['_start_restored_held_generation_worker'](job)
+        self.assertEqual(error.exception.status_code, 409)
+        thread.assert_not_called()
+        self.assertTrue(job['queue_held'])
+        self.assertEqual(job['recovery_state'], 'blocked')
+        self.assertEqual(job['_recovery_reason_code'], 'input_missing_or_changed')
+
+    def test_remote_held_tool_stays_blocked_without_worker_obligation(self):
+        _, job = self._restore_held_tool(source_remote=True)
+        self.assertTrue(job['queue_held'])
+        self.assertEqual(job['recovery_state'], 'blocked_remote_reauth')
+        self.assertNotIn('_recovery_worker_pending', job)
+
+    def test_released_tool_crash_restores_one_automatic_worker_obligation(self):
+        coordinator, job = self._restore_held_tool()
+        job['queue_held'] = False
+        # The durable release precedes Thread.start; simulate death there.
+        coordinator.prospective_transition(types.SimpleNamespace(jobs=(job,)))
+        snapshot = coordinator.restore().jobs[job['id']]
+        self.assertTrue(snapshot['_recovery_worker_pending'])
+        restored, may_start = self.ns['_queue_recovery_materialize_job'](snapshot,
+            {'project-a': (str(self.project), job['_recovery_project_digest'])})
+        self.assertTrue(may_start)
+        self.assertEqual(restored['recovery_attempt'], 1)
+        self.assertFalse(restored['queue_held'])
+        self.assertNotIn('_recovery_worker_pending', restored)
+        with patch.object(threading, 'Thread') as thread:
+            self.ns['_start_restored_held_generation_worker'](restored)
+        thread.assert_not_called()
+
+    def test_concurrent_held_tool_releases_attach_only_one_worker(self):
+        _, job = self._restore_held_tool()
+        job['queue_held'] = False
+        barrier = threading.Barrier(3)
+        starts, errors = [], []
+        def release():
+            try:
+                barrier.wait(timeout=5)
+                self.ns['_start_restored_held_generation_worker'](job)
+            except BaseException as error:
+                errors.append(error)
+        callers = [threading.Thread(target=release) for _ in range(2)]
+        class DeferredThread:
+            def __init__(self, **_kwargs):
+                pass
+            def start(self):
+                starts.append(job['id'])
+        with patch.object(threading, 'Thread', DeferredThread):
+            for caller in callers:
+                caller.start()
+            barrier.wait(timeout=5)
+            for caller in callers:
+                caller.join(timeout=5)
+        self.assertFalse(any(caller.is_alive() for caller in callers))
+        self.assertEqual(errors, [])
+        self.assertEqual(starts, [job['id']])
+
+    def test_held_tool_worker_failure_preserves_recoverable_hold(self):
+        for failure in ('unavailable', 'thread-start'):
+            with self.subTest(failure=failure):
+                _, job = self._restore_held_tool()
+                job['queue_held'] = False
+                if failure == 'unavailable':
+                    self.ns['_run_tool_revoice'] = None
+                with patch.object(threading, 'Thread') as thread:
+                    thread.return_value.start.side_effect = RuntimeError('start failed')
+                    expected = HTTPException if failure == 'unavailable' else RuntimeError
+                    with self.assertRaises(expected):
+                        self.ns['_start_restored_held_generation_worker'](job)
+                    if failure == 'unavailable':
+                        thread.assert_not_called()
+                self.assertTrue(job['queue_held'])
+                self.assertEqual(job['recovery_state'], 'blocked')
+                self.assertEqual(job['_recovery_reason_code'], 'worker_start_failed')
+                self.assertTrue(job['_recovery_worker_pending'])
+                load(self.ns, '_run_tool_revoice')
+
     def test_changed_content_owner_project_or_manifest_is_rejected(self):
         for change in ('content','owner','project','manifest','missing-descriptor'):
             with self.subTest(change=change):

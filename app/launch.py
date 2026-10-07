@@ -8333,11 +8333,10 @@ def _queue_recovery_materialize_job(
             "reruns_denoise": status == "running" or snapshot.get("reruns_denoise") is True,
             "message": str(snapshot.get("message") or "Queued"),
         })
-        if str(runtime.get("kind") or "studio_generation") == "studio_generation":
-            # Startup deliberately attaches no worker while held. Resume must
-            # reconstruct that obligation for ordinary generation as for H3;
-            # validation and blocked recovery branches above remain controlling.
-            runtime["_recovery_worker_pending"] = True
+        # Startup deliberately attaches no worker while held. Every validated
+        # restart-safe kind needs its own worker after an explicit release;
+        # validation and blocked recovery branches above remain controlling.
+        runtime["_recovery_worker_pending"] = True
         return runtime, False
     attempt, may_retry = next_recovery_attempt(snapshot)
     if not may_retry:
@@ -8350,6 +8349,9 @@ def _queue_recovery_materialize_job(
         })
         return runtime, False
     runtime["recovery_attempt"] = attempt
+    # Automatic startup recovery consumes the worker obligation itself. A
+    # retained release receipt must not also allow a second manual attachment.
+    runtime.pop("_recovery_worker_pending", None)
     runtime.update({
         "_recovery_reason_code": "",
         "queue_held": False,
@@ -9356,9 +9358,21 @@ def _start_restored_held_generation_worker(job: dict) -> None:
             if job.get("kind") == "studio_h3_delivery_recovery":
                 threading.Thread(target=_run_h3_cow_delivery_child, args=(str(job["id"]),),
                                  daemon=False, name=f"h3-delivery-held-recovery-{job['id']}").start()
-            else:
+            elif str(job.get("kind") or "studio_generation") == "studio_generation":
                 _require_job_runtime_model_admission(job)
                 _start_generation_worker(job, name_prefix="studio-held-recovery")
+            else:
+                worker = _queue_recovery_worker(job)
+                if not callable(worker):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Recovery worker is unavailable",
+                    )
+                _require_job_runtime_model_admission(job)
+                threading.Thread(
+                    target=worker, args=(str(job["id"]),), daemon=False,
+                    name=f"studio-held-recovery-{job['id']}",
+                ).start()
         except Exception:
             if not _queue_recovery_is_blocked(job):
                 job["_recovery_reason_code"] = "worker_start_failed"
