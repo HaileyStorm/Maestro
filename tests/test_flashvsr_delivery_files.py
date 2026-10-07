@@ -15,11 +15,21 @@ from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "app"))
+from services import upload_usage
 
 
 def load_functions(*names, **namespace):
     names = (*names, "_run_delivery_encoder")
     tree = ast.parse((ROOT / "app/launch.py").read_text())
+    if any(isinstance(node, ast.FunctionDef) and node.name in names
+           and any(isinstance(d, ast.Name) and d.id == "_upload_job_reader" for d in node.decorator_list)
+           for node in tree.body):
+        names = (*names, "_queue_recovery_file_values", "_upload_job_reader")
+        keys = next(node.value for node in tree.body if isinstance(node, ast.Assign)
+                    and any(isinstance(t, ast.Name) and t.id == "_RECOVERABLE_INPUT_KEYS" for t in node.targets))
+        namespace.setdefault("_RECOVERABLE_INPUT_KEYS", eval(compile(ast.Expression(keys), "recovery-keys", "eval"),
+                                                           {"wgp": namespace.get("wgp", SimpleNamespace())}))
+        namespace["upload_usage"] = upload_usage
     module = ast.Module(body=[node for node in tree.body
                               if isinstance(node, ast.FunctionDef) and node.name in names],
                         type_ignores=[])

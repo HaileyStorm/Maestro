@@ -156,7 +156,11 @@ if mmgp_version != target_mmgp_version:
 lock = threading.Lock()
 prompt_enhancer_lock = threading.RLock()
 prompt_enhancer_classic_entry_lock = threading.Lock()
-native_gpu_execution_lock = threading.Lock()
+from services.native_acceptance_reservation import (
+    reservation as _native_acceptance, installed as _acceptance_installed,
+)
+native_gpu_execution_lock = _native_acceptance.wrap_lock(threading.Lock())
+_acceptance_installed("model")
 _native_gpu_execution_epoch_lock = threading.Lock()
 _native_gpu_execution_epoch = 0
 current_task_id = None
@@ -6391,6 +6395,7 @@ def load_models(
     _h3_control_base_checkpoint=None,
     **model_kwargs,
 ):
+    _native_acceptance.require_model_admission()
     global transformer_type, loaded_profile, reload_needed
     global _loaded_model_configuration, _loaded_residency_base_key
     global _loaded_residency_affinity_key

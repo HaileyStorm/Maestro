@@ -462,35 +462,40 @@ class H3CumulativeQueueTests(unittest.TestCase):
                 "prompt": "scene",
             }
         )
-        expressions = [
-            node
-            for node in ast.walk(self.wgp)
-            if isinstance(node, ast.IfExp)
-            and isinstance(node.body, ast.Call)
-            and isinstance(node.body.func, ast.Name)
-            and node.body.func.id == "align_model_frame_count"
-            and isinstance(node.orelse, ast.Call)
-            and isinstance(node.orelse.func, ast.Attribute)
-            and node.orelse.func.attr == "sampling_frames"
-        ]
-        self.assertEqual(len(expressions), 3)
+        expressions = []
+        for name in ("video_length", "sampling_frame_num"):
+            owners = [node.value for node in ast.walk(self.wgp)
+                      if isinstance(node, ast.Assign)
+                      and any(isinstance(target, ast.Name) and target.id == name for target in node.targets)
+                      and any(isinstance(child, ast.Call) and isinstance(child.func, ast.Name)
+                              and child.func.id == "align_model_frame_count"
+                              for child in ast.walk(node.value))]
+            self.assertEqual(len(owners), 1, name)
+            expressions.extend(owners)
+        sampler_kwargs = next(node for node in ast.walk(self.wgp)
+                              if isinstance(node, ast.IfExp) and isinstance(node.orelse, ast.Call)
+                              and isinstance(node.orelse.func, ast.Attribute)
+                              and node.orelse.func.attr == "model_kwargs")
         for active, expected in ((dispatch, 56), (None, 124)):
             namespace.update(
                 _h3_cumulative_dispatch=active,
+                _h3_control_dispatch=None,
                 video_length=56,
                 current_video_length=56,
                 model_def=definition,
             )
             for expression in expressions:
-                self.assertEqual(
-                    eval(
-                        compile(
-                            ast.Expression(expression), "wgp-private-window", "eval"
-                        ),
-                        namespace,
-                    ),
-                    expected,
-                )
+                self.assertEqual(eval(compile(ast.Expression(expression), "wgp-private-window", "eval"), namespace), expected)
+            kwargs_namespace = dict(namespace, base_model_type="minimax_h3",
+                                    repeat_no=0, window_no=0, wan_model=object())
+            if active is not None:
+                from types import SimpleNamespace
+                kwargs_namespace["_h3_cumulative_dispatch"] = SimpleNamespace(
+                    sampling_frames=active.sampling_frames, model_kwargs=lambda **values: values)
+            kwargs = eval(compile(ast.Expression(sampler_kwargs), "wgp-sampler-window", "eval"), kwargs_namespace)
+            self.assertEqual(kwargs.get("frame_num"), 56 if active is not None else None)
+            if active is None:
+                self.assertEqual(kwargs, {})
         with self.assertRaises(ValueError):
             H3CumulativeDispatch(frames=362)
 

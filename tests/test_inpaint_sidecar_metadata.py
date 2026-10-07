@@ -19,6 +19,8 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 LAUNCH = ROOT / "app" / "launch.py"
+sys.path.insert(0, str(ROOT / "app"))
+from services import upload_usage
 
 
 class _HTTPException(Exception):
@@ -69,6 +71,7 @@ def _load_endpoint(published_jobs: list[dict]):
 
     namespace = {
         "Request": object,
+        "upload_usage": upload_usage,
         "HTTPException": _HTTPException,
         "os": types.SimpleNamespace(
             path=types.SimpleNamespace(isfile=lambda path: path == "cached.npy"),

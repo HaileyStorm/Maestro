@@ -109,7 +109,7 @@ class StudioHoldQueueModeTests(unittest.TestCase):
         self.assertNotIn("'held'", statuses)
         self.assertIn("if (queueJob?.held || publicJob.held) summary.held += 1", QUEUE_PROJECTION)
         self.assertIn(
-            "job.status === 'queued' || job.status === 'running' || job.held",
+            "projectLogicalQueue(jobs).activeCount",
             GENERATE_BUTTON,
         )
 

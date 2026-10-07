@@ -708,6 +708,7 @@ class H3CumulativeExecutionTests(unittest.TestCase):
             "_jobs": Registry(),
             "restore_scheduler_state": lambda *args: None,
             "_queue_recovery_coordinator": types.SimpleNamespace(compact=compact),
+            "_restore_h3_prompt_rewriter_cleanup": lambda jobs: None,
             "cleanup_orphan_request_manifests": lambda *args: 0,
             "cleanup_orphan_staged_outputs": cleanup,
         }
@@ -973,6 +974,8 @@ class H3CumulativeExecutionTests(unittest.TestCase):
             "wgp": types.SimpleNamespace(generate_video=generate_video),
             "task_h3_turbo_validation_authorized": False,
             "cumulative_dispatch": dispatch,
+            "job": {"params": {}},
+            "traceback": __import__("traceback"),
             "_H3_LONG_STUDIO_MODELS": set(),
             "_run_generation_task_with_llm_exclusion": lambda model, cmd, run: run(),
         }

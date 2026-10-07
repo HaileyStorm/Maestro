@@ -79,7 +79,7 @@ class _Registry:
 
 
 def _catalog(*, remote: bool, definition: dict | None = None):
-    namespace = _launch_namespace("list_models")
+    namespace = _launch_namespace("_retake_engines_for_architecture", "list_models")
     registry = _Registry(music3_definition=definition)
     readiness = []
     namespace.update({

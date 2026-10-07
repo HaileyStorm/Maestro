@@ -28,6 +28,10 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
+from services.native_acceptance_reservation import (
+    reservation as _native_acceptance, installed as _acceptance_installed,
+)
+
 from services.credit_runtime import (
     CreditReservationQuote,
     CreditReservationState,
@@ -3693,6 +3697,7 @@ def try_start(
             ):
                 return False
             job["_generation_slot_owned"] = False
+            _native_acceptance.released(job)
             generation_lock.release()
             _queue_condition.notify_all()
 
@@ -4459,7 +4464,8 @@ def acquire_generation_slot(
                 if blocked_by_restored_child:
                     _queue_condition.wait(timeout=max(0.01, poll_interval))
                     continue
-                eligible = _eligible_queue_entries()
+                eligible = [entry for entry in _eligible_queue_entries()
+                    if _native_acceptance.eligible(entry[1])]
                 selected, reason, skipped = _select_next_waiter(eligible)
                 is_next = bool(selected and selected[1] is job)
                 if is_next and not _queue_paused and generation_lock.acquire(blocking=False):
@@ -4476,6 +4482,7 @@ def acquire_generation_slot(
                         _record_queue_admission(
                             job, reason or "queue_order", skipped, eligible,
                         )
+                        _native_acceptance.admitted(job, generation_lock)
                         _queue_waiters.pop(waiter_key, None)
                         return True
                 _queue_condition.wait(timeout=max(0.01, poll_interval))
@@ -4552,6 +4559,7 @@ def release_generation_slot(
             return False
         if job.pop("_generation_slot_owned", False) is not True:
             return False
+        _native_acceptance.released(job)
         generation_lock.release()
         _queue_condition.notify_all()
         return True
@@ -4692,6 +4700,7 @@ def yield_generation_slot_after_output(
         _publish_job_unlocked(job, candidate)
         _queue_paused = prospective_paused
         _pause_after_current = prospective_after
+        _native_acceptance.released(job)
         generation_lock.release()
         _queue_condition.notify_all()
 
@@ -4756,8 +4765,12 @@ def generation_slot(
                     # the durable pause write fails. Preserve the prior global
                     # controls unless the prospective write succeeded.
                     job.pop("_generation_slot_owned", None)
+                    _native_acceptance.released(job)
                     generation_lock.release()
                     if prospective_paused and persistence_succeeded:
                         _queue_paused = True
                         _pause_after_current = False
                     _queue_condition.notify_all()
+
+
+_acceptance_installed("queue")

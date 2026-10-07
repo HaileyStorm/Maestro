@@ -1599,6 +1599,12 @@ async def _maestro_session_middleware(request: Request, call_next):
     rejected = _reject_cross_origin_mutation(request)
     if rejected is not None:
         return _stamp_recovery_no_store_response(request, rejected)
+    from services.native_acceptance_reservation import reservation
+    if not reservation.permits_http_action(request.method, request.url.path):
+        return _stamp_recovery_no_store_response(request, JSONResponse(
+            {"detail": "Maestro is running a brief generation check. Try again after it finishes."},
+            status_code=503,
+        ))
     # Most host-control denials do not admit an account override and retain
     # the historical pre-session fast path. Only the small explicit owner
     # parity allowlist needs the authenticated principal resolved first.
@@ -37162,6 +37168,10 @@ def _require_local_llm_control(request: Request) -> None:
             status_code=403,
             detail="This machine-wide control is available locally only",
         )
+
+
+from services.native_acceptance_reservation import installed as _acceptance_http_installed
+_acceptance_http_installed("http")
 
 
 @api.middleware("http")
@@ -73659,6 +73669,11 @@ def _run_generation(
                 worker_start_state = {"cancelled": False}
 
                 def make_error_handler(task, params, send_cmd, call_timing, cumulative_dispatch=None):
+                    from services.native_acceptance_reservation import reservation as acceptance
+                    worker_admission = (
+                        acceptance.capture_worker(job, _gen_lock, native_slot)
+                        if acceptance.target is not None else None
+                    )
                     def error_handler():
                         with worker_start_lock:
                             if worker_start_state["cancelled"]:
@@ -73669,60 +73684,61 @@ def _run_generation(
                         profile_observation = None
                         decode_observation = None
                         try:
-                            expected_args = set(inspect.signature(wgp.generate_video).parameters.keys())
-                            filtered_params = {k: v for k, v in params.items() if k in expected_args}
-                            if task_h3_turbo_validation_authorized:
-                                filtered_params[
-                                    "_h3_turbo_validation_authorized"
-                                ] = True
-                            plugin_data = task.get('plugin_data', {})
-                            call_model = str(filtered_params.get("model_type") or "")
-                            filtered_params.pop("_h3_profile_observer", None)
-                            filtered_params.pop("_h3_decode_observer", None)
-                            # Only this worker creates the decoded handoff. It is
-                            # absent from the durable manifest and HTTP inputs.
-                            filtered_params.pop("_h3_timeline_guides", None)
-                            filtered_params.pop("_h3_control_dispatch", None)
-                            if "_h3_control_gallery_source" in (job.get("params") or {}):
-                                if len(queue) != 1 or cumulative_dispatch is not None:
-                                    raise ValueError("H3 Control requires one independent output")
-                                filtered_params["_h3_control_dispatch"] = _decode_h3_gallery_control_job(
-                                    job, cancel_check=lambda: bool(gen.get("abort") or is_cancel_requested(job)),
-                                )
-                            if "_h3_timeline_av_guide_source" in (job.get("params") or {}):
-                                if len(queue) != 1 or cumulative_dispatch is not None:
-                                    raise ValueError("H3 interval guides require one independent output")
-                                filtered_params["_h3_timeline_guides"] = _decode_h3_gallery_av_guide_job(
-                                    job, resolution=filtered_params.get("resolution"),
-                                    cancel_check=lambda: bool(gen.get("abort") or is_cancel_requested(job)),
-                                )
-                            if cumulative_dispatch is not None:
-                                filtered_params["_h3_cumulative_dispatch"] = cumulative_dispatch
-                            if call_model in _H3_LONG_STUDIO_MODELS:
-                                from services.h3_benchmark import H3OffloadObservation
-                                profile_observation = H3OffloadObservation(call_model)
-                                filtered_params["_h3_profile_observer"] = profile_observation
-                                from services.h3_decode_capture import capture_for_job
-                                decode_observation = capture_for_job(
-                                    root=Path(_app_dir).parent, job_id=job_id,
-                                    task_index=task_idx, params=filtered_params,
-                                )
-                                if decode_observation is not None:
-                                    filtered_params["_h3_decode_observer"] = decode_observation
-                            call_timing["offload_context"] = {
-                                key: filtered_params.get(key)
-                                for key in ("model_type", "resolution", "video_length", "num_inference_steps", "repeat_generation", "batch_size")
-                            }
-                            _run_generation_task_with_llm_exclusion(
-                                call_model,
-                                send_cmd,
-                                lambda: wgp.generate_video(
-                                    task,
+                            with acceptance.worker(worker_admission):
+                                expected_args = set(inspect.signature(wgp.generate_video).parameters.keys())
+                                filtered_params = {k: v for k, v in params.items() if k in expected_args}
+                                if task_h3_turbo_validation_authorized:
+                                    filtered_params[
+                                        "_h3_turbo_validation_authorized"
+                                    ] = True
+                                plugin_data = task.get('plugin_data', {})
+                                call_model = str(filtered_params.get("model_type") or "")
+                                filtered_params.pop("_h3_profile_observer", None)
+                                filtered_params.pop("_h3_decode_observer", None)
+                                # Only this worker creates the decoded handoff. It is
+                                # absent from the durable manifest and HTTP inputs.
+                                filtered_params.pop("_h3_timeline_guides", None)
+                                filtered_params.pop("_h3_control_dispatch", None)
+                                if "_h3_control_gallery_source" in (job.get("params") or {}):
+                                    if len(queue) != 1 or cumulative_dispatch is not None:
+                                        raise ValueError("H3 Control requires one independent output")
+                                    filtered_params["_h3_control_dispatch"] = _decode_h3_gallery_control_job(
+                                        job, cancel_check=lambda: bool(gen.get("abort") or is_cancel_requested(job)),
+                                    )
+                                if "_h3_timeline_av_guide_source" in (job.get("params") or {}):
+                                    if len(queue) != 1 or cumulative_dispatch is not None:
+                                        raise ValueError("H3 interval guides require one independent output")
+                                    filtered_params["_h3_timeline_guides"] = _decode_h3_gallery_av_guide_job(
+                                        job, resolution=filtered_params.get("resolution"),
+                                        cancel_check=lambda: bool(gen.get("abort") or is_cancel_requested(job)),
+                                    )
+                                if cumulative_dispatch is not None:
+                                    filtered_params["_h3_cumulative_dispatch"] = cumulative_dispatch
+                                if call_model in _H3_LONG_STUDIO_MODELS:
+                                    from services.h3_benchmark import H3OffloadObservation
+                                    profile_observation = H3OffloadObservation(call_model)
+                                    filtered_params["_h3_profile_observer"] = profile_observation
+                                    from services.h3_decode_capture import capture_for_job
+                                    decode_observation = capture_for_job(
+                                        root=Path(_app_dir).parent, job_id=job_id,
+                                        task_index=task_idx, params=filtered_params,
+                                    )
+                                    if decode_observation is not None:
+                                        filtered_params["_h3_decode_observer"] = decode_observation
+                                call_timing["offload_context"] = {
+                                    key: filtered_params.get(key)
+                                    for key in ("model_type", "resolution", "video_length", "num_inference_steps", "repeat_generation", "batch_size")
+                                }
+                                _run_generation_task_with_llm_exclusion(
+                                    call_model,
                                     send_cmd,
-                                    plugin_data=plugin_data,
-                                    **filtered_params,
-                                ),
-                            )
+                                    lambda: wgp.generate_video(
+                                        task,
+                                        send_cmd,
+                                        plugin_data=plugin_data,
+                                        **filtered_params,
+                                    ),
+                                )
                         except Exception as e:
                             print(f"\n  [ERROR] {e}")
                             traceback.print_exc()

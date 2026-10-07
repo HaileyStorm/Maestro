@@ -64,7 +64,7 @@ class LlmChatUiLifecycleTests(unittest.TestCase):
         self.assertIn('aria-label="Language model response status"', self.source)
         self.assertIn('role="log"', self.source)
         self.assertIn('aria-atomic="false"', self.source)
-        self.assertIn("activeLiveStatus.partial_text", self.source)
+        self.assertIn("activeLiveStatus?.partial_text", self.source)
         for field in (
             "attempt_limit", "generated_tokens_approx", "live_tps", "average_tps",
         ):
@@ -285,8 +285,9 @@ class LlmChatUiLifecycleTests(unittest.TestCase):
         submit_end = self.source.index("const send = async () =>", submit_start)
         submit = self.source[submit_start:submit_end]
         guard = submit.index(
-            "if (interactionLocked || refusalLiteralSaveRef.current || !nextMessages.length) return"
+            "if (interactionLocked || refusalLiteralSaveRef.current || !nextMessages.length"
         )
+        self.assertIn("|| accountScope !== chatAccountScope()) return", submit)
         replacement = submit.index("setMessages(nextMessages)")
         before_replacement = submit[guard:replacement]
         self.assertNotIn("cancelActiveRefusalLiteralSave()", before_replacement)

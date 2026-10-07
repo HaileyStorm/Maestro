@@ -3984,6 +3984,9 @@ def load_model(
     global _runtime_abort_requested_at, _runtime_last_release
 
     provider = str(provider or "local").strip().lower()
+    if provider == "local" and not cpu_coexistence and str(device).lower() == "cuda":
+        from services.native_acceptance_reservation import reservation
+        reservation.require_model_admission()
     remote_url = str(remote_url or "").strip().rstrip("/")
     if cpu_coexistence and provider != "local":
         raise ValueError("CPU coexistence is available only for local LLMs")

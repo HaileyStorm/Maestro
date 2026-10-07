@@ -17,8 +17,13 @@ import unittest
 from unittest.mock import patch
 from urllib.parse import urlsplit
 
-
 ROOT = Path(__file__).resolve().parents[1]
+APP_ROOT = ROOT / "app"
+if str(APP_ROOT) not in sys.path:
+    sys.path.insert(0, str(APP_ROOT))
+
+from services import upload_usage
+
 LAUNCH_PATH = ROOT / "app" / "launch.py"
 APP_PATH = ROOT / "ui" / "src" / "App.tsx"
 CLIENT_PATH = ROOT / "ui" / "src" / "api" / "client.ts"
@@ -2725,6 +2730,7 @@ class LaunchSecurityContractTests(unittest.TestCase):
                 "Request": object,
                 "HTTPException": FakeHTTPException,
                 "asyncio": asyncio,
+                "upload_usage": upload_usage,
                 "threading": threading,
                 "uuid": __import__("uuid"),
                 "hmac": __import__("hmac"),
@@ -2879,6 +2885,7 @@ class LaunchSecurityContractTests(unittest.TestCase):
                 "Request": object,
                 "HTTPException": FakeHTTPException,
                 "asyncio": asyncio,
+                "upload_usage": upload_usage,
                 "threading": threading,
                 "uuid": __import__("uuid"),
                 "hmac": __import__("hmac"),

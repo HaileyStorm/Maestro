@@ -150,7 +150,9 @@ def _list_models_namespace(registry):
     )
     function = copy.deepcopy(function)
     function.decorator_list = []
-    module = ast.Module(body=[function], type_ignores=[])
+    retake_engines = next(node for node in tree.body
+                         if isinstance(node, ast.FunctionDef) and node.name == "_retake_engines_for_architecture")
+    module = ast.Module(body=[retake_engines, function], type_ignores=[])
     ast.fix_missing_locations(module)
 
     class _Updater:

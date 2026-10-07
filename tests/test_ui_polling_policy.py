@@ -192,8 +192,8 @@ class UiPollingStateTests(unittest.TestCase):
             self.assertIn(source_state, tracker)
 
         active_poll = STORE[
-            STORE.index("_pollRecoveredJob: (jobId, expectedWorkspace)"):
-            STORE.index("reconnectJobs: async", STORE.index("_pollRecoveredJob: (jobId, expectedWorkspace)"))
+            STORE.index("_pollRecoveredJob: (jobId, expectedWorkspace, pollQueuedFast = false)"):
+            STORE.index("reconnectJobs: async", STORE.index("_pollRecoveredJob: (jobId, expectedWorkspace, pollQueuedFast = false)"))
         ]
         self.assertIn("_activeOutputRefreshDue", active_poll)
         self.assertIn("document.removeEventListener('visibilitychange'", active_poll)
@@ -253,7 +253,7 @@ class UiPollingStateTests(unittest.TestCase):
         review = STORE[
             review_start:STORE.index("closeH3PlanReview: () =>", review_start)
         ]
-        recurring_start = STORE.index("_pollRecoveredJob: (jobId, expectedWorkspace) => {")
+        recurring_start = STORE.index("_pollRecoveredJob: (jobId, expectedWorkspace, pollQueuedFast = false) => {")
         recurring = STORE[
             recurring_start:STORE.index("reconnectJobs: async", recurring_start)
         ]
@@ -278,8 +278,8 @@ class UiPollingStateTests(unittest.TestCase):
         self.assertNotIn("const pollInterval = setInterval(async", STORE)
         self.assertNotIn("status.status === 'running') get().refreshOutputs()", STORE)
         self.assertEqual(
-            STORE.count("get()._pollRecoveredJob(result.job_id)"),
-            6,
+            STORE.count("get()._pollRecoveredJob(result.job_id"),
+            9,
         )
         director_start = STORE.index("directorGenerateStartImages: async")
         director_images = STORE[
@@ -288,7 +288,10 @@ class UiPollingStateTests(unittest.TestCase):
         self.assertIn("_waitForTerminalJobStatus(job_id, 600_000)", director_images)
         self.assertIn("get()._pollRecoveredJob(job_id)", director_images)
         self.assertNotIn("while (attempts <", director_images)
-        self.assertIn("_rejectTerminalJobWaiter(jobId, 'Generation cancelled')", STORE)
+        terminal = STORE[STORE.index("function _publishTerminalJobStatus("):STORE.index("function _rejectTerminalJobWaiter(")]
+        self.assertIn("status.status !== 'cancelled'", terminal)
+        self.assertIn("waiter.resolve(status)", terminal)
+        self.assertIn("_publishTerminalJobStatus(status)", recurring)
         self.assertIn("[..._recoveryJobPolls.values()]", STORE)
         self.assertIn("[..._terminalJobWaiters.keys()]", STORE)
 
@@ -303,8 +306,16 @@ class UiPollingStateTests(unittest.TestCase):
             {
                 "ui/src/api/client.ts": 1,
                 "ui/src/stores/useStore.ts": 5,
+                "ui/src/components/CompositionRecoveryStatus.tsx": 1,
             },
         )
+        composition = UI_SOURCES["ui/src/components/CompositionRecoveryStatus.tsx"]
+        review = composition[composition.index("const review = async () => {"):composition.index("const confirm = async")]
+        self.assertEqual(review.count("api.fetchJobStatus(jobId)"), 1)
+        self.assertIn("if (!current(epoch, generation)) return", review)
+        self.assertIn("job.created_at !== createdAt || job.workspace !== workspace", review)
+        self.assertNotIn("setTimeout", review)
+        self.assertNotIn("setInterval", review)
         references = UI_SOURCES[
             "ui/src/components/Sidebar/ProjectReferenceLibrary.tsx"
         ]

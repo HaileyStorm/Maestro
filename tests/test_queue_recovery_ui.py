@@ -193,7 +193,7 @@ class QueueRecoveryUiContracts(unittest.TestCase):
         # Existing cards merge against their prior state above; genuinely new
         # reconnect cards have no prior client state and map the server record.
         self.assertIn(".map(_newGenerationJobFromStatus)", new_jobs)
-        terminal_poll = source_slice(STORE, "_pollRecoveredJob: (jobId, expectedWorkspace)", "reconnectJobs: async")
+        terminal_poll = source_slice(STORE, "_pollRecoveredJob: (jobId, expectedWorkspace, pollQueuedFast = false)", "reconnectJobs: async")
         self.assertIn("_recoveryJobPolls.get(jobId)", terminal_poll)
         self.assertIn("api.fetchJobStatus(jobId)", terminal_poll)
         self.assertIn("status.status === 'completed'", terminal_poll)
@@ -205,7 +205,7 @@ class QueueRecoveryUiContracts(unittest.TestCase):
     def test_blocked_cards_use_only_server_actions_and_hide_generic_controls(self):
         placeholder = source_slice(MAIN, "function JobPlaceholder", "function queueSummaryLabel")
         queue_panel = source_slice(MAIN, "function QueuePanel", "function GalleryBulkToolbar")
-        self.assertIn("job.recoveryActions.map(action =>", placeholder)
+        self.assertIn("job.recoveryActions.filter(action => action !== 'recover_composition').map(action =>", placeholder)
         self.assertIn("Retry generation", placeholder)
         self.assertIn("job.recoveryActions?.includes('retry')", placeholder)
         self.assertNotIn("recoveryActionable ?", placeholder)

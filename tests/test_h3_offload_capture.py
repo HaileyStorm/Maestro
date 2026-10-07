@@ -241,6 +241,7 @@ class LaunchCaptureTests(unittest.TestCase):
             'Path': Path, '_app_dir': str(APP), 'job_id': 'profile-fixture', 'task_idx': 0,
             'worker_start_lock': threading.Lock(), 'worker_started': threading.Event(),
             'worker_start_state': {'cancelled': False},
+            'job': {'params': {}}, 'traceback': __import__('traceback'),
             'task_h3_turbo_validation_authorized': False,
             '_H3_LONG_STUDIO_MODELS': {'minimax_h3'},
             '_h3_model_is_resident': lambda model: True,

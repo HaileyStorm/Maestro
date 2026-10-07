@@ -27,6 +27,7 @@ from fastapi import HTTPException
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "app"))
+from services import upload_usage
 from services.queue_recovery_runtime import sha256_file
 from services.h3_bridge_plan import plan_h3_bridge
 from services.h3_bridge_media import SourceProbe
@@ -58,6 +59,7 @@ class H3BridgeRouteTests(unittest.TestCase):
             "Request": object,
             "HTTPException": HTTPException,
             "asyncio": asyncio,
+            "upload_usage": upload_usage,
             "os": os,
             "copy": copy,
             "hmac": hmac,

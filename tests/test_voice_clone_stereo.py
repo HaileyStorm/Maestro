@@ -17,6 +17,7 @@ from tqdm import tqdm
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
+import postprocessing
 from postprocessing.voice_clone import (
     _ffmpeg_demux_audio, _ffmpeg_remux_audio, _remix_vocals_with_background, apply_voice_clone_to_file,
     _convert_seedvc_with_cancellation, _VoiceCloneCancelled, _VoiceCloneCancellationUnavailable,
@@ -159,7 +160,8 @@ class VoiceCloneStereoTests(unittest.TestCase):
                         cancel_delivered = True
                         return True
                     return False
-                with patch.dict(sys.modules, {"postprocessing.seedvc": seedvc,
+                with patch.object(postprocessing, "seedvc", seedvc, create=True), \
+                        patch.dict(sys.modules, {"postprocessing.seedvc": seedvc,
                         "preprocessing.extract_vocals": separator}), \
                         patch("postprocessing.voice_clone._ffmpeg_demux_audio", side_effect=demux), \
                         patch("postprocessing.voice_clone.torchaudio.load", return_value=(torch.zeros((1, 100)), 100)), \
@@ -203,7 +205,8 @@ class VoiceCloneStereoTests(unittest.TestCase):
             seedvc.get_model = Mock(return_value=converter)
             separator = types.ModuleType("preprocessing.extract_vocals")
             separator.get_stems = Mock(return_value=("vocals.wav", "background.wav"))
-            with patch.dict(sys.modules, {"postprocessing.seedvc": seedvc,
+            with patch.object(postprocessing, "seedvc", seedvc, create=True), \
+                        patch.dict(sys.modules, {"postprocessing.seedvc": seedvc,
                     "preprocessing.extract_vocals": separator}), \
                     patch("postprocessing.voice_clone._ffmpeg_demux_audio", return_value=True), \
                     patch("postprocessing.voice_clone.torchaudio.load", return_value=(torch.zeros((1, 100)), 100)), \
@@ -276,7 +279,8 @@ class VoiceCloneStereoTests(unittest.TestCase):
                     return "ignored"
                 def remix(*_args):
                     self.assertIsNone(observations[-1])
-                with patch.dict(sys.modules, {"postprocessing.seedvc": seedvc,
+                with patch.object(postprocessing, "seedvc", seedvc, create=True), \
+                        patch.dict(sys.modules, {"postprocessing.seedvc": seedvc,
                         "preprocessing.extract_vocals": separator}), \
                         patch("postprocessing.voice_clone._ffmpeg_demux_audio", return_value=True), \
                         patch("postprocessing.voice_clone.torchaudio.load", return_value=(torch.zeros((1, 100)), 100)), \
@@ -395,7 +399,7 @@ class VoiceCloneStereoTests(unittest.TestCase):
             seedvc.get_model = Mock()
             separator = types.ModuleType("preprocessing.extract_vocals")
             separator.get_stems = get_stems
-            with patch.dict(sys.modules, {
+            with patch.object(postprocessing, "seedvc", seedvc, create=True), patch.dict(sys.modules, {
                 "postprocessing.seedvc": seedvc,
                 "preprocessing.extract_vocals": separator,
             }), patch("postprocessing.voice_clone._ffmpeg_demux_audio", return_value=True):
@@ -428,7 +432,7 @@ class VoiceCloneStereoTests(unittest.TestCase):
                     cfm=types.SimpleNamespace(estimator=torch.nn.Identity())))))
             separator = types.ModuleType("preprocessing.extract_vocals")
             separator.get_stems = Mock(side_effect=RuntimeError("unavailable"))
-            with patch.dict(sys.modules, {
+            with patch.object(postprocessing, "seedvc", seedvc, create=True), patch.dict(sys.modules, {
                 "postprocessing.seedvc": seedvc,
                 "preprocessing.extract_vocals": separator,
             }), patch("postprocessing.voice_clone._ffmpeg_demux_audio", return_value=True), \
@@ -441,6 +445,8 @@ class VoiceCloneStereoTests(unittest.TestCase):
                 )
 
             self.assertFalse(result)
+            self.assertTrue(cancelled, "The fake converter must run before cancellation")
+            seedvc.get_model.assert_called_once()
             remux.assert_not_called()
             self.assertEqual(video.read_bytes(), b"original")
 

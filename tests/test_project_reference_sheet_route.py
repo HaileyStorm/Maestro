@@ -119,6 +119,7 @@ def _load_route_symbols(namespace):
         "_public_manual_installation_manifest",
         "_compute_lora_id",
         "list_loras_details",
+        "_retake_engines_for_architecture",
         "list_models",
         "list_project_assets",
         "list_outputs",

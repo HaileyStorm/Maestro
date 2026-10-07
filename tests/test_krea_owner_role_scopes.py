@@ -157,7 +157,7 @@ class KreaActorLaunchWiringTests(unittest.TestCase):
 
     def test_main_generation_rejects_spoofed_authority_and_resolves_server_role(self):
         self.assertIn("_reject_client_krea_authority(body)", self.launch)
-        self.assertIn("_request_krea_principal_role(\n        request", self.launch)
+        self.assertRegex(self.launch, r"_request_krea_principal_role\(\s*request")
         self.assertIn(
             'principal = getattr(request.state, "maestro_account_principal", None)',
             self.launch,

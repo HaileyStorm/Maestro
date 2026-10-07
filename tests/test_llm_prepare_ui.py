@@ -541,7 +541,9 @@ class LlmPrepareClientContracts(unittest.TestCase):
         for block in (enhance, resume):
             self.assertIn("_enhancePromptEditGeneration", block)
             self.assertIn("get().params.prompt !== result.original", block)
-            self.assertIn("_enhanceSettingsFingerprint(get())", block)
+            fingerprint = ("_enhanceSettingsFingerprint(get(), h3)" if block is enhance else
+                           "_enhanceSettingsFingerprint(resultState, stored.engine === 'h3_rewriter', stored.h3DurationSeconds)")
+            self.assertIn(fingerprint, block)
             self.assertIn("_accountIdentityIsCurrent(accountIdentityEpoch)", block)
         self.assertLess(
             resume.index("await _enhanceFingerprintSalt()"),
@@ -575,8 +577,8 @@ class LlmPrepareClientContracts(unittest.TestCase):
         for identity in (
             "state.params.image_start",
             "state.params.image_refs",
-            "await _enhanceFileIdentity(startImage)",
-            "Promise.all(imageRefs.map(file => _enhanceFileIdentity(file)))",
+            "await _enhanceFileIdentity(startImage, h3 && !legacyH3)",
+            "Promise.all(imageRefs.map(file => _enhanceFileIdentity(file, h3 && !legacyH3)))",
             "file.name",
             "file.size",
             "file.type",

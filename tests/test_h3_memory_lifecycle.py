@@ -21,6 +21,7 @@ APP = ROOT / "app"
 if str(APP) not in sys.path:
     sys.path.insert(0, str(APP))
 
+from services.native_acceptance_reservation import Reservation
 from services.model_residency import (  # noqa: E402
     ModelResidencyError,
     ModelResidencyEvidenceStore,
@@ -1838,7 +1839,8 @@ class H3PrivateControlLoadBoundaryTests(unittest.TestCase):
             prefix.append(node)
             if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call) and getattr(node.value.func, "id", "") == "require_model_terms":
                 break
-        namespace = dict(_h3_control_checkpoint="not-an-absolute-existing-file",
+        namespace = dict(_native_acceptance=Reservation(),
+                         _h3_control_checkpoint="not-an-absolute-existing-file",
                          _h3_control_base_checkpoint="missing-original-shard", model_type="minimax_h3",
                          compile=[], args=SimpleNamespace(save_quantized=False),
                          server_config={"services": {}}, models_def={}, require_model_terms=Mock())

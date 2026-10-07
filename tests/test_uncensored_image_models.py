@@ -6,11 +6,14 @@ import copy
 import json
 from pathlib import Path
 import re
+import sys
 import tempfile
 import unittest
 
 
 _ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(_ROOT / "app"))
+from services.native_acceptance_reservation import Reservation
 _DEFAULTS = _ROOT / "app" / "defaults"
 _FLUX_MAIN = _ROOT / "app" / "models" / "flux" / "flux_main.py"
 _FLUX_HANDLER = _ROOT / "app" / "models" / "flux" / "flux_handler.py"
@@ -627,6 +630,7 @@ class TestLayeredKlein9BRegistry(unittest.TestCase):
         load_namespace = _load_functions(_WGP, {"load_models"})
         loader["get_local_model_filename"] = lambda _filename: None
         load_namespace.update({
+            "_native_acceptance": Reservation(),
             "server_config": {"services": {}},
             "require_model_terms": lambda *_args: None,
             "_require_manual_checkpoint_integrity": loader[
@@ -1185,6 +1189,7 @@ class TestLayeredKlein9BRegistry(unittest.TestCase):
 
         load_namespace = _load_functions(_WGP, {"load_models"})
         load_namespace.update({
+            "_native_acceptance": Reservation(),
             "server_config": {"services": {}},
             "require_model_terms": lambda *_args: None,
             "_require_manual_checkpoint_integrity": loader[

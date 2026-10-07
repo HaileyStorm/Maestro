@@ -118,9 +118,22 @@ def _load_functions(path: str, names: tuple[str, ...], namespace=None) -> dict:
     if len(selected) != len(names):
         found = {node.name for node in selected}
         raise AssertionError(f"Missing functions: {set(names) - found}")
+    loaded = dict(namespace or {})
+    if path == _LAUNCH_PATH and any(
+        isinstance(d, ast.Name) and d.id == "_upload_job_reader"
+        for node in selected for d in node.decorator_list
+    ):
+        from services import upload_usage
+        dependencies = {"_queue_recovery_file_values", "_upload_job_reader"}
+        selected = [node for node in tree.body if isinstance(node, ast.FunctionDef)
+                    and node.name in dependencies] + selected
+        keys = next(node.value for node in tree.body if isinstance(node, ast.Assign)
+                    and any(isinstance(t, ast.Name) and t.id == "_RECOVERABLE_INPUT_KEYS" for t in node.targets))
+        loaded.setdefault("_RECOVERABLE_INPUT_KEYS", eval(compile(ast.Expression(keys), "recovery-keys", "eval"),
+                                                        {"wgp": loaded.get("wgp", types.SimpleNamespace())}))
+        loaded["upload_usage"] = upload_usage
     module = ast.Module(body=selected, type_ignores=[])
     ast.fix_missing_locations(module)
-    loaded = dict(namespace or {})
     exec(compile(module, os.path.relpath(path, _ROOT), "exec"), loaded)
     return loaded
 

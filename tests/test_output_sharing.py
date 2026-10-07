@@ -20,13 +20,13 @@ from unittest import mock
 from fastapi import HTTPException
 from fastapi.responses import Response
 
-from app.services.output_access import OutputShareManager
-
-
 ROOT = Path(__file__).resolve().parents[1]
 APP_ROOT = ROOT / "app"
 if str(APP_ROOT) not in sys.path:
     sys.path.insert(0, str(APP_ROOT))
+
+from services import upload_usage
+from app.services.output_access import OutputShareManager
 
 
 class OutputShareManagerTests(unittest.TestCase):
@@ -237,6 +237,7 @@ class OutputShareRouteContractTests(unittest.TestCase):
             "Response": Response,
             "HTTPException": HTTPException,
             "asyncio": asyncio,
+            "upload_usage": upload_usage,
             "_materialize_output_share_snapshot": materialize,
             "_share_not_found": lambda: HTTPException(
                 status_code=404, detail="Shared output not found",
@@ -296,6 +297,7 @@ class OutputShareRouteContractTests(unittest.TestCase):
             "Response": Response,
             "HTTPException": HTTPException,
             "asyncio": asyncio,
+            "upload_usage": upload_usage,
             "_materialize_output_share_snapshot": materialize,
             "_share_not_found": lambda: HTTPException(
                 status_code=404, detail="Shared output not found",

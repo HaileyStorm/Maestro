@@ -59,7 +59,11 @@ process.stdout.write(JSON.stringify(cases.map(([name, payload, locked]) => [
             source.index("const enhanceBeforeGenerate"):
             source.index("stopGeneration: (jobId)")
         ]
-        self.assertEqual(generation.count("applyH3SegmentCeilingPolicy("), 1)
+        preparation = generation[generation.index("if (preparation) {"):generation.index("const holdForQueue = mode === 'queue'")]
+        legacy = generation[generation.index("const holdForQueue = mode === 'queue'"):]
+        self.assertEqual(preparation.count("applyH3SegmentCeilingPolicy("), 1)
+        self.assertIn("await _sendStudioSubmission(preparation)\n      return", preparation)
+        self.assertEqual(legacy.count("applyH3SegmentCeilingPolicy("), 1)
         self.assertNotIn("api.previewGenerationPlan(params)", generation)
         self.assertLess(
             generation.index("applyH3SegmentCeilingPolicy("),

@@ -34,6 +34,7 @@ from services.blend_plan import (  # noqa: E402
     rewrite_blend_sidecar,
 )
 from services.output_access import output_policy_from_request  # noqa: E402
+from services import upload_usage  # noqa: E402
 
 
 def _launch_tree() -> ast.Module:
@@ -48,8 +49,15 @@ def _function(tree: ast.AST, name: str) -> ast.FunctionDef | ast.AsyncFunctionDe
 
 
 def _load_function(name: str, namespace: dict):
-    node = _function(_launch_tree(), name)
-    module = ast.Module(body=[node], type_ignores=[])
+    tree = _launch_tree()
+    node = _function(tree, name)
+    nodes = [node]
+    if any(isinstance(d, ast.Name) and d.id == "_upload_job_reader" for d in node.decorator_list):
+        namespace["upload_usage"] = upload_usage
+        namespace.setdefault("_RECOVERABLE_INPUT_KEYS", _load_recoverable_input_keys())
+        nodes = [_function(tree, "_queue_recovery_file_values"),
+                 _function(tree, "_upload_job_reader"), node]
+    module = ast.Module(body=nodes, type_ignores=[])
     ast.fix_missing_locations(module)
     exec(compile(module, "app/launch.py", "exec"), namespace)  # noqa: S102 - isolated route seam
     return namespace[name]

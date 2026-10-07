@@ -1433,6 +1433,7 @@ class H3PromptRewriterChildTests(unittest.TestCase):
 
     def test_real_worker_rejects_unqualified_interpreter_without_model_stack(self):
         # The currently managed interpreter is deliberately NOT the isolated pin.
+        modules_before = set(sys.modules)
         with tempfile.TemporaryDirectory() as directory:
             worker = SOURCE.with_name("h3_prompt_rewriter_worker.py")
             exe = Path(sys.executable).resolve()
@@ -1451,7 +1452,7 @@ class H3PromptRewriterChildTests(unittest.TestCase):
             self.assertEqual(result["state"], "failed")
             self.assertNotIn("runtime", result)
             self.assertNotIn(directory, json.dumps(result))
-            self.assertNotIn("torch", sys.modules)
+            self.assertNotIn("torch", set(sys.modules) - modules_before)
 
 
 if __name__ == "__main__":

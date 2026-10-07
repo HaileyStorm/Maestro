@@ -758,6 +758,7 @@ print(json.dumps(diffusers_config_contract(Config().config), sort_keys=True))
                         "residency_key": {},
                         "residency_store": None,
                         "force_residency_reprofile": False,
+                        "h3_control_residency_identity": None,
                         "is_h3_load": True,
                         "offload_kwargs": {
                             "compile": failure == "compile",

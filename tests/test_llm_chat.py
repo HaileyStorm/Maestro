@@ -181,7 +181,9 @@ class ChatPolicyTests(unittest.TestCase):
 
         self.assertIn("pending.controller.abort()", adoption)
         self.assertIn("requestRef.current = null", adoption)
-        self.assertIn("setDraft('')", adoption)
+        self.assertIn("restoreDraft(activeWorkspace, nextProjectInstance, accountScope)", adoption)
+        self.assertIn("setDraft(restoredDraft.text)", adoption)
+        self.assertIn("setFreshImagesRequired(restoredDraft.requiresFreshImage)", adoption)
         self.assertIn("setUseGuide(false)", adoption)
         self.assertIn("setSelectedImages([])", adoption)
         self.assertGreaterEqual(source.count("pendingStillOwnsProject()"), 4)
@@ -619,6 +621,7 @@ def _launch_chat_namespace(**overrides):
     module = ast.Module(body=body, type_ignores=[])
     ast.fix_missing_locations(module)
     namespace = {
+        "_ensure_llm_chat_recovery_ready": lambda: None,
         "Request": object,
         "asyncio": asyncio,
         "hashlib": hashlib,
@@ -643,6 +646,7 @@ def _launch_chat_namespace(**overrides):
         ),
         "_resolve_llm_chat_images": lambda *_args: [],
         "_llm_operation_scope": lambda *_args: ("owner", "project"),
+        "_llm_chat_operation_scope": lambda *_args: ("owner", "project"),
         "_session_secret": lambda: b"test-session-secret",
         "_llm_chat_admission": threading.BoundedSemaphore(1),
         **overrides,
