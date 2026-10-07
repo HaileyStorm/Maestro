@@ -1101,6 +1101,7 @@ result={'pid':os.getpid(),'uid':os.getuid(),'start_ticks':int(f[19]),'exe':os.re
         layout = {"frame_directory": str(directory), "encoder_destination": str(destination)}
         # Seal both names before any mutation or encoder spawn.
         persist(identity, layout, None)
+        scratch.mkdir(mode=0o700, parents=True, exist_ok=True)
         directory.mkdir(mode=0o700)
         self._composition_prepared = (layout, persist, identity)
 

@@ -82,19 +82,23 @@ class CompositionProcessFenceTests(unittest.TestCase):
     def test_fixed_probe_matches_host_and_preparation_persists_before_mutation(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            client = FakeClient(root)
+            scratch = root / "scratch"
+            client = FakeClient(scratch)
             service = BlenderMCPService(client, root)
             seals = []
             def persist(identity, layout, encoder):
                 self.assertEqual(identity["pid"], os.getpid())
                 self.assertFalse(Path(layout["frame_directory"]).exists())
                 self.assertFalse(Path(layout["encoder_destination"]).exists())
+                self.assertFalse(scratch.exists())
                 self.assertIsNone(encoder)
                 self.assertTrue(all("scene_create" not in args.get("code", "") for _,args in client.calls))
                 seals.append((identity, layout))
             service.prepare_composition_segment(persist, cancelled=lambda: False)
             self.assertEqual(len(seals), 1)
             self.assertTrue(Path(seals[0][1]["frame_directory"]).is_dir())
+            if os.name == "posix":
+                self.assertEqual(scratch.stat().st_mode & 0o777, 0o700)
             changed = dict(seals[0][0], start_ticks=seals[0][0]["start_ticks"]+1)
             with self.assertRaises(BlenderMCPSecurityError):
                 service.composition_idle_probe(changed)
