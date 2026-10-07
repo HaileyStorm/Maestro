@@ -1268,7 +1268,8 @@ result={'pid':os.getpid(),'uid':os.getuid(),'start_ticks':int(f[19]),'exe':os.re
         response = self._call_upstream(
             RENDER_THUMBNAIL_TO_PATH,
             {"output_path": scratch_name},
-            retries=self.limits.max_retries,
+            # A lost response does not prove the native render failed. Keep
+            # its scratch evidence and let the owner reconcile before retrying.
             cancelled=cancelled,
         )
         result = self._extract_result(response, RENDER_THUMBNAIL_TO_PATH)

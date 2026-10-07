@@ -870,6 +870,27 @@ class TestBlenderMCPService(unittest.TestCase):
         self.assertEqual(existing.read_bytes(), b"keep")
         self.assertEqual(self.client.calls, [])
 
+    def test_render_preview_does_not_replay_after_ambiguous_transport_failure(self):
+        for error_type in (TimeoutError, ConnectionResetError):
+            with self.subTest(error=error_type.__name__):
+                class AmbiguousRenderClient(FakeClient):
+                    def call_tool(self, name, arguments, **kwargs):
+                        response = super().call_tool(name, arguments, **kwargs)
+                        if name == RENDER_THUMBNAIL_TO_PATH:
+                            # Native work can finish even when its response is lost.
+                            raise error_type("render response unavailable")
+                        return response
+
+                client = AmbiguousRenderClient(self.scratch)
+                destination = self.root / (error_type.__name__ + ".png")
+                service = BlenderMCPService(client, self.root, sleeper=lambda _: None)
+                with self.assertRaises(BlenderMCPToolError):
+                    service.render_preview({"output_path": destination})
+                renders = [args for name, args in client.calls if name == RENDER_THUMBNAIL_TO_PATH]
+                self.assertEqual(len(renders), 1)
+                self.assertFalse(destination.exists())
+                self.assertTrue((self.scratch / renders[0]["output_path"]).is_file())
+
     def test_render_preview_rejects_non_png_and_destination_race(self):
         class BadImageClient(FakeClient):
             def call_tool(self, name: str, arguments: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
