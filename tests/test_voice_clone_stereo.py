@@ -21,6 +21,7 @@ from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 import postprocessing
+from shared.utils.audio_backend_compat import ensure_legacy_audio_metadata
 from postprocessing.voice_clone import (
     _ffmpeg_demux_audio, _ffmpeg_remux_audio, _remix_vocals_with_background, apply_voice_clone_to_file,
     _convert_seedvc_with_cancellation, _VoiceCloneCancelled, _VoiceCloneCancellationUnavailable,
@@ -535,10 +536,13 @@ from unittest.mock import Mock
 source=Path(sys.argv[1]);tree=ast.parse(source.read_text())
 cls=next(n for n in tree.body if isinstance(n,ast.ClassDef) and n.name=='OptimizedPyannote31SpeakerSeparator')
 constructor=next(n for n in cls.body if isinstance(n,ast.FunctionDef) and n.name=='__init__')
+bootstrap=next(n for n in tree.body if isinstance(n,ast.Assign) and any(isinstance(t,ast.Name) and t.id=='app_root' for t in n.targets))
+bootstrap_if=next(n for n in tree.body if isinstance(n,ast.If) and 'app_root' in ast.unparse(n.test))
 model=Mock(side_effect=lambda path: Path(path).read_bytes());pipe=Mock()
 sys.modules['pyannote.audio']=types.SimpleNamespace(Model=types.SimpleNamespace(from_pretrained=model))
 sys.modules['pyannote.audio.pipelines']=types.SimpleNamespace(SpeakerDiarization=Mock(return_value=pipe))
-ns=dict(__file__=str(source),Path=Path,torch=types.SimpleNamespace(cuda=types.SimpleNamespace(is_available=lambda:False)),xprint=lambda *args:None)
+ns=dict(__file__=str(source),Path=Path,sys=sys,torch=types.SimpleNamespace(cuda=types.SimpleNamespace(is_available=lambda:False)),xprint=lambda *args:None)
+exec(compile(ast.Module(body=[bootstrap,bootstrap_if],type_ignores=[]),str(source),'exec'),ns)
 exec(compile(ast.Module(body=[constructor],type_ignores=[]),str(source),'exec'),ns)
 instance=types.SimpleNamespace();ns['__init__'](instance)
 assert instance.pipeline is pipe and model.call_count==2
@@ -551,6 +555,89 @@ assert instance.pipeline is pipe and model.call_count==2
             result = subprocess.run([sys.executable, "-I", "-S", "-c", script, str(source)],
                 cwd=temporary, capture_output=True, text=True, timeout=10)
             self.assertEqual(result.returncode, 0, result.stderr)
+
+
+class AudioMetadataCompatibilityTests(unittest.TestCase):
+    def test_native_apis_and_decoder_are_preserved_on_older_runtimes(self):
+        native = types.SimpleNamespace(AudioMetaData=object(), info=Mock(),
+                                       list_audio_backends=Mock(), load=Mock(), save=Mock())
+        original = vars(native).copy()
+        with patch.dict(sys.modules, {"torchaudio": native}):
+            ensure_legacy_audio_metadata()
+            ensure_legacy_audio_metadata()
+        self.assertEqual(vars(native), original)
+
+    def test_missing_metadata_reads_real_formats_and_preserves_existing_apis(self):
+        import soundfile as sf
+        import numpy as np
+        decoder = Mock()
+        native = types.SimpleNamespace(load=decoder)
+        with tempfile.TemporaryDirectory() as temporary, patch.dict(sys.modules, {"torchaudio": native}):
+            ensure_legacy_audio_metadata()
+            info_api = native.info
+            ensure_legacy_audio_metadata()
+            self.assertIs(native.info, info_api)
+            self.assertIs(native.load, decoder)
+            self.assertEqual(native.list_audio_backends(), ["soundfile"])
+            for extension, subtype, bits, encoding in (("wav", "PCM_16", 16, "PCM_S"),
+                    ("wav", "FLOAT", 32, "PCM_F"), ("flac", "PCM_24", 24, "FLAC")):
+                with self.subTest(extension=extension, subtype=subtype):
+                    path = Path(temporary) / (subtype + "." + extension)
+                    sf.write(path, np.zeros((320, 2)), 16000, subtype=subtype)
+                    info = native.info(path, backend="soundfile")
+                    self.assertEqual((info.sample_rate, info.num_frames, info.num_channels,
+                                      info.bits_per_sample, info.encoding), (16000, 320, 2, bits, encoding))
+            with self.assertRaises(ValueError):
+                native.info(path, backend="ffmpeg")
+            with self.assertRaises(RuntimeError):
+                native.info(Path(temporary) / "missing.wav")
+
+    def test_real_pyannote_import_duration_crop_and_stream_reads_on_cpu(self):
+        # This subprocess exercises the installed dependency, not an import stub.
+        script = """
+import sys,tempfile,io
+from pathlib import Path
+import numpy as np,soundfile as sf,torch,torchaudio
+sys.path.insert(0,sys.argv[1])
+from shared.utils.audio_backend_compat import ensure_legacy_audio_metadata
+original_load=torchaudio.load
+ensure_legacy_audio_metadata()
+assert torchaudio.load is original_load
+from pyannote.audio import Model
+from pyannote.audio.pipelines import SpeakerDiarization
+from pyannote.audio.core.io import Audio
+from pyannote.core import Segment
+assert not torch.cuda.is_available()
+with tempfile.TemporaryDirectory() as temporary:
+    path=Path(temporary)/'stereo.wav'
+    samples=np.stack([np.linspace(-.5,.5,16000),np.linspace(.5,-.5,16000)],axis=1).astype('float32')
+    sf.write(path,samples,16000,subtype='FLOAT')
+    audio=Audio()
+    assert audio.get_duration(path)==1
+    whole,rate=audio(path)
+    assert rate==16000 and whole.shape==(2,16000)
+    torch.testing.assert_close(whole,torch.from_numpy(samples.T))
+    cropped,rate=audio.crop(path,Segment(.25,.5))
+    assert rate==16000 and cropped.shape==(2,4000)
+    torch.testing.assert_close(cropped,whole[:,4000:8000])
+    stream=io.BytesIO(path.read_bytes())
+    assert audio.get_duration(stream)==1 and stream.tell()==0
+    streamed,rate=audio(stream)
+    torch.testing.assert_close(streamed,whole)
+    assert stream.tell()==0
+    cropped,rate=audio.crop(stream,Segment(.25,.5))
+    torch.testing.assert_close(cropped,whole[:,4000:8000])
+    assert stream.tell()==0
+    mono,_=Audio(mono='downmix')(path)
+    torch.testing.assert_close(mono,whole.mean(0,keepdim=True))
+import preprocessing.speakers_separator
+print('Actual CPU pyannote and direct separator import/audio I/O PASS')
+"""
+        environment = dict(os.environ, CUDA_VISIBLE_DEVICES="", HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1")
+        result = subprocess.run([sys.executable, "-c", script,
+            str(Path(__file__).resolve().parents[1] / "app")], env=environment,
+            capture_output=True, text=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
 
 if __name__ == "__main__":

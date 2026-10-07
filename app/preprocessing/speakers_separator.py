@@ -9,6 +9,14 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor
 import gc
 import logging
+import sys
+
+# Direct CLI execution starts with preprocessing/ rather than app/ on sys.path.
+app_root = str(Path(__file__).resolve().parents[1])
+if app_root not in sys.path:
+    sys.path.insert(0, app_root)
+from shared.utils.audio_backend_compat import ensure_legacy_audio_metadata
+ensure_legacy_audio_metadata()
 
 verbose_output = True
 
@@ -46,10 +54,6 @@ class OptimizedPyannote31SpeakerSeparator:
         """
         Initialize with Pyannote 3.1 pipeline with tunable VAD sensitivity.
         """
-        import sys
-        app_root = str(Path(__file__).resolve().parents[1])
-        if app_root not in sys.path:
-            sys.path.insert(0, app_root)
         from shared.utils import files_locator as fl
         embedding_path = fl.locate_file("pyannote/pyannote_model_wespeaker-voxceleb-resnet34-LM.bin")
         segmentation_path = fl.locate_file("pyannote/pytorch_model_segmentation-3.0.bin")

@@ -411,6 +411,8 @@ def get_diarizer_pipeline(profile: str = "speech"):
 
     try:
         import torch
+        from shared.utils.audio_backend_compat import ensure_legacy_audio_metadata
+        ensure_legacy_audio_metadata()
     except ImportError as e:
         print(f"[Diarization] Skipped (missing dependency): {e}")
         return None
