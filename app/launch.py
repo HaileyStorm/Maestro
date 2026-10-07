@@ -77361,7 +77361,21 @@ def _public_queue_recovery_metadata(job: dict) -> dict:
             recovery_reruns_denoise=eligible,
         )
     composition = (job.get("recovery_cursor") or {}).get("composition")
+    validated_composition_hold = (
+        job.get("kind") == "tool_editor_export"
+        and isinstance(composition, dict)
+        and job.get("status") == "queued" and job.get("queue_held") is True
+        and not blocked
+        and (not state or (state in {"interrupted", "restored"}
+                           and job.get("_recovery_worker_pending") is True))
+    )
+    if validated_composition_hold and state == "interrupted":
+        # Materialization verified the original request and native receipts and
+        # retained exactly one worker obligation for the explicit manual hold.
+        # Keep ordinary Resume/Start next visible; no new recovery is required.
+        public.update(recovery_state="restored", recovery_interrupted=False)
     if (job.get("kind") == "tool_editor_export" and isinstance(composition, dict)
+            and not validated_composition_hold
             and reason != "worker_start_failed"
             and not job.get("cancel_requested") and job.get("status") != "cancelled"
             and (job.get("status") == "failed" or (job.get("status") == "queued" and job.get("queue_held")))

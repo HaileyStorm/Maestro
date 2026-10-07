@@ -844,6 +844,24 @@ class BlenderEditorCompositionQueueTests(unittest.TestCase):
             self.assertTrue(restored['queue_held'])
             self.assertEqual(Boundary.invocations, [])
             self.assertEqual(NativeSlot.admissions, 0)
+            functions(ns, ['_public_queue_recovery_metadata'])
+            ns.update(_queue_recovery_reason_code=lambda current: current.get('_recovery_reason_code'),
+                _queue_recovery_attempt=lambda current: current.get('recovery_attempt', 0),
+                MAX_RECOVERY_ATTEMPTS=3, _QUEUE_RECOVERY_REASON_TEXT={})
+            # This verified manual hold already owns a single worker obligation.
+            # The live Queue must expose ordinary Start next/Resume controls.
+            public = ns['_public_queue_recovery_metadata'](restored)
+            self.assertFalse(public['recovery_blocked'])
+            self.assertFalse(public['recovery_interrupted'])
+            self.assertEqual(public['recovery_state'], 'restored')
+            self.assertEqual(public['recovery_actions'], [])
+            self.assertEqual(restored['recovery_state'], 'interrupted')
+            unverified = dict(restored)
+            unverified.pop('_recovery_worker_pending')
+            self.assertTrue(ns['_public_queue_recovery_metadata'](unverified)['recovery_blocked'])
+            blocked = dict(restored, recovery_state='blocked')
+            self.assertEqual(ns['_public_queue_recovery_metadata'](blocked)['recovery_actions'],
+                ['recover_composition'])
             ns.update(validate_manifest_inputs=validate_manifest_inputs,
                 _queue_recovery_manifest_validator=lambda _: True,
                 _queue_recovery_is_blocked=lambda current: current.get('recovery_state') == 'blocked',
