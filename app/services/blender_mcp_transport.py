@@ -50,8 +50,10 @@ except ModuleNotFoundError:  # launch.py runs with app/ as cwd + sys.path root
 
 try:
     from app.services.blender_native_fence import fence as _native_fence, BlenderNativeUnresolved
+    from app.services.native_acceptance_reservation import prepare_stdio_ownership, finish_stdio_ownership
 except ModuleNotFoundError:
     from services.blender_native_fence import fence as _native_fence, BlenderNativeUnresolved
+    from services.native_acceptance_reservation import prepare_stdio_ownership, finish_stdio_ownership
 
 
 def _native_identity_probe_code(token=""):
@@ -132,6 +134,7 @@ class StdioBlenderMCPClient:
         self._native_identity = None
         self._native_incarnation = None
         self._expected_binary = None
+        self._stdio_ownership = None
 
         self._requests: queue.Queue[_ToolRequest | None] = queue.Queue()
         self._ready = threading.Event()
@@ -245,6 +248,10 @@ class StdioBlenderMCPClient:
             if not self._stopping:
                 self._startup_error = exc
         finally:
+            try:
+                finish_stdio_ownership(self._stdio_ownership)
+            except Exception as exc:
+                self._startup_error = exc
             self._attestation = None
             self._ready.set()
             self._fail_pending_requests()
@@ -297,9 +304,10 @@ class StdioBlenderMCPClient:
                 "PYTHONPATH": str(self.checkout_root / "mcp"),
             }
         )
+        owned_args, self._stdio_ownership = prepare_stdio_ownership(self.args)
         parameters = server_parameters(
             command=str(self.command),
-            args=list(self.args),
+            args=list(owned_args),
             env=env,
         )
         async with stdio_client(parameters) as (read_stream, write_stream):  # noqa: SIM117

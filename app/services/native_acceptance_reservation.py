@@ -16,6 +16,7 @@ import stat
 import threading
 import time
 import weakref
+import uuid
 
 
 class NativeAcceptanceReserved(RuntimeError):
@@ -296,6 +297,140 @@ def _load_startup_plan():
 
 
 _PLAN, _PLAN_PATH, _PLAN_HASH = _load_startup_plan()
+
+
+def _stdio_record(path, value):
+    # Linux acceptance records become visible only after complete durable
+    # publication. RENAME_NOREPLACE preserves the once-only protocol.
+    import ctypes
+    temporary = path.with_name("." + path.name + "." + uuid.uuid4().hex)
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        with os.fdopen(fd, "w") as handle:
+            json.dump(value, handle, sort_keys=True, allow_nan=False)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        call = ctypes.CDLL(None, use_errno=True).renameat2
+        call.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+        call.restype = ctypes.c_int
+        if call(-100, os.fsencode(temporary), -100, os.fsencode(path), 1) != 0:
+            raise OSError(ctypes.get_errno(), "SDK ownership publication failed")
+    finally:
+        temporary.unlink(missing_ok=True)
+    fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _read_stdio_record(path):
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as handle:
+        info = os.fstat(handle.fileno())
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o600):
+            raise NativeAcceptanceReserved("Invalid SDK ownership record")
+        raw = handle.read(8193)
+    if len(raw) > 8192:
+        raise NativeAcceptanceReserved("Oversized SDK ownership record")
+    return json.loads(raw)
+
+
+def prepare_stdio_ownership(args):
+    """Fence a configured acceptance SDK spawn before it can leave our SID.
+
+    An unresolved intent is deliberately retained after a spawn error or parent
+    crash. The guardian must resolve/drain it before withdrawing GPU authority.
+    Ordinary clients retain their exact argv and create no ownership records.
+    """
+    if _PLAN is None:
+        return args, None
+    args = tuple(args)
+    if len(args) < 2 or args[0] != "-c" or type(args[1]) is not str:
+        raise NativeAcceptanceReserved("Invalid native acceptance SDK bootstrap")
+    root = _PLAN_PATH.parent / "stdio"
+    root.mkdir(mode=0o700, exist_ok=True)
+    info = root.lstat()
+    if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid()
+            or stat.S_IMODE(info.st_mode) != 0o700):
+        raise NativeAcceptanceReserved("Invalid native acceptance SDK directory")
+    entry = root / uuid.uuid4().hex
+    entry.mkdir(mode=0o700)
+    fields = Path("/proc/self/stat").read_text().rsplit(")", 1)[1].split()
+    intent = {"schema": "maestro/native-acceptance-stdio/v1", "id": entry.name,
+        "request": _PLAN["guardian_request"], "plan_sha256": _PLAN_HASH,
+        "parent_pid": os.getpid(), "parent_start_ticks": fields[19],
+        "bootstrap_sha256": hashlib.sha256(args[1].encode()).hexdigest()}
+    # The child records its birth before importing any MCP/application code and
+    # waits for the guardian to bind its pidfd. This also covers SDK setsid→exec.
+    prefix = f'''import ctypes,json,os,stat,time,uuid
+from pathlib import Path
+_entry = Path({str(entry)!r})
+_intent = {intent!r}
+_fields = Path('/proc/self/stat').read_text().rsplit(')',1)[1].split()
+_child = {{**_intent, 'pid':os.getpid(), 'start_ticks':_fields[19],
+    'sid':int(_fields[3]), 'uid':os.getuid(), 'exe':os.readlink('/proc/self/exe')}}
+_temporary=_entry/('.child.'+uuid.uuid4().hex)
+_fd=os.open(_temporary,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+with os.fdopen(_fd,'w') as _file:
+    json.dump(_child,_file,sort_keys=True); _file.write('\\n'); _file.flush(); os.fsync(_file.fileno())
+_rename=ctypes.CDLL(None,use_errno=True).renameat2
+_rename.argtypes=[ctypes.c_int,ctypes.c_char_p,ctypes.c_int,ctypes.c_char_p,ctypes.c_uint]
+_rename.restype=ctypes.c_int
+if _rename(-100,os.fsencode(_temporary),-100,os.fsencode(_entry/'child.json'),1)!=0:
+    raise OSError(ctypes.get_errno(),'SDK child publication failed')
+_fd=os.open(_entry,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+os.fsync(_fd); os.close(_fd)
+_deadline=time.monotonic()+30
+while True:
+    try:
+        _fd=os.open(_entry/'ack.json',os.O_RDONLY|os.O_NOFOLLOW)
+    except FileNotFoundError:
+        if time.monotonic()>=_deadline: raise RuntimeError('SDK ownership was not acknowledged')
+        time.sleep(.05); continue
+    with os.fdopen(_fd,'rb') as _file:
+        _info=os.fstat(_file.fileno()); _raw=_file.read(8193)
+    if (_info.st_uid!=os.getuid() or stat.S_IMODE(_info.st_mode)!=0o600
+            or not stat.S_ISREG(_info.st_mode) or _info.st_nlink!=1
+            or len(_raw)>8192 or json.loads(_raw)!=_child):
+        raise RuntimeError('SDK ownership acknowledgment changed')
+    break
+'''
+    owned_args = (args[0], prefix + args[1], *args[2:])
+    # Keep the argv hash outside the embedded prefix to avoid a circular hash.
+    # The guardian validates it against the actual process argv independently.
+    intent["argv_sha256"] = digest(list(owned_args))
+    _stdio_record(entry / "intent.json", intent)
+    return owned_args, entry
+
+
+def finish_stdio_ownership(entry):
+    """Record SDK exit only after its exact child birth is independently absent."""
+    if entry is None:
+        return
+    try:
+        child = _read_stdio_record(entry / "child.json")
+    except FileNotFoundError:
+        return  # Pre-spawn/crash ambiguity remains unresolved.
+    intent = _read_stdio_record(entry / "intent.json")
+    identity = {key: value for key, value in intent.items() if key != "argv_sha256"}
+    process_keys = {"pid", "start_ticks", "sid", "uid", "exe"}
+    if (set(child) != set(identity) | process_keys
+            or any(child[key] != value for key, value in identity.items())
+            or type(child["pid"]) is not int or child["pid"] <= 1
+            or child["sid"] != child["pid"] or child["uid"] != os.getuid()
+            or type(child["start_ticks"]) is not str or not child["start_ticks"].isdigit()):
+        raise NativeAcceptanceReserved("SDK child ownership changed")
+    try:
+        fields = (Path("/proc") / str(child["pid"]) / "stat").read_text().rsplit(")", 1)[1].split()
+    except FileNotFoundError:
+        pass
+    else:
+        if fields[19] == child["start_ticks"] and fields[0] not in {"Z", "X"}:
+            return
+    _stdio_record(entry / "closed.json", child)
 
 
 def _guardian_ready():

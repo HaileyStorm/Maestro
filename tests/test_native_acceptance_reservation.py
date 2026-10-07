@@ -457,5 +457,163 @@ class WorkerDelegationTests(unittest.TestCase):
             self.assertEqual(calls, [])
 
 
+@unittest.skipUnless(sys.platform.startswith('linux'), 'Linux acceptance-only SDK ownership')
+class StdioOwnershipTests(unittest.TestCase):
+    def setUp(self):
+        from services import native_acceptance_reservation as module
+        self.module = module
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.patches = [patch.object(module, '_PLAN', {'guardian_request': 'cpu-ownership-fixture'}),
+            patch.object(module, '_PLAN_PATH', self.root / 'plan.json'),
+            patch.object(module, '_PLAN_HASH', 'a' * 64)]
+        for item in self.patches:
+            item.start()
+
+    def tearDown(self):
+        for item in reversed(self.patches):
+            item.stop()
+        self.temp.cleanup()
+
+    def wait_file(self, path, process=None):
+        deadline = time.monotonic() + 5
+        while not path.exists():
+            if process is not None and process.poll() is not None:
+                self.fail('CPU child exited before publishing ownership')
+            if time.monotonic() >= deadline:
+                self.fail('CPU ownership deadline')
+            time.sleep(.01)
+        return json.loads(path.read_text())
+
+    def pidfd_open(self, pid):
+        # Pinokio's Python builds omit these wrappers; glibc exposes the same
+        # kernel process handles without falling back to a reusable numeric PID.
+        import ctypes
+        libc = ctypes.CDLL(None, use_errno=True)
+        call = libc.pidfd_open
+        call.argtypes = [ctypes.c_int, ctypes.c_uint]
+        call.restype = ctypes.c_int
+        result = call(pid, 0)
+        if result < 0:
+            raise OSError(ctypes.get_errno(), 'pidfd_open')
+        return result
+
+    def pidfd_kill(self, descriptor):
+        import ctypes, signal
+        call = ctypes.CDLL(None, use_errno=True).pidfd_send_signal
+        call.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint]
+        call.restype = ctypes.c_int
+        if call(descriptor, signal.SIGKILL, None, 0) < 0:
+            raise OSError(ctypes.get_errno(), 'pidfd_send_signal')
+
+    def test_unconfigured_spawn_keeps_original_arguments_and_creates_no_records(self):
+        args = ('-c', 'raise SystemExit(0)', '--transport', 'stdio')
+        with patch.object(self.module, '_PLAN', None):
+            actual, entry = self.module.prepare_stdio_ownership(args)
+        self.assertIs(actual, args)
+        self.assertIsNone(entry)
+        self.assertFalse((self.root / 'stdio').exists())
+
+    def test_duplicate_publication_and_invalid_exit_evidence_preserve_original(self):
+        args, entry = self.module.prepare_stdio_ownership(('-c', 'pass'))
+        intent = self.module._read_stdio_record(entry / 'intent.json')
+        with self.assertRaises(FileExistsError):
+            self.module._stdio_record(entry / 'intent.json', {'replacement': True})
+        self.assertEqual(self.module._read_stdio_record(entry / 'intent.json'), intent)
+        # A dead numeric PID alone cannot turn an unrelated receipt into closure.
+        unrelated = {**intent, 'id': 'other-launch', 'pid': 2147483647,
+            'sid': 2147483647, 'start_ticks': '1', 'uid': os.getuid(), 'exe': sys.executable}
+        unrelated.pop('argv_sha256')
+        self.module._stdio_record(entry / 'child.json', unrelated)
+        with self.assertRaises(self.module.NativeAcceptanceReserved):
+            self.module.finish_stdio_ownership(entry)
+        self.assertFalse((entry / 'closed.json').exists())
+        (entry / 'child.json').unlink()
+        (entry / 'child.json').symlink_to(entry / 'intent.json')
+        with self.assertRaises(OSError):
+            self.module.finish_stdio_ownership(entry)
+        self.assertFalse((entry / 'closed.json').exists())
+
+    def test_real_child_requires_exact_ack_before_application_contact_and_exit(self):
+        for valid in (True, False):
+            with self.subTest(valid=valid):
+                contact = self.root / ('contact-' + str(valid))
+                args, entry = self.module.prepare_stdio_ownership(
+                    ('-c', 'from pathlib import Path; Path(' + repr(str(contact)) + ').touch()'))
+                intent = json.loads((entry / 'intent.json').read_text())
+                self.assertEqual(intent['argv_sha256'], self.module.digest(list(args)))
+                child = subprocess.Popen([sys.executable, *args], start_new_session=True,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                try:
+                    receipt = self.wait_file(entry / 'child.json', child)
+                    self.assertEqual((receipt['pid'], receipt['sid']), (child.pid, child.pid))
+                    self.module.finish_stdio_ownership(entry)
+                    self.assertFalse((entry / 'closed.json').exists())
+                    self.assertFalse(contact.exists())
+                    ack = dict(receipt)
+                    if not valid:
+                        ack['start_ticks'] = 'wrong-birth'
+                    self.module._stdio_record(entry / 'ack.json', ack)
+                    self.assertEqual(child.wait(timeout=5), 0 if valid else 1)
+                    self.assertEqual(contact.exists(), valid)
+                    self.module.finish_stdio_ownership(entry)
+                    self.assertEqual(json.loads((entry / 'closed.json').read_text()), receipt)
+                finally:
+                    if child.poll() is None:
+                        child.kill(); child.wait(timeout=5)
+
+    def test_parent_death_between_setsid_and_exec_preserves_unresolved_intent(self):
+        # A real SDK-shaped POSIX launch pauses after setsid but before exec.
+        # Killing the parent leaves the child outside its SID, without marked
+        # argv yet. The pre-spawn intent must survive that exact race.
+        contact = self.root / 'orphan-contact'
+        event = self.root / 'pre-exec.json'
+        script = '''import os,json,subprocess,sys,time
+from pathlib import Path
+sys.path.insert(0,sys.argv[1])
+from services import native_acceptance_reservation as m
+root=Path(sys.argv[2]); m._PLAN={'guardian_request':'cpu-ownership-fixture'}
+m._PLAN_PATH=root/'plan.json'; m._PLAN_HASH='a'*64
+args,entry=m.prepare_stdio_ownership(('-c','from pathlib import Path; Path('+repr(str(root/'orphan-contact'))+').touch()'))
+def pause():
+    fields=Path('/proc/self/stat').read_text().rsplit(')',1)[1].split()
+    m._stdio_record(root/'pre-exec.json',{'pid':os.getpid(),'sid':os.getsid(0),'start_ticks':fields[19]})
+    time.sleep(1)
+subprocess.Popen([sys.executable,*args],start_new_session=True,preexec_fn=pause,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+time.sleep(30)
+'''
+        parent = subprocess.Popen([sys.executable, '-c', script,
+            str(Path(__file__).resolve().parents[1] / 'app'), str(self.root)],
+            start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        orphan_fd = None
+        try:
+            value = self.wait_file(event, parent)
+            self.assertEqual(value['pid'], value['sid'])
+            self.assertNotEqual(value['sid'], parent.pid)
+            orphan_fd = self.pidfd_open(value['pid'])
+            entry, = (self.root / 'stdio').iterdir()
+            self.assertTrue((entry / 'intent.json').is_file())
+            self.assertFalse((entry / 'child.json').exists())
+            parent.kill(); parent.wait(timeout=5)
+            self.module.finish_stdio_ownership(entry)
+            self.assertFalse((entry / 'closed.json').exists())
+            receipt = self.wait_file(entry / 'child.json')
+            self.assertEqual((receipt['pid'], receipt['start_ticks']),
+                (value['pid'], value['start_ticks']))
+            self.assertFalse(contact.exists())
+            self.assertFalse((entry / 'ack.json').exists())
+        finally:
+            if parent.poll() is None:
+                parent.kill(); parent.wait(timeout=5)
+            if orphan_fd is not None:
+                import select
+                self.pidfd_kill(orphan_fd)
+                self.assertTrue(select.select([orphan_fd], [], [], 5)[0])
+                os.close(orphan_fd)
+        self.module.finish_stdio_ownership(entry)
+        self.assertTrue((entry / 'closed.json').is_file())
+        self.assertFalse(contact.exists())
+
+
 if __name__ == "__main__":
     unittest.main()
