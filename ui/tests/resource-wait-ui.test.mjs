@@ -2008,6 +2008,22 @@ test('failed-card retry follows current project permissions and the advertised a
   assert.equal(retries(withoutRetry).length, 0)
   assert.equal(openGenerate(withoutRetry).length, 0)
   assert.equal(retries(renderCard({ status: 'cancelled' })).length, 0)
+  for (const recoveryState of ['interrupted', 'restored', 'retrying', 'blocked']) {
+    const cancelled = renderCard({
+      status: 'cancelled', recoveryState, recoveryInterrupted: true,
+      recoveryBlocked: true, recoveryActionable: true,
+      recoveryActions: ['resume', 'retry'], queueWaitReason: 'registering',
+      recoveryReasonText: 'Old recovery instruction',
+    })
+    assert.match(elementText(cancelled), /This generation was cancelled\./)
+    assert.doesNotMatch(elementText(cancelled), /Interrupted|Restored|Recovery|Adding to the queue|Overall ETA|Old recovery instruction/)
+    const actionLabels = flattenElements(cancelled)
+      .filter(element => element.type === 'button').map(elementText)
+    assert.ok(!actionLabels.some(label => /Stop|Retry|Resume/.test(label)), 'cached recovery cannot revive cancelled work')
+    assert.equal(flattenElements(cancelled).filter(element => (
+      element.type === 'button' && element.props['aria-label'] === 'Dismiss generation'
+    )).length, 1, 'the retained terminal card remains dismissible')
+  }
   const blocked = renderCard({ recoveryState: 'blocked', recoveryBlocked: true })
   assert.equal(retries(blocked).length, 0)
   assert.equal(flattenElements(blocked).filter(element => (

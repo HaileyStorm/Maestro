@@ -1396,10 +1396,12 @@ function JobPlaceholder({
     ? h3QueuedRuntime(job)
     : null
   const phase = stripTimeSuffix(job.phase || job.message)
-  const recoveryState = job.recoveryState
-  const recoveryBlocked = job.recoveryBlocked === true
+  // Saved terminal cards may retain recovery metadata from before cancellation.
+  // Cancellation always wins over that earlier notice and its active controls.
+  const recoveryState = job.status === 'cancelled' ? 'cancelled' : job.recoveryState
+  const recoveryBlocked = job.status !== 'cancelled' && job.recoveryBlocked === true
   const showRestoredNotice = job.status !== 'running' && recoveryState === 'restored'
-  const showInterruptedNotice = job.status !== 'running' && (
+  const showInterruptedNotice = job.status !== 'running' && job.status !== 'cancelled' && (
     recoveryState === 'interrupted' || job.recoveryInterrupted === true
   )
   const recoveryNotice = recoveryBlocked
