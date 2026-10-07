@@ -9,6 +9,7 @@ import ipaddress
 import json
 import os
 import queue
+import importlib.util
 import subprocess
 import sys
 import tempfile
@@ -18,13 +19,14 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 try:  # package import in tests / repository-root execution
     from app.services.blender_mcp_service import (
         EXECUTE_BLENDER_CODE,
         GET_OBJECTS_SUMMARY,
         PINNED_INSTALL,
+        RENDER_THUMBNAIL_TO_PATH,
         UPSTREAM_TOOL_ALLOWLIST,
         BlenderMCPCancelled,
         BlenderMCPError,
@@ -37,6 +39,7 @@ except ModuleNotFoundError:  # launch.py runs with app/ as cwd + sys.path root
         EXECUTE_BLENDER_CODE,
         GET_OBJECTS_SUMMARY,
         PINNED_INSTALL,
+        RENDER_THUMBNAIL_TO_PATH,
         UPSTREAM_TOOL_ALLOWLIST,
         BlenderMCPCancelled,
         BlenderMCPError,
@@ -44,6 +47,36 @@ except ModuleNotFoundError:  # launch.py runs with app/ as cwd + sys.path root
         BlenderMCPToolError,
         _version_tuple,
     )
+
+try:
+    from app.services.blender_native_fence import fence as _native_fence, BlenderNativeUnresolved
+except ModuleNotFoundError:
+    from services.blender_native_fence import fence as _native_fence, BlenderNativeUnresolved
+
+
+def _native_identity_probe_code(token=""):
+    # sys.modules survives loading another .blend; driver_namespace does not.
+    return (
+        "# Maestro native process/idle proof v1\n"
+        "import bpy, os, sys, types, uuid\n"
+        "_instance = sys.modules.get('_maestro_native_instance')\n"
+        "if _instance is None:\n"
+        "    _instance = types.ModuleType('_maestro_native_instance')\n"
+        "    _instance.incarnation = uuid.uuid4().hex\n"
+        "    sys.modules['_maestro_native_instance'] = _instance\n"
+        "result = {'status': 'ok', 'pid': os.getpid(), "
+        "'incarnation': _instance.incarnation, "
+        "'render_running': bpy.app.is_job_running('RENDER'), "
+        f"'token': {token!r}}}\n"
+    )
+
+
+class _ThumbnailParams(NamedTuple):
+    output_path: str
+
+    def __repr__(self):
+        # The pinned template defines Params with this exact field.
+        return f"Params(output_path={self.output_path!r})"
 
 
 @dataclass
@@ -68,6 +101,7 @@ class StdioBlenderMCPClient:
         bridge_port: int = PINNED_INSTALL.bridge_port,
         scratch_root: str | os.PathLike[str] | None = None,
         request_timeout_seconds: float = 300.0,
+        native_fence=None,
     ) -> None:
         self.checkout_root = Path(checkout_root).expanduser().resolve()
         # Keep the lexical venv entry point. Resolving it can collapse a
@@ -94,6 +128,10 @@ class StdioBlenderMCPClient:
         if not 1 <= float(request_timeout_seconds) <= 3600:
             raise ValueError("request_timeout_seconds must be between 1 and 3600")
         self.request_timeout_seconds = float(request_timeout_seconds)
+        self._native_fence = native_fence if native_fence is not None else _native_fence
+        self._native_identity = None
+        self._native_incarnation = None
+        self._expected_binary = None
 
         self._requests: queue.Queue[_ToolRequest | None] = queue.Queue()
         self._ready = threading.Event()
@@ -117,6 +155,7 @@ class StdioBlenderMCPClient:
                 return dict(self._attestation)
             self._validate_launcher_facts()
             self._verify_checkout()
+            self._native_fence.require_idle()
             self._requests = queue.Queue()
             self._ready.clear()
             self._startup_error = None
@@ -292,6 +331,20 @@ class StdioBlenderMCPClient:
                     await session.call_tool(GET_OBJECTS_SUMMARY, {}),
                 )
                 self._assert_probe_ok(probe)
+                identity_probe = self._decode_call_result(
+                    EXECUTE_BLENDER_CODE,
+                    await session.call_tool(EXECUTE_BLENDER_CODE,
+                        {"code": _native_identity_probe_code()}),
+                )
+                native = self._native_probe_result(identity_probe, "")
+                identity = self._native_fence._process_reader(native["pid"])
+                owner = self._native_fence._process_reader(os.getpid())
+                if (identity is None or self._expected_binary is None
+                        or Path(identity["exe"]).resolve() != self._expected_binary
+                        or owner is None or identity["owner"] != owner["owner"]):
+                    raise BlenderMCPSecurityError("Blender native process identity did not match")
+                self._native_identity = identity
+                self._native_incarnation = native["incarnation"]
                 if not self._scratch_root_explicit:
                     scratch_probe = self._decode_call_result(
                         EXECUTE_BLENDER_CODE,
@@ -332,15 +385,40 @@ class StdioBlenderMCPClient:
                     request = await asyncio.to_thread(self._requests.get)
                     if request is None:
                         return
-                    task = asyncio.create_task(
-                        session.call_tool(request.name, request.arguments)
-                    )
-                    while not task.done():
-                        if request.cancel.is_set():
-                            task.cancel()
-                            break
-                        await asyncio.sleep(0.05)
                     if request.cancel.is_set():
+                        request.result.cancel()
+                        continue
+                    mutating = request.name in {EXECUTE_BLENDER_CODE, RENDER_THUMBNAIL_TO_PATH}
+                    token = None
+                    try:
+                        if mutating:
+                            dispatch_name, dispatch_arguments = self._guarded_native_command(
+                                request.name, request.arguments)
+                            token = self._native_fence.begin(self._native_identity,
+                                self._native_incarnation, request.name, request.arguments)
+                        else:
+                            dispatch_name, dispatch_arguments = request.name, request.arguments
+                    except Exception as exc:
+                        request.result.set_exception(exc)
+                        continue
+                    task = asyncio.create_task(
+                        session.call_tool(dispatch_name, dispatch_arguments)
+                    )
+                    try:
+                        while not task.done():
+                            if request.cancel.is_set() and not mutating:
+                                task.cancel()
+                                break
+                            await asyncio.sleep(0.05)
+                    except asyncio.CancelledError:
+                        # Reap the SDK task, retaining the native-operation fence.
+                        task.cancel()
+                        try:
+                            await task
+                        except BaseException:
+                            pass
+                        raise
+                    if request.cancel.is_set() and not mutating:
                         try:
                             await task
                         except asyncio.CancelledError:
@@ -348,10 +426,33 @@ class StdioBlenderMCPClient:
                         request.result.cancel()
                         continue
                     try:
-                        request.result.set_result(
-                            self._decode_call_result(request.name, await task)
-                        )
+                        response = self._decode_call_result(request.name, await task)
+                        if token is not None:
+                            # A real terminal response must precede this private barrier.
+                            # Never run it to reconcile a timeout or lost response.
+                            self._assert_native_terminal(response)
+                            settled = self._decode_call_result(EXECUTE_BLENDER_CODE,
+                                await session.call_tool(EXECUTE_BLENDER_CODE,
+                                    {"code": _native_identity_probe_code(token)}))
+                            native = self._native_probe_result(settled, token)
+                            if (native["pid"] != self._native_identity["pid"]
+                                    or native["incarnation"] != self._native_incarnation):
+                                raise BlenderMCPSecurityError("Blender native incarnation changed")
+                            self._native_fence.completed(token, self._native_identity,
+                                self._native_incarnation)
+                        if request.cancel.is_set():
+                            request.result.cancel()
+                        else:
+                            request.result.set_result(response)
+                    except asyncio.CancelledError:
+                        # SDK/root-task shutdown is not native completion.
+                        raise
                     except BaseException as exc:  # noqa: BLE001 - return via Future
+                        if token is not None:
+                            state = self._native_fence.status()
+                            exc = (BlenderNativeUnresolved(state["recovery_action"])
+                                   if state["native_operation_unresolved"] else
+                                   BlenderMCPToolError("Blender native operation did not complete"))
                         request.result.set_exception(exc)
 
     def _validate_launcher_facts(self) -> None:
@@ -379,6 +480,96 @@ class StdioBlenderMCPClient:
             raise BlenderMCPSecurityError("Blender MCP must use stdio transport")
         if not self.scratch_root.is_absolute():
             raise BlenderMCPSecurityError("Blender MCP scratch root must be absolute")
+        marker = Path(__file__).resolve().parents[1] / "tools" / "blender" / "runtime.json"
+        try:
+            binary = json.loads(marker.read_text())["binary"]
+            self._expected_binary = Path(binary).resolve(strict=True)
+            if not self._expected_binary.is_file():
+                raise ValueError("not a file")
+        except (OSError, ValueError, KeyError, TypeError):
+            raise BlenderMCPSecurityError("Blender runtime identity is unavailable") from None
+
+    @staticmethod
+    def _assert_native_terminal(value):
+        current = value.get("structuredContent", value)
+        for _depth in range(3):
+            if not isinstance(current, Mapping):
+                break
+            if current.get("status") in {"ok", "error"}:
+                return
+            current = current.get("result")
+        raise BlenderMCPToolError("Blender returned no terminal native response")
+
+    def _guarded_native_command(self, name, arguments):
+        """Authenticate the actual socket recipient before any native effects.
+
+        A post-response probe alone cannot bind a newly opened TCP connection.
+        Thumbnail code is loaded through the verified upstream's pure template
+        helper, preserving its settings, restoration and deferred completion.
+        No public tool or caller-controlled exemption is introduced.
+        """
+        if name == EXECUTE_BLENDER_CODE:
+            if set(arguments) != {"code"} or not isinstance(arguments["code"], str):
+                raise BlenderMCPSecurityError("Invalid native command")
+            code = arguments["code"]
+        elif name == RENDER_THUMBNAIL_TO_PATH:
+            if set(arguments) != {"output_path"} or not isinstance(arguments["output_path"], str):
+                raise BlenderMCPSecurityError("Invalid thumbnail command")
+            # This helper imports only os; do not import/register another MCP server.
+            helper_path = self.checkout_root / "mcp/blmcp/tools_helpers/__init__.py"
+            spec = importlib.util.spec_from_file_location("_maestro_pinned_blender_templates", helper_path)
+            if spec is None or spec.loader is None:
+                raise BlenderMCPSecurityError("Pinned thumbnail template is unavailable")
+            helper = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(helper)
+            tool = self.checkout_root / "mcp/blmcp/tools/render_thumbnail_to_path.py"
+            expanded = helper.toolcode_load_from_filepath(str(tool))
+            # Use the exact upstream footer; Params is defined by the expanded code.
+            template = helper.toolcode_wrap_with_calling_convention(expanded)
+            code = helper.toolcode_format_call(template,
+                _ThumbnailParams(arguments["output_path"]))
+            # EXEC's socket envelope is non-strict. Preserve the thumbnail's
+            # strict JSON validation for both immediate and deferred results.
+            code += (
+                "\nimport json as _maestro_json\n"
+                "if callable(globals().get('check_is_finished')):\n"
+                "    _maestro_original_check = check_is_finished\n"
+                "    def check_is_finished():\n"
+                "        value = _maestro_original_check()\n"
+                "        if value is not None: _maestro_json.dumps(value)\n"
+                "        return value\n"
+                "else:\n"
+                "    _maestro_json.dumps(result)\n"
+            )
+        else:
+            raise BlenderMCPSecurityError("Unrecognized native mutation")
+        identity = self._native_identity
+        guard = (
+            "# Maestro authenticated native dispatch v1\n"
+            "import os as _maestro_os, sys as _maestro_sys\n"
+            f"if (_maestro_os.getpid() != {identity['pid']!r} or "
+            "getattr(_maestro_sys.modules.get('_maestro_native_instance'), 'incarnation', None) "
+            f"!= {self._native_incarnation!r}):\n"
+            "    raise RuntimeError('Native Blender incarnation changed before dispatch')\n"
+            f"exec(compile({code!r}, '<maestro-native>', 'exec'), globals(), globals())\n"
+        )
+        return EXECUTE_BLENDER_CODE, {"code": guard}
+
+    @staticmethod
+    def _native_probe_result(value, token):
+        current = value.get("structuredContent", value)
+        for _depth in range(3):
+            if not isinstance(current, Mapping) or "result" not in current:
+                break
+            current = current["result"]
+        if (not isinstance(current, Mapping) or current.get("status") != "ok"
+                or type(current.get("pid")) is not int or current["pid"] < 1
+                or current.get("token") != token or current.get("render_running") is not False
+                or not isinstance(current.get("incarnation"), str)
+                or len(current["incarnation"]) != 32
+                or any(c not in "0123456789abcdef" for c in current["incarnation"])):
+            raise BlenderMCPSecurityError("Blender native completion could not be verified")
+        return current
 
     def _verify_checkout(self) -> None:
         revision = self._git("rev-parse", "HEAD")

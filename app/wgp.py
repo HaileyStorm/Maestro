@@ -159,7 +159,9 @@ prompt_enhancer_classic_entry_lock = threading.Lock()
 from services.native_acceptance_reservation import (
     reservation as _native_acceptance, installed as _acceptance_installed,
 )
-native_gpu_execution_lock = _native_acceptance.wrap_lock(threading.Lock())
+from services.blender_native_fence import fence as _blender_native_fence
+native_gpu_execution_lock = _native_acceptance.wrap_lock(
+    _blender_native_fence.wrap_lock(threading.Lock()))
 _acceptance_installed("model")
 _native_gpu_execution_epoch_lock = threading.Lock()
 _native_gpu_execution_epoch = 0

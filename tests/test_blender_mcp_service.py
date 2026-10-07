@@ -47,6 +47,7 @@ from app.services.blender_mcp_service import (
     _scene_create_code,
 )
 from app.services.blender_mcp_transport import StdioBlenderMCPClient
+from app.services.blender_native_fence import NativeFence, process_identity
 
 _FAKE_MP4 = b"\x00\x00\x00\x18ftypmp42offline-video"
 
@@ -1204,6 +1205,10 @@ class TestBlenderMCPService(unittest.TestCase):
                 )
 
             async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
+                if "# Maestro native process/idle proof v1" in arguments.get("code", ""):
+                    return SimpleNamespace(isError=False, structuredContent={"result": {
+                        "status": "ok", "pid": os.getpid(), "incarnation": "a" * 32,
+                        "render_running": False, "token": ""}})
                 if arguments.get("delay"):
                     await __import__("asyncio").sleep(10)
                 return SimpleNamespace(
@@ -1228,7 +1233,9 @@ class TestBlenderMCPService(unittest.TestCase):
             checkout_root=self.root,
             blender_version="5.1.0",
             scratch_root=self.scratch,
+            native_fence=NativeFence(self.root / "native-fence"),
         )
+        client._expected_binary = Path(process_identity(os.getpid())["exe"]).resolve()
         with (
             mock.patch.object(client, "_validate_launcher_facts"),
             mock.patch.object(client, "_verify_checkout"),
@@ -1255,6 +1262,7 @@ class TestBlenderMCPService(unittest.TestCase):
                 checkout_root=self.root,
                 blender_version="5.1.0",
                 scratch_root=self.scratch,
+                native_fence=client._native_fence,
             )
             with (
                 mock.patch.object(cold_client, "_validate_launcher_facts"),

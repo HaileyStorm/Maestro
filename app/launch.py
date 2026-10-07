@@ -34631,6 +34631,11 @@ def _blender_readiness(runtime: dict | None = None) -> dict:
 
 
 def _require_blender_ready() -> dict:
+    from services.blender_native_fence import fence, BlenderNativeUnresolved
+    try:
+        fence.require_idle()
+    except BlenderNativeUnresolved as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
     readiness = _blender_readiness()
     if not readiness["ready"]:
         raise HTTPException(status_code=503, detail=readiness["recovery_action"])
@@ -34685,12 +34690,15 @@ def _blender_service_for(workspace: str, project_root: str):
 
 
 def _blender_error(error: Exception) -> HTTPException:
+    from services.blender_native_fence import BlenderNativeUnresolved
     from services.blender_mcp_service import (
         BlenderMCPCancelled,
         BlenderMCPSecurityError,
         BlenderMCPToolError,
         BlenderMCPValidationError,
     )
+    if isinstance(error, BlenderNativeUnresolved):
+        return HTTPException(status_code=503, detail=str(error))
     if isinstance(error, BlenderMCPValidationError):
         return HTTPException(status_code=400, detail=str(error))
     if isinstance(error, BlenderMCPCancelled):
@@ -34999,13 +35007,18 @@ def _set_blender_candidate_status(
 @api.get("/api/v1/blender/status")
 def blender_mcp_status(request: Request, workspace: str = ""):
     from services.blender_mcp_service import BlenderMCPLimits
+    from services.blender_native_fence import fence
 
     selected = workspace or _get_active_workspace()
     project_root = _require_project_access(request, selected)
     runtime = _blender_runtime_info()
     readiness = _blender_readiness(runtime)
+    native_status = fence.status()
+    if native_status["native_operation_unresolved"]:
+        readiness.update(ready=False, recovery_action=native_status["recovery_action"])
     return {
         **readiness,
+        **native_status,
         "workspace": selected,
         "bridge": "localhost:9876",
         "blender_min_version": "5.1.0",
