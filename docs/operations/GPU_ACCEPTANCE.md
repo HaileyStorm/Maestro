@@ -2694,3 +2694,33 @@ Stop during diffusion, queue/publication behavior, two-voice conversion and
 owner listening quality remain separate acceptance gates. The released wrapper
 also passed 102 targeted CPU tests; no production arithmetic or installed
 SeedVC files changed for the native probe.
+
+## 2026-10-07 Revoice diarization runtime and partial two-reference probe
+
+The first private two-reference attempt reached real CUDA vocal separation and
+SeedVC loading, then failed while importing pyannote 3.3.2: TorchAudio 2.10 had
+removed `AudioMetaData`. Revision `b0525953` supplies only missing metadata,
+information and backend-discovery APIs through the installed SoundFile library.
+It preserves existing APIs on older runtimes and leaves decoding unchanged.
+All 49 affected-module tests passed, including real CPU pyannote duration,
+crop, stream and downmix checks; those checks also passed on the CUDA 13 runtime.
+Direct CLI import, source compilation and publication checks passed. Independent
+review found no consequential issues. A coordinated Pinokio deployment restored
+local and stable health/readiness and cleared the exact restart notice.
+
+A distinct attempt on that revision used a private 16-second video containing
+two generated-song excerpts and two distinct reference WAVs. The production
+pipeline loaded both local diarization checkpoints on CUDA and completed real
+vocal separation. Diarization found only one segment, from 13.48 to 15.98 seconds,
+assigned to one speaker. SeedVC completed 25 CUDA estimator calls with the first
+reference. The wrapper remixed the original background and applied the result;
+the encoded video hash stayed unchanged and the decoded audio hash changed.
+
+The probe correctly failed its two-speaker and two-completed-reference checks.
+This establishes native diarizer loading and one-reference conversion on this
+fixture, not successful two-reference routing or natural-dialogue quality.
+Both attempts retained their frozen inputs and failure evidence. Each owned
+unit drained before its exact grant was withdrawn; current terminal responses
+confirmed cancellation. The ordinary service remained healthy after the probe.
+A source with two distinct speaking voices, owner listening, and two-reference
+browser/queue publication acceptance remain outstanding.
