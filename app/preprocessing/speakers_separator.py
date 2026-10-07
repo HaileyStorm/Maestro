@@ -46,8 +46,13 @@ class OptimizedPyannote31SpeakerSeparator:
         """
         Initialize with Pyannote 3.1 pipeline with tunable VAD sensitivity.
         """
-        embedding_path = "ckpts/pyannote/pyannote_model_wespeaker-voxceleb-resnet34-LM.bin"
-        segmentation_path = "ckpts/pyannote/pytorch_model_segmentation-3.0.bin"
+        import sys
+        app_root = str(Path(__file__).resolve().parents[1])
+        if app_root not in sys.path:
+            sys.path.insert(0, app_root)
+        from shared.utils import files_locator as fl
+        embedding_path = fl.locate_file("pyannote/pyannote_model_wespeaker-voxceleb-resnet34-LM.bin")
+        segmentation_path = fl.locate_file("pyannote/pytorch_model_segmentation-3.0.bin")
 
 
         xprint(f"Loading segmentation model from: {segmentation_path}")

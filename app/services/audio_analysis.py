@@ -371,7 +371,7 @@ def get_diarizer_pipeline(profile: str = "speech"):
     Three load paths, in order:
 
       1. MANUAL ASSEMBLY (preferred when present) — reads two .bin
-         files from app/ckpts/pyannote/ and builds a SpeakerDiarization
+         files from the configured checkpoint search roots and builds a SpeakerDiarization
          pipeline manually via pyannote.audio.pipelines. Bypasses
          HuggingFace's gated download entirely. This is the same
          approach app/preprocessing/speakers_separator.py uses, and
@@ -418,7 +418,6 @@ def get_diarizer_pipeline(profile: str = "speech"):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     _base = os.path.dirname(os.path.abspath(__file__))
     _project_root = os.path.normpath(os.path.join(_base, "..", ".."))
-    _app_root = os.path.normpath(os.path.join(_base, ".."))
 
     # PyTorch 2.6+ weights_only=True breaks pyannote's pickle
     # checkpoints. All three load paths use torch.load internally —
@@ -439,22 +438,26 @@ def get_diarizer_pipeline(profile: str = "speech"):
         # song) has no local files, no HF cache, and — without an
         # HF_TOKEN for the gated upstream repo — diarization silently
         # skipped. Fetch the two files directly when this host needs them.
-        embedding_path = os.path.join(_app_root, "ckpts", "pyannote",
-                                       "pyannote_model_wespeaker-voxceleb-resnet34-LM.bin")
-        segmentation_path = os.path.join(_app_root, "ckpts", "pyannote",
-                                          "pytorch_model_segmentation-3.0.bin")
+        from shared.utils import files_locator as fl
+        filenames = ("pyannote_model_wespeaker-voxceleb-resnet34-LM.bin",
+                     "pytorch_model_segmentation-3.0.bin")
+        embedding_path, segmentation_path = (
+            fl.locate_file(os.path.join("pyannote", name), create_path_if_none=True)
+            for name in filenames
+        )
         if not (os.path.isfile(embedding_path) and os.path.isfile(segmentation_path)):
             try:
                 import shutil
                 import tempfile
                 from huggingface_hub import hf_hub_download
-                target_dir = os.path.join(_app_root, "ckpts", "pyannote")
-                os.makedirs(target_dir, exist_ok=True)
-                for fname in ("pyannote_model_wespeaker-voxceleb-resnet34-LM.bin",
-                              "pytorch_model_segmentation-3.0.bin"):
-                    dest = os.path.join(target_dir, fname)
-                    if os.path.isfile(dest):
+                for fname in filenames:
+                    relative = os.path.join("pyannote", fname)
+                    if fl.locate_file(relative, error_if_none=False) is not None:
                         continue
+                    # Missing assets belong to the selected primary root.
+                    # A linked installation is a read source only.
+                    dest = fl.get_download_location(relative)
+                    os.makedirs(os.path.dirname(dest), exist_ok=True)
                     print(f"[Diarization] Downloading {fname} from the ungated mirror to this host...")
                     tmp_dir = tempfile.mkdtemp(prefix="pyannote_dl_")
                     try:
@@ -466,13 +469,16 @@ def get_diarizer_pipeline(profile: str = "speech"):
                 print("[Diarization] Checkpoints downloaded")
             except Exception as e:
                 print(f"[Diarization] Auto-download failed (trying other load paths): {e}")
+            embedding_path, segmentation_path = (
+                fl.locate_file(os.path.join("pyannote", name), create_path_if_none=True)
+                for name in filenames
+            )
 
         # ── Path 1: manual assembly from local .bin files ──────────
         # wgp's shared-model download (or Path 0 above) provides these
         # .bin files; Music Video mode references them too via
-        # speakers_separator.py. Resolve via absolute path from this
-        # module's location, since CWD isn't guaranteed to be the app/
-        # folder at every entry point.
+        # speakers_separator.py. Reuse the same configured search roots,
+        # including individually cached components in linked installations.
         if os.path.isfile(embedding_path) and os.path.isfile(segmentation_path):
             try:
                 from pyannote.audio import Model

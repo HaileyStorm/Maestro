@@ -3,8 +3,11 @@
 from pathlib import Path
 from abc import ABC
 import ast
+import importlib.util
+import os
 import threading
 import shutil
+import subprocess
 import sys
 import tempfile
 import types
@@ -449,6 +452,105 @@ class VoiceCloneStereoTests(unittest.TestCase):
             seedvc.get_model.assert_called_once()
             remux.assert_not_called()
             self.assertEqual(video.read_bytes(), b"original")
+
+
+class DiarizerModelRootsTests(unittest.TestCase):
+    def exercise(self, consumer, layout):
+        root = Path(__file__).resolve().parents[1]
+        source = root / "app/services/audio_analysis.py"
+        tree = ast.parse(source.read_text())
+        loader = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "get_diarizer_pipeline")
+        profiles = next(n.value for n in tree.body if isinstance(n, ast.Assign)
+                        and any(isinstance(t, ast.Name) and t.id == "_DIARIZER_PROFILES" for t in n.targets))
+        spec = importlib.util.spec_from_file_location("diarizer_test_locator", root / "app/shared/utils/files_locator.py")
+        locator = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(locator)
+        filenames = ["pyannote_model_wespeaker-voxceleb-resnet34-LM.bin", "pytorch_model_segmentation-3.0.bin"]
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            primary, linked = base / "models", base / "linked"
+            locator.set_checkpoints_paths([str(primary), str(linked)])
+            embedding = (primary if layout == "primary" else linked) / "pyannote" / filenames[0]
+            segmentation = primary / "pyannote" / filenames[1]
+            embedding.parent.mkdir(parents=True)
+            embedding.write_bytes(b"embedding-original")
+            if layout != "missing":
+                segmentation.parent.mkdir(parents=True, exist_ok=True)
+                segmentation.write_bytes(b"segmentation-original")
+            def fetch(**kwargs):
+                self.assertEqual(kwargs["filename"], filenames[1])
+                path = Path(kwargs["local_dir"]) / kwargs["filename"]
+                path.write_bytes(b"downloaded-segmentation")
+                return str(path)
+            download = Mock(side_effect=fetch)
+            pipe = Mock()
+            pipe.to.return_value = pipe
+            model = Mock(side_effect=lambda path: Path(path).read_bytes())
+            modules = {"shared.utils.files_locator": locator,
+                "shared.utils": types.SimpleNamespace(files_locator=locator),
+                "pyannote.audio": types.SimpleNamespace(Model=types.SimpleNamespace(from_pretrained=model)),
+                "pyannote.audio.pipelines": types.SimpleNamespace(SpeakerDiarization=Mock(return_value=pipe)),
+                "huggingface_hub": types.SimpleNamespace(hf_hub_download=download)}
+            with patch.dict(sys.modules, modules), patch.object(torch.cuda, "is_available", return_value=False):
+                if consumer == "analysis":
+                    ns = dict(os=os, __file__=str(base / "app/services/audio_analysis.py"),
+                        _diarizer_pipe=None, _diarizer_profile=None, _DIARIZER_PROFILES=ast.literal_eval(profiles))
+                    exec(compile(ast.Module(body=[loader], type_ignores=[]), str(source), "exec"), ns)
+                    original_load = torch.load
+                    self.assertIs(ns["get_diarizer_pipeline"](), pipe)
+                    self.assertIs(torch.load, original_load)
+                    self.assertIs(ns["get_diarizer_pipeline"](), pipe)
+                else:
+                    separator_tree = ast.parse((root / "app/preprocessing/speakers_separator.py").read_text())
+                    cls = next(n for n in separator_tree.body if isinstance(n, ast.ClassDef) and n.name == "OptimizedPyannote31SpeakerSeparator")
+                    constructor = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "__init__")
+                    ns = dict(torch=torch, os=os, Path=Path,
+                        __file__=str(root / "app/preprocessing/speakers_separator.py"), xprint=lambda *args: None)
+                    exec(compile(ast.Module(body=[constructor], type_ignores=[]), "speakers_separator.py", "exec"), ns)
+                    instance = types.SimpleNamespace()
+                    ns["__init__"](instance)
+                    self.assertIs(instance.pipeline, pipe)
+            self.assertEqual({Path(call.args[0]) for call in model.call_args_list}, {embedding, segmentation})
+            self.assertEqual(embedding.read_bytes(), b"embedding-original")
+            self.assertEqual(download.call_count, int(layout == "missing"))
+            if layout == "missing":
+                self.assertEqual(segmentation.read_bytes(), b"downloaded-segmentation")
+                self.assertFalse((linked / "pyannote" / filenames[1]).exists())
+
+    def test_configured_primary_and_split_linked_models_need_no_download(self):
+        for consumer in ("analysis", "speakers"):
+            for layout in ("primary", "split"):
+                with self.subTest(consumer=consumer, layout=layout):
+                    self.exercise(consumer, layout)
+
+    def test_missing_model_downloads_only_to_primary_and_keeps_linked_embedding(self):
+        self.exercise("analysis", "missing")
+
+    def test_direct_separator_constructor_resolves_app_imports_without_pythonpath(self):
+        source = Path(__file__).resolve().parents[1] / "app/preprocessing/speakers_separator.py"
+        script = """
+import ast,sys,types
+from pathlib import Path
+from unittest.mock import Mock
+source=Path(sys.argv[1]);tree=ast.parse(source.read_text())
+cls=next(n for n in tree.body if isinstance(n,ast.ClassDef) and n.name=='OptimizedPyannote31SpeakerSeparator')
+constructor=next(n for n in cls.body if isinstance(n,ast.FunctionDef) and n.name=='__init__')
+model=Mock(side_effect=lambda path: Path(path).read_bytes());pipe=Mock()
+sys.modules['pyannote.audio']=types.SimpleNamespace(Model=types.SimpleNamespace(from_pretrained=model))
+sys.modules['pyannote.audio.pipelines']=types.SimpleNamespace(SpeakerDiarization=Mock(return_value=pipe))
+ns=dict(__file__=str(source),Path=Path,torch=types.SimpleNamespace(cuda=types.SimpleNamespace(is_available=lambda:False)),xprint=lambda *args:None)
+exec(compile(ast.Module(body=[constructor],type_ignores=[]),str(source),'exec'),ns)
+instance=types.SimpleNamespace();ns['__init__'](instance)
+assert instance.pipeline is pipe and model.call_count==2
+"""
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary) / "ckpts/pyannote"
+            folder.mkdir(parents=True)
+            for name in ("pyannote_model_wespeaker-voxceleb-resnet34-LM.bin", "pytorch_model_segmentation-3.0.bin"):
+                (folder / name).write_bytes(b"local-model")
+            result = subprocess.run([sys.executable, "-I", "-S", "-c", script, str(source)],
+                cwd=temporary, capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
 
 
 if __name__ == "__main__":
