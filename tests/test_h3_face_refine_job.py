@@ -216,11 +216,12 @@ class FaceJobBoundaryTests(unittest.TestCase):
         self.fixture.manifests[job['id']]['params']=copy.deepcopy(job['params'])
         admission=Mock();parity=Mock(return_value={'sealed':True});apply=Mock()
         calls=[]
-        def generate(task,send_cmd,plugin_data,state,model_type,mode,video_length,resolution,image_refs,
+        def generate(task,send_cmd,plugin_data,state,model_type,mode,video_length,resolution,image_refs,custom_settings,
                      _h3_face_refine_dispatch,_h3_face_refine_output):
             calls.append((_h3_face_refine_dispatch,_h3_face_refine_output,video_length,resolution))
             self.assertEqual((model_type,mode),('minimax_h3','generate'))
-            self.assertEqual(image_refs,[]);return True
+            self.assertEqual(image_refs,[])
+            self.assertEqual(custom_settings,{'h3_attention_engine':'sdpa'});return True
         # The real attachment loader removes an empty reference-image list.
         # The worker must restore the required no-reference invocation value.
         tree=ast.parse((ROOT/'app/wgp.py').read_text())
@@ -228,7 +229,11 @@ class FaceJobBoundaryTests(unittest.TestCase):
                     and n.name=='_load_task_attachments')
         attachment_ns={'ATTACHMENT_KEYS':{'image_refs'}}
         exec(compile(ast.Module(body=[loader],type_ignores=[]),'wgp.py','exec'),attachment_ns)
+        from models.minimax_h3.minimax_h3_handler import family_handler
         def parse(manifest,state,cwd):
+            # Real H3 defaults add dormant SOL tuning keys even for SDPA.
+            family_handler.fix_settings('minimax_h3',0,{},manifest[0]['params'])
+            self.assertIn('h3_sol_tau',manifest[0]['params']['custom_settings'])
             attachment_ns['_load_task_attachments'](manifest[0]['params'],cwd)
             self.assertNotIn('image_refs',manifest[0]['params'])
             return manifest,None
