@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import ast
 import inspect
 import os
 import sys
@@ -2952,15 +2953,25 @@ class TestDirectorCancellation(unittest.TestCase):
         )
 
     def test_cancel_race_completion_fallback_persists_exact_clip_mapping(self):
-        source = inspect.getsource(pipeline._run_pipeline)
-        fallback = source.split("if not completed:", 1)[1].split(
-            "_save_pipeline_state(pid)", 1,
-        )[0]
-        self.assertIn("output_files=output_files or []", fallback)
-        self.assertIn(
-            "_clip_video_files=completed_clip_videos",
-            fallback,
-        )
+        pid = "cancel-completion-artifacts"
+        record = self._add_pipeline(pid, "cancelled")
+        record["params"]["seamless"] = False
+        record["clip_plans"] = [{"video_prompt": "first"}, {"video_prompt": "second"}]
+        groups = [[{"physical_index": 0, "filename": "first.mp4"},
+                   {"physical_index": 1, "filename": None}],
+                  [{"physical_index": 2, "filename": "second.mp4"}]]
+        artifacts = {"_clip_video_files": [None, "second.mp4"], "_h3_clip_video_groups": groups}
+        tree = ast.parse(inspect.getsource(pipeline._run_pipeline))
+        fallback = next(node for node in ast.walk(tree) if isinstance(node, ast.If)
+                        and ast.unparse(node.test) == "not completed")
+        namespace = {"completed": False, "pid": pid, "output_files": ["first.mp4", "second.mp4"],
+                     "completed_video_artifacts": artifacts, "_update_pipeline": pipeline._update_pipeline}
+        exec(compile(ast.Module(body=[fallback], type_ignores=[]), "actual-completion-fallback", "exec"), namespace)
+        self.assertEqual(record["status"], "cancelled")
+        self.assertTrue(pipeline._save_pipeline_state(pid))
+        state = pipeline.load_pipeline_state(self.temp_dir.name, pid)
+        self.assertEqual([c["video_filename"] for c in state["clips"]], [None, "second.mp4"])
+        self.assertEqual([c["h3_video_segments"] for c in state["clips"]], groups)
 
     def test_concurrent_saves_leave_latest_live_snapshot_as_valid_json(self):
         pid = "pipe-writers"

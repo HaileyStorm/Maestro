@@ -183,6 +183,7 @@ _CANCELLED_ARTIFACT_FIELDS = {
     "clip_images",
     "_clip_keyframes",
     "_clip_video_files",
+    "_h3_clip_video_groups",
     "_clip_timings",
 }
 _DIRECTOR_PIPELINE_FAILED_CODE = "director_pipeline_failed"
@@ -1179,6 +1180,73 @@ def _clip_video_slots(
     return _map_completed_clip_videos(output_files, clip_count)
 
 
+def _director_clip_video_artifacts(output_files: list[str], params: dict, clip_count: int) -> dict:
+    """Keep physical H3 children separate from authored Director clip slots."""
+    committed = params.get("_h3_longform")
+    if not isinstance(committed, dict):
+        slots = _clip_video_slots(output_files, clip_count) if not params.get("seamless", True) else []
+        return {"_clip_video_files": slots}
+
+    restored = {}
+    from services.h3_upstream_skills import validate_resolved_h3_style_workflow
+    workflow = validate_resolved_h3_style_workflow(params.get("h3_style_workflow"))
+    if not _rehydrate_director_h3_longform(restored, committed, h3_style_workflow=workflow):
+        raise ValueError("Saved Director H3 output plan is unsupported")
+    plan = restored["_h3_longform"]
+    owners = plan.get("segment_source_indices")
+    count = int(plan["clip_count"])
+    if (not isinstance(owners, list) or len(owners) != count
+            or any(type(owner) is not int or not 0 <= owner < clip_count for owner in owners)
+            or owners != sorted(owners) or set(owners) != set(range(clip_count))):
+        raise ValueError("Saved Director H3 scene ownership is incomplete")
+    indexed = getattr(output_files, "clip_output_files", None)
+    if isinstance(indexed, dict) and indexed:
+        physical = [None] * count
+        seen = set()
+        for index, filename in indexed.items():
+            try:
+                position = int(index)
+            except (TypeError, ValueError, OverflowError) as error:
+                raise ValueError("H3 physical output index is invalid") from error
+            if (isinstance(index, bool) or not 0 <= position < count or position in seen
+                    or str(position) != str(index)):
+                raise ValueError("H3 physical output index is ambiguous")
+            seen.add(position)
+            if filename and (not isinstance(filename, str) or os.path.basename(filename) != filename
+                             or os.path.splitext(filename)[1].lower() not in {".mp4", ".webm", ".mkv", ".mov"}):
+                raise ValueError("H3 physical output filename is invalid")
+            physical[position] = filename or None
+    else:
+        # A partial list or whole-film join cannot identify physical children.
+        # Keep the files discoverable, but leave their scene ownership unresolved.
+        physical = [None] * count
+    slots = [None] * clip_count
+    groups = [[] for _ in range(clip_count)]
+    cursor = 0
+    for index, owner in enumerate(owners):
+        model = plan["segment_models"][index]
+        generated = int(plan["clip_frames"][index])
+        published = int(plan["clip_published_frames"][index])
+        discard = int(model.get("discard_frames") or 0)
+        groups[owner].append({
+            "physical_index": index,
+            "filename": physical[index],
+            "generated_frames": generated,
+            "published_frames": published,
+            "trim_tail_frames": int(plan["clip_trim_tail_frames"][index]),
+            "boundary_discard_frames": discard,
+            "published_start_frame": cursor,
+            "model_type": model["model_type"],
+        })
+        cursor += published
+    for owner, members in enumerate(groups):
+        # A partial or split group is not an assembled scene. Native history
+        # also needs removal before its raw child can become that scene's file.
+        if len(members) == 1 and members[0]["boundary_discard_frames"] == 0:
+            slots[owner] = members[0]["filename"]
+    return {"_clip_video_files": slots, "_h3_clip_video_groups": groups}
+
+
 def _save_pipeline_state(pid: str) -> bool:
     """Serialize one live pipeline snapshot without racing other writers."""
     with _pipeline_file_lock:
@@ -1280,14 +1348,14 @@ def _save_pipeline_state_locked(pid: str) -> bool:
     pre_polish = p.get("_clip_plans_pre_polish", [])
     clip_timings = p.get("_clip_timings", {})
 
-    # Per-clip video filenames. Multi-clip output files are emitted in clip
-    # order, followed by the optional *_multiclip join. Preserve a completed
-    # prefix after cancellation so the Dashboard can rerun/rejoin those clips.
+    # Authored scene filenames and H3 physical-child ownership are separate.
+    # Preserve sparse completion after cancellation without positional guesses.
     clip_videos = p.get("_clip_video_files") or []
-    if not clip_videos and not params.get("seamless", True):
-        clip_videos = _clip_video_slots(
-            p.get("output_files") or [], len(clip_plans),
-        )
+    h3_groups = p.get("_h3_clip_video_groups") or []
+    if not clip_videos:
+        projected = _director_clip_video_artifacts(p.get("output_files") or [], params, len(clip_plans))
+        clip_videos = projected["_clip_video_files"]
+        h3_groups = projected.get("_h3_clip_video_groups") or h3_groups
 
     clips = []
     for i, plan in enumerate(clip_plans):
@@ -1326,6 +1394,8 @@ def _save_pipeline_state_locked(pid: str) -> bool:
             clip_state["_h3_shot"] = plan["_h3_shot"]
         if "source_voice_intervals" in plan:
             clip_state["source_voice_intervals"] = copy.deepcopy(plan["source_voice_intervals"])
+        if i < len(h3_groups):
+            clip_state["h3_video_segments"] = copy.deepcopy(h3_groups[i])
         clips.append(clip_state)
 
     state = {
@@ -1519,6 +1589,10 @@ def _backfill_clip_video_filenames(state: dict, state_dir: str) -> dict:
     output) never match the count and are left untouched.
     """
     clips = state.get("clips") or []
+    # H3 physical indices belong to the committed partition, not card order.
+    # Never let this legacy positional repair guess their authored owners.
+    if isinstance((state.get("_params_snapshot") or {}).get("_h3_longform"), dict):
+        return state
     outputs = [
         filename for filename in (state.get("output_files") or [])
         if "_multiclip" not in os.path.splitext(filename)[0].lower()
@@ -5343,6 +5417,9 @@ def _resume_pipeline_reserved(
         "_clip_video_files": [
             c.get("video_filename") for c in saved_clips
         ],
+        "_h3_clip_video_groups": [
+            copy.deepcopy(c.get("h3_video_segments") or []) for c in saved_clips
+        ] if any("h3_video_segments" in c for c in saved_clips) else [],
         "output_files": data.get("output_files", []) or [],
         "error": None,
         "created_at": data.get("created_at") or time.time(),
@@ -5504,6 +5581,9 @@ def restore_registered_pipeline(
         "_clip_video_files": [
             clip.get("video_filename") for clip in saved_clips
         ],
+        "_h3_clip_video_groups": [
+            copy.deepcopy(clip.get("h3_video_segments") or []) for clip in saved_clips
+        ] if any("h3_video_segments" in clip for clip in saved_clips) else [],
         "output_files": data.get("output_files", []) or [],
         "error": restored_error,
         "error_code": restored_error_code or None,
@@ -6096,27 +6176,18 @@ def _run_pipeline(pid: str, resume: bool = False):
         if _pipelines[pid]["status"] == "cancelled":
             print(f"[Pipeline {pid}] Cancelled during video generation — keeping {len(output_files or [])} finished clip(s)")
             artifacts = {"output_files": output_files or []}
-            if not params.get("seamless", True):
-                clip_videos = _clip_video_slots(
-                    output_files or [], len(clip_plans),
-                )
-                if clip_videos:
-                    artifacts["_clip_video_files"] = clip_videos
+            artifacts.update(_director_clip_video_artifacts(output_files or [], params, len(clip_plans)))
             _update_pipeline(pid, **artifacts)
             _save_pipeline_state(pid)
             return
 
-        completed_clip_videos = []
-        if not params.get("seamless", True):
-            completed_clip_videos = _clip_video_slots(
-                output_files or [], len(clip_plans),
-            )
+        completed_video_artifacts = _director_clip_video_artifacts(output_files or [], params, len(clip_plans))
         completed = _update_pipeline(
             pid,
             status="completed",
             phase="completed",
             output_files=output_files,
-            _clip_video_files=completed_clip_videos,
+            **completed_video_artifacts,
             _completed_at=time.time(),
             progress={
                 "current": 3, "total": 3, "message": "Done!",
@@ -6127,7 +6198,7 @@ def _run_pipeline(pid: str, resume: bool = False):
             _update_pipeline(
                 pid,
                 output_files=output_files or [],
-                _clip_video_files=completed_clip_videos,
+                **completed_video_artifacts,
             )
         _require_pipeline_checkpoint(pid, "completed")
 
@@ -6148,12 +6219,9 @@ def _run_pipeline(pid: str, resume: bool = False):
                 current_pipeline = _pipelines.get(pid) or {}
                 current_plans = current_pipeline.get("clip_plans") or []
                 current_params = current_pipeline.get("params") or {}
-            if not current_params.get("seamless", True):
-                clip_slots = _clip_video_slots(
-                    partial_outputs, len(current_plans),
-                )
-                if clip_slots:
-                    artifact_updates["_clip_video_files"] = clip_slots
+            artifact_updates.update(_director_clip_video_artifacts(
+                partial_outputs, current_params, len(current_plans),
+            ))
             _update_pipeline(pid, **artifact_updates)
         traceback.print_exc()
         # Tag with OOM info if applicable so the UI can surface the

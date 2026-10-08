@@ -139,6 +139,110 @@ non_diegetic_music: N/A"""
             "sliding_window_size": 480,
         }
 
+    def _output_group_fixture(self, *, workflow=None):
+        clips = [{"video_prompt": "The host walks without a cut."},
+                 {"video_prompt": "The guest answers."}]
+        planned = [{"start": 2.013, "end": 22.013, "duration_sec": 20},
+                   {"start": 22.013, "end": 32.013, "duration_sec": 10}]
+        params = {"video_model": "minimax_h3", "seamless": True,
+                  "h3_ref2va_terms_accepted": True}
+        if workflow:
+            params["h3_style_workflow"] = workflow
+        plan = pipeline._prepare_director_h3_longform(self._base_generation_params(),
+            params=params, clip_plans=clips, planned_clips=planned, fps=24)
+        self.assertEqual(plan["segment_source_indices"], [0, 0, 1])
+        return params, clips, planned
+
+    def test_worker_physical_outputs_never_become_the_next_authored_scene(self):
+        params, clips, planned = self._output_group_fixture()
+        original = copy.deepcopy(params)
+        job = {"status": "completed", "output_files": ["a.mp4", "b.mp4", "c.mp4", "joined_multiclip.mp4"],
+               "clip_output_files": {"0": "a.mp4", "1": "b.mp4", "2": "c.mp4"},
+               "join_output_file": "joined_multiclip.mp4"}
+        outputs = pipeline._director_job_outputs(job)
+        projected = pipeline._director_clip_video_artifacts(outputs, params, 2)
+        self.assertEqual(projected["_clip_video_files"], [None, "c.mp4"])
+        groups = projected["_h3_clip_video_groups"]
+        self.assertEqual([[s["filename"] for s in members] for members in groups], [["a.mp4", "b.mp4"], ["c.mp4"]])
+        self.assertEqual([sum(s["published_frames"] for s in members) for members in groups], [480, 240])
+        self.assertEqual(groups[1][0]["published_start_frame"], 480)
+        self.assertEqual(params, original)
+        # Physical children remain discoverable until each scene is assembled.
+        self.assertEqual(outputs.clip_output_files, {0: "a.mp4", 1: "b.mp4", 2: "c.mp4"})
+
+    def test_sparse_h3_completion_retains_missing_members_and_exact_owner(self):
+        params, _, _ = self._output_group_fixture()
+        outputs = pipeline._DirectorOutputs(["b.mp4", "c.mp4"], {1: "b.mp4", 2: "c.mp4"})
+        projected = pipeline._director_clip_video_artifacts(outputs, params, 2)
+        self.assertEqual(projected["_clip_video_files"], [None, "c.mp4"])
+        self.assertEqual([s["filename"] for s in projected["_h3_clip_video_groups"][0]], [None, "b.mp4"])
+        for outputs in (["b.mp4", "c.mp4"], ["a.mp4", "b.mp4", "c.mp4", "joined-multiclip.mp4"],
+                        pipeline._DirectorOutputs(["b.mp4", "c.mp4"], {})):
+            with self.subTest(unindexed=list(outputs)):
+                unresolved = pipeline._director_clip_video_artifacts(outputs, params, 2)
+                self.assertEqual(unresolved["_clip_video_files"], [None, None])
+                self.assertTrue(all(member["filename"] is None
+                    for group in unresolved["_h3_clip_video_groups"] for member in group))
+        for indices in ({3: "x.mp4"}, {"01": "x.mp4"}, {0: "x.mp4", "0": "x.mp4"}, {True: "x.mp4"}, {0: "../x.mp4"}):
+            with self.subTest(indices=indices), self.assertRaises(ValueError):
+                pipeline._director_clip_video_artifacts(pipeline._DirectorOutputs(["x.mp4"], indices), params, 2)
+        bad = copy.deepcopy(params)
+        bad["_h3_longform"]["segment_source_indices"] = [0, 1, 0]
+        with self.assertRaises(ValueError):
+            pipeline._director_clip_video_artifacts(outputs, bad, 2)
+
+    def test_output_ownership_preserves_explicit_style_and_native_history(self):
+        params, _, _ = self._output_group_fixture(workflow=self._style_workflow())
+        before = copy.deepcopy(params)
+        projected = pipeline._director_clip_video_artifacts(
+            pipeline._DirectorOutputs(["a.mp4", "b.mp4", "c.mp4"], {0: "a.mp4", 1: "b.mp4", 2: "c.mp4"}), params, 2)
+        self.assertEqual(projected["_clip_video_files"], [None, "c.mp4"])
+        self.assertEqual(params, before)
+        clips = [{"video_prompt": "The host opens."}, {"video_prompt": "The guest answers."}]
+        planned = [{"start": 0, "end": 10, "duration_sec": 10},
+                   {"start": 10, "end": 20, "duration_sec": 10}]
+        params = {"h3_native_boundary_conditioning": True, "h3_ref2va_terms_accepted": True,
+                  "h3_boundary_overrides": [{"type": "continuous"}]}
+        pipeline._prepare_director_h3_longform(self._base_generation_params(), params=params,
+            clip_plans=clips, planned_clips=planned, fps=24)
+        projected = pipeline._director_clip_video_artifacts(
+            pipeline._DirectorOutputs(["a.mp4", "b.mp4"], {0: "a.mp4", 1: "b.mp4"}), params, 2)
+        self.assertEqual(projected["_clip_video_files"], ["a.mp4", None])
+        self.assertGreater(projected["_h3_clip_video_groups"][1][0]["boundary_discard_frames"], 0)
+
+    def test_h3_output_groups_save_restore_without_aliasing_or_positional_backfill(self):
+        params, clips, planned = self._output_group_fixture()
+        outputs = pipeline._DirectorOutputs(["a.mp4", "b.mp4", "c.mp4"], {0: "a.mp4", 1: "b.mp4", 2: "c.mp4"})
+        artifacts = pipeline._director_clip_video_artifacts(outputs, params, 2)
+        pid = "physical-group-save"
+        pipeline._pipelines[pid] = {"id": pid, "status": "completed", "params": params,
+            "clip_plans": clips, "_planned_clips": planned, "out_dir": self.temp_dir.name,
+            "created_at": 1, "output_files": list(outputs), **artifacts}
+        self.assertTrue(pipeline._save_pipeline_state(pid))
+        state = pipeline.load_pipeline_state(self.temp_dir.name, pid)
+        self.assertEqual([c["video_filename"] for c in state["clips"]], [None, "c.mp4"])
+        self.assertEqual([c["h3_video_segments"] for c in state["clips"]], artifacts["_h3_clip_video_groups"])
+        state["clips"][0]["h3_video_segments"][0]["filename"] = "changed.mp4"
+        self.assertEqual(artifacts["_h3_clip_video_groups"][0][0]["filename"], "a.mp4")
+        state = pipeline.load_pipeline_state(self.temp_dir.name, pid)
+        path = pipeline._find_pipeline_file(self.temp_dir.name, pid)
+        with patch.object(pipeline, "_start_pipeline_worker") as worker:
+            restored = pipeline.restore_registered_pipeline(state, path, {"id": "parent"}, defer_worker=True)
+        worker.assert_not_called()
+        self.assertEqual(restored["_h3_clip_video_groups"], artifacts["_h3_clip_video_groups"])
+        restored["_h3_clip_video_groups"][0][0]["filename"] = "different.mp4"
+        self.assertEqual(state["clips"][0]["h3_video_segments"][0]["filename"], "a.mp4")
+        # These two legacy files are physical members of scene one. Count
+        # coincidence must never make the second one scene two's filename.
+        legacy = copy.deepcopy(state)
+        legacy["output_files"] = ["a.mp4", "b.mp4"]
+        legacy["clips"][1]["video_filename"] = None
+        for filename in legacy["output_files"]:
+            with open(os.path.join(self.temp_dir.name, filename), "wb") as handle:
+                handle.write(b"media")
+        self.assertIs(pipeline._backfill_clip_video_filenames(legacy, self.temp_dir.name), legacy)
+        self.assertIsNone(legacy["clips"][1]["video_filename"])
+
     @staticmethod
     def _style_workflow() -> dict:
         catalog = builtin_catalog()
