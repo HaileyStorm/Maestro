@@ -2769,3 +2769,29 @@ cancellation with admission-gate exclusion. They do not establish an actual
 second queue dispatch, new LAN behavior, Windows/macOS execution, audible
 output or owner visual/listening acceptance. Those gates remain open; accepted
 renders were not repeated to gather this documentation.
+
+
+## 2026-10-07 live Editor recovery before publication
+
+At source revision `00d15b70`, one new synthetic CPU source and a separate
+saved Editor draft were used for a real, signed-in Gallery **Export MP4**.
+No accepted sample or earlier export was regenerated. While the ordinary
+Editor FFmpeg child held nonempty unsealed staging, the exact backend and
+encoder were terminated. Independent process handles confirmed both exits
+before Pinokio restored the production service. A separate bounded guardian
+had already passed actual CPU controller-death checks before and after backend
+termination; this does not qualify simultaneous guardian/controller failure.
+
+Startup recovered the same job with one recovery attempt and published one
+private final media/sidecar pair. The result contains 240 frames at 24 fps,
+960×540, exactly ten seconds, and 48 kHz stereo audio. Full FFmpeg decode
+passed; the signed-in Chrome Gallery viewer played to ten seconds without a
+media error. Existing accepted media, the earlier Editor draft, and foreign
+job statuses, attempts, holds, owner/project identities, manifests and outputs
+were preserved. Local and stable-share health/readiness passed and the exact
+public maintenance generation was cleared.
+
+This closes the observed whole-service recovery boundary for an ordinary
+unsealed CPU Editor export. It does not establish every publication crash
+window, LAN workflow parity, Windows/macOS behavior or human acceptance. No
+GPU/model workload, production source change or full-suite replay was needed.
