@@ -123,6 +123,7 @@ const componentBundle = await build({
             return { jobs: control.trainingJobs[workspace] || [] };
           }
           export function submitYue2Training(input) {
+            control.beforeTraining?.(input);
             const pending = { ...deferred(), input }; control.trainingSubmits.push(pending); return pending.promise;
           }
           export function cancelYue2Training(id, workspace) {
@@ -234,10 +235,16 @@ const fillTraining = (h, name = 'Private artist', caption = 'Private style capti
   trainingField(h, 'Style caption', caption)
   trainingField(h, 'Lyrics, if present', lyrics)
 }
-async function trainingFixture() {
+async function trainingFixture({ reload = false, accountContext } = {}) {
+  if (!reload) {
+    const entries = new Map()
+    globalThis.sessionStorage = { getItem: key => entries.get(key) ?? null,
+      setItem: (key, value) => entries.set(key, value), removeItem: key => entries.delete(key) }
+  }
   const { Yue2Training, createHarness, control, account } = await import(
     `data:text/javascript;base64,${Buffer.from(componentBundle.outputFiles[0].text).toString('base64')}#yue2-training-${++componentRealm}`,
   )
+  if (accountContext !== undefined) account.setContext(accountContext)
   const reports = []
   const props = { workspace: 'A', gpuBlocked: false,
     tracks: [{ id: 'private-take', project: 'A', title: 'Private take', status: 'succeeded' }],
@@ -1018,13 +1025,17 @@ test('YuE2 async results are fenced to the captured workspace and review can be 
 })
 
 test('YuE2 training keeps existing jobs visible but blocks new work after supervision loss', async () => {
-  const fs = await import('node:fs/promises')
-  const controls = await fs.readFile(new URL('../src/components/Sidebar/Yue2Controls.tsx', import.meta.url), 'utf8')
-  const training = await fs.readFile(new URL('../src/components/Sidebar/Yue2Training.tsx', import.meta.url), 'utf8')
-  assert.match(controls, /gpuBlocked=\{!!status\.gpuBlocked\}/)
-  assert.match(training, /disabled=\{\(!valid && !pending\) \|\| busy \|\| gpuBlocked\}/)
-  assert.match(training, /gpuBlocked && <p role="alert"/)
-  assert.match(training, /jobs\.map\(job =>/)
+  const { h, control } = await trainingFixture()
+  fillTraining(h)
+  const request = { input: { workspace: 'A', requestId: 'existing', name: 'Existing training', kind: 'artist', trigger: 'sv_existing', tracks: [] } }
+  control.trainingJobs.A = [trainingJob(request)]
+  h.render({ ...h.props, gpuBlocked: true }); h.flush()
+  trainingRefresh(h).props.onClick(); await settle(h)
+  assert.match(textContent(h.tree), /Existing training/)
+  assert.match(textContent(h.tree), /GPU work is paused/)
+  assert.equal(trainingSubmitButton(h).props.disabled, true)
+  trainingSubmitButton(h).props.onClick(); await settle(h)
+  assert.equal(control.trainingSubmits.length, 0)
 })
 
 test('YuE2 picker submits the selected exact checkpoint pair and blocks stale choices', async () => {
@@ -1037,4 +1048,93 @@ test('YuE2 picker submits the selected exact checkpoint pair and blocks stale ch
   assert.match(source, /id: checkpoint\.id, sha256: checkpoint\.sha256, strength/)
   assert.match(source, /!!checkpointError/)
   assert.match(source, /Unavailable · \{savedCheckpoint\.id\} · SHA-256 \{savedCheckpoint\.sha256\}/)
+})
+
+
+test('YuE2 training reload retains an accepted request and retries its frozen original inputs', async () => {
+  const first = await trainingFixture()
+  fillTraining(first.h, 'Original training', 'original caption', 'original lyrics')
+  first.control.beforeTraining = input => {
+    const stored = JSON.parse(sessionStorage.getItem('maestro:yue2-training-v1:account:owner-0'))
+    assert.deepEqual(stored.A.payload, input, 'original identity and inputs must be durable at the POST boundary')
+  }
+  button(first.h, 'Queue training').props.onClick(); first.h.flush()
+  const request = first.control.trainingSubmits[0]
+  first.h.unmount()
+  const restored = await trainingFixture({ reload: true })
+  assert.match(textContent(restored.h.tree), /previous request is unconfirmed/i)
+  assert.equal(restored.control.trainingSubmits.length, 0, 'reload never posts automatically')
+  fillTraining(restored.h, 'Changed training', 'changed caption', 'changed lyrics')
+  button(restored.h, 'Retry original training request').props.onClick(); restored.h.flush()
+  assert.deepEqual(restored.control.trainingSubmits[0].input, request.input)
+  restored.control.trainingSubmits[0].reject(restored.control.requestError(422, 'Ambiguous retry'))
+  await settle(restored.h)
+  assert.match(textContent(restored.h.tree), /Retry original training request/)
+})
+
+test('YuE2 training fresh reload adopts only the exact retained job without another POST', async () => {
+  const first = await trainingFixture()
+  fillTraining(first.h)
+  button(first.h, 'Queue training').props.onClick(); first.h.flush()
+  const request = first.control.trainingSubmits[0]
+  first.h.unmount()
+  const restored = await trainingFixture({ reload: true })
+  restored.control.trainingJobs.A = [trainingJob(request, { id: 'unrelated-job' })]
+  trainingRefresh(restored.h).props.onClick(); await settle(restored.h)
+  assert.match(textContent(restored.h.tree), /Retry original training request/)
+  restored.control.trainingJobs.A = [trainingJob(request, { state: 'succeeded' })]
+  trainingRefresh(restored.h).props.onClick(); await settle(restored.h)
+  assert.doesNotMatch(textContent(restored.h.tree), /Retry original training request/)
+  assert.equal(restored.control.trainingSubmits.length, 0)
+})
+
+test('YuE2 training refuses submission when this tab cannot retain recovery data', async () => {
+  const { h, control } = await trainingFixture()
+  fillTraining(h)
+  sessionStorage.setItem = () => { throw new Error('storage denied') }
+  trainingSubmitButton(h).props.onClick(); h.flush(); await settle(h)
+  assert.equal(control.trainingSubmits.length, 0)
+  assert.match(textContent(h.tree), /could not retain|recovery.*unavailable/i)
+})
+
+
+test('YuE2 training scope-only account changes retire private jobs and late POST before paint', async () => {
+  const { h, control, account, reports } = await trainingFixture()
+  fillTraining(h)
+  button(h, 'Queue training').props.onClick(); h.flush()
+  const old = control.trainingSubmits[0]
+  control.trainingJobs.A = [trainingJob(old, { id: 'other-private-job' })]
+  trainingRefresh(h).props.onClick(); await settle(h)
+  assert.match(textContent(h.tree), /Private artist/)
+  const readCount = control.trainingReads.length
+  const reportCount = reports.length
+  account.setContext({ enabled: true, authenticated: false })
+  h.render(); h.render()
+  assert.doesNotMatch(textContent(h.tree), /Private artist|Retry original training request/)
+  assert.equal(trainingSubmitButton(h).props.disabled, true)
+  old.reject(control.requestError(503, 'Old response'))
+  await settle(h)
+  assert.equal(control.trainingReads.length, readCount, 'late POST cannot reconcile under unresolved identity')
+  assert.equal(reports.length, reportCount)
+})
+
+test('YuE2 generation and training receipts in the same project remain independent across reload', async () => {
+  const composer = await componentFixture()
+  button(composer.h, 'Generate with YuE2').props.onClick(); composer.h.flush()
+  const song = composer.control.submits[0]
+  composer.h.unmount()
+  const trainer = await trainingFixture({ reload: true })
+  assert.doesNotMatch(textContent(trainer.h.tree), /Retry original training request/)
+  fillTraining(trainer.h)
+  button(trainer.h, 'Queue training').props.onClick(); trainer.h.flush()
+  const training = trainer.control.trainingSubmits[0]
+  assert.notEqual(training.input.requestId, song.input.requestId)
+  trainer.h.unmount()
+  const restoredSong = await componentFixture({ reload: true })
+  button(restoredSong.h, 'Retry this submission').props.onClick(); restoredSong.h.flush()
+  assert.deepEqual(restoredSong.control.submits[0].input, song.input)
+  restoredSong.h.unmount()
+  const restoredTraining = await trainingFixture({ reload: true })
+  button(restoredTraining.h, 'Retry original training request').props.onClick(); restoredTraining.h.flush()
+  assert.deepEqual(restoredTraining.control.trainingSubmits[0].input, training.input)
 })

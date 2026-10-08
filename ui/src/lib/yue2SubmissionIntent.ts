@@ -46,35 +46,67 @@ function boundedJson(value: unknown): boolean {
   return true
 }
 
-function readLedger(): Ledger | null {
-  if (!activeScope || activeScope !== yue2SubmissionScope()) return null
-  try {
-    const raw = sessionStorage.getItem(STORAGE_PREFIX + activeScope)
-    if (raw === null) return Object.create(null) as Ledger
-    if (raw.length > MAX_LEDGER_BYTES) return null
-    const ledger = JSON.parse(raw)
-    if (!ledger || typeof ledger !== 'object' || Array.isArray(ledger) || Object.keys(ledger).length > MAX_INTENTS) return null
-    for (const [workspace, entry] of Object.entries(ledger)) {
-      const payload = (entry as StoredIntent)?.payload
-      if (!workspace || !payload || typeof payload !== 'object' || Array.isArray(payload)
-        || payload.workspace !== workspace || typeof payload.requestId !== 'string'
-        || !payload.requestId || payload.requestId.length > 128 || !boundedJson(payload) || JSON.stringify(payload).length > MAX_PAYLOAD_BYTES) return null
-    }
-    return ledger as Ledger
-  } catch { return null }
-}
+/** Shared bounded tab storage; operation namespaces never mix generation and training. */
+export class Yue2RequestLedger {
+  private prefix: string
+  constructor(operation: 'generation' | 'training') {
+    // Preserve existing generation receipts from earlier UI revisions.
+    this.prefix = operation === 'generation' ? STORAGE_PREFIX : 'maestro:yue2-training-v1:'
+  }
 
-function writeLedger(expected: Ledger, next: Ledger): boolean {
-  try {
-    const current = readLedger()
-    if (!activeScope || !current || JSON.stringify(current) !== JSON.stringify(expected)) return false
-    const raw = JSON.stringify(next)
-    if (raw.length > MAX_LEDGER_BYTES) return false
-    sessionStorage.setItem(STORAGE_PREFIX + activeScope, raw)
-    const stored = readLedger()
-    return stored !== null && JSON.stringify(stored) === raw
-  } catch { return false }
+  read(scope: string | null): Ledger | null {
+    if (!scope || scope !== yue2SubmissionScope()) return null
+    try {
+      const raw = sessionStorage.getItem(this.prefix + scope)
+      if (raw === null) return Object.create(null) as Ledger
+      if (raw.length > MAX_LEDGER_BYTES) return null
+      const ledger = JSON.parse(raw)
+      if (!ledger || typeof ledger !== 'object' || Array.isArray(ledger) || Object.keys(ledger).length > MAX_INTENTS) return null
+      for (const [workspace, entry] of Object.entries(ledger)) {
+        const payload = (entry as StoredIntent)?.payload
+        if (!workspace || !payload || typeof payload !== 'object' || Array.isArray(payload)
+          || payload.workspace !== workspace || typeof payload.requestId !== 'string'
+          || !payload.requestId || payload.requestId.length > 128 || !boundedJson(payload) || JSON.stringify(payload).length > MAX_PAYLOAD_BYTES) return null
+      }
+      return ledger as Ledger
+    } catch { return null }
+  }
+
+  write(scope: string | null, expected: Ledger, next: Ledger): boolean {
+    try {
+      const current = this.read(scope)
+      if (!scope || !current || JSON.stringify(current) !== JSON.stringify(expected)) return false
+      const raw = JSON.stringify(next)
+      if (raw.length > MAX_LEDGER_BYTES) return false
+      sessionStorage.setItem(this.prefix + scope, raw)
+      const stored = this.read(scope)
+      return stored !== null && JSON.stringify(stored) === raw
+    } catch { return false }
+  }
+
+  payload(entry: StoredIntent): Record<string, unknown> {
+    const payload = JSON.parse(JSON.stringify(entry.payload)) as Record<string, unknown>
+    freeze(payload)
+    return payload
+  }
+
+  reserve(scope: string | null, workspace: string, payload: Record<string, unknown>): Record<string, unknown> {
+    const ledger = this.read(scope)
+    if (!ledger) throw new Error('Submission recovery could not be read in this tab. Check the jobs before trying again.')
+    if (Object.hasOwn(ledger, workspace)) throw new Error('This project already has a submission awaiting confirmation.')
+    if (Object.keys(ledger).length >= MAX_INTENTS) throw new Error('Confirm an unresolved YuE2 submission in another project before starting another.')
+    const frozen = JSON.parse(JSON.stringify(payload)) as Record<string, unknown>
+    if (frozen.workspace !== workspace || typeof frozen.requestId !== 'string' || !frozen.requestId
+      || frozen.requestId.length > 128 || !boundedJson(frozen) || JSON.stringify(frozen).length > MAX_PAYLOAD_BYTES) throw new Error('This submission is too large or invalid to retain safely.')
+    const nextLedger = Object.assign(Object.create(null), ledger, { [workspace]: { payload: frozen } }) as Ledger
+    if (!this.write(scope, ledger, nextLedger)) throw new Error('This tab could not retain the submission safely. Check the jobs before trying again.')
+    freeze(frozen)
+    return frozen
+  }
 }
+const submissionLedger = new Yue2RequestLedger('generation')
+const readLedger = () => submissionLedger.read(activeScope)
+const writeLedger = (expected: Ledger, next: Ledger) => submissionLedger.write(activeScope, expected, next)
 
 export function pruneYue2SubmissionIntents(accountEpoch: number): void {
   const scope = yue2SubmissionScope()
@@ -119,16 +151,7 @@ function freeze(value: unknown): void {
 
 export function reserveYue2SubmissionIntent(accountEpoch: number, workspace: string, payload: Record<string, unknown>): Yue2SubmissionIntent {
   pruneYue2SubmissionIntents(accountEpoch)
-  const ledger = readLedger()
-  if (!ledger) throw new Error('Submission recovery could not be read in this tab. Check the song library before trying again.')
-  if (Object.hasOwn(ledger, workspace)) throw new Error('This project already has a submission awaiting confirmation.')
-  if (Object.keys(ledger).length >= MAX_INTENTS) throw new Error('Confirm an unresolved YuE2 submission in another project before starting another.')
-  const frozen = JSON.parse(JSON.stringify(payload)) as Record<string, unknown>
-  if (frozen.workspace !== workspace || typeof frozen.requestId !== 'string' || !frozen.requestId
-    || frozen.requestId.length > 128 || !boundedJson(frozen) || JSON.stringify(frozen).length > MAX_PAYLOAD_BYTES) throw new Error('This submission is too large or invalid to retain safely.')
-  const nextLedger = Object.assign(Object.create(null), ledger, { [workspace]: { payload: frozen } }) as Ledger
-  if (!writeLedger(ledger, nextLedger)) throw new Error('This tab could not retain the submission safely. Check the song library before trying again.')
-  freeze(frozen)
+  const frozen = submissionLedger.reserve(activeScope, workspace, payload)
   const intent: Yue2SubmissionIntent = Object.freeze({ accountEpoch, accountScope: activeScope, workspace,
     requestId: String(frozen.requestId), payload: frozen, phase: 'sending', ambiguous: false })
   intents.set(workspace, intent)

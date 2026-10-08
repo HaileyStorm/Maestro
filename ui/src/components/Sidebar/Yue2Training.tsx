@@ -2,6 +2,7 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import { Loader2, RefreshCw, Square } from 'lucide-react'
 import * as api from '../../api/client'
 import { currentAccountIdentityEpoch, useStore } from '../../stores/useStore'
+import { yue2SubmissionScope } from '../../lib/yue2SubmissionIntent'
 import { matchingYue2TrainingJob, yue2TrainingAttempts } from './yue2TrainingAttempts'
 
 type Props = { workspace: string; tracks: api.Yue2Track[]; gpuBlocked: boolean; onJobs?: (jobs: api.Yue2TrainingJob[]) => void }
@@ -18,7 +19,8 @@ const jobStateLabel: Record<api.Yue2TrainingJob['state'], string> = {
 
 export function Yue2Training({ workspace, tracks, gpuBlocked, onJobs }: Props) {
   const accountEpoch = useStore(() => currentAccountIdentityEpoch())
-  const scope = useMemo(() => ({ workspace, accountEpoch }), [workspace, accountEpoch])
+  const accountScope = useStore(yue2SubmissionScope)
+  const scope = useMemo(() => ({ workspace, accountEpoch, accountScope }), [workspace, accountEpoch, accountScope])
   const scopeRef = useRef(scope)
   const [jobs, setJobs] = useState<api.Yue2TrainingJob[]>([])
   const [selected, setSelected] = useState<Record<string, boolean>>({})
@@ -42,6 +44,7 @@ export function Yue2Training({ workspace, tracks, gpuBlocked, onJobs }: Props) {
   workspaceRef.current = workspace
   const [, setAttemptVersion] = useState(0)
   const pending = yue2TrainingAttempts.current(accountEpoch, workspace)
+  const recoveryUnavailable = yue2TrainingAttempts.unavailable(accountEpoch)
 
   const ready = useMemo(() => tracks.filter(track => track.project === workspace && track.status === 'succeeded'), [tracks, workspace])
   const selectedTracks = ready.filter(track => selected[track.id])
@@ -50,8 +53,8 @@ export function Yue2Training({ workspace, tracks, gpuBlocked, onJobs }: Props) {
     && selectedTracks.every(track => !!captions[track.id]?.trim() && !/[\r\n]/.test(captions[track.id]))
 
   const isCurrent = useCallback((operation: number, requestWorkspace: string, requestEpoch: number) =>
-    mounted.current && scopeRef.current === scope && operationSequence.current === operation && workspaceRef.current === requestWorkspace
-      && currentAccountIdentityEpoch() === requestEpoch, [scope])
+    scope.accountScope !== null && mounted.current && scopeRef.current === scope && operationSequence.current === operation && workspaceRef.current === requestWorkspace
+      && currentAccountIdentityEpoch() === requestEpoch && yue2SubmissionScope() === scope.accountScope, [scope])
 
   useLayoutEffect(() => {
     mounted.current = true
@@ -94,11 +97,11 @@ export function Yue2Training({ workspace, tracks, gpuBlocked, onJobs }: Props) {
     }
   }, [workspace, accountEpoch, isCurrent])
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     setJobs([]); setSelected({}); setCaptions({}); setLyrics({})
     setName(''); setKind('artist'); setTrigger(''); setSteps(400)
     setBusy(false); setError(null); setMessage(null)
-  }, [workspace, accountEpoch])
+  }, [workspace, accountEpoch, accountScope])
 
   useEffect(() => { void refresh() }, [refresh])
 
@@ -110,14 +113,20 @@ export function Yue2Training({ workspace, tracks, gpuBlocked, onJobs }: Props) {
 
   const submit = async () => {
     if (!isCurrent(operationSequence.current, workspace, accountEpoch)
-      || (!valid && !pending) || busy || submitting.current || gpuBlocked) return
+      || (!valid && !pending) || busy || submitting.current || gpuBlocked || recoveryUnavailable) return
     const requestWorkspace = workspace
     const requestEpoch = accountEpoch
-    const attempt = yue2TrainingAttempts.next(requestEpoch, requestWorkspace, () => ({
-      workspace: requestWorkspace, requestId: `train-${crypto.randomUUID()}`,
-      name: name.trim(), kind, trigger, steps,
-      tracks: selectedTracks.map(track => ({ takeId: track.id, caption: captions[track.id].trim(), lyrics: lyrics[track.id] || '' })),
-    }))
+    let attempt: api.Yue2TrainingRequest | undefined
+    try {
+      attempt = yue2TrainingAttempts.next(requestEpoch, requestWorkspace, () => ({
+        workspace: requestWorkspace, requestId: `train-${crypto.randomUUID()}`,
+        name: name.trim(), kind, trigger, steps,
+        tracks: selectedTracks.map(track => ({ takeId: track.id, caption: captions[track.id].trim(), lyrics: lyrics[track.id] || '' })),
+      }))
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : 'Training recovery is unavailable in this tab.')
+      return
+    }
     if (!attempt) return
     const operation = ++operationSequence.current
     submitting.current = true
@@ -202,6 +211,7 @@ export function Yue2Training({ workspace, tracks, gpuBlocked, onJobs }: Props) {
           <label className="text-text-muted">Training steps<select value={steps} onChange={event => setSteps(Number(event.target.value))} className={`${inputClass} mt-1`}>{[200, 400, 600, 800, 1000, 1200, 1400, 1600].map(value => <option key={value} value={value}>{value}</option>)}</select></label>
         </div>
         <p className="text-text-muted">Use a trigger beginning with <code>sv_</code>, followed by 3–40 lowercase letters, digits, or underscores.</p>
+        {recoveryUnavailable && <p role="alert" className="text-red-400">Training recovery is unavailable in this tab. Check training jobs before trying again.</p>}
         {pending && !busy && <p role="status" className="text-amber-300">A previous request is unconfirmed. Retry will send its original inputs and request ID.</p>}
         {gpuBlocked && <p role="alert" className="text-red-400">GPU work is paused because a YuE2 worker could not be confirmed stopped. Check the local Sound/Vision service before starting another job.</p>}
         {ready.length === 0 && <p className="text-text-muted">Finish a YuE2 take in this project to use it for training.</p>}
@@ -214,7 +224,7 @@ export function Yue2Training({ workspace, tracks, gpuBlocked, onJobs }: Props) {
             </div>}
           </div>)}
         </div>
-        <button type="button" onClick={() => void submit()} disabled={(!valid && !pending) || busy || gpuBlocked} className="mobile-control-target flex w-full items-center justify-center rounded bg-cta px-2 text-[10px] font-semibold text-cta-foreground hover:ring-2 hover:ring-accent-blue/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:opacity-40">{busy ? <Loader2 size={12} className="animate-spin" /> : pending ? 'Retry original training request' : `Queue training with ${selectedTracks.length} ${selectedTracks.length === 1 ? 'take' : 'takes'}`}</button>
+        <button type="button" onClick={() => void submit()} disabled={(!valid && !pending) || busy || gpuBlocked || recoveryUnavailable} className="mobile-control-target flex w-full items-center justify-center rounded bg-cta px-2 text-[10px] font-semibold text-cta-foreground hover:ring-2 hover:ring-accent-blue/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:opacity-40">{busy ? <Loader2 size={12} className="animate-spin" /> : pending ? 'Retry original training request' : `Queue training with ${selectedTracks.length} ${selectedTracks.length === 1 ? 'take' : 'takes'}`}</button>
         <div className="flex items-center justify-between"><strong className="text-text-primary">Training jobs</strong><button type="button" aria-label="Refresh YuE2 training jobs" onClick={() => void refresh()} className="text-text-muted hover:text-text-primary"><RefreshCw size={12} /></button></div>
         {jobs.length === 0 && <p className="text-text-muted">No training jobs in this project yet.</p>}
         {jobs.map(job => <div key={job.id} className="rounded border border-border p-1.5 text-text-secondary">
