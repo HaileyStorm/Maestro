@@ -1677,54 +1677,26 @@ def polish_prompts_third_pass(
         parts.append(_replace_outside_quotes(text[pos:]))
         return "".join(parts), reverts, replaces
 
-    def _revert_modified_dialogue(before: str, after: str) -> tuple[str, int]:
-        """Position-pair quoted spans between input and polish output.
-        Any quoted span whose contents differ from the input gets reverted
-        to the input's original text.
+    def _revert_modified_dialogue(before: str, after: str) -> tuple[str, int, bool]:
+        """Restore authored quote contents when spans can be position-paired.
 
-        Defensive complement to _normalize_names_descriptors. That function
-        only reverts known descriptor→name substitutions inside quotes; it
-        can't catch when the polish LLM hallucinates a NEW descriptor
-        ("woman in middle with massive breasts") that isn't in our map at
-        all. This function reverts ANY modification to quoted text — the
-        polish layer has no business changing dialogue, period.
+        A changed span count cannot be repaired without guessing where a
+        speaker's words belong. Keep the entire authored prompt in that case
+        and tell the caller to skip further cleanup. Equal-count spans retain
+        the polished quote style while restoring the original contents,
+        including contractions and empty speech beats.
 
-        Conservative on edge cases:
-        - If quote counts differ between before and after (polish added or
-          removed a quoted span), returns the polished text unchanged
-          rather than risk a misalignment that mangles output. The
-          mismatch is logged so we can investigate.
-        - Quote characters from the input are preserved (straight " vs '
-          stay the way the screenplay author wrote them).
-        - Empty quotes are skipped to avoid replacing intentional speech
-          beats with empty strings.
-
-        Uses _iter_quoted_spans which is contraction-aware — the previous
-        regex split single-quoted dialogue containing apostrophes
-        ("it's", "you've") into multiple fake spans, causing this revert
-        to silently bail on count mismatch. Real-world impact: dialogue
-        like "Cathy" being mangled to descriptor inside quotes was
-        passing through unfixed.
-
-        Returns (cleaned_text, reverts_count).
+        Returns (cleaned_text, reverts_count, keep_original_prompt).
         """
-        if not before or not after:
-            return after, 0
         before_quotes = list(_iter_quoted_spans(before))
         after_quotes = list(_iter_quoted_spans(after))
-        if not after_quotes:
-            return after, 0
         if len(before_quotes) != len(after_quotes):
-            # Polish added/removed quoted spans. Possible legitimate cases
-            # (rare): polish split a long line into two. But more often
-            # this means the polish output is malformed in some other way.
-            # Don't try to repair — that risks worse output.
             print(
-                f"[PromptPolish] Dialogue revert skipped — quote count "
+                f"[PromptPolish] Kept authored prompt — quote count "
                 f"mismatch (input had {len(before_quotes)}, output has "
                 f"{len(after_quotes)})"
             )
-            return after, 0
+            return before, 0, True
 
         # Build the reverted output by walking after-quotes in order and
         # substituting each one's content with the matching before-quote.
@@ -1745,7 +1717,7 @@ def polish_prompts_third_pass(
                 reverts += 1
             pos = a_end
         out_parts.append(after[pos:])
-        return "".join(out_parts), reverts
+        return "".join(out_parts), reverts, False
 
     def _enhance_video(
         prompt: str, system_prompt: str, desc_to_name: dict,
@@ -1801,7 +1773,9 @@ def polish_prompts_third_pass(
             # dialogue, including hallucinated descriptors that aren't in
             # our character map. Runs after the descriptor-aware revert
             # above so that any remaining quote modifications get caught.
-            cleaned, dlg_reverts = _revert_modified_dialogue(prompt, cleaned)
+            cleaned, dlg_reverts, keep_original = _revert_modified_dialogue(prompt, cleaned)
+            if keep_original:
+                return prompt
             if dlg_reverts:
                 print(f"[PromptPolish] Reverted {dlg_reverts} quoted-dialogue modification(s) by position-pair")
             # Hallucinated-name strip: any proper noun in output not in
@@ -1874,7 +1848,9 @@ def polish_prompts_third_pass(
             # but when they do (Pass 2 sometimes leaves quoted text in
             # an image_prompt), apply the same position-paired revert as
             # video prompts so polish can't mangle quoted speech.
-            cleaned, dlg_reverts = _revert_modified_dialogue(prompt, cleaned)
+            cleaned, dlg_reverts, keep_original = _revert_modified_dialogue(prompt, cleaned)
+            if keep_original:
+                return prompt
             if dlg_reverts:
                 print(f"[PromptPolish] Reverted {dlg_reverts} image-prompt quoted-dialogue modification(s) by position-pair")
             # Hallucinated-name strip (same defense-in-depth as video).
@@ -2083,6 +2059,11 @@ def polish_prompts_third_pass(
                             full_text, _build_video_system_for(full_text),
                             shot_desc_to_name, shot_name_to_desc, plan_duration,
                         )
+                        # The enhancer may keep its entire input on a
+                        # dialogue mismatch or unchanged response. Its
+                        # context prefix belongs only to this LLM call.
+                        if enhanced == full_text:
+                            enhanced = wp
                         _count_outcome(wp, enhanced)
                         if enhanced and enhanced.strip() and enhanced.strip() != wp.strip():
                             polished_wps.append(enhanced.strip())

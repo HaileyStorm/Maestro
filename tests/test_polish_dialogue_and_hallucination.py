@@ -18,15 +18,16 @@ Blaine's logic").
 
 The fixes ship across four layers: apostrophe-aware quoted-span
 helper, input-filtered character block, strengthened anti-hallucination
-system-prompt rules, and a post-process hallucination stripper. Each
-test below exercises one of the four; together they cover the
-production scenarios end-to-end.
+system-prompt rules, and a post-process hallucination stripper. Dialogue
+regressions invoke the real third-pass pipeline with the LLM response
+mocked; they do not prove live model or generated-video behavior.
 """
 from __future__ import annotations
 
 import os
 import sys
 import unittest
+from unittest import mock
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _APP_DIR = os.path.abspath(os.path.join(_HERE, "..", "app"))
@@ -35,97 +36,91 @@ if _APP_DIR not in sys.path:
 
 from services.director.prompt_polish import (  # noqa: E402
     _strip_hallucinated_names,
+    polish_prompts_third_pass,
 )
 
 
-# Test the apostrophe-aware iterator + revert helper. These are nested
-# inside polish_prompts_third_pass(), so we test them via a module-level
-# wrapper that exercises the same logic.
-def _import_nested_helpers():
-    """Fish out the nested helpers from polish_prompts_third_pass.
-
-    They're closures inside that function, but they don't capture any
-    of the function's local state needed for THESE tests (no LLM calls,
-    no character maps). We rebuild a minimal version here for testing
-    by re-importing the regex pieces from the module.
-    """
-    import re as _re
-    from services.director import prompt_polish as pp
-
-    # Reconstruct the iterator helper using the same patterns. We
-    # can't easily get the closure version, so we test the regex
-    # pieces directly. The patterns are NOT module-level constants in
-    # the source (they're inside the closure), so this test mirrors
-    # them — if the source patterns change, this test will become
-    # stale and a manual sync is needed.
-    DOUBLE = _re.compile(r'"([^"]*?)"', _re.DOTALL)
-    SINGLE = _re.compile(
-        r"(?<![A-Za-z])'(.*?)'(?![A-Za-z])",
-        _re.DOTALL,
-    )
-
-    def iter_spans(text: str):
-        if not text:
-            return
-        spans = []
-        for m in DOUBLE.finditer(text):
-            spans.append(('"', m.group(1), m.start(), m.end()))
-        for m in SINGLE.finditer(text):
-            spans.append(("'", m.group(1), m.start(), m.end()))
-        spans.sort(key=lambda s: s[2])
-        last_end = -1
-        for span in spans:
-            if span[2] >= last_end:
-                yield span
-                last_end = span[3]
-
-    return iter_spans
+def _polish(before, after, *, field="video_prompt", video_model="ltx2", **kwargs):
+    """Run the real third-pass pipeline with only its LLM response mocked."""
+    plans = [{field: before}]
+    with mock.patch("services.llm_service.enhance_prompt", return_value=after) as enhance:
+        result = polish_prompts_third_pass(
+            plans, video_model=video_model, image_model="flux",
+            polish_video_prompts=field == "video_prompt",
+            polish_image_prompts=field == "image_prompt", **kwargs,
+        )
+    return result[0][field], enhance
 
 
-class TestApostropheAwareQuotedSpans(unittest.TestCase):
-    """Incident 1 root cause: the old regex split dialogue at every
-    contraction apostrophe."""
+class TestAuthoredDialoguePreservation(unittest.TestCase):
+    def test_changed_quote_count_keeps_complete_authored_prompt(self):
+        # Include names and duplicate articles that later cleanup would alter:
+        # falling back must bypass every remaining post-processing step.
+        before = "  Cathy waits by the the door. She says 'It's me.' He says 'Don't go.'  "
+        outputs = [
+            'She says "An altered line."',
+            'She says "One." He says "Two." She adds "Three."',
+            'She speaks without any quotation marks.',
+            'She says "An unfinished line.',
+        ]
+        characters = [{"display_name": "Cathy", "physical_description": "woman in white"}]
+        for field in ("video_prompt", "image_prompt"):
+            for after in outputs:
+                with self.subTest(field=field, after=after):
+                    actual, enhance = _polish(before, after, field=field, characters=characters)
+                    self.assertEqual(actual, before)
+                    enhance.assert_called_once()
 
-    def setUp(self):
-        self.iter_spans = _import_nested_helpers()
+    def test_new_quoted_turns_keep_unquoted_input(self):
+        before = "A woman waves silently."
+        for field in ("video_prompt", "image_prompt"):
+            with self.subTest(field=field):
+                actual, _ = _polish(before, 'A woman says "Hello."', field=field)
+                self.assertEqual(actual, before)
 
-    def test_single_quoted_dialogue_with_contraction_is_one_span(self):
-        # Original incident input: dialogue with multiple contraction
-        # apostrophes inside a single-quoted span.
-        text = "She says 'You know, it's ridiculous how much you've been on my mind.'"
-        spans = list(self.iter_spans(text))
-        self.assertEqual(len(spans), 1, f"expected 1 span, got {len(spans)}: {spans}")
-        quote_char, content, _start, _end = spans[0]
-        self.assertEqual(quote_char, "'")
-        # Content should include both contractions intact.
-        self.assertIn("it's", content)
-        self.assertIn("you've", content)
+    def test_equal_count_restores_contractions_and_keeps_polished_prose(self):
+        before = "She says 'You know, it's ridiculous.' He replies 'I've missed you.'"
+        after = 'She leans forward and says "Changed." He whispers "Altered."'
+        actual, enhance = _polish(before, after)
+        self.assertEqual(actual, 'She leans forward and says "You know, it\'s ridiculous." He whispers "I\'ve missed you."')
+        enhance.assert_called_once()
 
-    def test_double_quoted_dialogue_with_contractions(self):
-        text = 'She says "You know, it\'s ridiculous how much you\'ve been on my mind."'
-        spans = list(self.iter_spans(text))
-        self.assertEqual(len(spans), 1)
-        quote_char, content, _, _ = spans[0]
-        self.assertEqual(quote_char, '"')
-        self.assertIn("it's", content)
+    def test_unquoted_prose_still_polishes(self):
+        actual, enhance = _polish("A woman waves.", "A woman slowly waves by the door.")
+        self.assertEqual(actual, "A woman slowly waves by the door.")
+        enhance.assert_called_once()
 
-    def test_two_distinct_dialogue_spans(self):
-        # Two separate dialogue lines — the iterator should find both.
-        text = "She says 'Hello, it's me.' He replies 'I've missed you.'"
-        spans = list(self.iter_spans(text))
-        self.assertEqual(len(spans), 2)
+    def test_window_fallback_never_publishes_enhancer_context(self):
+        windows = [
+            "  She says 'It's me.' He replies 'Don't go.'  ",
+            "  He says 'Stay.' She replies 'I will.'  ",
+        ]
+        for unchanged in (False, True):
+            with self.subTest(unchanged=unchanged):
+                plans = [{"video_prompt": "unused", "window_prompts": list(windows)}]
+                response = (lambda **kw: kw["prompt"]) if unchanged else None
+                with mock.patch(
+                    "services.llm_service.enhance_prompt", side_effect=response,
+                    return_value='She says "An altered line."',
+                ) as enhance:
+                    actual = polish_prompts_third_pass(
+                        plans, video_model="ltx2", image_model="flux",
+                        polish_video_prompts=True, polish_image_prompts=False,
+                    )
+                self.assertEqual(actual[0]["window_prompts"], windows)
+                self.assertEqual(enhance.call_count, 2)
+                self.assertTrue(enhance.call_args_list[1].kwargs["prompt"].startswith("[Window 2"))
 
-    def test_count_matches_after_quote_style_change(self):
-        # Polish LLM commonly converts ' to " in output. Both forms
-        # should produce the SAME span count for position-paired
-        # revert to work.
-        before = "She says 'You know, it's ridiculous.'"
-        after = 'She says "You know, it\'s ridiculous."'
-        before_spans = list(self.iter_spans(before))
-        after_spans = list(self.iter_spans(after))
-        self.assertEqual(len(before_spans), len(after_spans),
-                         "Count must match for dialogue revert to fire")
-        self.assertEqual(len(before_spans), 1)
+    def test_h3_and_storyboard_remain_exact_without_llm_calls(self):
+        cases = [
+            ("minimax_h3", "Duration: 6s. She says 'It's me.'"),
+            ("ltx2", "Shot 1 (Medium, 8s): She says 'Don't go.'"),
+        ]
+        for model, before in cases:
+            with self.subTest(model=model):
+                actual, enhance = _polish(before, 'She says "Altered."', video_model=model)
+                self.assertEqual(actual, before)
+                enhance.assert_not_called()
 
 
 class TestStripHallucinatedNames(unittest.TestCase):
@@ -242,11 +237,6 @@ class TestEndToEndIncidentReproduction(unittest.TestCase):
     """End-to-end reproductions of the user-reported polish output."""
 
     def test_incident_1_dialogue_mangle_post_apostrophe_fix(self):
-        # The dialogue revert depends on apostrophe-aware spans.
-        # We can't fully test the revert without spinning up the polish
-        # closure, but we can verify the iterator reports matching
-        # span counts for the specific input/output that broke before.
-        iter_spans = _import_nested_helpers()
         before = (
             "She leans in slightly and speaks, her voice breathy with anticipation, "
             "'You know, it's ridiculous how much you've been on my mind since. since the shower.' "
@@ -261,15 +251,11 @@ class TestEndToEndIncidentReproduction(unittest.TestCase):
             'a piece of hair from his forehead while his jaw tightens, responding with a low, '
             'guarded tone: "What about me, woman in white with massive breasts? My terrible taste in soap?"'
         )
-        before_spans = list(iter_spans(before))
-        after_spans = list(iter_spans(after))
-        # Both must produce 2 spans (the two dialogue lines).
-        self.assertEqual(len(before_spans), 2,
-                         f"expected 2 before-spans, got {len(before_spans)}")
-        self.assertEqual(len(after_spans), 2,
-                         f"expected 2 after-spans, got {len(after_spans)}")
-        # Counts match → position-paired revert can fire.
-        self.assertEqual(len(before_spans), len(after_spans))
+        actual, enhance = _polish(before, after)
+        self.assertIn('"What about me, Cathy? My terrible taste in soap?"', actual)
+        self.assertIn("it's ridiculous how much you've been on my mind", actual)
+        self.assertNotIn("massive breasts", actual)
+        enhance.assert_called_once()
 
     def test_incident_2_blaine_hallucination_strip(self):
         # End-to-end: "the strong man in black" + "his logic" → polish
