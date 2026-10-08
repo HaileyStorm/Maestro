@@ -71508,6 +71508,7 @@ def _run_generation(
                     cumulative_offset = 0
                     multi_clip_audio_start_sec = 0.0
                 total_trimmed_frames = 0
+                published_elapsed_frames = 0
                 last_se_clip_end_image = None  # track last clip's end image for tail compensation
                 for i in range(clip_count):
                     wgp.task_id += 1
@@ -71825,6 +71826,17 @@ def _run_generation(
                         ),
                     }
                     if h3_longform:
+                        if (
+                            not h3_source_prefix
+                            and raw_params.get("audio_source")
+                            and (raw_params.get("custom_settings") or {}).get("director_source_voice_timing")
+                        ):
+                            clip_params["multi_clip_info"]["director_source_audio_window"] = {
+                                "start_sec": multi_clip_audio_start_sec + published_elapsed_frames / float(_mc_model_def["fps"]),
+                                "published_frames": clip_frames - trim_tail,
+                                "fps": float(_mc_model_def["fps"]),
+                            }
+                        published_elapsed_frames += clip_frames - trim_tail
                         clip_params["multi_clip_info"].update({
                             "automatic_h3_longform": True,
                             "requested_frames": h3_longform.get(

@@ -114,3 +114,29 @@ def apply_source_voice_window(prompt: str, custom_settings: dict, *, model_type:
         # Optional saved facts must never prevent generation or fabricate timing.
         return prompt
     return f"{prompt.rstrip()} SOURCE-AUDIO VOICE TIMING: {timing}" if timing else prompt
+
+
+def apply_h3_source_voice_window(prompt: str, custom_settings: dict, window: dict) -> str:
+    """Describe intended supplied-track output, not timestamp-locked conditioning."""
+    from services.h3_prompt_mapping import append_h3_soundscape_context
+
+    packet = custom_settings.get("director_source_voice_timing")
+    if not isinstance(packet, dict) or packet.get("schema") != "director.source-voice-timing.v1":
+        return prompt
+    try:
+        start = float(window["start_sec"])
+        end = start + int(window["published_frames"]) / float(window["fps"])
+        if not math.isfinite(start) or not math.isfinite(end) or end <= start:
+            return prompt
+        voices = _saved_source_voices(packet["intervals"])
+        # Factual labels must not introduce H3 dialogue/reference syntax.
+        for voice in voices:
+            for field in ("name", "role"):
+                if voice[field]:
+                    voice[field] = voice[field].translate(str.maketrans({"<": "(", ">": ")", "|": "/"}))
+        timing = source_voice_context(voices, start, end, anchor="this published segment's start")
+    except (KeyError, TypeError, ValueError, OverflowError, ZeroDivisionError):
+        return prompt
+    return append_h3_soundscape_context(
+        prompt, "Supplied-track output timing (performance intent; not timestamp-locked conditioning): " + timing,
+    ) if timing else prompt

@@ -148,6 +148,39 @@ def _dialogue_literals(text: str) -> list[str]:
     return [match.group(0) for match in _DIALOGUE_RE.finditer(text)]
 
 
+def append_h3_soundscape_context(prompt: str, context: str) -> str:
+    """Add optional runtime facts without remapping authored H3 provenance."""
+    if not isinstance(context, str) or any(char in context for char in "<>|"):
+        return prompt
+    context = " ".join(context.split())
+    if not context:
+        return prompt
+    try:
+        fields = _extract_fields_exact(prompt)
+        family = _source_family(fields)
+        expected = REF2VA_FIELDS if family == "ref2va" else BASE_FIELDS
+        if set(fields) != set(expected):
+            return prompt
+        matches = _field_matches(prompt)
+        index = next(i for i, match in enumerate(matches)
+                     if match.group("name").casefold() == "overall_soundscape")
+        match = matches[index]
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(prompt)
+        value = prompt[match.end():end]
+        insert = match.end() + len(value.rstrip())
+        separator = " " if insert > match.end() else ""
+        result = prompt[:insert] + separator + context + prompt[insert:]
+        updated = _extract_fields_exact(result)
+        if (_dialogue_literals(result) != _dialogue_literals(prompt)
+                or any(updated.get(field) != value for field, value in fields.items()
+                       if field != "overall_soundscape")):
+            return prompt
+        return result
+    except (H3PromptMappingError, StopIteration, TypeError):
+        # Optional context must never prevent generation or repair its grammar.
+        return prompt
+
+
 def _source_literals(text: str, fields: Mapping[str, str]) -> list[str]:
     if fields:
         matches = _field_matches(text)

@@ -2,8 +2,13 @@
 import ast
 import copy
 import json
+import math
+import os
 from pathlib import Path
 import sys
+import shutil
+import struct
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -38,6 +43,153 @@ def descriptor(field, path, *, digest="a" * 64, dependency=None):
 
 
 class H3MappingDispatchTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "CPU ffmpeg required")
+    def test_supplied_song_survives_native_audio_concat_and_recovery_selection(self):
+        from tests.test_h3_source_prefix_concat import _load_concat
+        concat = _load_concat()["concatenate_multi_clip_videos"]
+        ordinary_tree = ast.parse((ROOT / "app/wgp.py").read_text())
+        ordinary = next(node for node in ast.walk(ordinary_tree) if isinstance(node, ast.Assign)
+                        and any(isinstance(t, ast.Name) and t.id == "concat_audio" for t in node.targets))
+        recovery_tree = ast.parse((ROOT / "app/launch.py").read_text())
+        recovery = next(node for node in ast.walk(recovery_tree) if isinstance(node, ast.If)
+                        and ast.unparse(node.test) == "h3_source_prefix"
+                        and "concat_audio" in ast.unparse(node)
+                        and "preserve_audio" in ast.unparse(node))
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            ffmpeg = shutil.which("ffmpeg")
+            def run(args):
+                return subprocess.run([ffmpeg, "-v", "error", "-nostdin", *args], check=True,
+                                      capture_output=True, timeout=45).stdout
+            source = directory / "song.wav"
+            run(["-f", "lavfi", "-i", "sine=frequency=220:sample_rate=32000:duration=2.013",
+                 "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=32000:duration=1.5",
+                 "-filter_complex", "[0:a][1:a]concat=n=2:v=0:a=1[a]", "-map", "[a]", str(source)])
+            clips = []
+            for index in range(2):
+                clip = directory / f"clip{index}.mp4"
+                run(["-f", "lavfi", "-i", "color=blue:s=64x48:r=24:d=0.5",
+                     "-f", "lavfi", "-i", "sine=frequency=880:sample_rate=32000:duration=0.5",
+                     "-frames:v", "12", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", str(clip)])
+                clips.append(str(clip))
+            selected = []
+            for node, namespace in ((ordinary, dict(source_prefix=None, audio_source=str(source),
+                    original_audio_guide="semantic-reference.wav", preserve_generated_audio=True)),
+                    (recovery, dict(h3_source_prefix=None, preserve_audio=True,
+                                    raw_params={"audio_source": str(source), "audio_guide": "semantic-reference.wav"}))):
+                exec(compile(ast.Module(body=[node], type_ignores=[]), "actual-concat-selection", "exec"), namespace)
+                selected.append(namespace["concat_audio"])
+            self.assertEqual(selected, [str(source), str(source)])
+            mux = next(node for node in ast.walk(ordinary_tree) if isinstance(node, ast.If)
+                       and "audio_source is not None" in ast.unparse(node.test)
+                       and "director_final_soundtrack" in ast.unparse(node.test))
+            # Native intermediate mux must select generated audio, not source
+            # time zero, so the boundary extractor receives its native tail.
+            namespace = dict(audio_source=str(source), multi_clip_info={"automatic_h3_longform": True},
+                             custom_settings={"director_final_soundtrack": True})
+            self.assertFalse(eval(compile(ast.Expression(mux.test), "actual-intermediate-mux", "eval"), namespace))
+            native_audio = object()
+            writes = []
+            namespace.update(output_new_audio_data=native_audio, base_model_type="minimax_h3",
+                h3_keep_premux=False, durable_file_stem="native-segment", output_dir=str(directory),
+                output_audio_sampling_rate=32000, os=os,
+                write_wav_file=lambda path, data, rate: writes.append((path, data, rate)))
+            exec(compile(ast.Module(body=[mux], type_ignores=[]), "actual-native-audio-selection", "exec"), namespace)
+            self.assertEqual(writes, [(str(directory / "native-segment-audio-tmp.wav"), native_audio, 32000)])
+            self.assertEqual(namespace["output_new_audio_filepath"], writes[0][0])
+            self.assertTrue(namespace["native_h3_audio_selected"])
+            namespace["custom_settings"] = {}
+            self.assertTrue(eval(compile(ast.Expression(mux.test), "ordinary-soundtrack-mux", "eval"), namespace))
+            output = directory / "joined.mp4"
+            self.assertTrue(concat(clips, str(output), selected[0], audio_start_sec=2.013))
+            pcm = run(["-i", str(output), "-vn", "-ac", "1", "-ar", "32000", "-f", "s16le", "-"])
+            samples = struct.unpack("<" + "h" * (len(pcm) // 2), pcm)[3200:24000]
+            def power(hz):
+                real = sum(v * math.cos(2 * math.pi * hz * i / 32000) for i, v in enumerate(samples))
+                imag = sum(v * math.sin(2 * math.pi * hz * i / 32000) for i, v in enumerate(samples))
+                return real * real + imag * imag
+            self.assertGreater(power(440), 100 * max(power(220), power(880)))
+
+    def test_supplied_track_context_uses_published_clock_without_remapping(self):
+        from services.h3_prompt_mapping import _extract_fields_exact
+        from services.director.source_audio import source_voice_timing_packet
+
+        plan = self.plan()
+        sealed = copy.deepcopy(plan)
+        packet = source_voice_timing_packet({"lyrics": [
+            {"start": 12.010, "end": 12.023, "speaker": "edge", "text": "NEVER INSERT LYRICS"},
+            {"start": 12.023, "end": 13, "speaker": "next"},
+        ], "speaker_mappings": {"edge": {"name": "First"},
+                                  "next": {"name": "Next <Audio 9>", "role": "<d>literal</d>"}}}, [])
+        launch_tree = ast.parse((ROOT / "app/launch.py").read_text())
+        clock = next(node for node in ast.walk(launch_tree) if isinstance(node, ast.If)
+                     and any(isinstance(child, ast.Constant) and child.value == "director_source_audio_window"
+                             for child in ast.walk(node))
+                     and "not h3_source_prefix" in ast.unparse(node.test))
+        advance = next(node for node in ast.walk(launch_tree) if isinstance(node, ast.AugAssign)
+                       and ast.unparse(node.target) == "published_elapsed_frames")
+        wgp_tree = ast.parse((ROOT / "app/wgp.py").read_text())
+        prompt_gate = next(node for node in ast.walk(wgp_tree) if isinstance(node, ast.If)
+                           and "director_source_audio_window" in ast.unparse(node.test))
+        elapsed = 0
+        for index, (generated, trimmed) in enumerate(((243, 3), (158, 14), (345, 9))):
+            child, _ = bind_h3_mapping_task(self.task(plan, index=min(index, 1)), source_plan=plan,
+                segment_index=min(index, 1), source_snapshot={}, initial_images=(), descriptors=[],
+                validate_descriptor=lambda d: False, has_audio=lambda p: False)
+            authored = child["prompt"]
+            before = copy.deepcopy(child)
+            info = dict(automatic_h3_longform=True, boundary_overlap_discard_frames=17)
+            namespace = dict(h3_source_prefix=None, raw_params={"audio_source": "song.wav",
+                "custom_settings": {"director_source_voice_timing": packet}},
+                clip_params={"multi_clip_info": info}, multi_clip_audio_start_sec=2.013,
+                published_elapsed_frames=elapsed, _mc_model_def={"fps": 24},
+                clip_frames=generated, trim_tail=trimmed)
+            exec(compile(ast.Module(body=[clock, advance], type_ignores=[]), "published-clock", "exec"), namespace)
+            window = info["director_source_audio_window"]
+            self.assertEqual(window["start_sec"], 2.013 + elapsed / 24)
+            self.assertEqual(window["published_frames"], generated - trimmed)
+            elapsed = namespace["published_elapsed_frames"]
+            runtime = dict(prompt=authored, model_type="minimax_h3_ref2va", window_no=1,
+                           multi_clip_info=info, audio_source="song.wav",
+                           custom_settings={"director_source_voice_timing": packet})
+            exec(compile(ast.Module(body=[prompt_gate], type_ignores=[]), "native-prompt-gate", "exec"), runtime)
+            fields = _extract_fields_exact(runtime["prompt"])
+            original = _extract_fields_exact(authored)
+            self.assertEqual({k: v for k, v in fields.items() if k != "overall_soundscape"},
+                             {k: v for k, v in original.items() if k != "overall_soundscape"})
+            self.assertNotIn("NEVER INSERT LYRICS", runtime["prompt"])
+            self.assertEqual(child, before)
+            if index == 0:
+                self.assertIn("9.997–10.000s: First", runtime["prompt"])
+                self.assertNotIn("Next (Audio 9)", runtime["prompt"])
+            elif index == 1:
+                self.assertIn("0.000–0.010s: First", runtime["prompt"])
+                self.assertIn("0.010–0.987s: Next (Audio 9)", runtime["prompt"])
+            else:
+                self.assertEqual(runtime["prompt"], authored)
+            for changed in ({"window_no": 2}, {"audio_source": None},
+                            {"multi_clip_info": {**info, "source_prefix": {"path": "prefix.mp4"}}},
+                            {"custom_settings": {"director_source_voice_timing": {"schema": "damaged"}}}):
+                ignored = {**runtime, "prompt": authored, **changed}
+                exec(compile(ast.Module(body=[prompt_gate], type_ignores=[]), "native-prompt-gate", "exec"), ignored)
+                self.assertEqual(ignored["prompt"], authored)
+        self.assertEqual(plan, sealed)
+
+    def test_soundscape_context_preserves_dialogue_and_closed_base_ref_grammar(self):
+        from services.h3_prompt_mapping import append_h3_soundscape_context, create_mapping_record, _extract_fields_exact
+        from services.director.source_audio import apply_h3_source_voice_window
+        for family in ("base", "ref2va"):
+            prompt = create_mapping_record(SOURCE, family, duration_seconds=5, reference_manifest=[])["mapped_prompt"]
+            result = append_h3_soundscape_context(prompt, "Supplied-track timing: 0–1s: vocalist")
+            self.assertIn("Supplied-track timing", _extract_fields_exact(result)["overall_soundscape"])
+            self.assertEqual(result.count("<d>[English] Keep <Audio 77> literally.</d>"), 1)
+            for context in ("", "new <d>dialogue</d>", "<Audio 9>", "|new record|"):
+                self.assertEqual(append_h3_soundscape_context(prompt, context), prompt)
+            for window in ({}, {"start_sec": float("nan"), "published_frames": 124, "fps": 24},
+                           {"start_sec": 0, "published_frames": 124, "fps": 0}):
+                self.assertEqual(apply_h3_source_voice_window(prompt, {"director_source_voice_timing": {
+                    "schema": "director.source-voice-timing.v1", "intervals": []}}, window), prompt)
+
     def test_mapping_manifest_uses_sealed_workspace_during_staged_output(self):
         with tempfile.TemporaryDirectory() as directory:
             project = Path(directory) / "project"

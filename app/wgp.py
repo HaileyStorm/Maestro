@@ -13681,6 +13681,19 @@ def _generate_video_impl(
             # the exact per-window prompt here (after global-timeline mapping
             # and prompt preprocessing selection) instead of asking the UI to
             # guess which timestamp segment is active.
+            if (
+                model_type in {"minimax_h3", "minimax_h3_pinkcherry_fl2va", "minimax_h3_w4a8_fl2va", "minimax_h3_ref2va"}
+                and window_no == 1
+                and multi_clip_info
+                and multi_clip_info.get("automatic_h3_longform")
+                and not multi_clip_info.get("source_prefix")
+                and multi_clip_info.get("director_source_audio_window")
+                and audio_source
+            ):
+                from services.director.source_audio import apply_h3_source_voice_window
+                prompt = apply_h3_source_voice_window(
+                    prompt, custom_settings or {}, multi_clip_info["director_source_audio_window"],
+                )
             gen["current_window_prompt"] = prompt
             return_latent_slice = None 
             frames_relative_positions_list = []
@@ -15057,7 +15070,13 @@ def _generate_video_impl(
                             )
                             video_to_audio(save_path_tmp, prompt = MMAudio_prompt, negative_prompt = MMAudio_neg_prompt, seed = seed, num_steps = 25, cfg_strength = 4.5, duration= output_frame_count / fps, save_path = output_new_audio_filepath, persistent_models = mmaudio_persistence == MMAUDIO_PERSIST_RAM, audio_file_only = True, verboseLevel = verbose_level, model_name = mmaudio_model_name, model_path = mmaudio_model_path)
                             new_audio_added_from_audio_start =  False
-                        elif audio_source is not None:
+                        elif audio_source is not None and not (
+                            multi_clip_info
+                            and multi_clip_info.get("automatic_h3_longform")
+                            and (custom_settings or {}).get("director_final_soundtrack")
+                        ):
+                            # Director's supplied song belongs to final concat.
+                            # Keep native segment audio for boundary handoff.
                             output_new_audio_filepath = audio_source
                             new_audio_added_from_audio_start =  True
                         elif output_new_audio_data is not None:

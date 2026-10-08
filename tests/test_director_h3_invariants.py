@@ -1492,6 +1492,46 @@ non_diegetic_music: N/A"""
         # counts, so scene two begins at frame 240 rather than the 243 grid.
         self.assertEqual(plan["shot_plan"]["shots"][1]["published_start_frame"], 240)
 
+    def test_initial_music_video_keeps_supplied_soundtrack_through_adaptive_h3_plan(self):
+        clips = [{"video_prompt": "The singer opens."}, {"video_prompt": "The singer continues."}]
+        planned = [{"start": 2.013, "end": 12.013, "duration_sec": 10},
+                   {"start": 12.013, "end": 22.013, "duration_sec": 10}]
+        audio = os.path.join(self.temp_dir.name, "song.wav")
+        with open(audio, "wb") as handle:
+            handle.write(b"sealed source audio input")
+        params = {"video_model": pipeline._H3_BASE_FL2VA_MODEL,
+                  "pipeline_type": "music_video", "audio_path": audio,
+                  "h3_ref2va_terms_accepted": True, "seamless": False,
+                  "lyrics": [{"start": 12.010, "end": 12.023, "speaker": "s", "text": "PRIVATE WORDS"}],
+                  "speaker_mappings": {"s": {"name": "Singer"}},
+                  "video_params": {"resolution": "608x352"}}
+        with patch.object(pipeline, "_submit_and_wait", return_value=["joined.mp4"]) as submit, \
+                patch.object(pipeline, "_require_pipeline_checkpoint"):
+            self.assertEqual(pipeline._run_video_generation("source-song", params, clips, planned,
+                ["start.png", "start.png"], out_dir=self.temp_dir.name), ["joined.mp4"])
+        request = submit.call_args.args[0]
+        self.assertEqual(request["audio_source"], audio)
+        self.assertTrue(request["custom_settings"]["director_final_soundtrack"])
+        timing = request["custom_settings"]["director_source_voice_timing"]
+        self.assertEqual(timing["intervals"][0]["start"], 12.010)
+        self.assertEqual(timing["audio_origin_sec"], 0)
+        self.assertNotIn("PRIVATE WORDS", json.dumps(timing))
+        self.assertEqual(request["multi_clip_audio_start_sec"], 2.013)
+        self.assertTrue(request["_h3_longform"]["preserve_generated_audio"])
+        self.assertEqual(request["_h3_longform"]["clip_published_frames"], [240, 240])
+        # Native-sized seamless music requests must also reach final assembly;
+        # its floating source origin cannot use the time-zero ordinary mux.
+        single_params = {**params, "seamless": True}
+        single_params.pop("_h3_longform", None)
+        with patch.object(pipeline, "_submit_and_wait", return_value=["single.mp4"]) as submit, \
+                patch.object(pipeline, "_require_pipeline_checkpoint"):
+            pipeline._run_video_generation("single-song", single_params, clips[:1],
+                [{"start": 2.013, "end": 7.013, "duration_sec": 5}], ["start.png"], out_dir=self.temp_dir.name)
+        request = submit.call_args.args[0]
+        self.assertEqual(request["multi_prompts_gen_type"], 3)
+        self.assertEqual(request["_h3_longform"]["clip_count"], 1)
+        self.assertEqual(request["multi_clip_audio_start_sec"], 2.013)
+
     def test_scene_boundary_override_wins_over_structured_continuity(self):
         planned = [
             {"start": 0, "end": 10, "duration_sec": 10},

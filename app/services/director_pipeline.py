@@ -9170,7 +9170,8 @@ def _prepare_director_h3_longform(
     clip_published_frames = list(shot_plan["clip_published_frames"])
     clip_trim_tail_frames = list(shot_plan["clip_trim_tail_frames"])
 
-    if len(segment_frames) == 1 and len(requested_scene_frames) == 1:
+    if (len(segment_frames) == 1 and len(requested_scene_frames) == 1
+            and not (gen_params.get("custom_settings") or {}).get("director_final_soundtrack")):
         # Native-sized Director clips need no automatic long-form contract.
         # Terms are still enforced below for a directly selected Ref2VA job.
         effective = selected
@@ -9882,11 +9883,19 @@ def _run_video_generation(pid: str, params: dict, clip_plans: list[dict],
         if direct_refs:
             gen_params["image_refs"] = direct_refs
 
-    if pipeline_type == "music_video" and audio_path and _is_ltx25_model(video_model, model_def):
+    if pipeline_type == "music_video" and audio_path and (
+        _is_ltx25_model(video_model, model_def) or video_model in _H3_VIDEO_MODELS
+    ):
         from services.director.source_audio import source_voice_timing_packet
         voice_timing = source_voice_timing_packet(params, clip_plans)
         if voice_timing:
             gen_params.setdefault("custom_settings", {})["director_source_voice_timing"] = voice_timing
+        if video_model in _H3_VIDEO_MODELS:
+            # Semantic/native audio conditions generation; the supplied song
+            # remains Director's explicitly selected final soundtrack.
+            gen_params["audio_source"] = audio_path
+            gen_params.setdefault("custom_settings", {})["director_final_soundtrack"] = True
+            gen_params["multi_clip_audio_start_sec"] = audio_start_sec
 
     h3_longform = _prepare_director_h3_longform(
         gen_params,
