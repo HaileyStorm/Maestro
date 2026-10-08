@@ -100,6 +100,8 @@ initialization behind `MAESTRO_H3_FACE_REFINE_EXPERIMENTAL=1`. This is an intern
 tensor handoff, not a saved setting, public API or Gallery operation. Its caller
 must own source/plan validation, exact decoding, existing model residency and
 a fresh GPU-coordinator grant. The CPU CLI has no native-generation command.
+The private worker decoder and WGP transport are implemented below; neither
+creates a public job or activates Gallery admission.
 
 `models.minimax_h3.face_refine.H3FaceRefinePayload` contains:
 
@@ -112,6 +114,11 @@ a fresh GPU-coordinator grant. The CPU CLI has no native-generation command.
 - `frame_multipliers`: a tuple of one explicit `[0,1]` multiplier per decoded
   frame. They map linearly to latent frames with aligned endpoints, following
   upstream FaceRefine. Zero holds the source; one fully advances the prediction.
+- `waveform`: optional selected-source CPU float32 stereo `[2,samples]` at
+  32 kHz. Its exact conditioning clock is `round(frames/24*40)*800` samples.
+  It is encoded through the loaded audio VAE's posterior mode and native
+  statistics. Both channel blocks stay at clean conditioning time and their
+  source rows are restored after every paired prediction.
 
 The admitted first path is one independent Base output at exactly 24 fps,
 124–345 frames with `frames % 17 == 5`, and a 32-pixel-aligned canvas at most
@@ -127,10 +134,44 @@ multiplier stays in the sampler and does not change model token timesteps.
 Both modality updates publish together and cancellation resets both clocks.
 Ordinary requests retain their existing sampler arithmetic and random draws.
 
-Audio retains its independently generated ordinary clock in this first path.
-It does not condition face motion on source audio; discard generated audio and
-use the CPU compositor to preserve every original encoded audio stream.
-Source-audio conditioning remains an unfinished quality requirement.
+With no waveform, audio retains its independently generated ordinary clock.
+With a waveform, source audio conditions the joint transformer and remains
+locked throughout sampling. In both cases discard the generated audio export
+and use the CPU compositor to preserve every original encoded audio stream.
+Full-weight audio-conditioned face quality remains unverified.
+
+## Sealed worker handoff
+
+`services.h3_face_refine_worker.make_face_refine_dispatch` accepts the original
+source file, prepared crop file and plan, plus the explicitly expected plan
+SHA, strength, frame multipliers, sampling steps and audio-stream ordinal.
+It snapshots both files, rechecks byte commitments and full video clocks, and
+decodes exact RGB crops without resizing or resampling. Unresolved rectangles
+require multiplier zero. Native payloads remain capped at 512 MiB; the worker
+also bounds coexisting captures and validation/pipe scratch to 2 GiB before
+decoding.
+
+Choose `audio_stream=0` for the first source audio stream, `1` for the second,
+and so on. The choice is required; `None` deliberately disables source-audio
+conditioning. A missing selected stream fails rather than choosing another.
+The conditioning copy preserves initial timestamp gaps as silence, then pads
+or trims to the rounded 40 Hz clock. For example, 124 video frames need 207
+audio ticks, or 165600 stereo samples at 32 kHz. This conditioning-only rounding
+does not change the original clip or the final compositor's packet copy.
+
+The returned `H3FaceRefineDispatch` contains no file paths. An owning generation
+worker passes it as `wgp.generate_video(..., _h3_face_refine_dispatch=dispatch)`.
+WGP revalidates and captures it before model preparation, preserves the exact
+native frame count, and forwards its typed payload to H3. It excludes the
+dispatch from UI setting enumeration and refuses OOM relief that would silently
+retry with different geometry, steps or profile. Private crop runs do not
+calibrate ordinary generation limits.
+
+This handoff grants no project or compute authority and publishes no media.
+Public Gallery/Queue admission, source revision/privacy checks at job execution,
+crop-result provenance, compositor integration and durable publication/recovery
+remain unfinished. The private worker must already own its generation inputs,
+model residency and fresh exact GPU grant.
 
 The long-grid tail and temporal hold mapping follow
 [upstream nodes.py at the pinned revision](https://github.com/Carasibana/ComfyUI-H3-FaceRefine/blob/d8521d14fe0d721d80cd9417fff5a559cbc21aba/nodes.py).
@@ -141,4 +182,10 @@ execution, lip sync or improved faces:
 
 ```sh
 app/env/bin/python -m unittest discover -s tests -p test_h3_face_refine_native.py
+app/env/bin/python -m unittest discover -s tests -p test_h3_face_refine_worker.py
 ```
+
+Worker checks use real CPU FFmpeg crop/audio decoding, including an explicitly
+selected delayed second audio stream. Source-audio sampler checks use an audio
+encoder fixture to prove normalization, packing, clean token timing and row
+locking; they do not establish native audio-VAE weight acceptance.

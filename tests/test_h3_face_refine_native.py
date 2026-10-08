@@ -272,6 +272,64 @@ class H3FaceRefineNativeTests(unittest.TestCase):
                 self.assertIn("private worker handoff", family_handler.validate_generative_settings(
                     "minimax_h3", {}, inputs))
 
+    def test_source_audio_is_encoded_conditioned_and_locked_across_sampler_ticks(self):
+        import types
+        main, runtime, _ = control_tests.OriginalH3ControlSamplerTests.runtime()
+        waveform = torch.linspace(-0.2, 0.2, 2 * 165600).reshape(2, 165600)
+        original = waveform.clone()
+        payload = self.payload()
+        payload = H3FaceRefinePayload(payload.video, payload.strength,
+                                      payload.frame_multipliers, waveform)
+        raw = torch.linspace(-0.3, 0.4, 2 * 32 * 207).reshape(2, 32, 207)
+        encoded_inputs, forwarded = [], []
+        def encode(value):
+            encoded_inputs.append(value.clone())
+            return types.SimpleNamespace(latent_dist=types.SimpleNamespace(mode=lambda: raw))
+        runtime.audio_vae.encode = encode
+        def observe(module, args, kwargs):
+            forwarded.append({key: kwargs[key].clone() for key in
+                ("audio_hidden_states", "timestep", "timestep_indices", "audio_indices")})
+        hook = runtime.transformer.register_forward_pre_hook(observe, with_kwargs=True)
+        try:
+            with patch.dict(os.environ, MAESTRO_H3_FACE_REFINE_EXPERIMENTAL="1"), \
+                    patch.object(main, "_decode_h3_video_rows", return_value=(torch.zeros(1, 3, 124, 32, 32), None)):
+                result = runtime.generate("An adult in a violent fictional scene", frame_num=124,
+                    height=32, width=32, sampling_steps=4, seed=73, _h3_face_refine=payload,
+                    custom_settings={"h3_attention_engine": "sdpa"},
+                    callback=lambda *args, **kwargs: waveform.zero_())
+        finally:
+            hook.remove()
+        self.assertIsNotNone(result)
+        self.assertEqual(len(encoded_inputs), 1)
+        torch.testing.assert_close(encoded_inputs[0], original[:, None], rtol=0, atol=0)
+        mean = torch.tensor(main.AUDIO_LATENTS_MEAN).view(1, 32, 1)
+        std = torch.tensor(main.AUDIO_LATENTS_STD).view(1, 32, 1)
+        expected = ((raw - mean) / std).permute(0, 2, 1).reshape(414, 32)
+        self.assertEqual(len(forwarded), 4)
+        for call in forwarded:
+            torch.testing.assert_close(call["audio_hidden_states"][0], expected, rtol=0, atol=0)
+            audio_times = call["timestep"][call["timestep_indices"]][call["audio_indices"]]
+            torch.testing.assert_close(audio_times, torch.ones_like(audio_times), rtol=0, atol=0)
+
+    def test_source_audio_clock_validation_and_encoding_cancellation(self):
+        base = self.payload()
+        for waveform in (torch.zeros(2, 165599), torch.zeros(2, 165600, dtype=torch.float64),
+                         torch.full((2, 165600), float("nan")), torch.full((2, 165600), 1.1)):
+            with self.assertRaises(ValueError):
+                self.validate(H3FaceRefinePayload(base.video, 0.5, base.frame_multipliers, waveform))
+        main, runtime, _ = control_tests.OriginalH3ControlSamplerTests.runtime()
+        waveform = torch.zeros(2, 165600)
+        payload = H3FaceRefinePayload(base.video, 0.5, base.frame_multipliers, waveform)
+        def stop(value):
+            runtime._interrupt = True
+            return torch.zeros(2, 32, 207)
+        with patch.dict(os.environ, MAESTRO_H3_FACE_REFINE_EXPERIMENTAL="1"), \
+                patch.object(runtime, "_encode_reference_audio", side_effect=stop):
+            self.assertIsNone(runtime.generate("Crop", frame_num=124, height=32, width=32,
+                sampling_steps=4, _h3_face_refine=payload,
+                custom_settings={"h3_attention_engine": "sdpa"}))
+        self.assertEqual(runtime._sampler_prompts, [])
+
 
 if __name__ == "__main__":
     unittest.main()

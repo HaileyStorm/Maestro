@@ -1635,6 +1635,7 @@ class MiniMaxH3Model:
             # fields/scalar now; prepared rows remain fixed through sampling.
             control = {**control, "strength": float(control["strength"])}
         from services.h3_pdd import H3PDDError, pdd_requested, validate_pdd_request
+        face_audio_locked = face_refine is not None and face_refine.waveform is not None
         timeline_guides = _kwargs.get("_h3_timeline_guides")
         if "_h3_timeline_guides" in custom_settings:
             raise ValueError("H3 timeline guides require the private decoded-media handoff")
@@ -2337,6 +2338,19 @@ class MiniMaxH3Model:
                 )
 
         boundary_video_rows = None
+        if face_audio_locked:
+            report_phase("Encoding H3 FaceRefine source audio")
+            if self._interrupt:
+                return None
+            face_audio_latents = self._encode_reference_audio(face_refine.waveform)
+            if self._interrupt:
+                return None
+            if (face_audio_latents.ndim != 3 or face_audio_latents.shape[:2] != (2, 32)
+                    or not torch.isfinite(face_audio_latents).all()):
+                raise ValueError("H3 FaceRefine source audio VAE returned invalid stereo latents")
+            source_audio_target_rows = _audio_rows(
+                _fit_h3_source_audio_latents(face_audio_latents, num_audio_latents),
+            ).to(self.device)
         if native_continuation:
             report_phase("Encoding H3 native boundary history")
             history_latent = self._encode_reference_video(
@@ -2617,7 +2631,7 @@ class MiniMaxH3Model:
                 audio_condition_anchors=audio_condition_anchors,
                 target_condition_audio_latents=(
                     num_audio_latents
-                    if source_audio_roles.mode == "lock_source" else 0
+                    if source_audio_roles.mode == "lock_source" or face_audio_locked else 0
                 ),
             )
         if timeline_guides is not None:
@@ -2647,7 +2661,7 @@ class MiniMaxH3Model:
         )
         locked_target_audio_rows = None
         if source_audio_target_rows is not None:
-            if source_audio_roles.mode == "lock_source":
+            if source_audio_roles.mode == "lock_source" or face_audio_locked:
                 audio_rows = source_audio_target_rows.clone()
                 locked_target_audio_rows = source_audio_target_rows.clone()
             elif source_audio_roles.mode == "remix_source":

@@ -982,7 +982,7 @@ def _get_generate_video_param_names():
     if _generate_video_param_names is None:
         _generate_video_param_names = [
             x for x in inspect.signature(generate_video).parameters
-            if x not in ["task", "send_cmd", "plugin_data"]
+            if x not in ["task", "send_cmd", "plugin_data", "_h3_face_refine_dispatch"]
         ]
     return _generate_video_param_names
 
@@ -11281,6 +11281,7 @@ def generate_video(*args, **kwargs):
     cumulative_dispatch = _bound_value("_h3_cumulative_dispatch")
     interval_guides = _bound_value("_h3_timeline_guides")
     control_dispatch = _bound_value("_h3_control_dispatch")
+    face_refine_dispatch = _bound_value("_h3_face_refine_dispatch")
     cumulative_started = False
     try:
         if cumulative_dispatch is not None:
@@ -11319,7 +11320,7 @@ def generate_video(*args, **kwargs):
                     _release_failed_generation_resources()
                 except Exception as error:
                     print(f"[Memory] Failed-generation cleanup: {type(error).__name__}")
-            if result and interval_guides is None and control_dispatch is None:
+            if result and interval_guides is None and control_dispatch is None and face_refine_dispatch is None:
                 try:
                     from services.h3_host_limits import record_denoise_success
                     record_denoise_success(
@@ -11340,7 +11341,7 @@ def generate_video(*args, **kwargs):
                     pass
             return result
         except H3OomReliefRetry as retry:
-            if interval_guides is not None or control_dispatch is not None:
+            if interval_guides is not None or control_dispatch is not None or face_refine_dispatch is not None:
                 # Decoded guide geometry is immutable. Never retry it after
                 # changing the canvas, steps or profile behind the owner.
                 try:
@@ -11807,6 +11808,8 @@ def _generate_video_impl(
     _h3_timeline_guides=None,
     # Host-selected acquired assets and CPU decoded Control media, worker-only.
     _h3_control_dispatch=None,
+    # Exact sealed crop bundle decoded on its owning worker; never saved.
+    _h3_face_refine_dispatch=None,
 ):
     if _h3_control_dispatch is not None:
         from services.h3_gallery_control import validate_gallery_control_dispatch
@@ -11833,6 +11836,34 @@ def _generate_video_impl(
             or type(custom_settings) is not dict or custom_settings != {"h3_attention_engine": "sdpa"}
         ):
             raise ValueError("H3 Control requires an independent dense Base worker handoff")
+    if _h3_face_refine_dispatch is not None:
+        from services.h3_face_refine_worker import validate_face_refine_dispatch
+        try:
+            face_width, face_height = (int(part) for part in resolution.lower().split("x"))
+        except (AttributeError, TypeError, ValueError):
+            raise ValueError("H3 FaceRefine canvas is invalid") from None
+        if (
+            model_type != "minimax_h3" or image_mode != 0
+            or not isinstance(mode, str) or mode.startswith("edit_")
+            or _h3_control_dispatch is not None or _h3_timeline_guides is not None
+            or _h3_cumulative_dispatch is not None or _h3_native_boundary is not None
+            or h3_native_boundary_conditioning
+            or type(repeat_generation) is not int or repeat_generation != 1
+            or type(batch_size) is not int or batch_size != 1
+            or activated_loras or skip_steps_cache_type
+            or video_source or audio_source or image_start is not None or image_end is not None
+            or image_refs or video_guide or video_guide2 or video_guide3 or image_guide
+            or audio_guide or audio_guide2 or audio_guide3 or audio_guide4 or audio_guide5 or audio_guide6
+            or audio_conditioning_guide or image_prompt_type or video_prompt_type or audio_prompt_type
+            or guidance_scale != 1 or trim_tail_frames or multi_prompts_gen_type
+            or temporal_upsampling or spatial_upsampling
+            or type(custom_settings) is not dict or custom_settings != {"h3_attention_engine": "sdpa"}
+        ):
+            raise ValueError("H3 FaceRefine requires an independent dense Base worker handoff")
+        _h3_face_refine_dispatch = validate_face_refine_dispatch(
+            _h3_face_refine_dispatch, frame_num=video_length,
+            height=face_height, width=face_width, sampling_steps=num_inference_steps,
+        )
     if _h3_timeline_guides is not None:
         from models.minimax_h3.timeline_guides import H3TimelineGuidePayload
         if (
@@ -12885,7 +12916,7 @@ def _generate_video_impl(
                       else get_model_filename(base_model_type))
 
     _, _, latent_size = get_model_min_frames_and_step(model_type)
-    video_length = (video_length if _h3_control_dispatch is not None else
+    video_length = (video_length if _h3_control_dispatch is not None or _h3_face_refine_dispatch is not None else
                     align_model_frame_count(video_length, model_def) if _h3_cumulative_dispatch is None
                     else _h3_cumulative_dispatch.sampling_frames(video_length))
     published_video_length = video_length
@@ -14253,7 +14284,7 @@ def _generate_video_impl(
                             abort_check=lambda: gen.get("abort", False), timeout=600,
                         )
                 sampling_frame_num = (
-                    current_video_length if _h3_control_dispatch is not None else
+                    current_video_length if _h3_control_dispatch is not None or _h3_face_refine_dispatch is not None else
                     (align_model_frame_count(current_video_length, model_def, for_generation=True)
                      if _h3_cumulative_dispatch is None else
                      _h3_cumulative_dispatch.sampling_frames(current_video_length))
@@ -14281,6 +14312,8 @@ def _generate_video_impl(
                        if h3_timeline_still_guide_requested else {}),
                     **({"_h3_timeline_guides": _h3_timeline_guides}
                        if _h3_timeline_guides is not None else {}),
+                    **({"_h3_face_refine": _h3_face_refine_dispatch.payload}
+                       if _h3_face_refine_dispatch is not None else {}),
                     **({"_h3_control": {
                         "video": _h3_control_dispatch.video,
                         "mask": None, "inpaint": None,

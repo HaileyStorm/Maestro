@@ -15,7 +15,7 @@ from torch.nn import functional as F
 
 from .packing import (
     MINIMAX_H3_PIXEL_MEAN, MINIMAX_H3_PIXEL_STD,
-    patchify_video_latents, video_latent_num_frames,
+    audio_latent_num_frames, patchify_video_latents, video_latent_num_frames,
 )
 
 
@@ -26,6 +26,9 @@ class H3FaceRefinePayload:
     strength: float
     # Explicit reviewed multipliers in decoded frame order; no content inference.
     frame_multipliers: tuple[float, ...]
+    # Optional explicitly selected source stream, stereo 32 kHz on the
+    # conditioning-only rounded 40 Hz audio clock. Original packets stay intact.
+    waveform: torch.Tensor | None = None
 
 
 def validate_face_refine_request(
@@ -73,13 +76,25 @@ def validate_face_refine_request(
     video = payload.video
     if (not isinstance(video, torch.Tensor) or video.device.type != "cpu"
             or video.dtype != torch.float32 or video.requires_grad
+            or video.layout != torch.strided
             or tuple(video.shape) != (1, 3, frame_num, height, width)
             or video.numel() * video.element_size() > 512 * 1024**2):
         raise ValueError("H3 FaceRefine requires bounded exact CPU float32 decoded crops")
     if not torch.isfinite(video).all() or video.min() < 0 or video.max() > 1:
         raise ValueError("H3 FaceRefine crops must contain finite unit-range RGB")
+    waveform = payload.waveform
+    if waveform is not None:
+        if (not isinstance(waveform, torch.Tensor) or waveform.device.type != "cpu"
+                or waveform.dtype != torch.float32 or waveform.requires_grad
+                or waveform.layout != torch.strided
+                or waveform.shape != (2, audio_latent_num_frames(frame_num) * 800)
+                or (waveform.numel() + video.numel()) * 4 > 512 * 1024**2):
+            raise ValueError("H3 FaceRefine source audio must match the bounded stereo 32 kHz clock")
+        if not torch.isfinite(waveform).all() or waveform.abs().max() > 1:
+            raise ValueError("H3 FaceRefine source audio must be finite and normalized")
     return H3FaceRefinePayload(video.detach().clone(), float(strength),
-                               tuple(float(value) for value in multipliers))
+                               tuple(float(value) for value in multipliers),
+                               None if waveform is None else waveform.detach().clone())
 
 
 def encode_face_refine_rows(payload, *, device, encode_mode, latents_mean,
@@ -112,8 +127,9 @@ def configure_face_refine_schedule(scheduler, *, steps, strength, device):
     """Build a longer full shifted grid, then keep N evaluations plus zero.
 
     Slicing a short shifted grid gives excessive noise even at low strength.
-    Only the video clock changes; independently generated audio keeps its
-    ordinary full grid and is discarded by the source-audio compositor.
+    Only the video schedule changes. Audio keeps its ordinary full grid;
+    the caller holds selected source-audio rows at clean conditioning time,
+    or independently generated audio is discarded by the compositor.
     """
     full_steps = int(steps / strength)
     scheduler.set_timesteps(full_steps + 1, device=device)
