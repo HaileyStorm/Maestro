@@ -73970,6 +73970,9 @@ def _run_generation(
                                     filtered_params["_h3_control_dispatch"] = _decode_h3_gallery_control_job(
                                         job, cancel_check=lambda: bool(gen.get("abort") or is_cancel_requested(job)),
                                     )
+                                    # The parser adds general SOL tuning defaults;
+                                    # this admitted Control worker is dense SDPA.
+                                    filtered_params["custom_settings"] = {"h3_attention_engine": "sdpa"}
                                 if "_h3_timeline_av_guide_source" in (job.get("params") or {}):
                                     if len(queue) != 1 or cumulative_dispatch is not None:
                                         raise ValueError("H3 interval guides require one independent output")

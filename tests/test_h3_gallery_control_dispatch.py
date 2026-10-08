@@ -156,7 +156,8 @@ class ControlDispatchTests(unittest.TestCase):
         _, job = self.queue()
         before = copy.deepcopy(job)
         calls, commands = [], []
-        def generate_video(task, send_cmd, plugin_data, model_type, resolution, _h3_control_dispatch=None):
+        def generate_video(task, send_cmd, plugin_data, model_type, resolution, custom_settings, _h3_control_dispatch=None):
+            self.assertEqual(custom_settings, {"h3_attention_engine": "sdpa"})
             calls.append(_h3_control_dispatch)
         self.ns.update({
             "inspect": inspect, "time": time, "traceback": traceback, "job": job, "queue": [{}], "gen": {},
@@ -168,8 +169,13 @@ class ControlDispatchTests(unittest.TestCase):
         })
         self.ns["wgp"].generate_video = generate_video
         load_nested_launch_function(self.ns, "_run_generation", "make_error_handler")
-        task = {"params": copy.deepcopy(job["params"])}
-        handler = self.ns["make_error_handler"](task, {**job["params"], "_h3_control_dispatch": "forged"},
+        # The real parser expands attention defaults even for admitted SDPA.
+        from models.minimax_h3.minimax_h3_handler import family_handler
+        parsed = copy.deepcopy(job["params"])
+        family_handler.fix_settings("minimax_h3", 0, {}, parsed)
+        self.assertIn("h3_sol_tau", parsed["custom_settings"])
+        task = {"params": parsed}
+        handler = self.ns["make_error_handler"](task, {**parsed, "_h3_control_dispatch": "forged"},
             lambda *args: commands.append(args), {})
         with redirect_stderr(io.StringIO()), redirect_stdout(io.StringIO()):
             handler()
