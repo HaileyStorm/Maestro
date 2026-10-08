@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import socket
+import os
 import sys
 import unittest
 from pathlib import Path
@@ -31,7 +32,7 @@ class ServerPortHoldTests(unittest.TestCase):
         self.assertGreater(torch_at, hold_at)
         self.assertIn('if __name__ == "__main__":', source[:torch_at])
 
-    def test_hold_uses_a_plain_bind_and_blocks_a_second_listener(self) -> None:
+    def test_hold_blocks_a_second_listener_including_reuse_address(self) -> None:
         probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         probe.bind(("127.0.0.1", 0))
         preferred = probe.getsockname()[1]
@@ -43,16 +44,40 @@ class ServerPortHoldTests(unittest.TestCase):
             }
         )
         self.assertEqual(self._held.host, "127.0.0.1")
-        self.assertEqual(self._held.sock.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR), 0)
         rival = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.addCleanup(rival.close)
+        if os.name == "posix":
+            rival.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         with self.assertRaises(OSError):
             rival.bind((self._held.host, self._held.port))
+
+    @unittest.skipUnless(os.name == "posix", "POSIX closed connection reuse")
+    def test_strict_hold_reuses_recently_closed_connection_on_exact_port(self) -> None:
+        # Let the server close first so its port stays in TCP TIME_WAIT.
+        with socket.create_server(("127.0.0.1", 0)) as prior:
+            preferred = prior.getsockname()[1]
+            with socket.create_connection(("127.0.0.1", preferred), timeout=2) as client:
+                accepted, _ = prior.accept()
+                accepted.close()
+                self.assertEqual(client.recv(1), b"")
+        env = {"SERVER_PORT": str(preferred), "MAESTRO_STRICT_SERVER_PORT": "true",
+               "PINOKIO_SHARE_LOCAL": "false"}
+        self._held = acquire_configured_server_port(environ=env, span=0)
+        self.assertEqual(self._held.port, preferred)
+        self.assertFalse(self._held.relocated)
+        self.assertEqual(env["SERVER_PORT"], str(preferred))
+        with socket.socket() as rival:
+            rival.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            with self.assertRaises(OSError):
+                rival.bind(("127.0.0.1", preferred))
 
     def test_strict_mode_refuses_to_relocate(self) -> None:
         blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.addCleanup(blocker.close)
+        if os.name == "posix":
+            blocker.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         blocker.bind(("127.0.0.1", 0))
+        blocker.listen()
         preferred = blocker.getsockname()[1]
         with self.assertRaises(ServerPortHoldError) as raised:
             acquire_configured_server_port(

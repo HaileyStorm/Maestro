@@ -397,6 +397,9 @@ Caddy cannot steal it while models load. Caddy is Pinokio's HTTPS reverse
 proxy, not Blender. Keep `MAESTRO_STRICT_SERVER_PORT=true` in the ignored
 operator ENVIRONMENT so a busy requested port fails instead of silently
 moving the stable-share backend; set it false only as a temporary recovery.
+On POSIX, the held listening socket reuses addresses left by recently closed
+TCP connections, while still refusing an active listener on that port. Windows
+keeps its plain bind; enabling address reuse there could share an active socket.
 
 After Start, use the current `ready_url` and probe `/health` then `/ready`.
 Never reuse a previous session's port.

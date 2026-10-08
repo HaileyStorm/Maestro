@@ -1,8 +1,9 @@
 """Bind Maestro's HTTP port before heavy imports.
 
 Pinokio's Caddy reverse proxy can listen on a reserved SERVER_PORT while
-launch.py is still importing WanGP. Holding the socket with a plain bind
-(no SO_REUSEADDR) keeps that port until uvicorn inherits it.
+launch.py is still importing WanGP. Listening on the held socket keeps that
+port until uvicorn inherits it. POSIX address reuse permits an immediate
+restart after closed connections without sharing an active listener.
 """
 from __future__ import annotations
 
@@ -47,6 +48,11 @@ def _strict_port(environ: Mapping[str, str]) -> bool:
 def _bind_listen(host: str, port: int) -> socket.socket:
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
+        # Match socket.create_server on POSIX: reuse TIME_WAIT addresses,
+        # never SO_REUSEPORT. listen() still excludes a competing listener.
+        # Windows SO_REUSEADDR can share active sockets, so keep its plain bind.
+        if os.name == "posix":
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind((host, port))
         sock.listen(2048)
     except OSError:
