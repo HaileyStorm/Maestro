@@ -1982,6 +1982,7 @@ _startup_recovery_once_complete = False
 _startup_recovery_restart_requested = False
 _startup_recovery_restart_generation = 0
 _startup_recovery_cancelled_restart_generation = 0
+_h3_prompt_rewriter_cleanup_remainder = ()
 
 
 def _set_startup_recovery_state(state: str) -> None:
@@ -4460,6 +4461,14 @@ def _run_startup_recovery_background() -> None:
         lambda: _set_startup_recovery_state("ready"),
     )
     if not ready_published:
+        _reset_startup_recovery_lifecycle_after_stop()
+        return
+    # Saved cleanup must not delay readiness or require another restart when
+    # the initial bounded batch cannot reach every obligation.
+    cleanup = globals().get("_continue_h3_prompt_rewriter_cleanup")
+    if callable(cleanup):
+        cleanup()
+    if _startup_recovery_stop.is_set():
         _reset_startup_recovery_lifecycle_after_stop()
 
 
@@ -9034,7 +9043,10 @@ def _restore_queue_recovery_on_startup(
                         _queue_recovery_reconcile_delivery_publication(restored_child, staged)
                     except (ValueError, QueueRecoveryRuntimeError):
                         restored_child["_recovery_reason_code"] = "delivery_publication_reconciliation_blocked"
-    _restore_h3_prompt_rewriter_cleanup(restored_jobs)
+    global _h3_prompt_rewriter_cleanup_remainder
+    _h3_prompt_rewriter_cleanup_remainder = _restore_h3_prompt_rewriter_cleanup(
+        restored_jobs, stop_event=_startup_recovery_stop,
+    )
     restore_scheduler_state(restored_jobs, _queue_recovery_restored.global_state)
     prompt_results = globals().get("_prompt_enhancement_result_store")
     if prompt_results is not None:
@@ -41021,14 +41033,17 @@ def _validate_standalone_enhanced_prompt_cardinality(
     return result
 
 
-def _restore_h3_prompt_rewriter_cleanup(jobs):
-    """Reconcile only exact saved cleanup; never infer a reaped child or dispatch."""
+def _restore_h3_prompt_rewriter_cleanup(jobs, *, stop_event=None):
+    """Attempt four exact saved intents and return the unvisited remainder."""
     from services.h3_prompt_rewriter_config import load_runtime_snapshot
     from services.h3_prompt_rewriter_gpu_lease import H3PromptRewriterGpuLease
     from services.job_lifecycle import checkpoint_prompt_enhancement_gpu_intent
     from services.queue_recovery_adapter import prompt_enhancement_gpu_cleanup_pending
     attempted = 0
-    for job in jobs:
+    jobs = tuple(jobs)
+    for index, job in enumerate(jobs):
+        if stop_event is not None and stop_event.is_set():
+            return jobs[index:]
         cursor = job.get("recovery_cursor")
         if (job.get("kind") != "prompt_enhancement"
                 or not prompt_enhancement_gpu_cleanup_pending(job)
@@ -41036,7 +41051,7 @@ def _restore_h3_prompt_rewriter_cleanup(jobs):
                 or cursor.get("h3_prompt_rewriter_child_reaped") is not True):
             continue
         if attempted >= 4:
-            break
+            return jobs[index:]
         attempted += 1
         try:
             snapshot = load_runtime_snapshot(workspace=Path(__file__).resolve().parent.parent)
@@ -41050,6 +41065,16 @@ def _restore_h3_prompt_rewriter_cleanup(jobs):
         except Exception:
             # Retain the exact durable evidence for later reconciliation.
             continue
+    return ()
+
+
+def _continue_h3_prompt_rewriter_cleanup():
+    """Drain the finite startup snapshot once, on the existing recovery thread."""
+    global _h3_prompt_rewriter_cleanup_remainder
+    while _h3_prompt_rewriter_cleanup_remainder and not _startup_recovery_stop.is_set():
+        _h3_prompt_rewriter_cleanup_remainder = _restore_h3_prompt_rewriter_cleanup(
+            _h3_prompt_rewriter_cleanup_remainder, stop_event=_startup_recovery_stop,
+        )
 
 
 async def _submit_h3_prompt_rewriter_operation(request, body, workspace, authorized_images):

@@ -108,6 +108,7 @@ def _isolated_functions(tree: ast.Module, names: tuple[str, ...], namespace: dic
     dependencies = {"_h3_segment_uses_native_boundary_history"} if "_run_generation" in names else set()
     if "_restore_queue_recovery_on_startup" in names:
         dependencies.add("_restore_h3_prompt_rewriter_cleanup")
+        namespace.setdefault("_startup_recovery_stop", threading.Event())
         namespace.setdefault("Path", Path)
         namespace.setdefault("__file__", str(ROOT / "app" / "launch.py"))
     if "_publish_h3_delivery_outputs" in names:

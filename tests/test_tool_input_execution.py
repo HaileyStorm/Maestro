@@ -30,6 +30,8 @@ TREE = ast.parse((ROOT / 'app/launch.py').read_text())
 
 
 def load(ns, *names):
+    if '_restore_queue_recovery_on_startup' in names:
+        ns.setdefault('_startup_recovery_stop', threading.Event())
     nodes = [copy.deepcopy(n) for n in TREE.body
              if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and n.name in names]
     for n in nodes: n.decorator_list = []

@@ -3950,7 +3950,8 @@ class H3ComposeRouteIntegrationTests(unittest.IsolatedAsyncioTestCase):
         from fastapi import HTTPException
         from starlette.responses import JSONResponse
         names = {"_submit_h3_prompt_rewriter_operation", "llm_h3_prompt_rewriter_apply", "llm_enhance_prompt",
-            "_restore_h3_prompt_rewriter_cleanup", "_ScopedPromptEnhancementRequest",
+            "_restore_h3_prompt_rewriter_cleanup", "_continue_h3_prompt_rewriter_cleanup",
+            "_run_startup_recovery_background", "_ScopedPromptEnhancementRequest",
             "_seal_prompt_enhancement_images", "_materialize_prompt_enhancement_images",
             "_remove_prompt_enhancement_snapshots"}
         nodes = [node for node in ast.parse((APP / "launch.py").read_text()).body
@@ -4044,6 +4045,63 @@ class H3ComposeRouteIntegrationTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(changes=changes), self.assertRaises(HTTPException):
                 await self.submit({**self.body, **changes})
         self.manager.submit.assert_not_called()
+        self.factory.assert_not_called()
+
+    async def test_startup_cleanup_reaches_fifth_intent_after_readiness_without_retrying_failures(self):
+        from services import h3_prompt_rewriter_gpu_lease, queue_recovery_adapter
+        candidates = [{"id": str(index), "kind": "prompt_enhancement", "execution_attempt": 1,
+            "status": "failed", "recovery_cursor": {"h3_prompt_rewriter_child_reaped": True,
+                "h3_prompt_rewriter_gpu": {"state": "withdraw_attempted", "request_id": str(index)}}}
+            for index in range(5)]
+        ready = []
+        stop = __import__("threading").Event()
+        self.namespace.update({"_startup_recovery_stop": stop,
+            "_startup_recovery_once_complete": True,
+            "_wait_for_listener_before_recovered_execution": lambda: None,
+            "_startup_recovery_launch_operation": lambda operation: (operation(), True)[1],
+            "_start_sample_campaign_preemption_after_recovery": lambda: None,
+            "_set_startup_recovery_state": ready.append,
+            "_reset_startup_recovery_lifecycle_after_stop": mock.Mock()})
+        attempts = []
+        def restore(_binding, intent, **_kwargs):
+            attempts.append(intent["request_id"])
+            if len(attempts) <= 4:
+                raise ValueError("Exact saved ownership is unavailable")
+            self.assertEqual(ready, ["ready"], "continuation must follow public readiness")
+            return self.lease
+        with mock.patch.object(queue_recovery_adapter, "prompt_enhancement_gpu_cleanup_pending", return_value=True), mock.patch.object(h3_prompt_rewriter_gpu_lease, "H3PromptRewriterGpuLease", types.SimpleNamespace(restore_from_intent=restore)):
+            remainder = self.namespace["_restore_h3_prompt_rewriter_cleanup"](candidates, stop_event=stop)
+            self.assertEqual(attempts, ["0", "1", "2", "3"])
+            self.assertEqual(remainder, (candidates[4],))
+            self.namespace["_h3_prompt_rewriter_cleanup_remainder"] = remainder
+            self.namespace["_run_startup_recovery_background"]()
+        self.assertEqual(attempts, ["0", "1", "2", "3", "4"])
+        self.assertEqual(self.namespace["_h3_prompt_rewriter_cleanup_remainder"], ())
+        self.lease.close.assert_called_once_with(child_reaped=True, confirm_seconds=2)
+        self.factory.assert_not_called()
+
+    async def test_startup_cleanup_stop_preserves_unvisited_intents(self):
+        from services import h3_prompt_rewriter_gpu_lease, queue_recovery_adapter
+        stop = __import__("threading").Event()
+        candidates = [{"kind": "prompt_enhancement", "execution_attempt": 1,
+            "recovery_cursor": {"h3_prompt_rewriter_child_reaped": True,
+                "h3_prompt_rewriter_gpu": {"state": "withdraw_attempted"}}} for _ in range(5)]
+        restore = mock.Mock(return_value=self.lease)
+        self.lease.close.side_effect = lambda **_kwargs: stop.set()
+        with mock.patch.object(queue_recovery_adapter, "prompt_enhancement_gpu_cleanup_pending", return_value=True), mock.patch.object(h3_prompt_rewriter_gpu_lease, "H3PromptRewriterGpuLease", types.SimpleNamespace(restore_from_intent=restore)):
+            self.namespace.update({"_startup_recovery_stop": stop,
+                "_h3_prompt_rewriter_cleanup_remainder": tuple(candidates)})
+            self.namespace["_continue_h3_prompt_rewriter_cleanup"]()
+        self.assertEqual(restore.call_count, 1)
+        remainder = self.namespace["_h3_prompt_rewriter_cleanup_remainder"]
+        self.assertEqual(len(remainder), 4)
+        self.assertIs(remainder[0], candidates[1])
+        stop.clear()
+        self.lease.close.side_effect = None
+        with mock.patch.object(queue_recovery_adapter, "prompt_enhancement_gpu_cleanup_pending", return_value=True), mock.patch.object(h3_prompt_rewriter_gpu_lease, "H3PromptRewriterGpuLease", types.SimpleNamespace(restore_from_intent=restore)):
+            self.namespace["_continue_h3_prompt_rewriter_cleanup"]()
+        self.assertEqual(restore.call_count, 5, "resume visits only the four unattempted intents")
+        self.assertEqual(self.namespace["_h3_prompt_rewriter_cleanup_remainder"], ())
         self.factory.assert_not_called()
 
     async def test_public_enhance_route_enters_explicit_branch_without_ordinary_runtime(self):
