@@ -44,6 +44,99 @@ def _load_wgp_helpers(*names: str) -> dict[str, object]:
 
 
 class TestLtxAudioRuntimeContracts(unittest.TestCase):
+    def test_director_voice_timing_follows_real_wgp_audio_window(self):
+        import soundfile as sf
+        from services.director.source_audio import source_voice_timing_packet
+
+        # Execute the production slice branch without importing the model stack.
+        # Comparing its real samples and prompt catches a clock mismatch that a
+        # standalone timing formatter test would miss.
+        branch = next(node for node in ast.walk(_wgp_tree())
+                      if isinstance(node, ast.If)
+                      and ast.unparse(node.test).startswith("audio_guide is not None")
+                      and "audio_guide_window_slicing" in ast.unparse(node.test))
+        namespace = _load_wgp_helpers("slice_audio_window", "_audio_waveform_sample_count")
+        namespace.update({"np": np, "_ensure_soundfile_readable": lambda path: path})
+        packet = source_voice_timing_packet({
+            "lyrics": [
+                {"start": 0, "end": 0.5, "speaker": "lead", "text": "private words"},
+                {"start": 7.02, "end": 7.08, "speaker": "lead"},
+                {"start": 8, "end": 9, "speaker": "other"},
+            ],
+            "speaker_mappings": {"lead": {"name": "Mira", "role": "singer"}},
+        }, [])
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "source.wav"
+            rate = 2400  # 100 samples per video frame: exact sample assertions.
+            waveform = np.arange(12 * rate, dtype=np.float32) / (12 * rate)
+            sf.write(path, waveform, rate, subtype="FLOAT")
+            cases = [
+                # First cut extends past its authored end at 7.0 seconds.
+                (0, 48, False, 0, 121, "5.020–5.042s: Mira (singer)"),
+                # The next cut carries the previous 121-frame rounding.
+                (0, 169, False, 0, 119, "0.000–0.038s: Mira (singer)"),
+                # A reused window begins before the new guide region.
+                (80, 48, False, 0, 121, "1.687–1.747s: Mira (singer)"),
+                # Source-video prefix alignment uses the slice's adjusted clock.
+                (-24, 48, True, 24, 121, "5.020–5.042s: Mira (singer)"),
+                (-24, 0, False, 0, 48, "1.000–1.500s: Mira (singer)"),
+            ]
+            for aligned, offset, reset, overlap, frames, timing in cases:
+                with self.subTest(aligned=aligned, offset=offset, reset=reset):
+                    namespace.update({
+                        "audio_guide": str(path), "model_def": {"architecture": "ltx2_25", "audio_guide_window_slicing": True},
+                        "semantic_reference_mode": False, "aligned_window_start_frame": aligned,
+                        "reset_control_aligment": reset, "source_video_overlap_frames_count": overlap,
+                        "audio_frame_offset": offset, "current_video_length": frames,
+                        "fps": 24, "save_path": directory, "window_no": 1,
+                        "video_length_not_limited_by_audio": False, "pre_audio_guide": None,
+                        "custom_settings": {"director_source_voice_timing": packet},
+                        "model_type": "ltx2_25", "prompt": "A singer performs.", "gen": {},
+                    })
+                    exec(compile(ast.Module(body=[branch], type_ignores=[]), str(_WGP_PATH), "exec"), namespace)
+                    start = aligned + (overlap if reset else 0) + offset
+                    samples = namespace["input_waveform"][0]
+                    head = max(0, -start * 100)
+                    np.testing.assert_array_equal(samples[:head], np.zeros(head))
+                    np.testing.assert_array_equal(samples[head:], waveform[max(0, start * 100):max(0, start * 100) + frames * 100])
+                    self.assertIn(timing, namespace["prompt"])
+                    self.assertEqual(namespace["gen"]["current_window_prompt"], namespace["prompt"])
+                    self.assertNotIn("private words", namespace["prompt"])
+
+            # A rerun has already sliced the source: local frame zero must add
+            # the saved absolute source origin exactly once.
+            rerun_path = Path(directory) / "rerun.wav"
+            sf.write(rerun_path, waveform[16900:28800], rate, subtype="FLOAT")
+            namespace.update({"audio_guide": str(rerun_path), "aligned_window_start_frame": 0,
+                              "audio_frame_offset": 0, "current_video_length": 119,
+                              "prompt": "A singer performs.", "gen": {},
+                              "custom_settings": {"director_source_voice_timing": {**packet, "audio_origin_sec": 169 / 24}}})
+            exec(compile(ast.Module(body=[branch], type_ignores=[]), str(_WGP_PATH), "exec"), namespace)
+            self.assertIn("0.000–0.038s: Mira (singer)", namespace["prompt"])
+            np.testing.assert_array_equal(namespace["input_waveform"][0], waveform[16900:28800])
+
+            # Past-source continuation uses generated audio, never stale source
+            # voice timing. Ordinary jobs and H3 receive no grammar additions.
+            namespace.update({"audio_guide": str(path), "aligned_window_start_frame": 400,
+                              "video_length_not_limited_by_audio": True, "pre_audio_guide": np.ones((1, 100)),
+                              "pre_audio_guide_sample_rate": rate, "prompt": "Original", "gen": {}})
+            exec(compile(ast.Module(body=[branch], type_ignores=[]), str(_WGP_PATH), "exec"), namespace)
+            self.assertEqual(namespace["prompt"], "Original")
+            np.testing.assert_array_equal(namespace["input_waveform"], namespace["pre_audio_guide"])
+
+    def test_optional_voice_timing_does_not_change_other_models_or_invalid_facts(self):
+        from services.director.source_audio import apply_source_voice_window
+        for model, packet in [
+            ("hunyuan_video_1_5", {"schema": "director.source-voice-timing.v1"}),
+            ("ltx2_25", "invalid"),
+            ("ltx2_25", {"schema": "director.source-voice-timing.v1", "audio_origin_sec": "bad"}),
+            ("ltx2_25", {"schema": "director.source-voice-timing.v1", "audio_origin_sec": 10 ** 400}),
+            ("ltx2_25", {"schema": "director.source-voice-timing.v1", "audio_origin_sec": 0, "intervals": []}),
+        ]:
+            with self.subTest(model=model, packet=packet):
+                self.assertEqual(apply_source_voice_window("Original", {"director_source_voice_timing": packet},
+                    model_type=model, model_def={}, start_frame=0, num_frames=121, fps=24), "Original")
+
     def test_standalone_audio_inference_preserves_explicit_and_control_modes(self):
         normalize = _load_wgp_helpers(
             "_normalize_audio_prompt_type_from_guide"

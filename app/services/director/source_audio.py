@@ -19,7 +19,7 @@ def source_voice_intervals(lyrics: list[dict] | None, speaker_mappings) -> list[
             continue
         try:
             start, end = float(line["start"]), float(line["end"])
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             continue
         if not math.isfinite(start) or not math.isfinite(end) or end <= start:
             continue
@@ -39,7 +39,7 @@ def overlapping_source_voices(intervals: list[dict], start: float, end: float) -
             if voice["start"] < end and voice["end"] > start]
 
 
-def source_voice_context(intervals: list[dict], start: float, end: float) -> str:
+def source_voice_context(intervals: list[dict], start: float, end: float, *, anchor: str = "shot start") -> str:
     """Render intersecting turns relative to a supplied source-audio slice."""
     turns = []
     for voice in overlapping_source_voices(intervals, start, end):
@@ -51,9 +51,66 @@ def source_voice_context(intervals: list[dict], start: float, end: float) -> str
     if not turns:
         return ""
     return (
-        "Transcribed voice intervals relative to shot start: " + "; ".join(turns)
+        f"Transcribed voice intervals relative to {anchor}: " + "; ".join(turns)
         + ". These identify audible source parts; lip-sync only the assigned "
         "person when visible, and this does not require them on screen. "
         "Unmapped voices have no assigned visual identity. Missing transcript "
         "coverage does not establish silence; follow the supplied audio through gaps"
     )
+
+
+def source_voice_timing_packet(params: dict, clips: list[dict], *, audio_origin_sec: float = 0.0) -> dict | None:
+    """Bind the full saved source timeline; planned overlaps alone miss rounded cuts."""
+    if "lyrics" in params:
+        intervals = source_voice_intervals(params.get("lyrics"), params.get("speaker_mappings"))
+    else:
+        intervals = []
+        for clip in clips:
+            for voice in _saved_source_voices(clip.get("source_voice_intervals")):
+                if voice not in intervals:
+                    intervals.append(dict(voice))
+        intervals.sort(key=lambda voice: voice["start"])
+    if not intervals:
+        return None
+    return {"schema": "director.source-voice-timing.v1", "intervals": intervals,
+            "audio_origin_sec": audio_origin_sec}
+
+
+def _saved_source_voices(records) -> list[dict]:
+    """Skip damaged optional facts without inventing absent source timestamps."""
+    valid = []
+    for record in records if isinstance(records, list) else []:
+        if not isinstance(record, dict):
+            continue
+        try:
+            start, end = float(record["start"]), float(record["end"])
+        except (KeyError, TypeError, ValueError, OverflowError):
+            continue
+        if not math.isfinite(start) or not math.isfinite(end) or end <= start:
+            continue
+        valid.append({"start": start, "end": end, "speaker_id": record.get("speaker_id"),
+                      "name": record.get("name") if isinstance(record.get("name"), str) else None,
+                      "role": record.get("role") if isinstance(record.get("role"), str) else None})
+    return valid
+
+
+def apply_source_voice_window(prompt: str, custom_settings: dict, *, model_type: str,
+                            model_def: dict, start_frame: int, num_frames: int, fps: float) -> str:
+    """Apply source facts after slicing, against exactly the same frame clock."""
+    if not any(str(value or "").lower().startswith("ltx2_25") for value in
+               (model_type, model_def.get("architecture"))):
+        return prompt
+    packet = custom_settings.get("director_source_voice_timing")
+    if not isinstance(packet, dict) or packet.get("schema") != "director.source-voice-timing.v1":
+        return prompt
+    try:
+        start = float(packet["audio_origin_sec"]) + start_frame / float(fps)
+        end = start + num_frames / float(fps)
+        if not math.isfinite(start) or not math.isfinite(end) or end <= start:
+            return prompt
+        timing = source_voice_context(_saved_source_voices(packet["intervals"]), start, end,
+                                      anchor="this generation window's start")
+    except (KeyError, TypeError, ValueError, OverflowError, ZeroDivisionError):
+        # Optional saved facts must never prevent generation or fabricate timing.
+        return prompt
+    return f"{prompt.rstrip()} SOURCE-AUDIO VOICE TIMING: {timing}" if timing else prompt

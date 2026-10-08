@@ -1049,17 +1049,19 @@ class TestDirectorCancellation(unittest.TestCase):
             "video_params": {"resolution": "1280x704"},
             "audio_path": audio_path,
             "audio_vocals_path": vocals_path,
-            "lyrics": [{"text": "Sing the next line"}],
+            "lyrics": [{"start": 7.02, "end": 7.08, "speaker": "lead", "text": "Sing the next line"}],
+            "speaker_mappings": {"lead": {"name": "Mira", "role": "singer"}},
             "fps": 24,
         })
         record["_planned_clips"] = [
             {"start": 2, "end": 7, "duration_sec": 5},
+            {"start": 7, "end": 12, "duration_sec": 5},
         ]
         record["clip_plans"] = [{
             "image_prompt": "singer at microphone",
             "video_prompt": "The lead singer performs into a microphone.",
-        }]
-        record["clip_images"] = ["start.jpg"]
+        }] * 2
+        record["clip_images"] = ["start.jpg"] * 2
         self._write_media("start.jpg", b"image")
         self.assertTrue(pipeline._save_pipeline_state(pid))
 
@@ -1083,7 +1085,7 @@ class TestDirectorCancellation(unittest.TestCase):
                 ),
             ),
         ):
-            pipeline.rerun_clip_video(self.temp_dir.name, pid, 0)
+            pipeline.rerun_clip_video(self.temp_dir.name, pid, 1)
 
         self.assertIn("SOURCE-AUDIO LIP SYNC", submitted[0]["prompt"])
         self.assertIn(
@@ -1092,6 +1094,43 @@ class TestDirectorCancellation(unittest.TestCase):
         )
         self.assertEqual(submitted[0]["audio_prompt_type"], "A")
         self.assertIn("audio_conditioning_guide", submitted[0])
+        packet = submitted[0]["custom_settings"]["director_source_voice_timing"]
+        self.assertAlmostEqual(packet["audio_origin_sec"], 2 + 121 / 24)
+        self.assertEqual(packet["intervals"], [{
+            "start": 7.02, "end": 7.08, "speaker_id": "lead", "name": "Mira", "role": "singer",
+        }])
+        self.assertNotIn("Sing the next line", str(packet))
+
+        # Saved per-shot facts survive state serialization when the original
+        # transcript is unavailable. A failed real slice must not attach them.
+        record["params"].pop("lyrics")
+        record["clip_plans"][1]["source_voice_intervals"] = packet["intervals"] + [
+            None, {}, {"start": "bad", "end": 9}, {"start": 9, "end": 8},
+            {"start": "inf", "end": 10},
+            {"start": 10 ** 400, "end": 10},
+        ]
+        self.assertTrue(pipeline._save_pipeline_state(pid))
+        saved = pipeline.load_pipeline_state(self.temp_dir.name, pid)
+        self.assertEqual(saved["clips"][1]["source_voice_intervals"][0], packet["intervals"][0])
+        with (
+            patch.object(pipeline, "_slice_audio_segment"),
+            patch.object(pipeline, "_submit_and_wait", side_effect=lambda params, **kw: submitted.append(params) or ["replacement.mp4"]),
+        ):
+            pipeline.rerun_clip_video(self.temp_dir.name, pid, 1)
+        self.assertEqual(submitted[1]["custom_settings"]["director_source_voice_timing"], packet)
+        with (
+            patch.object(pipeline, "_slice_audio_segment", side_effect=RuntimeError("slice failed")),
+            patch.object(pipeline, "_submit_and_wait", side_effect=lambda params, **kw: submitted.append(params) or ["replacement.mp4"]),
+        ):
+            pipeline.rerun_clip_video(self.temp_dir.name, pid, 1)
+        self.assertNotIn("director_source_voice_timing", submitted[2].get("custom_settings", {}))
+        restored = pipeline.restore_registered_pipeline(
+            saved, pipeline._find_pipeline_file(self.temp_dir.name, pid),
+            {"inputs": []}, defer_worker=True,
+        )
+        self.assertEqual(restored["clip_plans"][1]["source_voice_intervals"][0], packet["intervals"][0])
+        restored["clip_plans"][1]["source_voice_intervals"][0]["name"] = "changed after recovery"
+        self.assertEqual(saved["clips"][1]["source_voice_intervals"][0]["name"], "Mira")
 
     def test_standard_video_uses_each_generated_start_image(self):
         pid = "pipe-video-starts"
@@ -1466,6 +1505,8 @@ class TestDirectorCancellation(unittest.TestCase):
             "video_params": {"resolution": "1280x704"},
             "audio_path": audio_path,
             "fps": 24,
+            "lyrics": [{"start": 20.2, "end": 24, "speaker": "lead", "text": "private words"}],
+            "speaker_mappings": {"lead": {"name": "Mira", "role": "singer"}},
         }
         plans = [{
             "video_prompt": "unused combined prompt",
@@ -1510,6 +1551,10 @@ class TestDirectorCancellation(unittest.TestCase):
             for prompt in window_prompts
         ))
         self.assertEqual(submitted[0]["per_clip_prompt_modes"], [1])
+        packet = submitted[0]["custom_settings"]["director_source_voice_timing"]
+        self.assertEqual(packet["audio_origin_sec"], 0)
+        self.assertEqual(packet["intervals"][0]["start"], 20.2)
+        self.assertNotIn("private words", str(packet))
 
     def test_video_phase_rejects_a_recorded_start_image_missing_on_disk(self):
         with open(

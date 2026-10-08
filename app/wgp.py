@@ -13796,6 +13796,14 @@ def _generate_video_impl(
                 # detect that case and substitute the previous window's
                 # trailing generated audio as a continuation prefix.
                 input_waveform, input_waveform_sample_rate = slice_audio_window(audio_guide, audio_start_frame, current_video_length, fps, save_path, suffix=f"_win{window_no}", pad_tail=not video_length_not_limited_by_audio)
+                if (isinstance(custom_settings, dict) and custom_settings.get("director_source_voice_timing")
+                        and _audio_waveform_sample_count(input_waveform) > 0):
+                    from services.director.source_audio import apply_source_voice_window
+                    prompt = apply_source_voice_window(
+                        prompt, custom_settings, model_type=model_type, model_def=model_def,
+                        start_frame=audio_start_frame, num_frames=current_video_length, fps=fps,
+                    )
+                    gen["current_window_prompt"] = prompt
                 # If the requested audio window fell past the source (empty slice),
                 # fall back to the previous window's trailing generated audio so we
                 # get a non-empty prefix — the model will continue the voice/tone.

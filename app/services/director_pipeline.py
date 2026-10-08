@@ -1324,6 +1324,8 @@ def _save_pipeline_state_locked(pid: str) -> bool:
             # planning data, not runtime media, and lets recovery replay the
             # committed shared shot plan without another LLM/planner pass.
             clip_state["_h3_shot"] = plan["_h3_shot"]
+        if "source_voice_intervals" in plan:
+            clip_state["source_voice_intervals"] = copy.deepcopy(plan["source_voice_intervals"])
         clips.append(clip_state)
 
     state = {
@@ -2506,6 +2508,11 @@ def _rerun_clip_video_impl(out_dir: str, pid: str, clip_index: int, prompt_overr
             audio_path=audio_path,
         )
         gen_params["prompt"] = rerun_prompts[0] if rerun_prompts else ""
+        if pipeline_type == "music_video" and _is_ltx25_model(video_model, model_def):
+            from services.director.source_audio import source_voice_timing_packet
+            voice_timing = source_voice_timing_packet(snapshot, clips, audio_origin_sec=clip_start)
+            if voice_timing:
+                gen_params.setdefault("custom_settings", {})["director_source_voice_timing"] = voice_timing
 
     try:
         output_files = _submit_and_wait(
@@ -5314,6 +5321,7 @@ def _resume_pipeline_reserved(
         "window_prompts": c.get("window_prompts", []) or [],
         "window_count": c.get("window_count", 1),
         "_h3_shot": c.get("_h3_shot"),
+        "source_voice_intervals": copy.deepcopy(c.get("source_voice_intervals", [])),
     } for c in saved_clips]
     planned_clips = [c.get("planned_clip") for c in saved_clips]
     clip_images = [c.get("start_image_filename") for c in saved_clips]
@@ -5407,6 +5415,7 @@ def restore_registered_pipeline(
         "window_prompts": clip.get("window_prompts", []) or [],
         "window_count": clip.get("window_count", 1),
         "_h3_shot": clip.get("_h3_shot"),
+        "source_voice_intervals": copy.deepcopy(clip.get("source_voice_intervals", [])),
     } for clip in saved_clips]
     runtime_status = (
         saved_status if terminal
@@ -9872,6 +9881,12 @@ def _run_video_generation(pid: str, params: dict, clip_plans: list[dict],
         ]
         if direct_refs:
             gen_params["image_refs"] = direct_refs
+
+    if pipeline_type == "music_video" and audio_path and _is_ltx25_model(video_model, model_def):
+        from services.director.source_audio import source_voice_timing_packet
+        voice_timing = source_voice_timing_packet(params, clip_plans)
+        if voice_timing:
+            gen_params.setdefault("custom_settings", {})["director_source_voice_timing"] = voice_timing
 
     h3_longform = _prepare_director_h3_longform(
         gen_params,
