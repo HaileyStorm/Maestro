@@ -982,7 +982,7 @@ def _get_generate_video_param_names():
     if _generate_video_param_names is None:
         _generate_video_param_names = [
             x for x in inspect.signature(generate_video).parameters
-            if x not in ["task", "send_cmd", "plugin_data", "_h3_face_refine_dispatch"]
+            if x not in ["task", "send_cmd", "plugin_data", "_h3_face_refine_dispatch", "_h3_face_refine_output"]
         ]
     return _generate_video_param_names
 
@@ -11810,6 +11810,7 @@ def _generate_video_impl(
     _h3_control_dispatch=None,
     # Exact sealed crop bundle decoded on its owning worker; never saved.
     _h3_face_refine_dispatch=None,
+    _h3_face_refine_output=None,
 ):
     if _h3_control_dispatch is not None:
         from services.h3_gallery_control import validate_gallery_control_dispatch
@@ -11836,6 +11837,12 @@ def _generate_video_impl(
             or type(custom_settings) is not dict or custom_settings != {"h3_attention_engine": "sdpa"}
         ):
             raise ValueError("H3 Control requires an independent dense Base worker handoff")
+    if _h3_face_refine_output is not None:
+        from services.h3_face_refine_job import FaceRefineResultSink
+        if (type(_h3_face_refine_output) is not FaceRefineResultSink
+                or _h3_face_refine_dispatch is None or after_repeat_output is not None
+                or after_segment_output is not None):
+            raise ValueError("Face repair requires a private single-output result sink")
     if _h3_face_refine_dispatch is not None:
         from services.h3_face_refine_worker import validate_face_refine_dispatch
         try:
@@ -11864,6 +11871,9 @@ def _generate_video_impl(
             _h3_face_refine_dispatch, frame_num=video_length,
             height=face_height, width=face_width, sampling_steps=num_inference_steps,
         )
+        if _h3_face_refine_output is not None:
+            _h3_face_refine_output.validate_binding(
+                _h3_face_refine_dispatch.binding,video_length,face_width,face_height)
     if _h3_timeline_guides is not None:
         from models.minimax_h3.timeline_guides import H3TimelineGuidePayload
         if (
@@ -14695,6 +14705,14 @@ def _generate_video_impl(
             gc.collect()
             torch.cuda.empty_cache()
 
+            if _h3_face_refine_output is not None:
+                if samples is None or abort_scheduled or gen.get("abort", False):
+                    clear_status(state)
+                    return False
+                _h3_face_refine_output.capture(samples, _h3_face_refine_dispatch.binding)
+                clear_status(state)
+                return True
+
             if samples is None and h3_encoded_video is None:
                 abort = True
                 state["prompt"] = ""
@@ -14908,6 +14926,8 @@ def _generate_video_impl(
                 inputs.pop("_h3_cumulative_dispatch", None)
                 inputs.pop("_h3_timeline_guides", None)
                 inputs.pop("_h3_control_dispatch", None)
+                inputs.pop("_h3_face_refine_dispatch", None)
+                inputs.pop("_h3_face_refine_output", None)
                 durable_file_stem = None
                 if durable_output_dir is not None:
                     durable_repeat = (
@@ -15240,6 +15260,8 @@ def _generate_video_impl(
                 inputs.pop("_h3_cumulative_dispatch", None)
                 inputs.pop("_h3_timeline_guides", None)
                 inputs.pop("_h3_control_dispatch", None)
+                inputs.pop("_h3_face_refine_dispatch", None)
+                inputs.pop("_h3_face_refine_output", None)
                 inputs["model_type"] = model_type
                 inputs["model_filename"] = (model_filename if _h3_control_dispatch is not None
                                              else get_model_filename(model_type, transformer_quantization, transformer_dtype_policy))

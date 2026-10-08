@@ -2729,7 +2729,7 @@ _CREDIT_INTERNAL_PARAMS = frozenset({
 })
 _CREDIT_EXEMPT_JOB_KINDS = frozenset({
     "tool_upscale", "tool_revoice", "tool_hflip", "tool_editor_export",
-    "tool_browser_copy",
+    "tool_browser_copy", "tool_h3_face_refine",
 })
 _CREDIT_LINEAGE_JOB_KINDS = frozenset({
     "director_pipeline",
@@ -5118,7 +5118,7 @@ def _queue_recovery_input_descriptors(job: dict, owner_digest: str) -> list[dict
             raise QueueRecoveryRuntimeError("Unexpected Editor input in this job.")
         if field.startswith("browser_copy_source_path:") and job.get("kind") != "tool_browser_copy":
             raise QueueRecoveryRuntimeError("Unexpected browser-copy input in this job.")
-        if field.startswith("_tool_input_paths:") and job.get("kind") not in {"tool_upscale", "tool_revoice"}:
+        if field.startswith("_tool_input_paths:") and job.get("kind") not in {"tool_upscale", "tool_revoice", "tool_h3_face_refine"}:
             raise QueueRecoveryRuntimeError("Unexpected tool input in this job.")
         resolved = os.path.realpath(path)
         size, digest = _recovery_sha256_file(resolved)
@@ -5944,7 +5944,7 @@ def _queue_recovery_worker(job: dict):
         # Private prompt execution is never reconstructed from durable bytes.
         # A fresh explicit route submission creates a new canonical job.
         return None
-    if kind in {"tool_upscale", "tool_revoice"}:
+    if kind in {"tool_upscale", "tool_revoice", "tool_h3_face_refine"}:
         return globals().get("_run_" + kind)
     if kind == "tool_hflip":
         return globals().get("_run_tool_hflip")
@@ -7422,7 +7422,7 @@ def _queue_recovery_materialize_job(
         "_recovery_project_digest": expected_project,
         "_recovery_manifest_pointer": dict(snapshot.get("request_manifest") or {}),
     })
-    if (snapshot.get("kind") in {"tool_upscale", "tool_revoice", "tool_hflip", "tool_browser_copy", "tool_editor_export"}
+    if (snapshot.get("kind") in {"tool_upscale", "tool_revoice", "tool_hflip", "tool_browser_copy", "tool_h3_face_refine", "tool_editor_export"}
             and (str(snapshot.get("status") or "").casefold() in {"cancelled", "canceled"}
                  or snapshot.get("cancel_requested"))
             and (("editor_export_publication" if snapshot.get("kind") == "tool_editor_export"
@@ -7441,7 +7441,7 @@ def _queue_recovery_materialize_job(
             except (KeyError, TypeError, ValueError, OSError, QueueRecoveryRuntimeError):
                 pass
         return runtime, False
-    if (snapshot.get("kind") in {"tool_upscale", "tool_revoice", "tool_hflip", "tool_browser_copy"}
+    if (snapshot.get("kind") in {"tool_upscale", "tool_revoice", "tool_hflip", "tool_browser_copy", "tool_h3_face_refine"}
             and ("processed_tool_publication" in (snapshot.get("recovery_cursor") or {})
                  or "processed_tool_legacy_cleanup" in (snapshot.get("recovery_cursor") or {})
                  or any(isinstance(unit, dict) and unit.get("kind") == "ordinary_repeat"
@@ -8019,6 +8019,17 @@ def _queue_recovery_materialize_job(
             "error": None,
         })
         return runtime, False
+
+    if (runtime.get("kind") == "tool_h3_face_refine" and not blocked_reason
+            and (status == "running" or (status == "queued" and snapshot.get("_recovery_reason_code")
+                 in {"generation_failed","owner_reauthentication_required"}))):
+        # Private crops are not a sealed public result. Keep this hold across
+        # further restarts; owner Retry starts a fresh dedicated tool attempt.
+        runtime.update(status="queued",queue_held=True,
+                       recovery_state="blocked_remote_reauth" if remote else "blocked",reruns_denoise=False,
+                       _recovery_reason_code="owner_reauthentication_required" if remote else "generation_failed",
+                       message="Face repair was interrupted. Review the request before retrying.")
+        return runtime,False
 
     # Executable H3 recovery remains visible but held.  Preserve its prior
     # attempt counter and never start a model worker.  Verified delivery-only
@@ -67217,6 +67228,8 @@ def _write_tool_sidecar(out_dir, filename, *, source_name, tool, params, elapsed
         "created_at": time.time(),
         "output_filename": filename,
     }
+    if tool == "h3_face_refine":
+        sidecar["params"] = None  # A composite is not an ordinary generation recipe.
     job = _jobs.get(job_id) or {}
     if tool == "hflip":
         sidecar["artifact_class"] = "final"
@@ -67369,6 +67382,184 @@ def _browser_copy_source(job: dict) -> tuple[str, dict]:
         raise ValueError("The selected video changed or was removed. Refresh Gallery.")
     metadata = load_media_sidecars(out_dir, {name}).get(name) or {}
     return source, metadata
+
+
+def _face_refine_available():
+    return (os.environ.get("MAESTRO_H3_FACE_REFINE_EXPERIMENTAL") == "1"
+            and os.environ.get("MAESTRO_H3_FACE_REFINE_GALLERY_EXPERIMENTAL") == "1")
+
+
+def _face_refine_source(job):
+    params = job["params"]
+    binding = params["face_refine"]["source"]
+    out_dir = _existing_workspace_dir(job["workspace"])
+    if os.path.realpath(out_dir) != os.path.realpath(job["out_dir"]):
+        raise ValueError("Face repair project changed")
+    path, metadata = _h3_gallery_av_source_state(job["workspace"],out_dir,binding["name"],binding["revision"])
+    if path != params["video_path"] or binding["workspace"] != job["workspace"]:
+        raise ValueError("Face repair source changed")
+    for key in ("private","explicit"):
+        if (metadata.get(key,False) != binding[key]
+                or (binding[key] and not (job.get(key) is True or (job.get("access_policy") or {}).get(key) is True))):
+            raise ValueError("Face repair source privacy changed")
+    return path, metadata
+
+
+@_upload_job_reader
+def _run_tool_h3_face_refine(job_id):
+    import tempfile
+    from services.h3_face_refine_job import run_face_repair
+    job = _jobs[job_id]
+    state = {"gen":{"queue":[],"in_progress":False,"abort":False,"file_list":[],
+                    "artifact_list":[],"file_settings_list":[],"audio_file_list":[],
+                    "audio_file_settings_list":[],"selected":0,"audio_selected":0,
+                    "prompt_no":0,"prompts_max":0,"repeat_no":0,"total_generation":1,
+                    "window_no":0,"total_windows":0,"progress_status":"","process_status":"process:main"},
+             "loras":[]}
+    abort_state = state["gen"];started=time.time()
+    with generation_slot(_gen_lock,job) as acquired:
+        if not acquired:
+            if is_cancel_requested(job) and processed_tool_publication_pending(job):
+                _cleanup_cancelled_processed_tool_output(job)
+            return False
+        try:
+            if not try_start(job,generation_lock=_gen_lock,message="Preparing face repair...",phase="Preparing"):
+                return False
+            if not register_abort_state(job,job_id,_active_gen_states,abort_state):
+                return False
+            def aborted():
+                return bool(abort_state.get("abort")) or is_cancel_requested(job)
+            with _reserve_workspace_operations(job["workspace"]):
+                _validated_tool_input_paths(job)
+                adopted = _resume_processed_tool_output(job)
+                if adopted is not None:
+                    return adopted
+                if not _face_refine_available():
+                    raise ValueError("Face repair is unavailable")
+                _require_remote_visible_job_models(job)
+                _require_job_runtime_model_admission(job)
+                sealed_plan=_require_h3_offload_plan_parity(job)
+                source,_ = _face_refine_source(job)
+                request = job["params"]["face_refine"]
+                def native(dispatch,sink,request):
+                    if aborted():
+                        raise InterruptedError("Face repair cancelled")
+                    _validated_tool_input_paths(job)
+                    params=copy.deepcopy(wgp.get_default_settings("minimax_h3"))
+                    params.update(request["settings"])
+                    for key in tuple(params):
+                        if key.startswith("_h3_"):params.pop(key)
+                    for key in _GENERATION_MEDIA_INPUTS:params[key]=[] if key=="image_refs" else None
+                    frames=dispatch.plan["source"]["frame_count"];width,height=dispatch.plan["track"]["canvas"]
+                    params.update(model_type="minimax_h3",prompt=request["prompt"],generation_mode="video",image_mode=0,
+                                  resolution=f"{width}x{height}",video_length=frames,duration_seconds=frames/24,
+                                  sliding_window_size=frames,guidance_scale=1.0,repeat_generation=1,batch_size=1,
+                                  activated_loras=[],loras_multipliers="",tea_cache=0,skip_steps_cache_type="",
+                                  image_prompt_type="",video_prompt_type="",audio_prompt_type="",trim_tail_frames=0,
+                                  multi_prompts_gen_type=0,h3_native_boundary_conditioning=False,h3_adaptive_conditioning=False,
+                                  custom_settings={"h3_attention_engine":"sdpa"},spatial_upsampling="",temporal_upsampling="",
+                                  voice_clone_enabled=False,voice_clone_refs=[],input_waveform=None,audio_path=None,
+                                  film_grain_intensity=0,MMAudio_setting=0)
+                    wgp.task_id+=1
+                    manifest=[{"id":wgp.task_id,"params":params,"plugin_data":{}}]
+                    _apply_h3_offload_plan_to_manifest(manifest,sealed_plan)
+                    queue,error=wgp._parse_task_manifest(manifest,state,os.getcwd())
+                    if error or len(queue)!=1:
+                        raise ValueError("Face repair model settings could not be prepared")
+                    # Parsing never receives tensors or a private sink. The
+                    # worker appends them only to the one prepared invocation.
+                    task=queue[0];call=dict(task["params"])
+                    call.update(state=state,model_type="minimax_h3",mode="generate",
+                                video_length=frames,resolution=f"{width}x{height}",multi_prompts_gen_type=0,
+                                _h3_face_refine_dispatch=dispatch,_h3_face_refine_output=sink)
+                    expected=set(inspect.signature(wgp.generate_video).parameters)
+                    call={k:v for k,v in call.items() if k in expected}
+                    errors=[]
+                    def send_cmd(kind,*values):
+                        if kind=="error":errors.append(True)
+                        if aborted():abort_state["abort"]=True
+                        if kind=="status" and values:
+                            update_job(job,message=str(values[0])[:180],phase="Repairing")
+                    update_job(job,message="Repairing the reviewed face crops...",phase="Repairing")
+                    with _WgpNativeGpuExecutionSlot(True,cancel_checkpoint=aborted) as native_acquired:
+                        if not native_acquired:raise InterruptedError("Face repair cancelled")
+                        result=_run_generation_task_with_llm_exclusion("minimax_h3",send_cmd,
+                            lambda:wgp.generate_video(task,send_cmd,plugin_data={},**call))
+                    return result is True and not errors and not aborted()
+                # Retain private attempts, including failed native samples. A
+                # bare crop is never a ready or recoverable public result.
+                staging=tempfile.mkdtemp(prefix=f".face-refine-{job_id}-",dir=job["out_dir"])
+                staged,provenance=run_face_repair(source,request,staging,native=native,cancel_check=aborted)
+                _validated_tool_input_paths(job)
+                if aborted():return False
+                job["_face_refine_provenance"]=provenance
+                return _publish_processed_tool_output(job,str(staged),source=source,tool="h3_face_refine",
+                    params={"model_type":"minimax_h3","prompt":request["prompt"],**request["settings"]},
+                    source_revision=request["source"]["revision"],elapsed=time.time()-started)
+        except Exception as error:
+            if job.get("status")=="completed":return True
+            if not is_cancel_requested(job):
+                updates=_safe_failure_updates(error,job)
+                updates["message"]="Face repair failed. Refresh the source or review the request before retrying."
+                finish_job(job,"failed",**updates)
+            return False
+        finally:
+            job.pop("_face_refine_provenance",None)
+            unregister_abort_state(job_id,_active_gen_states,abort_state)
+
+
+@api.post("/api/v1/tools/h3-face-refine")
+async def tools_h3_face_refine(request: Request):
+    """Queue reviewed crop regeneration; publish only its source composite."""
+    if not _face_refine_available():
+        raise HTTPException(status_code=409,detail="Face repair is not available yet")
+    try:body=await request.json()
+    except Exception:raise HTTPException(status_code=400,detail="A reviewed face-repair request is required") from None
+    if type(body) is not dict or any(type(body.get(k)) is not str or not body[k] for k in ("workspace","name","revision")):
+        raise HTTPException(status_code=400,detail="Select a current Gallery video")
+    workspace=_request_project_workspace(request,body["workspace"])
+    _require_remote_visible_models(request,["minimax_h3"])
+    _require_h3_legal_execution(["minimax_h3"])
+    _require_model_recipe_terms(["minimax_h3"])
+    from services.h3_face_refine_job import validate_request
+    from services import h3_face_refine as face
+    from services import h3_gallery_av_guide as av
+    with _reserve_workspace_operations(workspace):
+        out_dir=_require_project_access(request,workspace,permission="project.generate")
+        with _output_lineage_mutation_guard(out_dir):
+            selected_dir,path,_=_require_authorized_output(request,workspace,body["name"])
+            try:
+                source,metadata=_h3_gallery_av_source_state(workspace,out_dir,body["name"],body["revision"])
+                if source != path or os.path.realpath(selected_dir)!=os.path.realpath(out_dir):raise ValueError()
+                def inspect_source():
+                    with av._snapshot(source,"video",None) as (snapshot,digest,size):
+                        return face._probe(snapshot,None),digest,size
+                facts,digest,size=await upload_usage.to_thread(inspect_source)
+                normalized=validate_request(body,facts)
+                _,current=_h3_gallery_av_source_state(workspace,out_dir,body["name"],body["revision"])
+                if any(current.get(k,False)!=metadata.get(k,False) for k in ("private","explicit")):raise ValueError()
+            except (ValueError,OSError,KeyError,TypeError):
+                raise HTTPException(status_code=409,detail="The source or face observations changed. Refresh and review the clip.") from None
+            normalized['source']={"workspace":workspace,"name":body["name"],"revision":body["revision"],
+                                  "sha256":digest,"size":size,**facts,
+                                  "private":metadata.get("private",False),"explicit":metadata.get("explicit",False)}
+            job_id=_new_generation_job_id()
+            canvas=normalized["observations"]["canvas"]
+            params={"model_type":"minimax_h3","resolution":f"{canvas[0]}x{canvas[1]}",
+                    "video_length":facts["frame_count"],"duration_seconds":facts["frame_count"]/24,
+                    **normalized["settings"],"custom_settings":{"h3_attention_engine":"sdpa"},
+                    "generation_mode":"video","image_mode":0,"sliding_window_size":facts["frame_count"],
+                    "repeat_generation":1,"batch_size":1,"guidance_scale":1.0,
+                    "video_path":source,"_tool_input_paths":[source],"face_refine":normalized,
+                    "private_output":bool(body.get("private_output",False) or metadata.get("private",False)),
+                    "explicit_output":bool(body.get("explicit_output",False) or metadata.get("explicit",False))}
+            job={"id":job_id,"kind":"tool_h3_face_refine","status":"queued","progress":0,"step":0,"total_steps":0,
+                 "session_id":request.state.maestro_session_id,"source_remote":bool(_request_remote.get()),
+                 "_tool_inputs_authorized_live":True,"phase":"","message":"Queued (face repair)","created_at":time.time(),
+                 "params":params,"output_files":[],"error":None,"workspace":workspace,"out_dir":out_dir}
+            _queue_recovery_register_and_publish(job,worker=_run_tool_h3_face_refine,
+                recovery_kind="tool_h3_face_refine",thread_name=f"tool-face-refine-{job_id}")
+    return {"job_id":job_id,"status":"queued"}
 
 
 @_upload_job_reader
@@ -68922,7 +69113,7 @@ def _validated_tool_input_paths(job: dict) -> list[str]:
     try:
         kind = job.get("kind")
         if kind not in {
-            "tool_upscale", "tool_revoice", "tool_hflip", "tool_browser_copy",
+            "tool_upscale", "tool_revoice", "tool_hflip", "tool_browser_copy", "tool_h3_face_refine",
         }:
             raise ValueError("Unsupported tool job")
         project_dir = _existing_workspace_dir(job["workspace"])
@@ -68974,6 +69165,8 @@ def _validated_tool_input_paths(job: dict) -> list[str]:
                 )
             if not valid:
                 raise ValueError("Input ownership or content changed")
+        if kind == "tool_h3_face_refine":
+            _face_refine_source(job)
         if source_field is not None:
             prefix = "hflip" if kind == "tool_hflip" else "browser_copy"
             if (params.get(f"{prefix}_source_name") != os.path.basename(paths[0])
@@ -69548,6 +69741,11 @@ def _publish_processed_tool_output(job, staged_path, *, source, tool, params, el
         "producer_media_size": size, "producer_media_sha256": digest,
         "producer_artifact_class": "final", "artifact_class": "final",
     }
+    if tool == "h3_face_refine":
+        provenance = job.get("_face_refine_provenance")
+        if (type(provenance) is not dict or provenance.get("composition", {}).get("output_sha256") != "sha256:" + digest):
+            raise ValueError("Face repair completion evidence is missing or changed")
+        producer["face_refine"] = copy.deepcopy(provenance)
     with _output_lineage_mutation_guard(out_dir):
         validated_paths = _validated_tool_input_paths(job)
         if is_cancel_requested(job):
@@ -80003,7 +80201,7 @@ def _resume_recovered_job(
                 raise HTTPException(status_code=409, detail="The Editor publication cannot be recovered safely") from error
             reruns_denoise = False
             retry_updates["reruns_denoise"] = False
-        if (job.get("kind") in {"tool_upscale", "tool_revoice", "tool_hflip", "tool_browser_copy"}
+        if (job.get("kind") in {"tool_upscale", "tool_revoice", "tool_hflip", "tool_browser_copy", "tool_h3_face_refine"}
                 and "processed_tool_publication" in (job.get("recovery_cursor") or {})):
             try:
                 retry_updates["recovery_cursor"] = _prepare_processed_tool_completion_retry(job)

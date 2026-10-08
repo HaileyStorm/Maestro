@@ -140,6 +140,13 @@ class FaceWorkerTests(unittest.TestCase):
         with patch.dict(os.environ, MAESTRO_H3_FACE_REFINE_EXPERIMENTAL="1"):
             exec(compile(ast.Module(body=[guard], type_ignores=[]), "wgp.py", "exec"), namespace)
         self.assertIsNot(namespace["_h3_face_refine_dispatch"].payload.video, dispatch.payload.video)
+        from services.h3_face_refine_job import FaceRefineResultSink
+        with tempfile.TemporaryDirectory(dir=self.root) as folder:
+            sink = FaceRefineResultSink(Path(folder)/"replacement.mkv", dispatch.binding,124,64,64)
+            bad = {**namespace, "_h3_face_refine_output":sink}
+            sink.width = 96
+            with patch.dict(os.environ, MAESTRO_H3_FACE_REFINE_EXPERIMENTAL="1"), self.assertRaisesRegex(ValueError,"binding"):
+                exec(compile(ast.Module(body=[guard], type_ignores=[]), "wgp.py", "exec"), bad)
         for key, value in (("video_length", 125), ("batch_size", 2), ("audio_source", "source"),
                            ("spatial_upsampling", "2x"), ("_h3_control_dispatch", object())):
             bad = {**namespace, key: value}
@@ -170,7 +177,7 @@ class FaceWorkerTests(unittest.TestCase):
         calls = []
         should_fail = [True]
         def implementation(model_type="minimax_h3", resolution="64x64", override_profile=4.5,
-                           _h3_face_refine_dispatch=None):
+                           _h3_face_refine_dispatch=None, _h3_face_refine_output=None):
             calls.append((resolution, _h3_face_refine_dispatch))
             if should_fail[0]:
                 raise H3OomReliefRetry({"resolution": "32x32", "num_inference_steps": 2})
@@ -193,6 +200,7 @@ class FaceWorkerTests(unittest.TestCase):
         namespace["generate_video"] = implementation
         exec(compile(ast.Module(body=[names], type_ignores=[]), "wgp.py", "exec"), namespace)
         self.assertNotIn("_h3_face_refine_dispatch", namespace["_get_generate_video_param_names"]())
+        self.assertNotIn("_h3_face_refine_output", namespace["_get_generate_video_param_names"]())
 
 
 if __name__ == "__main__":
