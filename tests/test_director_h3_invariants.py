@@ -153,6 +153,201 @@ non_diegetic_music: N/A"""
         self.assertEqual(plan["segment_source_indices"], [0, 0, 1])
         return params, clips, planned
 
+    def _rerun_partition_fixture(self, *, native=False, workflow=None, structured=False):
+        durations = [10, 20, 10]
+        clips = [{"video_prompt": text} for text in (
+            "An adult courier reaches the hall.",
+            "An adult courier crosses the hall without a cut.",
+            "An adult courier leaves the hall.",
+        )]
+        if structured:
+            clips[1]["_h3_shot"] = {
+                "dialogue_beats": [{"spoken_text": "Keep the blue case open.",
+                                    "language": "English"}],
+                "spatial_setup": "The courier waits beside a blue case.",
+                "closing_blocking": "The courier leaves the blue case open.",
+            }
+        cursor = 2.013
+        planned = []
+        for duration in durations:
+            planned.append({"start": cursor, "end": cursor + duration,
+                            "duration_sec": duration})
+            cursor += duration
+        params = {"video_model": "minimax_h3", "seamless": True,
+                  "h3_ref2va_terms_accepted": True,
+                  "h3_native_boundary_conditioning": native}
+        if native:
+            params["h3_boundary_overrides"] = [{"type": "continuous"}] * 3
+        if workflow:
+            params["h3_style_workflow"] = workflow
+        plan = pipeline._prepare_director_h3_longform(self._base_generation_params(),
+            params=params, clip_plans=clips, planned_clips=planned, fps=24)
+        self.assertEqual(plan["segment_source_indices"], [0, 1, 1, 2])
+        return plan
+
+    def test_scene_rerun_edit_keeps_absolute_partition_and_fractional_song_clock(self):
+        original = self._rerun_partition_fixture(native=True)
+        before = copy.deepcopy(original)
+        prompt = (
+            "subject_definitions: <Subject 1> is an adult courier.\n\n"
+            "integrated_multimodal_description:\n"
+            "[Shot 1] [0s-20s] shot_name: Red case | "
+            "audiovisual_description: <Subject 1> carries a red case through the hall. | "
+            "dialogue_and_vocalizations: <Subject 1> says: "
+            "<d>[English] Keep the red case closed.</d>\n"
+            "overall_soundscape: Footsteps and a distant train.\n"
+            "non_diegetic_music: N/A"
+        )
+        params = {"seed": 723, "audio_source": "original.wav"}
+        repaired = pipeline._prepare_director_h3_scene_rerun(params,
+            committed=original, scene_index=1, audio_origin_sec=2.013,
+            prompt_override=prompt)
+        self.assertEqual(original, before)
+        selection = repaired["scene_rerun"]
+        self.assertEqual(selection["physical_indices"], [1, 2])
+        self.assertEqual(selection["predecessor_index"], 0)
+        self.assertEqual(selection["published_start_frame"], 240)
+        self.assertEqual(selection["published_frames"], 480)
+        self.assertEqual(selection["audio_origin_sec"], 2.013)
+        self.assertEqual(selection["audio_start_sec"], 12.013)
+        self.assertNotEqual(selection["audio_start_sec"], round(2.013 * 24) / 24 + 10)
+        for key in ("clip_frames", "clip_published_frames", "clip_trim_tail_frames",
+                    "segment_models", "clip_boundaries", "segment_source_indices"):
+            self.assertEqual(repaired[key], before[key], key)
+        self.assertEqual([shot["physical_segment_id"] for shot in repaired["shot_plan"]["shots"]],
+                         [shot["physical_segment_id"] for shot in before["shot_plan"]["shots"]])
+        self.assertEqual(params["seed"], 723)
+        self.assertEqual(params["audio_source"], "original.wav")
+        self.assertEqual(params["multi_clip_audio_start_sec"], 2.013)
+        executable = params["per_clip_prompts"]
+        self.assertEqual(sum("Keep the red case closed." in text for text in executable), 1)
+        self.assertTrue(all("red case" in executable[index] for index in (1, 2)))
+        self.assertNotEqual(repaired["shot_plan"]["prompt_contract_seal"]["digest"],
+                            selection["original_plan_sha256"])
+        for index in (0, 3):
+            self.assertEqual(executable[index], before["shot_plan"]["clip_prompts"][index])
+        continuation = repaired["shot_plan"]["source_contracts"][1]["event_ownership"][0]["continuation_slices"]
+        self.assertTrue(continuation)
+        self.assertEqual(continuation[0]["physical_segment_index"], 1)
+        restored = {}
+        self.assertTrue(pipeline._rehydrate_director_h3_longform(restored, repaired))
+        self.assertEqual(restored["per_clip_prompts"], executable)
+
+    def test_scene_rerun_without_edit_reuses_canonical_sources_and_cut_policy(self):
+        original = self._rerun_partition_fixture()
+        params = {}
+        repaired = pipeline._prepare_director_h3_scene_rerun(params,
+            committed=original, scene_index=1, audio_origin_sec=2.013)
+        self.assertEqual(repaired["shot_plan"]["clip_prompts"], original["shot_plan"]["clip_prompts"])
+        self.assertEqual(repaired["shot_plan"]["source_contracts"], original["shot_plan"]["source_contracts"])
+        self.assertEqual(repaired["segment_models"], original["segment_models"])
+        self.assertEqual(repaired["scene_rerun"]["physical_indices"], [1, 2])
+        self.assertEqual(repaired["segment_models"][1]["model_type"], "minimax_h3_ref2va")
+        self.assertEqual(repaired["clip_boundaries"][0]["type"], "cut")
+
+    def test_scene_rerun_edit_does_not_restore_old_structured_dialogue_or_blocking(self):
+        original = self._rerun_partition_fixture(native=True, structured=True)
+        contract = original["shot_plan"]["source_contracts"][1]
+        self.assertIn("Keep the blue case open.", contract["semantic_prompt"])
+        self.assertTrue(contract["structured_dialogue_blocks"])
+        params = {}
+        repaired = pipeline._prepare_director_h3_scene_rerun(params, committed=original,
+            scene_index=1, audio_origin_sec=2.013,
+            prompt_override=("An adult courier crosses the hall with a red case. "
+                             "<d>[English] Keep the red case closed.</d>"))
+        text = "\n".join(params["per_clip_prompts"][1:3])
+        self.assertEqual(text.count("Keep the red case closed."), 1)
+        self.assertNotIn("blue case", text)
+        self.assertNotIn("Keep the blue case open.", text)
+        self.assertEqual(repaired["shot_plan"]["source_contracts"][1]["structured_dialogue_blocks"], [])
+
+    def test_opening_scene_rerun_does_not_invent_a_predecessor(self):
+        original = self._rerun_partition_fixture(native=True)
+        repaired = pipeline._prepare_director_h3_scene_rerun({}, committed=original,
+            scene_index=0, audio_origin_sec=2.013, prompt_override="A courier waits in the lobby.")
+        self.assertEqual(repaired["scene_rerun"]["physical_indices"], [0])
+        self.assertIsNone(repaired["scene_rerun"]["predecessor_index"])
+        self.assertEqual(repaired["scene_rerun"]["audio_start_sec"], 2.013)
+
+    def test_scene_rerun_rebuilds_adaptive_mapping_and_preserves_style(self):
+        workflow = self._style_workflow()
+        original = self._rerun_partition_fixture(workflow=workflow)
+        self.assertEqual(original["prompt_mapping_version"], 1)
+        repaired = pipeline._prepare_director_h3_scene_rerun({}, committed=original,
+            scene_index=1, audio_origin_sec=2.013,
+            prompt_override="A courier in a purple coat crosses the hall without a cut.")
+        mapped = repaired["prompt_mapping_source_plan"]
+        self.assertEqual(mapped["director_runtime_contract"]["scene_rerun"], repaired["scene_rerun"])
+        self.assertEqual(repaired["h3_style_workflow"], workflow)
+        self.assertNotEqual(mapped["prompt_contract_seal"]["digest"],
+                            original["prompt_mapping_source_plan"]["prompt_contract_seal"]["digest"])
+        restored = {}
+        self.assertTrue(pipeline._rehydrate_director_h3_longform(restored, repaired,
+            h3_style_workflow=workflow))
+        self.assertEqual(restored["_h3_longform"], repaired)
+
+    def test_scene_rerun_preserves_structured_scene_join_without_user_override(self):
+        for strategy in ("continuous", "extend_previous"):
+            clips = [{"video_prompt": "An adult courier reaches the hall."},
+                     {"video_prompt": "An adult courier crosses the hall.",
+                      "_h3_shot": {"continuity_strategy": strategy}}]
+            planned = [{"duration_sec": 10}, {"duration_sec": 20}]
+            original = pipeline._prepare_director_h3_longform(self._base_generation_params(),
+                params={"h3_ref2va_terms_accepted": True,
+                        "h3_native_boundary_conditioning": True},
+                clip_plans=clips, planned_clips=planned, fps=24)
+            boundary = original["clip_boundaries"][0]
+            self.assertNotEqual(boundary["source"], "user_override")
+            self.assertEqual(boundary["continuity_mode"], strategy)
+            for index in (0, 1):
+                with self.subTest(strategy=strategy, scene=index):
+                    repaired = pipeline._prepare_director_h3_scene_rerun({}, committed=original,
+                        scene_index=index, audio_origin_sec=2.013,
+                        prompt_override="An adult courier carries a red case through the hall.")
+                    self.assertEqual(repaired["clip_boundaries"], original["clip_boundaries"])
+                    self.assertEqual(repaired["segment_models"], original["segment_models"])
+                    self.assertEqual(repaired["shot_plan"]["shots"][1]["continuity_mode"], strategy)
+                    self.assertTrue(pipeline._rehydrate_director_h3_longform({}, repaired))
+
+    def test_scene_rerun_rejects_changed_geometry_source_and_selection_seals(self):
+        original = self._rerun_partition_fixture(native=True)
+        for mutate in (
+            lambda p: p["clip_published_frames"].__setitem__(1, 239),
+            lambda p: p["segment_source_indices"].__setitem__(1, 0),
+            lambda p: p["segment_models"][1].__setitem__("discard_frames", 0),
+            lambda p: p["shot_plan"]["source_contracts"][1].__setitem__("authored_prompt", "Changed"),
+        ):
+            changed = copy.deepcopy(original)
+            mutate(changed)
+            params = {"seed": 723}
+            with self.assertRaises(ValueError):
+                pipeline._prepare_director_h3_scene_rerun(params, committed=changed,
+                    scene_index=1, audio_origin_sec=2.013)
+            self.assertEqual(params, {"seed": 723})
+        repaired = pipeline._prepare_director_h3_scene_rerun({}, committed=original,
+            scene_index=1, audio_origin_sec=2.013)
+        for key, value in (("physical_indices", [0, 1]), ("audio_origin_sec", 2.0),
+                           ("predecessor_index", None), ("scene_index", 0)):
+            changed = copy.deepcopy(repaired)
+            changed["scene_rerun"][key] = value
+            with self.assertRaises(ValueError):
+                pipeline._rehydrate_director_h3_longform({}, changed)
+
+    def test_scene_rerun_rejects_invalid_inputs_without_mutating_caller(self):
+        original = self._rerun_partition_fixture(native=True)
+        for values in (
+            {"scene_index": True}, {"scene_index": -1}, {"scene_index": 3},
+            {"audio_origin_sec": True}, {"audio_origin_sec": float("nan")},
+            {"audio_origin_sec": float("inf")}, {"audio_origin_sec": -0.1},
+            {"audio_origin_sec": 10 ** 1000}, {"prompt_override": " "},
+            {"prompt_override": 12},
+        ):
+            params = {"seed": 723}
+            with self.subTest(values=str(values)[:120]), self.assertRaises(ValueError):
+                pipeline._prepare_director_h3_scene_rerun(params, committed=original,
+                    **({"scene_index": 1, "audio_origin_sec": 2.013} | values))
+            self.assertEqual(params, {"seed": 723})
+
     def test_worker_physical_outputs_never_become_the_next_authored_scene(self):
         params, clips, planned = self._output_group_fixture()
         original = copy.deepcopy(params)

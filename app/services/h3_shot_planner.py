@@ -2509,6 +2509,7 @@ def plan_h3_native_shots(
     clip_requested_frames: Sequence[int] | None = None,
     segment_frames_maximum: int | None = None,
     segment_policy: Mapping[str, Any] | None = None,
+    replay_boundary_policy: bool = False,
 ) -> dict[str, Any]:
     """Reconcile semantic H3 shots into persistent native execution segments.
 
@@ -2516,6 +2517,9 @@ def plan_h3_native_shots(
     profile/model ceiling. A semantic prompt is preserved once per authored
     source, then deterministically compiled into segment-local executable
     Context-IR. A model-grid split never requests another LLM rewrite.
+
+    A caller replaying verified compiler inputs may preserve its committed
+    boundary policy instead of deriving authored joins from structured shots.
     """
 
     counts = [int(value) for value in clip_frame_counts]
@@ -2999,6 +3003,14 @@ def plan_h3_native_shots(
         source_contracts.append(source_contract)
 
     raw_boundaries = list(clip_boundaries or [])
+    if type(replay_boundary_policy) is not bool or (
+        replay_boundary_policy and (
+            replay_inputs is None
+            or len(raw_boundaries) != len(counts) - 1
+            or any(not isinstance(boundary, Mapping) for boundary in raw_boundaries)
+        )
+    ):
+        raise H3ShotPlanError("H3 boundary replay needs complete committed compiler inputs and joins")
     if len(raw_boundaries) > len(counts) - 1:
         raise H3ShotPlanError("H3 boundary count exceeds native joins")
     boundaries: list[dict[str, Any]] = []
@@ -3029,7 +3041,7 @@ def plan_h3_native_shots(
             boundary_before = None
         else:
             existing = raw_boundaries[index - 1] if index - 1 < len(raw_boundaries) else {}
-            if str(existing.get("source") or "") == "user_override":
+            if replay_boundary_policy or str(existing.get("source") or "") == "user_override":
                 continuity = _boundary_mode(existing)
             elif source_index != indices[index - 1]:
                 source_shot = shots[source_index] if source_index < len(shots) else None

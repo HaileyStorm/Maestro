@@ -1117,3 +1117,26 @@ This is assembly and recovery evidence. Exact H3 single-scene rerun geometry,
 edited-prompt compilation, original predecessor conditioning and the combined
 runtime rollout remain in progress. Native generation quality, LAN workflow
 and human listening acceptance are not established by these CPU checks.
+
+### 2026-10-08 — Fixed-geometry compiler for H3 scene repair
+
+The H3 repair compiler now rebuilds an edited authored prompt on the verified
+original physical partition. Generated frames, published frames, tail trims,
+absolute segment identities, checkpoint selection and boundary policy remain
+unchanged. The selected scene and original-plan digest are bound into the fresh
+execution seal, with the original floating soundtrack origin and published
+frame offset. Adaptive prompt mapping and style workflows replay that new seal.
+
+An edited prompt replaces stale structured dialogue and blocking for its scene.
+Other scenes keep their executable text. Replay also preserves structured
+continuous and `extend_previous` joins, including their original provenance;
+it does not derive a new cut from missing structured shot data. A regression
+failed for both join modes and edits to either adjacent scene before this fix.
+All 288 affected Director, shared shot-planner, execution-contract and native
+boundary checks pass; source review, syntax and publication checks pass.
+
+This is a compiler milestone in the complete scene-rerun repair. It is not yet
+wired into rerun submission: the new job still needs verified original
+predecessor input admission, selected-segment dispatch and recovery, scene-only
+completion, and persisted replacement provenance. The combined runtime rollout
+and native generation/listening acceptance remain pending.

@@ -8691,6 +8691,10 @@ def _bind_director_h3_runtime_contract(plan: dict) -> None:
         if type(plan["prompt_mapping_version"]) is not int or plan["prompt_mapping_version"] != 1:
             raise ValueError("Director H3 prompt mapping version is unsupported")
         shot_plan["director_runtime_contract"]["prompt_mapping_version"] = 1
+    if "scene_rerun" in plan:
+        shot_plan["director_runtime_contract"]["scene_rerun"] = copy.deepcopy(
+            plan["scene_rerun"]
+        )
     from services.h3_shot_planner import seal_h3_shot_plan
 
     seal_h3_shot_plan(shot_plan)
@@ -8717,8 +8721,156 @@ def _validate_director_h3_runtime_contract(plan: dict, shot_plan: dict) -> None:
     }
     if "prompt_mapping_version" in plan:
         expected["prompt_mapping_version"] = plan["prompt_mapping_version"]
+    if "scene_rerun" in plan:
+        expected["scene_rerun"] = plan["scene_rerun"]
     if not isinstance(saved, dict) or saved != expected:
         raise ValueError("Saved Director H3 runtime contract disagrees")
+
+
+def _prepare_director_h3_scene_rerun(
+    gen_params: dict,
+    *,
+    committed: dict,
+    scene_index: int,
+    audio_origin_sec: float,
+    prompt_override: str | None = None,
+) -> dict:
+    """Compile one authored edit on its sealed original physical partition.
+
+    The returned plan keeps absolute segment indices and the original boundary
+    policy. Admission must separately verify and bind the selected scene's
+    original predecessor as a new input; this compiler does not confer media
+    authority or adopt old producers into a new job.
+    """
+    from services.h3_shot_planner import (
+        h3_source_compiler_inputs,
+        plan_h3_native_shots,
+    )
+
+    if type(scene_index) is not int or scene_index < 0:
+        raise ValueError("Director H3 rerun scene index is invalid")
+    if type(audio_origin_sec) not in {int, float}:
+        raise ValueError("Director H3 rerun soundtrack origin is invalid")
+    try:
+        origin = float(audio_origin_sec)
+        if not math.isfinite(origin) or origin < 0:
+            raise ValueError("invalid origin")
+    except (ValueError, OverflowError):
+        raise ValueError("Director H3 rerun soundtrack origin is invalid") from None
+    if prompt_override is not None and (
+        not isinstance(prompt_override, str) or not prompt_override.strip()
+    ):
+        raise ValueError("Director H3 rerun prompt is empty")
+    if not isinstance(committed, dict):
+        raise ValueError("Director H3 rerun has no committed plan")
+
+    # Verify both the source seal and every outer execution control before
+    # taking geometry or compiler inputs from the saved plan.
+    restored: dict = {}
+    workflow = committed.get("h3_style_workflow")
+    if not _rehydrate_director_h3_longform(
+        restored, committed, h3_style_workflow=workflow,
+    ):
+        raise ValueError("Director H3 rerun plan version is unsupported")
+    plan = restored["_h3_longform"]
+    shot_plan = plan["shot_plan"]
+    if shot_plan.get("semantic_physical_contract_version") != 2:
+        raise ValueError("Director H3 rerun needs a sealed semantic source plan")
+    frames = plan["clip_frames"]
+    published = plan["clip_published_frames"]
+    trims = plan["clip_trim_tail_frames"]
+    owners = plan.get("segment_source_indices")
+    contracts = shot_plan.get("source_contracts")
+    if (
+        not isinstance(owners, list)
+        or len(owners) != len(frames)
+        or any(type(value) is not int or value < 0 for value in owners)
+        or not isinstance(contracts, list)
+        or not 0 <= scene_index < len(contracts)
+        or sorted(set(owners)) != list(range(len(contracts)))
+        or float(shot_plan.get("fps") or 0) != 24
+        or any(type(value) is not int or value <= 0 for value in frames + published)
+        or any(type(value) is not int or value < 0 for value in trims)
+        or owners != [shot.get("source_index") for shot in shot_plan["shots"]]
+    ):
+        raise ValueError("Director H3 rerun physical ownership is incomplete")
+    positions = [index for index, owner in enumerate(owners) if owner == scene_index]
+    if positions != list(range(positions[0], positions[-1] + 1)):
+        raise ValueError("Director H3 rerun scene partition is not chronological")
+    original_digest = shot_plan["prompt_contract_seal"]["digest"]
+    original_executable = list(restored["per_clip_prompts"])
+
+    if prompt_override is not None:
+        source_prompts = [contract["authored_prompt"] for contract in contracts]
+        compiler_inputs = [h3_source_compiler_inputs(contract) for contract in contracts]
+        source_prompts[scene_index] = _director_h3_canonical_prompt(
+            prompt_override,
+            duration_seconds=sum(published[index] for index in positions) / 24.0,
+        )
+        # The edited authored text controls its full scene. Replaying stale
+        # structured dialogue or blocking would silently reinsert old content.
+        compiler_inputs[scene_index] = {
+            "version": 1,
+            "authored_shot_id": contracts[scene_index]["authored_shot_id"],
+            "visual_context": "",
+            "opening_blocking": "",
+            "final_blocking": "",
+            "structured_dialogue_blocks": [],
+        }
+        fresh = plan_h3_native_shots(
+            global_prompt="\n\n".join(source_prompts),
+            clip_frame_counts=frames,
+            clip_requested_frames=published,
+            fps=24,
+            clip_boundaries=plan["clip_boundaries"],
+            source_prompts=source_prompts,
+            source_indices=owners,
+            source_compiler_inputs=compiler_inputs,
+            segment_frames_maximum=plan["segment_frames_maximum"],
+            segment_policy=plan["segment_policy"],
+            replay_boundary_policy=True,
+        )
+        _director_h3_drop_planner_carry(fresh)
+        prompts = _canonicalize_director_h3_shot_plan(
+            fresh, h3_style_workflow=workflow,
+        )
+        executable = _director_h3_executable_clip_prompts(fresh, prompts)
+        if any(executable[index] != original_executable[index]
+               for index in range(len(frames)) if index not in positions):
+            raise ValueError("Director H3 rerun changed another authored scene")
+        if any(
+            fresh[key] != shot_plan[key]
+            for key in ("clip_frames", "clip_published_frames", "clip_trim_tail_frames", "clip_boundaries")
+        ) or any(
+            fresh["shots"][index]["physical_segment_id"]
+            != shot_plan["shots"][index]["physical_segment_id"]
+            for index in range(len(frames))
+        ):
+            raise ValueError("Director H3 rerun changed its committed partition")
+        plan["shot_plan"] = fresh
+        plan["global_prompt"] = fresh["global_prompt"]
+        plan["clip_prompt_previews"] = [prompt[:240] for prompt in prompts]
+
+    start_frame = sum(published[:positions[0]])
+    plan["scene_rerun"] = {
+        "version": 1,
+        "original_plan_sha256": original_digest,
+        "scene_index": scene_index,
+        "physical_indices": positions,
+        "predecessor_index": positions[0] - 1 if positions[0] else None,
+        "published_start_frame": start_frame,
+        "published_frames": sum(published[index] for index in positions),
+        "audio_origin_sec": origin,
+        "audio_start_sec": origin + start_frame / 24.0,
+    }
+    _bind_director_h3_runtime_contract(plan)
+    # Reuse the ordinary replay validator, including schema/checkpoint and
+    # adaptive prompt-mapping checks, before touching the caller's parameters.
+    prepared: dict = {}
+    _rehydrate_director_h3_longform(prepared, plan, h3_style_workflow=workflow)
+    gen_params.update(prepared)
+    gen_params["multi_clip_audio_start_sec"] = origin
+    return gen_params["_h3_longform"]
 
 
 def _rehydrate_director_h3_longform(
