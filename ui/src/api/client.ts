@@ -1451,6 +1451,52 @@ export async function submitH3GalleryAVGuide(params: H3GalleryAVGuideRequest): P
   return result as H3GalleryStillGuideSubmission
 }
 
+export function faceRepairFrameUrl(source: { workspace: string; name: string; revision: string }, frame: number): string {
+  const query = new URLSearchParams({ ...source, frame_index: String(frame) })
+  return `${BASE}/api/v1/tools/h3-face-refine/frame?${query}`
+}
+
+export async function getFaceRepairSource(source: { workspace: string; name: string; revision: string }, signal?: AbortSignal): Promise<unknown> {
+  const res = await fetch(`${BASE}/api/v1/tools/h3-face-refine/source?${new URLSearchParams(source)}`, { signal })
+  if (!res.ok) {
+    if (res.status === 409) throw new Error('This video changed. Refresh Gallery and select it again.')
+    if (res.status === 401 || res.status === 403 || res.status === 423) throw new Error('Open and unlock this project with generation access before repairing its video.')
+    throw new Error('Face repair is unavailable for this source on this installation.')
+  }
+  return res.json()
+}
+
+export class FaceRepairSubmissionError extends Error {
+  readonly uncertain: boolean
+  constructor(message: string, uncertain: boolean) { super(message); this.uncertain = uncertain }
+}
+
+export async function submitFaceRepair(params: ReturnType<typeof import('../lib/faceRepairReview').buildFaceRepairRequest>): Promise<{ job_id: string; status: string }> {
+  let res: Response
+  try {
+    res = await fetch(`${BASE}/api/v1/tools/h3-face-refine`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(params),
+    })
+  } catch {
+    throw new FaceRepairSubmissionError('The queue acknowledgement is unavailable. Check Queue before submitting another repair.', true)
+  }
+  if (!res.ok) {
+    const messages: Record<number, string> = {
+      401: 'Sign in before repairing this video.', 403: 'You do not have generation access to this project.',
+      404: 'Face repair is unavailable on this installation.', 409: 'The source or repair setup changed. Refresh Gallery and review the current video.',
+      423: 'Unlock this project before repairing its video.', 451: 'Check MiniMax H3 model access in Settings.',
+    }
+    throw new FaceRepairSubmissionError(messages[res.status] ?? (res.status >= 500
+      ? 'The queue acknowledgement is unavailable. Check Queue before submitting another repair.'
+      : 'Check the reviewed regions and repair settings before trying again.'), res.status >= 500)
+  }
+  const result = await res.json().catch(() => null) as { job_id?: unknown; status?: unknown } | null
+  if (!result || typeof result.job_id !== 'string' || !result.job_id.trim() || typeof result.status !== 'string') {
+    throw new FaceRepairSubmissionError('The queue response could not be read. Check Queue before submitting another repair.', true)
+  }
+  return result as { job_id: string; status: string }
+}
+
 export interface H3GalleryStillGuideRequest {
   workspace: string
   name: string

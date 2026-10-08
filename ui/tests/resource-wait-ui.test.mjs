@@ -55,7 +55,7 @@ async function loadJobPlaceholder() {
         bundle.onResolve({ filter: /^react\/jsx-runtime$/ }, () => ({ path: 'jsx-runtime', namespace: 'resource-wait' }))
         bundle.onResolve({ filter: /^lucide-react$/ }, () => ({ path: 'lucide', namespace: 'resource-wait' }))
         bundle.onResolve({ filter: /stores\/useStore$/ }, () => ({ path: 'store', namespace: 'resource-wait' }))
-        bundle.onResolve({ filter: /^(\.\/TabFilter|\.\/ThumbnailGallery|\.\/MediaFeedItem|\.\/GalleryViewer|\.\/ProjectAccessPanel|\.\.\/LlmChat|\.\.\/H3DeliveryRecoveryStatus)$/ }, () => ({ path: 'components', namespace: 'resource-wait' }))
+        bundle.onResolve({ filter: /^(\.\/TabFilter|\.\/ThumbnailGallery|\.\/MediaFeedItem|\.\/GalleryViewer|\.\/ProjectAccessPanel|\.\/FaceRepairPanel|\.\.\/LlmChat|\.\.\/H3DeliveryRecoveryStatus)$/ }, () => ({ path: 'components', namespace: 'resource-wait' }))
         bundle.onResolve({ filter: /api\/client$/ }, () => ({ path: 'api', namespace: 'resource-wait' }))
         bundle.onResolve({ filter: /lib\/(privatePreview|useVisibilityPolling)$/ }, () => ({ path: 'lib', namespace: 'resource-wait' }))
         bundle.onResolve({ filter: /lib\/clipboard$/ }, () => ({ path: 'clipboard', namespace: 'resource-wait' }))
@@ -91,7 +91,7 @@ async function loadJobPlaceholder() {
           }
           if (args.path === 'components') {
             return { contents: `
-              export const TabFilter = () => null, ThumbnailGallery = () => null, MediaFeedItem = () => null, GalleryViewer = () => null, ProjectAccessPanel = () => null, LlmChat = () => null, H3DeliveryRecoveryStatus = () => null
+              export const TabFilter = () => null, ThumbnailGallery = () => null, MediaFeedItem = () => null, GalleryViewer = () => null, ProjectAccessPanel = () => null, FaceRepairPanel = () => null, LlmChat = () => null, H3DeliveryRecoveryStatus = () => null
               export const OPEN_GALLERY_EVENT = 'open-gallery'
             ` }
           }

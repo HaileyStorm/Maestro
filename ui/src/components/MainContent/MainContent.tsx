@@ -8,6 +8,8 @@ import { ProjectAccessPanel } from './ProjectAccessPanel'
 import { H3BridgePanel } from './H3BridgePanel'
 import { resolveH3BridgeSelection } from './h3BridgeSelection'
 import { H3GuidePanel, resolveH3GuideSelections, resolveH3AVGuideSelections } from './H3GuidePanel'
+import { FaceRepairPanel } from './FaceRepairPanel'
+import { resolveFaceRepairSelection } from '../../lib/faceRepairReview'
 import { LlmChat } from '../LlmChat'
 import { H3PromptRewriteComparison } from '../H3PromptRewriteComparison'
 import { H3DeliveryRecoveryStatus, OPEN_GALLERY_EVENT } from '../H3DeliveryRecoveryStatus'
@@ -2555,6 +2557,19 @@ function GalleryBulkToolbar() {
   const guideStills = resolveH3GuideSelections(outputs, selected, activeWorkspace, canGenerateBridge)
     ?? resolveH3AVGuideSelections(outputs, selected, activeWorkspace, canGenerateBridge, models, enabledModels, modelsLoaded)
   const guideStill = guideStills?.[0]
+  const faceSource = resolveFaceRepairSelection(outputs, selected, activeWorkspace, canGenerateBridge, models, enabledModels, modelsLoaded)
+  const faceAccountEpoch = currentAccountIdentityEpoch()
+  const faceSelectionIdentity = faceSource ? JSON.stringify([faceSource.workspace, faceSource.name, faceSource.revision, faceSource.private, faceSource.explicit]) : ''
+  const isCurrentFaceSelection = () => {
+    const state = useStore.getState()
+    const project = state.workspaces.find(item => item.name === activeWorkspace)
+    const allowed = workspaceAllowsPermission(project, 'project.generate')
+      && (api.isAccountProjectAccessActive(state.accessContext, state.accountProjectMigration) || project?.unlocked !== false)
+    const now = resolveFaceRepairSelection(state.filteredOutputs(), state.selectedOutputKeys, state.activeWorkspace,
+      allowed, state.models, state.enabledModels, state.modelsLoaded)
+    return currentAccountIdentityEpoch() === faceAccountEpoch && state.activeWorkspace === activeWorkspace
+      && Boolean(now) && JSON.stringify([now!.workspace, now!.name, now!.revision, now!.private, now!.explicit]) === faceSelectionIdentity
+  }
   const bridgeSelectionIdentity = JSON.stringify(
     (bridgeCandidates || []).map(output => output.workspace + '\0' + output.name).sort(),
   )
@@ -2654,6 +2669,15 @@ function GalleryBulkToolbar() {
             }}
           />
         )}
+        {faceSource && <FaceRepairPanel key={`${faceAccountEpoch}:${faceSelectionIdentity}`} source={faceSource}
+          accountScope={accessContext?.accounts?.account?.id ?? 'legacy-session'}
+          isCurrentSelection={isCurrentFaceSelection} onQueued={async isCurrent => {
+            if (!isCurrent()) return
+            await useStore.getState().reconnectJobs()
+            if (!isCurrent()) return
+            requestQueueView()
+            window.dispatchEvent(new CustomEvent(QUEUE_REFRESH_EVENT))
+          }} />}
         <div className="mx-1 hidden h-5 w-px bg-border sm:block" />
         {canMutateSelection && <>
           <select

@@ -53,6 +53,8 @@ export interface ModelDef {
   retake_engines?: string[]
   /** Host-owned admission for experimental Gallery video/audio Guides. */
   h3_gallery_av_guides?: boolean
+  /** Exact host admission for the reviewed-source FaceRefine tool and frame reader. */
+  h3_face_refine?: boolean
   is_i2v: boolean
   is_t2v: boolean
   guidance_max_phases: number
