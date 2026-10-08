@@ -14,6 +14,7 @@ Supports feature flags for gradual migration from old system.
 
 from __future__ import annotations
 import os
+import copy
 from typing import Optional, Any
 
 from .schema import ProductionPlan, ShotPlan, RenderedPrompts
@@ -256,6 +257,9 @@ class DirectorOrchestrator:
             if shot.keyframe_prompts:
                 result["keyframe_prompts"] = shot.keyframe_prompts
 
+            if shot.metadata and "source_voice_intervals" in shot.metadata:
+                result["source_voice_intervals"] = copy.deepcopy(shot.metadata["source_voice_intervals"])
+
             results.append(result)
 
         return results
@@ -434,6 +438,8 @@ class DirectorOrchestrator:
                 clip["window_prompts"] = r["video_prompt"].split("\n") if r.get("video_prompt") else []
             if r.get("keyframe_prompts"):
                 clip["keyframe_prompts"] = r["keyframe_prompts"]
+            if "source_voice_intervals" in r:
+                clip["source_voice_intervals"] = copy.deepcopy(r["source_voice_intervals"])
             result.append(clip)
         return result
 

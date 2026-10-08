@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ast
+import json
 from contextlib import contextmanager
 from pathlib import Path
 import sys
@@ -41,7 +42,8 @@ from services.director.planners.viral_video import (  # noqa: E402
     ViralVideoPlanner,
     _VIRAL_STYLES,
 )
-from services.director.schema import ShotPlan  # noqa: E402
+from services.director.schema import ProductionPlan, ShotPlan  # noqa: E402
+from services.director.prompt_polish import polish_prompts_third_pass  # noqa: E402
 
 
 def _shot(*, visual_style: str = "", image_strategy: str = "fresh_generation") -> ShotPlan:
@@ -336,6 +338,42 @@ class VisualStylePolicyTests(unittest.TestCase):
                 self.assertIn("does not require them on screen", context)
                 self.assertFalse(plan.shots[0].dialogue_beats)
                 self.assertFalse(plan.shots[0].subjects_on_screen)
+                restored = ProductionPlan.from_dict(json.loads(json.dumps(plan.to_dict())))
+                facts = restored.shots[0].metadata["source_voice_intervals"]
+                self.assertEqual(facts[0], {
+                    "start": 9.0, "end": 12.0, "speaker_id": "a",
+                    "name": "Ada", "role": "lead",
+                })
+                self.assertEqual([f["speaker_id"] for f in facts], ["a", "b", "unknown", "b"])
+                self.assertIsNone(facts[2]["name"])
+                self.assertNotIn("text", facts[0])
+                flags = DirectorFlags()
+                flags.use_prompt_validation = False
+                flags.use_prompt_compression = False
+                director = DirectorOrchestrator(flags=flags)
+                # The planner/polisher omits all timing from its prose. The
+                # source facts must survive independently in saved records.
+                restored.shots[0].video_prompt = "A fixed view of an empty stage."
+                for windowed in (False, True):
+                    restored.shots[0].window_prompts = (
+                        ["A fixed view of the empty stage.", "A wide view of the empty stage."]
+                        if windowed else None
+                    )
+                    rendered = director.render_plan(restored, prompt_type="video", video_model=model)
+                    clips = director.plan_to_clip_plans(rendered)
+                    with mock.patch.object(llm_service, "enhance_prompt", return_value="A softly lit empty stage.") as enhance:
+                        polished = polish_prompts_third_pass(
+                            clips, model, "", polish_video_prompts=True,
+                            polish_image_prompts=False,
+                        )
+                    self.assertEqual(enhance.called, model == "ltx2_25")
+                    persisted = json.loads(json.dumps(polished))
+                    self.assertEqual(persisted[0]["source_voice_intervals"], facts)
+                    polished[0]["source_voice_intervals"][0]["name"] = "edited"
+                    self.assertEqual(restored.shots[0].metadata["source_voice_intervals"][0]["name"], "Ada")
+                    self.assertEqual(rendered[0]["source_voice_intervals"][0]["name"], "Ada")
+                    rendered[0]["source_voice_intervals"][0]["name"] = "render edited"
+                    self.assertEqual(restored.shots[0].metadata["source_voice_intervals"][0]["name"], "Ada")
 
     def test_music_and_short_film_planners_keep_structured_style_authoritative(self):
         music = MusicVideoPlanner()

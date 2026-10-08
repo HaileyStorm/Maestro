@@ -10,7 +10,6 @@ Outputs: ProductionPlan with ShotPlan objects (NOT final prompts).
 from __future__ import annotations
 import os
 import re
-import math
 from typing import Optional, Any
 
 from ..schema import (
@@ -26,6 +25,7 @@ from ..policies import (
     resolve_planned_visual_style,
 )
 from .base import BasePlanner
+from ..source_audio import source_voice_intervals, overlapping_source_voices, source_voice_context
 
 
 def _compact_lyrics_for_context(
@@ -317,6 +317,11 @@ class MusicVideoPlanner(BasePlanner):
             speaker_mappings = sm_dict
 
         # Build character profiles
+        self._source_audio_drives_vocals = video_model.lower().startswith(("minimax_h3", "ltx2_25"))
+        self._source_voice_intervals = (
+            source_voice_intervals(lyrics, speaker_mappings)
+            if self._source_audio_drives_vocals else []
+        )
         char_profiles = self._build_characters(characters, speaker_mappings, lyrics, performer_map)
 
         # Build speaker lookup
@@ -342,9 +347,7 @@ class MusicVideoPlanner(BasePlanner):
             performer_map,
             speaker_names,
             speaker_mappings,
-            source_audio_drives_vocals=video_model.lower().startswith(
-                ("minimax_h3", "ltx2_25")
-            ),
+            source_audio_drives_vocals=self._source_audio_drives_vocals,
         )
 
         # Call LLM for creative planning
@@ -497,6 +500,7 @@ class MusicVideoPlanner(BasePlanner):
     ) -> list[str]:
         """Build text descriptions for each clip (context for LLM)."""
         contexts = []
+        voices = source_voice_intervals(lyrics, speaker_mappings) if source_audio_drives_vocals else []
         for i, clip in enumerate(clips):
             section = (clip.get("label") or "verse").lower()
             beat_count = clip.get("beat_count", 8)
@@ -541,40 +545,11 @@ class MusicVideoPlanner(BasePlanner):
                 # Diarization may leave several turns (including overlaps)
                 # inside one shot. Keep their source timing without supplying
                 # transcript words as new dialogue or inventing a performer.
-                timed_voices = []
-                for line in lyrics or []:
-                    if "start" not in line or "end" not in line:
-                        continue
-                    try:
-                        voice_start = float(line["start"])
-                        voice_end = float(line["end"])
-                    except (TypeError, ValueError):
-                        continue
-                    if not math.isfinite(voice_start) or not math.isfinite(voice_end):
-                        continue
-                    local_start = max(voice_start, start_sec) - start_sec
-                    local_end = min(voice_end, end_sec) - start_sec
-                    if local_end <= local_start:
-                        continue
-                    mapping = (speaker_mappings or {}).get(line.get("speaker"), {})
-                    name = mapping.get("name") or "unmapped source voice"
-                    role = mapping.get("role")
-                    if role:
-                        name += f" ({role})"
-                    timed_voices.append((local_start, local_end, name))
-                if timed_voices:
-                    turns = "; ".join(
-                        f"{start:.3f}–{end:.3f}s: {voice}"
-                        for start, end, voice in sorted(timed_voices, key=lambda turn: turn[0])
-                    )
-                    vocal_info += (
-                        f". Transcribed voice intervals relative to shot start: {turns}. "
-                        "These identify audible source parts; lip-sync only the "
-                        "assigned person when visible, and this does not require "
-                        "them on screen. Unmapped voices have no assigned visual "
-                        "identity. Missing transcript coverage does not establish "
-                        "silence; follow the supplied audio through gaps"
-                    )
+                timing = source_voice_context(
+                    voices, start_sec, end_sec,
+                )
+                if timing:
+                    vocal_info += ". " + timing
             else:
                 vocal_info = (
                     f'lyrics excerpt: "{lyrics_snippet}"'
@@ -912,6 +887,9 @@ Write {len(clips)} structured shot plans. Go:"""
                     "bpm": clip.get("bpm", 120),
                     "clip_start": clip.get("start", 0),
                     "clip_end": clip.get("end", 0),
+                    **({"source_voice_intervals": overlapping_source_voices(
+                        self._source_voice_intervals, clip.get("start", 0), clip.get("end", 0),
+                    )} if getattr(self, "_source_audio_drives_vocals", False) else {}),
                 },
                 # LLM-generated prompts (used directly, skipping renderer pass 2)
                 video_prompt=raw.get("video_prompt"),
