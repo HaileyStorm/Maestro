@@ -33,7 +33,7 @@ beforeEach(() => {
     setItem: (key, value) => entries.set(key, value),
     removeItem: key => entries.delete(key),
   }
-  editorTestStore.setState({ accountContext: { enabled: false } })
+  editorTestStore.setState({ accountContext: { enabled: false }, accessContext: null })
 })
 
 function sequenceProject() {
@@ -508,6 +508,72 @@ test('accepted receipt survives navigation before the reply and allows an explic
   await handlers.handleExport()
   assert.equal(posts, 2)
   await new Promise(resolve => setTimeout(resolve, 10))
+})
+
+test('explicit anonymous legacy access exports once and retains its receipt through reopen', async t => {
+  const previous = globalThis.fetch
+  t.after(() => { globalThis.fetch = previous })
+  editorTestStore.setState({ accountContext: { enabled: true, authenticated: false }, accessContext: { account_project_access_active: false } })
+  let posts = 0
+  globalThis.fetch = async () => { posts += 1; return Response.json({ job_id: 'a'.repeat(32), status: 'queued' }) }
+  const original = exportStateFixture()
+  await (await editorExportHandlers(original)).handleExport()
+  assert.equal(posts, 1)
+  assert.equal(original.exportState, 'queued')
+  const reopened = exportStateFixture()
+  const handlers = await editorExportHandlers(reopened)
+  handlers.restoreExport(reopened.project, 1)
+  assert.equal(reopened.exportState, 'queued')
+  await handlers.handleExport()
+  assert.equal(posts, 1)
+  await new Promise(resolve => setTimeout(resolve, 10))
+})
+
+test('legacy export requires explicit server mode and resolved anonymous identity', async t => {
+  const previous = globalThis.fetch
+  t.after(() => { globalThis.fetch = previous })
+  let posts = 0
+  globalThis.fetch = async () => { posts += 1; throw new Error('must not submit') }
+  for (const [accountContext, accessContext] of [
+    [{ enabled: true, authenticated: false }, { account_project_access_active: true }],
+    [{ enabled: true, authenticated: false }, {}],
+    [{ enabled: true }, { account_project_access_active: false }],
+    [null, { account_project_access_active: false }],
+  ]) {
+    editorTestStore.setState({ accountContext, accessContext })
+    assert.equal(editorExportKey(sequenceProject()), null)
+    await (await editorExportHandlers(exportStateFixture())).handleExport()
+  }
+  assert.equal(posts, 0)
+})
+
+test('migration activation retires late accepted legacy UI while retaining the original receipt', async t => {
+  const previous = globalThis.fetch
+  t.after(() => { globalThis.fetch = previous })
+  editorTestStore.setState({ accountContext: { enabled: true, authenticated: false }, accessContext: { account_project_access_active: false } })
+  const legacyKey = editorExportKey(sequenceProject())
+  let finish, posts = 0
+  globalThis.fetch = async () => { posts += 1; return new Promise(resolve => { finish = resolve }) }
+  const original = exportStateFixture()
+  const pending = (await editorExportHandlers(original)).handleExport()
+  assert.equal(posts, 1)
+  editorTestStore.setState({ accessContext: { account_project_access_active: true } })
+  finish(Response.json({ job_id: 'b'.repeat(32), status: 'queued' }))
+  await pending
+  assert.equal(original.acceptedExport.current, null)
+  assert.equal(original.exportState, 'unconfirmed')
+  assert.equal(original.exporting.current, false)
+  assert.equal(readEditorExport(legacyKey).jobId, 'b'.repeat(32))
+  assert.equal(editorExportKey(sequenceProject()), null)
+  editorTestStore.setState({ accessContext: { account_project_access_active: false } })
+  assert.equal(editorExportKey(sequenceProject()), legacyKey)
+  const reopened = exportStateFixture()
+  ;(await editorExportHandlers(reopened)).restoreExport(reopened.project, 1)
+  assert.equal(reopened.exportState, 'queued')
+  editorTestStore.setState({ accountContext: { enabled: false } })
+  assert.notEqual(editorExportKey(sequenceProject()), legacyKey)
+  editorTestStore.setState({ accountContext: { enabled: true, authenticated: true, account: { id: 'owner-a' } } })
+  assert.notEqual(editorExportKey(sequenceProject()), legacyKey)
 })
 
 test('export receipts isolate accounts and projects and refuse unreadable or unwritable recovery before POST', async t => {

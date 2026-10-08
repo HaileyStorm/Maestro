@@ -13,9 +13,19 @@ import { audioLayerGain as audioGain } from './audioPreviewClock'
 type SaveState = 'saved' | 'unsaved' | 'saving' | 'error'
 type ExportSubmission = { token: string; jobId: string | null }
 
+function editorExportScope(state: Pick<ReturnType<typeof useStore.getState>, 'accountContext' | 'accessContext'>): string | null {
+  const context = state.accountContext ?? state.accessContext?.accounts
+  const account = terminalJobScope(context)
+  if (account) return account
+  // Accounts can be enabled while existing projects still use legacy access.
+  // Only the server's explicit pre-migration projection permits this tab scope.
+  return context?.enabled === true && context.authenticated === false
+    && state.accessContext?.account_project_access_active === false ? 'legacy-project-access' : null
+}
+
 function editorExportKey(project: EditorProject): string | null {
   const state = useStore.getState()
-  const account = terminalJobScope(state.accountContext ?? state.accessContext?.accounts)
+  const account = editorExportScope(state)
   return account ? `maestro:editor-export-v1:${JSON.stringify([account, project.workspace, project.id, project.revision])}` : null
 }
 
@@ -470,7 +480,7 @@ export function EditorWorkspace({ source }: { source: OutputFile }) {
   const openRetakeDialog = useStore(state => state.openRetakeDialog)
   const outputs = useStore(state => state.outputs)
   const jobs = useStore(state => state.jobs)
-  const exportAccountScope = useStore(state => terminalJobScope(state.accountContext ?? state.accessContext?.accounts))
+  const exportAccountScope = useStore(editorExportScope)
   const [draft, setProject] = useState<EditorProject | null>(null)
   const [loadedSource, setLoadedSource] = useState('')
   const sourceKey = privatePreviewIdentity(source.workspace, source.name, source.revision)
@@ -895,7 +905,7 @@ export function EditorWorkspace({ source }: { source: OutputFile }) {
       const result = await exportEditorProject(source.workspace, project)
       // Persist acceptance even if navigation or an account change retired this UI.
       writeEditorExport(key, submission, { ...submission, jobId: result.job_id })
-      if (!isCurrent(epoch)) return
+      if (!isCurrent(epoch) || editorExportKey(project) !== key) return
       if (editVersion.current !== version) return
       const receipt = { jobId: result.job_id, epoch, version }
       acceptedExport.current = receipt
@@ -906,7 +916,7 @@ export function EditorWorkspace({ source }: { source: OutputFile }) {
     } catch (reason) {
       const rejected = reason instanceof ProjectAssetRequestError && reason.status >= 400 && reason.status < 500
       const cleared = rejected && writeEditorExport(key, submission, null)
-      if (!isCurrent(epoch)) return
+      if (!isCurrent(epoch) || editorExportKey(project) !== key) return
       if (editVersion.current === version) {
         const uncertain = !cleared
         setExportState(uncertain ? 'unconfirmed' : 'idle')
@@ -914,7 +924,13 @@ export function EditorWorkspace({ source }: { source: OutputFile }) {
         else setExportError(projectReferenceSafeErrorMessage(reason, 'Could not queue this export. Try again.'))
       }
     } finally {
-      if (isCurrent(epoch)) exporting.current = false
+      if (isCurrent(epoch)) {
+        exporting.current = false
+        if (editorExportKey(project) !== key) {
+          resetExport()
+          restoreExport(project, epoch)
+        }
+      }
     }
   }
 
