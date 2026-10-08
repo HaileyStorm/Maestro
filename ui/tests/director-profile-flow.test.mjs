@@ -98,6 +98,10 @@ async function withStore(action, { legacyRoles = false, storage = new StorageFak
       if (queueControl.operation) return queueControl.operation(url, init, requests)
       return json({ entries: [], admissions: [], project_instance: PROJECT_INSTANCE, pipeline_id: 'pipeline-a' })
     }
+    if (url.pathname.startsWith('/api/v1/director/pipeline/') && url.pathname.endsWith('/stop')) {
+      if (queueControl.stop) return queueControl.stop(url, init, requests)
+      return json({ status: 'cancelled', cancelled: true })
+    }
     if (url.pathname.startsWith('/api/v1/director/pipelines/')) {
       if (queueControl.pipeline) return queueControl.pipeline(url, init, requests)
       return json({ pipeline_id: 'pipeline-a', clips: [] })
@@ -850,5 +854,44 @@ test('Director newer entry without a pipeline or failed entry clears retired pip
         return json({ pipeline_id: 'pipeline-a', clips: [] })
       },
     } })
+  }
+})
+
+
+test('Director Open exposes current pipeline failure and preserves ordinary dashboard failure behavior', async () => {
+  await withStore(async store => {
+    await assert.rejects(store.getState().loadDirectorQueueEntry('abcd1234'), /pipeline failed/)
+    assert.equal(store.getState().dashboardLoading, false)
+    assert.equal(await store.getState().loadSavedPipeline('pipeline-a'), false)
+  }, { queueControl: { pipeline: async () => { throw new Error('pipeline failed') } } })
+})
+
+test('Director Stop reports current failure without hiding the active pipeline, and retires account/ABA failures', async () => {
+  for (const change of ['none', 'account', 'ABA']) {
+    const hold = deferred()
+    await withStore(async (store, { requests }) => {
+      store.setState({ pipelineId: 'pipeline-a', pipelinePolling: true })
+      const pending = store.getState().stopPipeline()
+      if (change === 'account') store.setState({ accountContext: { enabled: true, authenticated: true, account: { id: 'other' } } })
+      if (change === 'ABA') { store.setState({ activeWorkspace: 'project-b' }); store.setState({ activeWorkspace: 'project-a' }) }
+      hold.resolve()
+      assert.equal(await pending, change === 'none' ? false : undefined)
+      assert.equal(requests.filter(r => r.url.endsWith('/stop')).length, 1)
+      if (change === 'none') { assert.equal(store.getState().pipelineId, 'pipeline-a'); assert.equal(store.getState().pipelinePolling, true) }
+    }, { queueControl: { stop: async () => { await hold.promise; throw new Error('stop failed') } } })
+  }
+})
+
+
+test('Director Stop keeps live pipeline until cancellation or a terminal response is confirmed', async () => {
+  for (const result of [{ status: 'running', cancelled: false }, { status: 'unknown', cancelled: false }, null,
+    { status: 'cancelled', cancelled: true }, { status: 'completed', cancelled: false }]) {
+    await withStore(async store => {
+      store.setState({ pipelineId: 'pipeline-a', pipelinePolling: true })
+      const terminal = result?.cancelled === true || result?.status === 'completed'
+      assert.equal(await store.getState().stopPipeline(), terminal)
+      assert.equal(store.getState().pipelineId, terminal ? null : 'pipeline-a')
+      assert.equal(store.getState().pipelinePolling, !terminal)
+    }, { queueControl: { stop: async () => json(result) } })
   }
 })

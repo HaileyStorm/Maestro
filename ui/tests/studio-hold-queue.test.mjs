@@ -309,3 +309,45 @@ test('Popover Open requires successful current-project loading before navigation
       ? ['abcd1234', ['popover', false], ['sidebar', true]] : ['abcd1234'])
   }
 })
+
+
+test('Popover queue failures are handled visibly, scoped, and never replayed', async () => {
+  for (const change of ['none', 'project', 'newer-action']) {
+    let scope = 'project-a'
+    const errors = []
+    let calls = 0
+    const hold = deferred()
+    const run = popoverHandler('runQueueAction', {
+      currentDirectorQueueScope: () => scope,
+      queueActionSequence: { current: 0 },
+      setQueueActionError: value => errors.push(value),
+    })
+    const pending = run(async () => { calls++; await hold.promise; throw new Error('request failed') })
+    if (change === 'project') scope = 'project-b'
+    if (change === 'newer-action') await run(async () => { calls++ })
+    hold.resolve(); await pending
+    assert.equal(calls, change === 'newer-action' ? 2 : 1)
+    const visible = errors.filter(Boolean)
+    if (change === 'none') {
+      assert.equal(visible.length, 1)
+      assert.equal(visible[0].scope, 'project-a')
+      assert.match(visible[0].message, /could not be confirmed/)
+      assert.match(visible[0].message, /Check the queue/)
+    } else assert.deepEqual(visible, [])
+  }
+})
+
+
+test('Popover queue wrapper handles explicit current failure and ignores retired operation results', async () => {
+  const errors = []
+  const run = popoverHandler('runQueueAction', {
+    currentDirectorQueueScope: () => 'project-a',
+    queueActionSequence: { current: 0 },
+    setQueueActionError: value => errors.push(value),
+  })
+  await run(async () => false)
+  assert.equal(errors.filter(Boolean).length, 1)
+  errors.length = 0
+  await run(async () => undefined)
+  assert.deepEqual(errors, [null])
+})

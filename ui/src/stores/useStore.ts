@@ -3546,7 +3546,7 @@ interface AppState {
   dashboardLoading: boolean
   setDashboardOpen: (open: boolean) => void
   loadPipelineList: () => Promise<void>
-  loadSavedPipeline: (pid: string) => Promise<boolean>
+  loadSavedPipeline: (pid: string, reportFailure?: boolean) => Promise<boolean>
   tagClip: (pid: string, clipIndex: number, tag: string | null) => Promise<void>
   startPipelineRepair: (pid: string) => Promise<PipelineRepairState>
   cancelPipelineRepair: (pid: string) => Promise<PipelineRepairState>
@@ -4247,7 +4247,7 @@ interface AppState {
   pipelinePolling: boolean
   startDirectorPipeline: (mode?: 'now' | 'queue') => Promise<void>
   continuePipeline: (updates?: { clip_plans?: Array<{ video_prompt: string; image_prompt: string }> }) => Promise<void>
-  stopPipeline: () => Promise<void>
+  stopPipeline: () => Promise<boolean | undefined>
   pollPipelineStatus: () => void
 }
 
@@ -7294,7 +7294,7 @@ export const useStore = create<AppState>((set, get) => ({
       })
     }
   },
-  loadSavedPipeline: async (pid) => {
+  loadSavedPipeline: async (pid, reportFailure = false) => {
     const workspace = get().activeWorkspace
     const key = currentDirectorQueueScope()
     const loadToken = ++_dashboardPipelineLoadToken
@@ -7311,6 +7311,7 @@ export const useStore = create<AppState>((set, get) => ({
       if (loadToken !== _dashboardPipelineLoadToken || currentDirectorQueueScope() !== key) return false
       console.error('Failed to load pipeline:', e)
       set({ dashboardLoading: false })
+      if (reportFailure) throw e
       return false
     }
   },
@@ -10804,7 +10805,7 @@ export const useStore = create<AppState>((set, get) => ({
     const entry = await api.fetchDirectorQueueEntry(entryId, workspace)
     if (!current() || loadToken !== _dashboardPipelineLoadToken) return false
     const pipelineId = typeof entry?.pipeline_id === 'string' ? entry.pipeline_id : ''
-    if (pipelineId && !await get().loadSavedPipeline(pipelineId)) return false
+    if (pipelineId && !await get().loadSavedPipeline(pipelineId, true)) return false
     if (!current()) return false
     await get().loadDirectorQueue()
     return current()
@@ -19690,14 +19691,18 @@ export const useStore = create<AppState>((set, get) => ({
   stopPipeline: async () => {
     const pid = get().pipelineId
     if (!pid) return
-    const workspace = get().activeWorkspace
+    const key = currentDirectorQueueScope()
     _directorPipelineLifecycleToken = null
     try {
-      await api.stopPipeline(pid)
-      if (get().pipelineId !== pid || get().activeWorkspace !== workspace) return
+      const result = await api.stopPipeline(pid)
+      if (get().pipelineId !== pid || currentDirectorQueueScope() !== key) return
+      if (result?.cancelled !== true && !['completed', 'failed', 'cancelled'].includes(result?.status)) return false
       set({ pipelineId: null, pipelineStatus: null, pipelinePolling: false, directorLoading: false, directorShotDeck: null })
+      return true
     } catch (e) {
+      if (get().pipelineId !== pid || currentDirectorQueueScope() !== key) return
       console.error('Failed to stop pipeline:', e)
+      return false
     }
   },
 

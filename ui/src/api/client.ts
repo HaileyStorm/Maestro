@@ -6328,11 +6328,12 @@ export async function continuePipeline(pid: string, updates?: { clip_plans?: Arr
   if (!res.ok) throw new Error('Failed to continue pipeline')
 }
 
-export async function stopPipeline(pid: string): Promise<void> {
+export async function stopPipeline(pid: string): Promise<{ status: string; cancelled: boolean }> {
   const res = await fetch(`${BASE}/api/v1/director/pipeline/${encodeURIComponent(pid)}/stop`, {
     method: 'POST',
   })
   if (!res.ok) throw new Error('Failed to stop pipeline')
+  return res.json()
 }
 
 export interface ResumePipelineResult {

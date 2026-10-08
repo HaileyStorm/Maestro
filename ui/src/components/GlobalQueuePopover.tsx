@@ -60,6 +60,9 @@ export function GlobalQueuePopover({
 }) {
   const [open, setOpen] = useState(false)
   const [startingAll, setStartingAll] = useState(false)
+  const [queueActionError, setQueueActionError] = useState<{ scope: string; message: string } | null>(null)
+  const queueActionSequence = useRef(0)
+  const queueScope = useStore(() => currentDirectorQueueScope())
   const rootRef = useRef<HTMLDivElement>(null)
   const triggerRef = useRef<HTMLButtonElement>(null)
   const dialogRef = useRef<HTMLDivElement>(null)
@@ -168,6 +171,18 @@ export function GlobalQueuePopover({
     }
   }
 
+  const runQueueAction = async (action: () => Promise<unknown>) => {
+    const scope = currentDirectorQueueScope()
+    const sequence = ++queueActionSequence.current
+    setQueueActionError(null)
+    try {
+      if (await action() === false) throw new Error('Queue action failed')
+    } catch {
+      if (scope !== currentDirectorQueueScope() || sequence !== queueActionSequence.current) return
+      setQueueActionError({ scope, message: 'The queue action could not be confirmed. Check the queue before trying again.' })
+    }
+  }
+
   const openDirectorEntry = async (entryId: string) => {
     const scope = currentDirectorQueueScope()
     if (!await loadDirectorQueueEntry(entryId) || currentDirectorQueueScope() !== scope) return
@@ -249,10 +264,21 @@ export function GlobalQueuePopover({
           </div>
 
           <div className="min-h-0 flex-1 space-y-3 overflow-y-auto p-2.5">
+            {queueActionError?.scope === queueScope && (
+              <div role="alert" className="rounded-lg border border-indicator-error/30 bg-indicator-error/10 p-2 text-[11px] text-text-primary">
+                <p>{queueActionError.message}</p>
+                <button
+                  type="button"
+                  onClick={() => void loadDirectorQueue()}
+                  disabled={directorQueueLoading}
+                  className="mt-1 min-h-11 rounded-lg px-2 font-semibold text-accent-blue hover:bg-bg-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:opacity-40"
+                >Check queue</button>
+              </div>
+            )}
             {canStartHeldWork && (
               <button
                 type="button"
-                onClick={() => void startAllQueues()}
+                onClick={() => void runQueueAction(() => startAllQueues())}
                 disabled={startingAll || directorQueueLoading}
                 className="flex min-h-11 w-full items-center justify-center gap-2 rounded-lg border border-green-500/30 bg-green-500/10 px-3 py-2 text-[11px] font-semibold text-indicator-success hover:bg-green-500/15 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:opacity-40"
                 aria-label={startActionLabel}
@@ -280,7 +306,7 @@ export function GlobalQueuePopover({
                     </div>
                     <button
                       type="button"
-                      onClick={() => void stopPipeline()}
+                      onClick={() => void runQueueAction(() => stopPipeline())}
                       className="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg text-red-400 hover:bg-red-500/10 hover:text-red-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue md:h-9 md:w-9"
                       aria-label="Stop Director generation"
                     >
@@ -379,7 +405,7 @@ export function GlobalQueuePopover({
                   {directorQueue?.running && !directorQueue.paused ? (
                     <button
                       type="button"
-                      onClick={() => void pauseDirectorQueue()}
+                      onClick={() => void runQueueAction(() => pauseDirectorQueue())}
                       disabled={directorQueueLoading}
                       className="flex min-h-11 items-center gap-1 rounded-lg border border-orange-500/30 bg-orange-500/10 px-2.5 py-2 text-[10px] text-chip-orange focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:opacity-40 md:min-h-9"
                       aria-label="Pause Director queue after the current project"
@@ -398,7 +424,7 @@ export function GlobalQueuePopover({
                           : <Clock size={10} className="shrink-0 text-text-muted" />}
                       <button
                         type="button"
-                        onClick={() => void openDirectorEntry(entry.id)}
+                        onClick={() => void runQueueAction(() => openDirectorEntry(entry.id))}
                         disabled={directorQueueLoading}
                         className="min-h-11 min-w-0 flex-1 rounded text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue md:min-h-9"
                         title={entry.message || entry.scene_description}
@@ -412,7 +438,7 @@ export function GlobalQueuePopover({
                       </button>
                       <button
                         type="button"
-                        onClick={() => void openDirectorEntry(entry.id)}
+                        onClick={() => void runQueueAction(() => openDirectorEntry(entry.id))}
                         disabled={directorQueueLoading}
                         aria-label="Open Director project"
                         className="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg text-text-muted hover:bg-bg-hover hover:text-accent-blue focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:opacity-40 md:h-9 md:w-9"
@@ -423,7 +449,7 @@ export function GlobalQueuePopover({
                         <>
                           <button
                             type="button"
-                            onClick={() => void moveDirectorQueueEntry(entry.id, -1)}
+                            onClick={() => void runQueueAction(() => moveDirectorQueueEntry(entry.id, -1))}
                             disabled={index === 0 || directorQueueLoading}
                             className="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg text-text-muted hover:bg-bg-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:opacity-20 md:h-9 md:w-9"
                             aria-label="Move Director project up"
@@ -432,7 +458,7 @@ export function GlobalQueuePopover({
                           </button>
                           <button
                             type="button"
-                            onClick={() => void moveDirectorQueueEntry(entry.id, 1)}
+                            onClick={() => void runQueueAction(() => moveDirectorQueueEntry(entry.id, 1))}
                             disabled={index === directorEntries.length - 1 || directorQueueLoading}
                             className="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg text-text-muted hover:bg-bg-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:opacity-20 md:h-9 md:w-9"
                             aria-label="Move Director project down"
@@ -441,7 +467,7 @@ export function GlobalQueuePopover({
                           </button>
                           <button
                             type="button"
-                            onClick={() => void removeDirectorQueueEntry(entry.id)}
+                            onClick={() => void runQueueAction(() => removeDirectorQueueEntry(entry.id))}
                             disabled={directorQueueLoading}
                             className="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg text-text-muted hover:bg-red-500/10 hover:text-red-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:opacity-40 md:h-9 md:w-9"
                             aria-label="Remove Director project from queue"
