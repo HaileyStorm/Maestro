@@ -250,6 +250,141 @@ non_diegetic_music: N/A"""
             scene_index=1, audio_origin_sec=2.013, prompt_override="An adult courier carries a red case.")
         return state, repaired
 
+    def _saved_scene_repair_fixture(self):
+        state, _ = self._rerun_source_state()
+        state["_params_snapshot"]["_maestro_session_id"] = "owner"
+        cursor = 2.013
+        for index, duration in enumerate((10, 20, 10)):
+            state["clips"][index].update(video_filename=f"scene-{index}.mp4",
+                video_prompt=f"Original scene {index}", video_stale=True,
+                planned_clip={"start": cursor, "end": cursor + duration, "duration_sec": duration})
+            cursor += duration
+        state["output_files"] = ["original-film.mp4"]
+        path = os.path.join(self.temp_dir.name, pipeline.pipeline_state_filename(state["pipeline_id"]))
+        with open(path, "w") as handle:
+            json.dump(state, handle)
+        return state
+
+    def test_scene_repair_dispatch_saves_intent_and_replaces_only_selected_scene(self):
+        state = self._saved_scene_repair_fixture()
+        before = copy.deepcopy(state)
+        controls = {"seed": 723, "num_inference_steps": 4, "audio_source": "sealed-song.wav",
+                    "activated_loras": ["original-lora"], "_h3_rerun_predecessor_path": "old-path"}
+        received = []
+        def submit(params, **kwargs):
+            saved = pipeline.load_pipeline_state(self.temp_dir.name, state["pipeline_id"])
+            intent = saved["recovery"]["scene_repairs"]["1"]
+            self.assertEqual(intent["state"], "submitted")
+            self.assertEqual(intent["job_id"], params["_director_recovery_job_id"])
+            self.assertEqual(params["seed"], 723)
+            self.assertEqual(params["audio_source"], "sealed-song.wav")
+            self.assertEqual(params["activated_loras"], ["original-lora"])
+            self.assertEqual(params["multi_clip_audio_start_sec"], 2.013)
+            self.assertNotIn("_h3_rerun_predecessor_path", params)
+            self.assertEqual(params["_h3_longform"]["segment_source_indices"], [0, 1, 1, 2])
+            self.assertEqual(kwargs["h3_scene_rerun_admission"]["scene_index"], 1)
+            received.append(params)
+            return pipeline._DirectorOutputs(["repair-1.mp4", "repair-2.mp4", "repair-scene.mp4"],
+                {"1": "repair-1.mp4", "2": "repair-2.mp4"}, {"1": "repair-scene.mp4"})
+        with patch.object(pipeline, "_recovery_prepare_h3_scene_rerun", return_value=controls), \
+                patch.object(pipeline, "_recovery_submit_child", lambda *a, **k: None), \
+                patch.object(pipeline, "_submit_and_wait", side_effect=submit):
+            result = pipeline._rerun_h3_scene_video_impl(self.temp_dir.name, state["pipeline_id"], 1, state,
+                prompt_override="An adult courier carries a red case.")
+        saved = pipeline.load_pipeline_state(self.temp_dir.name, state["pipeline_id"])
+        self.assertEqual(result["filename"], "repair-scene.mp4")
+        self.assertEqual(saved["clips"][0], before["clips"][0])
+        self.assertEqual(saved["clips"][2], before["clips"][2])
+        self.assertEqual(saved["_params_snapshot"], before["_params_snapshot"])
+        self.assertEqual(saved["recovery"]["children"], before["recovery"]["children"])
+        self.assertEqual(saved["clips"][1]["h3_original_video_segments"], before["clips"][1]["h3_video_segments"])
+        self.assertEqual([entry["physical_index"] for entry in saved["clips"][1]["h3_video_segments"]], [1, 2])
+        self.assertEqual(saved["recovery"]["scene_repairs"]["1"]["state"], "completed")
+
+    def test_edited_scene_repair_resumes_same_intent_after_ambiguous_submission(self):
+        state = self._saved_scene_repair_fixture()
+        with patch.object(pipeline, "_recovery_prepare_h3_scene_rerun", return_value={"seed": 723}), \
+                patch.object(pipeline, "_recovery_submit_child", lambda *a, **k: None), \
+                patch.object(pipeline, "_submit_and_wait", side_effect=RuntimeError("ACK uncertain")) as submit:
+            with self.assertRaisesRegex(RuntimeError, "ACK uncertain"):
+                pipeline._rerun_h3_scene_video_impl(self.temp_dir.name, state["pipeline_id"], 1, state,
+                    prompt_override="An adult courier carries a red case.")
+            first = submit.call_args.args[0]
+            restored = pipeline.load_pipeline_state(self.temp_dir.name, state["pipeline_id"])
+            with self.assertRaisesRegex(RuntimeError, "ACK uncertain"):
+                pipeline._rerun_h3_scene_video_impl(self.temp_dir.name, state["pipeline_id"], 1, restored)
+            self.assertEqual(submit.call_args.args[0], first)
+            with self.assertRaisesRegex(RuntimeError, "unfinished repair"):
+                pipeline._rerun_h3_scene_video_impl(self.temp_dir.name, state["pipeline_id"], 1, restored,
+                    prompt_override="An adult courier carries a green case.")
+            self.assertEqual(submit.call_count, 2)
+
+    def test_confirmed_failed_scene_repair_permits_a_new_user_revision(self):
+        state = self._saved_scene_repair_fixture()
+        with patch.object(pipeline, "_recovery_prepare_h3_scene_rerun", return_value={"seed": 723}), \
+                patch.object(pipeline, "_recovery_submit_child", lambda *a, **k: None), \
+                patch.object(pipeline, "_submit_and_wait", side_effect=pipeline.DirectorChildGenerationError("failed")) as submit:
+            ids = []
+            for _ in range(2):
+                with self.assertRaises(pipeline.DirectorChildGenerationError):
+                    pipeline._rerun_h3_scene_video_impl(self.temp_dir.name, state["pipeline_id"], 1, state)
+                ids.append(submit.call_args.args[0]["_director_recovery_job_id"])
+                state = pipeline.load_pipeline_state(self.temp_dir.name, state["pipeline_id"])
+                self.assertEqual(state["recovery"]["scene_repairs"]["1"]["state"], "failed")
+            self.assertNotEqual(*ids)
+            self.assertEqual(state["recovery"]["scene_repairs"]["1"]["revision"], 2)
+
+    def test_managed_scene_cancel_before_registration_skips_worker(self):
+        import threading
+        pid = "repair-cancel-before-start"
+        event = threading.Event()
+        event.set()
+        unit = {"kind": "video_scene_rerun", "variant": 1, "index": 1}
+        params = {"_director_pipeline_id": pid, "_director_detached_operation": True,
+            "_director_repair_operation_id": "cancelled-operation",
+            "_director_recovery_parent_id": pid, "_director_recovery_unit": unit,
+            "_director_recovery_job_id": pipeline._director_child_job_id(pid, unit, 0)}
+        def register(job, parent, unit, attempt, **kwargs):
+            pipeline._jobs[job["id"]] = job
+            self.assertFalse(kwargs["h3_scene_rerun_before_worker"](job))
+            self.assertEqual(job["status"], "cancelled")
+            self.assertFalse(job.get("_director_scene_repair_worker_active"))
+            return job
+        with patch.dict(pipeline._pipeline_repairs, {pid: {"operation_id": "cancelled-operation", "cancel_event": event}}), \
+                patch.object(pipeline, "_recovery_submit_child", side_effect=register), \
+                patch.object(pipeline, "_run_generation", side_effect=AssertionError("generation must not start")):
+            with self.assertRaises(pipeline.GenerationCancelledError):
+                pipeline._submit_and_wait(params, timeout_s=1, out_dir=self.temp_dir.name,
+                    h3_scene_rerun_admission={"scene_index": 1})
+        self.assertNotIn(pid, pipeline._pipeline_child_jobs)
+
+    def test_managed_scene_worker_lease_precedes_start_and_does_not_checkpoint_parent(self):
+        import threading
+        pid = "repair-lease"
+        unit = {"kind": "video_scene_rerun", "variant": 1, "index": 1}
+        params = {"_director_pipeline_id": pid, "_director_detached_operation": True,
+            "_director_recovery_parent_id": pid, "_director_recovery_unit": unit,
+            "_director_recovery_job_id": pipeline._director_child_job_id(pid, unit, 0)}
+        pipeline._pipelines[pid] = {"status": "completed", "_recovery_parent": True}
+        def run(job_id):
+            self.assertIn(job_id, pipeline._pipeline_child_jobs[pid])
+            pipeline._jobs[job_id].update(status="completed", output_files=["scene.mp4"])
+        def register(job, parent, unit, attempt, **kwargs):
+            pipeline._jobs[job["id"]] = job
+            self.assertTrue(kwargs["h3_scene_rerun_before_worker"](job))
+            worker = threading.Thread(target=kwargs["h3_scene_rerun_worker"], args=(job["id"],))
+            worker.start()
+            worker.join(2)
+            self.assertFalse(worker.is_alive())
+            return job
+        with patch.object(pipeline, "_recovery_submit_child", side_effect=register), \
+                patch.object(pipeline, "_run_generation", side_effect=run), \
+                patch.object(pipeline, "_recovery_verify_child", return_value={"outputs": ["scene.mp4"]}), \
+                patch.object(pipeline, "_checkpoint_child_entry", side_effect=AssertionError("parent mutation")):
+            self.assertEqual(pipeline._submit_and_wait(params, timeout_s=1, out_dir=self.temp_dir.name,
+                h3_scene_rerun_admission={"scene_index": 1}), ["scene.mp4"])
+        self.assertNotIn(pid, pipeline._pipeline_child_jobs)
+
     def test_rerun_source_identity_is_absolute_and_keeps_original_membership(self):
         state, repaired = self._rerun_source_state()
         before = copy.deepcopy(state)

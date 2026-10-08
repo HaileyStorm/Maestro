@@ -707,7 +707,10 @@ class H3CumulativeExecutionTests(unittest.TestCase):
             "_queue_recovery_materialize_job": materialize,
             "_jobs": Registry(),
             "restore_scheduler_state": lambda *args: None,
-            "_queue_recovery_coordinator": types.SimpleNamespace(compact=compact),
+            "_queue_recovery_coordinator": types.SimpleNamespace(
+                compact=compact,
+                read_only_snapshot=lambda: ({self.job["id"]: self.job}, frozenset()),
+            ),
             "_restore_h3_prompt_rewriter_cleanup": lambda jobs, **kwargs: (),
             "_startup_recovery_stop": threading.Event(),
             "cleanup_orphan_request_manifests": lambda *args: 0,

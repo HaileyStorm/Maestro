@@ -1162,3 +1162,51 @@ needs to revalidate and snapshot the predecessor as a fresh sealed input, retain
 original provenance across terminal compaction, and bind selected-segment
 dispatch/recovery to scene-only completion. Runtime rollout and native quality,
 LAN workflow and human listening acceptance remain pending.
+
+### 2026-10-08 — Preserve original H3 repair provenance through queue cleanup
+
+The Director parent now records the deterministic original H3 child intent
+before its registration. Queue compaction and dismissal retain that one child's
+snapshot while the parent remains repairable, with matching parent identity,
+child kind, owner, project instance and workspace. Explicit parent deletion
+releases the relationship, including when parent and child are deleted in one
+transaction. A submitted scene repair retains its exact scoped child until the
+verified replacement is committed; completed replacement releases that temporary
+relationship.
+
+Startup cleanup preserves the original private request manifest while allowing
+obsolete completed-child conditioning files to retire. Retention preserves
+evidence only; the original producer and input verification remain required
+before reuse. An empty deletion transaction after retention is a successful
+no-op. The 28 adapter checks pass after a regression exposed that edge case;
+Director intent timing and actual private-manifest/staging cleanup also pass.
+Independent source review is clear. Full backend CI ran 6,473 checks with seven
+isolated fixture errors; all seven pass after repair. Frontend checks, type
+checking, build and publication/syntax gates pass. Revision-bound affected
+checks qualify the later scene-dispatch changes.
+
+
+### 2026-10-08 — Durable dispatch and replacement for one H3 scene
+
+Scene repair now takes the original generation controls from its private
+manifest and snapshots the verified predecessor into a fresh job-scoped input.
+The worker selects only the authored scene's absolute physical indices, retaining
+its exact frame partition, native history, prompt mapping and fractional source
+soundtrack clock. The predecessor is an input to the new first segment, while
+later segments depend only on newly completed children. Scene assembly publishes
+one verified component and avoids a full-film concatenation.
+
+Director saves the deterministic repair intent before submission. An interrupted
+edited repair resumes its sealed edit under the same job identity; ambiguous
+registration does not create another attempt. Confirmed failure or cancellation
+allows a new owner-requested revision. A pre-start child lease protects live
+writers and cancellation, and failed thread startup releases the lease. Only the
+selected scene's video and physical member records are replaced. Original
+membership and the full original plan remain available as provenance.
+
+Submitted repair evidence survives terminal compaction until Director commits
+the replacement. Completed attachment verifies the new producer graph and any
+inputs still present; consumed predecessor bytes need not remain. CPU checks
+cover real private manifests, media hashes, sparse producer graphs, saved-state
+replacement, edited-request recovery and worker leases. Runtime rollout, full
+native generation quality, LAN interaction and human listening remain pending.

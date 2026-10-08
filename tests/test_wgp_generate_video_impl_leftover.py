@@ -122,6 +122,7 @@ class GenerateVideoImplLeftoverTests(unittest.TestCase):
             "video_length": 123, "model_def": model_def,
             "align_model_frame_count": aligner, "_h3_cumulative_dispatch": None,
             "_h3_control_dispatch": None,
+            "_h3_face_refine_dispatch": None,
         }
         self.assertEqual(eval(frame_choice, frame_namespace), 124)
         aligner.assert_called_once_with(123, model_def)

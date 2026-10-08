@@ -8,6 +8,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 from pathlib import Path
 import sys
 import tempfile
@@ -1186,6 +1187,7 @@ class DirectorRecoveryTests(unittest.TestCase):
             "_CREDIT_REALM_PARAM": "_maestro_credit_execution_realm",
             "_credit_prepare_director_pipeline": lambda _body: False,
             "_init_pipeline": lambda: None,
+            "_director_component_error_response": lambda _error: None,
             "_reject_client_director_image_role_internals": lambda _body: None,
             "_authorize_director_media_inputs": (
                 lambda _request, _body: "project-a"
@@ -1211,7 +1213,7 @@ class DirectorRecoveryTests(unittest.TestCase):
             "_begin_workspace_operation": lambda _workspace: None,
             "_end_workspace_operation": lambda _workspace: None,
         }
-        _launch_functions({"director_pipeline_start"}, namespace)
+        _launch_functions({"director_pipeline_start", "_reject_client_h3_internal_state"}, namespace)
         request = types.SimpleNamespace(
             json=request_json,
             state=types.SimpleNamespace(maestro_session_id="owner"),
@@ -1228,6 +1230,18 @@ class DirectorRecoveryTests(unittest.TestCase):
         self.assertEqual(checked, [(request_id, "project-a")])
         self.assertEqual(starts[0]["director_request_id"], request_id)
         self.assertNotIn("_director_request_id", starts[0])
+
+        for private_field in ({"_h3_rerun_predecessor_path": "/private/predecessor.mp4"},
+                {"_h3_rerun_input": {"snapshot": {}}},
+                {"custom_settings": {"_h3_rerun_input": {"snapshot": {}}}}):
+            async def forged_json():
+                return {"workspace": "project-a", **private_field}
+            forged = types.SimpleNamespace(json=forged_json, state=request.state)
+            with self.subTest(field=private_field), patch.object(director, "start_pipeline") as start_pipeline:
+                with self.assertRaises(HTTPError) as rejected:
+                    asyncio.run(namespace["director_pipeline_start"](forged))
+                self.assertEqual(rejected.exception.status_code, 400)
+                start_pipeline.assert_not_called()
 
         def reject_foreign(*_args, **_kwargs):
             raise HTTPError(status_code=404, detail="Director request not found")
@@ -2315,6 +2329,58 @@ class DirectorSceneAssemblyTests(unittest.TestCase):
 class DirectorH3RerunSourceTests(unittest.TestCase):
     """Real manifest/media seals with model-free original producer graphs."""
 
+    def test_parent_seals_original_child_intent_before_completion(self):
+        from tests.test_director_h3_invariants import TestDirectorH3Invariants
+        fixture = TestDirectorH3Invariants()
+        fixture.setUp()
+        self.addCleanup(fixture.tearDown)
+        state, _ = fixture._rerun_source_state()
+        pid = state["pipeline_id"]
+        entry = next(iter(state["recovery"]["children"].values()))
+        for outcome in ("submitted", "completed", "failed", "wrong-id", "ordinary"):
+            with self.subTest(outcome=outcome):
+                current = copy.deepcopy(state)
+                child = next(iter(current["recovery"]["children"].values()))
+                child["state"] = outcome if outcome in {"submitted", "completed", "failed"} else "submitted"
+                if outcome == "wrong-id":
+                    child["job_id"] = "director-other-original"
+                if outcome == "ordinary":
+                    current["_params_snapshot"] = {}
+                parent = {"recovery_cursor": {"pipeline_id": pid}}
+                checkpoints = []
+                namespace = _launch_functions({"_director_recovery_checkpoint_parent"}, {
+                    "_director_recovery_parents": {pid: parent},
+                    "_queue_recovery_checkpoint": lambda _parent, **updates: checkpoints.append(updates),
+                    "QueueRecoveryRuntimeError": RuntimeError,
+                })
+                namespace["_director_recovery_checkpoint_parent"](pid, current, {"sha256": "a" * 64})
+                cursor = checkpoints[0]["recovery_cursor"]
+                if outcome in {"submitted", "completed", "failed"}:
+                    self.assertEqual(cursor["h3_original_video_job_id"], entry["job_id"])
+                else:
+                    self.assertNotIn("h3_original_video_job_id", cursor)
+
+    def test_parent_retains_only_submitted_scene_intents_until_verified_replacement(self):
+        state, _ = self.fixture._rerun_source_state()
+        pid = state["pipeline_id"]
+        unit = {"kind": "video_scene_rerun", "variant": 2, "index": 1}
+        job_id = director._director_child_job_id(pid, unit, 0)
+        state["recovery"]["scene_repairs"] = {"1": {"unit": unit, "revision": 2,
+            "attempt": 0, "job_id": job_id, "state": "submitted", "prompt_override": "private edited prompt"}}
+        parent = {"recovery_cursor": {"pipeline_id": pid}}
+        updates = []
+        namespace = _launch_functions({"_director_recovery_checkpoint_parent"}, {
+            "_director_recovery_parents": {pid: parent}, "QueueRecoveryRuntimeError": RuntimeError,
+            "_queue_recovery_checkpoint": lambda current, **kwargs: updates.append(kwargs)})
+        namespace["_director_recovery_checkpoint_parent"](pid, state, {"sha256": "a" * 64})
+        cursor = updates[-1]["recovery_cursor"]
+        self.assertEqual(cursor["h3_pending_scene_repairs"], [{"job_id": job_id, "index": 1, "revision": 2}])
+        self.assertNotIn("private edited prompt", json.dumps(cursor))
+        parent["recovery_cursor"] = cursor
+        state["recovery"]["scene_repairs"]["1"]["state"] = "completed"
+        namespace["_director_recovery_checkpoint_parent"](pid, state, {"sha256": "b" * 64})
+        self.assertNotIn("h3_pending_scene_repairs", updates[-1]["recovery_cursor"])
+
     def setUp(self):
         from tests.test_director_h3_invariants import TestDirectorH3Invariants
         from services.queue_recovery_runtime import (
@@ -2394,12 +2460,13 @@ class DirectorH3RerunSourceTests(unittest.TestCase):
         self.namespace["_queue_recovery_coordinator"] = types.SimpleNamespace(
             read_only_snapshot=lambda: ({self.job_id: copy.deepcopy(self.snapshot)}, frozenset()))
 
-    def write_unit(self, unit, name):
+    def write_unit(self, unit, name, *, job_id=None):
         from services.queue_recovery_runtime import artifact_descriptor
+        job_id = job_id or self.job_id
         data = ("sealed:" + name).encode()
         (self.root / name).write_bytes(data)
         role = "final" if unit["kind"] == "h3_concat" else "component"
-        meta = {"job_id": self.job_id, "workspace": "default", "output_filename": name,
+        meta = {"job_id": job_id, "workspace": "default", "output_filename": name,
             "producer_unit_id": unit["unit_id"], "producer_unit_kind": unit["kind"],
             "producer_unit_index": unit["index"], "producer_unit_variant": unit["variant"],
             "producer_unit_settings": unit["settings"], "producer_unit_dependencies": unit["dependencies"],
@@ -2411,6 +2478,10 @@ class DirectorH3RerunSourceTests(unittest.TestCase):
             meta["producer_unit_continuation"] = unit["continuation"]
         if "attestation" in unit:
             meta["producer_unit_attestation"] = unit["attestation"]
+        if unit["kind"] == "h3_scene":
+            # Production scene assembly authors job-level parameters, without
+            # the transient per-task multi_clip_info variant metadata.
+            meta["params"] = {}
         sidecar = Path(name).stem + ".meta.json"
         (self.root / sidecar).write_text(json.dumps(meta))
         unit["artifacts"] = [artifact_descriptor(self.root, basename=name,
@@ -2419,6 +2490,330 @@ class DirectorH3RerunSourceTests(unittest.TestCase):
     def resolve(self, **kwargs):
         return self.namespace["_director_recovery_h3_rerun_source"](
             self.state, self.prepared, **({"session_id": "owner", "project_dir": str(self.root)} | kwargs))
+
+    def repair_job(self):
+        job = {"id": "director-fresh-scene-repair", "kind": "director_child",
+            "workspace": "default", "out_dir": str(self.root), "session_id": "owner",
+            "params": {"_director_pipeline_id": self.state["pipeline_id"],
+                "_h3_longform": copy.deepcopy(self.prepared), "multi_clip_audio_start_sec": 2.013}}
+        selection = job["params"]["_h3_longform"]["scene_rerun"]
+        packet = {"pipeline_id": self.state["pipeline_id"],
+            "scene_index": selection["scene_index"],
+            "original_plan_sha256": selection["original_plan_sha256"]}
+        self.namespace.update(re=re, _app_dir=str(APP),
+            _RECOVERABLE_INPUT_KEYS={"_h3_rerun_predecessor_path"})
+        _launch_functions({"_director_recovery_h3_rerun_plan",
+            "_director_recovery_admit_h3_rerun_input", "_queue_recovery_file_values",
+            "_queue_recovery_input_descriptors", "_prepare_generation_sidecar_params"}, self.namespace)
+        return job, packet
+
+    def admit(self, job, packet):
+        with patch.object(director, "load_pipeline_state", side_effect=lambda *args: copy.deepcopy(self.state)):
+            self.namespace["_director_recovery_admit_h3_rerun_input"](job, packet,
+                owner_digest=self.owner, project_digest=self.project)
+
+    def worker_job(self):
+        from services.queue_recovery_runtime import sha256_file, ensure_recovery_staging_directory
+        job, packet = self.repair_job()
+        self.admit(job, packet)
+        job.update(status="running", _recovery_owner_digest=self.owner,
+            _recovery_project_digest=self.project, recovery_cursor={"completed_units": []})
+        self.namespace.update(json=json, hashlib=hashlib, _recovery_sha256_file=sha256_file,
+            ensure_recovery_staging_directory=ensure_recovery_staging_directory)
+        _launch_functions({"_director_h3_scene_repair_selection", "_director_h3_scene_repair_input_identity",
+            "_filter_director_h3_scene_repair_tasks", "_director_h3_scene_repair_handoff",
+            "_director_h3_scene_repair_dependency", "_director_h3_scene_repair_outputs",
+            "_verified_h3_concat_output_names", "_h3_incomplete_recovery_prefix"}, self.namespace)
+        return job
+
+    def seal_repair_scene(self, job):
+        from services.director_h3_scene_assembly import director_h3_scene_specs
+        from services.queue_recovery_runtime import recovery_unit_id
+        snapshot = job["params"]["_h3_rerun_input"]["snapshot"]
+        job["recovery_cursor"]["h3_scene_repair_handoff"] = {"mode": "prompt_only",
+            "dependency": self.namespace["_director_h3_scene_repair_input_identity"](snapshot)}
+        units = []
+        for index in [1, 2]:
+            settings = copy.deepcopy(self.snapshot["recovery_cursor"]["completed_units"][index]["settings"])
+            settings.pop("predecessor_artifact_hashes", None)
+            settings.pop("predecessor_continuation_sha256", None)
+            if units:
+                dependencies = [units[-1]["unit_id"]]
+                settings.update(predecessor_artifact_hashes=[units[-1]["artifacts"][0]["sha256"]],
+                    predecessor_continuation_sha256="")
+            else:
+                dependencies = []
+                settings.update(self.namespace["_director_h3_scene_repair_dependency"](job, index))
+            unit_id = recovery_unit_id(job["id"], "h3_segment", variant=0, index=index,
+                settings=settings, dependencies=dependencies)
+            unit = {"unit_id": unit_id, "kind": "h3_segment", "variant": 0, "index": index,
+                "settings": settings, "dependencies": dependencies, "state": "completed",
+                "continuation": {"dependency": unit_id, "mode": "prompt_only"}}
+            self.write_unit(unit, f"repair-{index}.mp4", job_id=job["id"])
+            units.append(unit)
+        spec = director_h3_scene_specs(job["params"]["_h3_longform"],
+            {unit["index"]: unit for unit in units}, audio_start_sec=2.013)[0]
+        settings = dict(spec["settings"], source_audio_sha256=None, h3_audio_true_peak_policy=self.policy)
+        unit_id = recovery_unit_id(job["id"], "h3_scene", variant=0, index=1,
+            settings=settings, dependencies=spec["dependencies"])
+        data = b"sealed:repaired-scene.mp4"
+        scene = {"unit_id": unit_id, "kind": "h3_scene", "variant": 0, "index": 1,
+            "settings": settings, "dependencies": spec["dependencies"], "state": "completed",
+            "attestation": {"h3_audio_true_peak": {**self.policy, "verified": True},
+                "media": {"validation": "valid", "fps": 24,
+                    "frame_count": settings["published_frames"], "artifact_size_bytes": len(data),
+                    "artifact_sha256": "sha256:" + hashlib.sha256(data).hexdigest()}}}
+        self.write_unit(scene, "repaired-scene.mp4", job_id=job["id"])
+        job["recovery_cursor"]["completed_units"] = [*units, scene]
+        job["h3_scene_output_files"] = {"1": "repaired-scene.mp4"}
+        job["clip_output_files"] = {str(unit["index"]): unit["artifacts"][0]["basename"] for unit in units}
+        return units, scene
+
+    def test_worker_selects_absolute_scene_tasks_and_preserves_source_clock(self):
+        job = self.worker_job()
+        manifest = [{"id": f"task-{index}", "params": {"prompt": f"full-timeline-{index}",
+            "audio_start_sec": 2.013 + index * 10, "multi_clip_info": {
+                "automatic_h3_longform": True, "index": index, "total": 4,
+                "output_index": 0, "output_total": 1}}} for index in range(4)]
+        before = copy.deepcopy(manifest)
+        selected = self.namespace["_filter_director_h3_scene_repair_tasks"](job, manifest)
+        self.assertEqual([task["params"]["multi_clip_info"]["index"] for task in selected], [1, 2])
+        self.assertEqual([task["params"]["audio_start_sec"] for task in selected],
+            [before[index]["params"]["audio_start_sec"] for index in [1, 2]])
+        self.assertEqual([task["params"]["prompt"] for task in selected], ["full-timeline-1", "full-timeline-2"])
+        self.assertTrue(all(task["params"]["multi_clip_info"]["defer_concat"] for task in selected))
+        self.assertEqual(manifest, before)
+        self.assertIsNone(self.namespace["_h3_incomplete_recovery_prefix"](job))
+        for invalid in (manifest[::-1], manifest[:2], manifest + [manifest[1]],
+                        [dict(task, params=dict(task["params"], multi_clip_info=dict(task["params"]["multi_clip_info"], output_total=2))) for task in manifest]):
+            with self.assertRaises(self.error): self.namespace["_filter_director_h3_scene_repair_tasks"](job, invalid)
+
+    def test_worker_prepares_new_input_handoff_once_and_rejects_changed_input(self):
+        job = self.worker_job()
+        prepared, restored, checkpoints = [], [], []
+        def checkpoint(target, **updates):
+            checkpoints.append(copy.deepcopy(updates)); target.update(updates); return True
+        self.namespace.update(_queue_recovery_checkpoint=checkpoint,
+            _prepare_task_continuation=lambda *args, **kwargs: prepared.append((args, kwargs)) or {"mode": "prompt_only", "path": None},
+            _queue_recovery_continuation_descriptor=lambda _root, _path, **kwargs: {"mode": "prompt_only", "dependency": kwargs["dependency"]},
+            _queue_recovery_continuation_path=lambda *_args: None,
+            _restore_task_continuation=lambda task, unit, root: restored.append(unit))
+        task = {"params": {"_h3_native_boundary_request": True, "multi_clip_info": {"index": 1}}}
+        handoff = self.namespace["_director_h3_scene_repair_handoff"]
+        first = handoff(job, task, str(self.root))
+        self.assertEqual(prepared[0][0][2], job["params"]["_h3_rerun_predecessor_path"])
+        self.assertEqual(prepared[0][1]["recovery_output_prefix"], f"unit-{job['id']}-repair-input")
+        self.assertEqual(handoff(job, task, str(self.root)), first)
+        self.assertEqual((len(prepared), len(checkpoints), len(restored)), (1, 1, 1))
+        (self.root / "original-0.mp4").unlink()
+        self.assertEqual(handoff(job, task, str(self.root)), first)
+        Path(job["params"]["_h3_rerun_predecessor_path"]).write_bytes(b"changed private input")
+        with self.assertRaises(self.error): handoff(job, task, str(self.root))
+        self.assertEqual(len(prepared), 1)
+
+    def test_scene_completion_uses_only_new_selected_graph_after_original_and_input_retirement(self):
+        job = self.worker_job(); units, scene = self.seal_repair_scene(job)
+        outputs = self.namespace["_director_h3_scene_repair_outputs"](job, str(self.root), ["repaired-scene.mp4"])
+        self.assertEqual(outputs, ["repaired-scene.mp4"])
+        self.assertEqual(units[0]["dependencies"], [])
+        self.assertNotIn(self.job_id, units[0]["unit_id"])
+        self.assertEqual(units[0]["settings"]["external_predecessor_input"]["input_job_id"], job["id"])
+        job["status"] = "completed"
+        (self.root / "original-0.mp4").unlink()
+        Path(job["params"]["_h3_rerun_predecessor_path"]).unlink()
+        graph = self.namespace["_queue_recovery_completed_h3_graph"](job, str(self.root))
+        self.assertIsNotNone(graph)
+        self.assertEqual(graph["output_files"], outputs)
+        self.assertEqual({unit["index"] for unit in graph["completed_units"] if unit["kind"] == "h3_segment"}, {1, 2})
+        meta = json.loads((self.root / "repaired-scene.meta.json").read_text())
+        self.assertEqual((meta["artifact_class"], meta["producer_artifact_class"]), ("component", "component"))
+        job["status"] = "running"
+        with self.assertRaises(self.error): self.namespace["_director_h3_scene_repair_handoff"](
+            job, {"params": {"multi_clip_info": {"index": 1}}}, str(self.root))
+
+    def test_scene_completion_rejects_missing_extra_or_changed_selected_evidence(self):
+        job = self.worker_job(); units, scene = self.seal_repair_scene(job)
+        job["status"] = "completed"
+        for mutation in ("missing", "extra", "old-root", "input-identity", "scene-map", "scene-bytes"):
+            altered = copy.deepcopy(job)
+            sealed = altered["recovery_cursor"]["completed_units"]
+            if mutation == "missing": sealed.pop(1)
+            elif mutation == "extra": sealed.append(copy.deepcopy(self.snapshot["recovery_cursor"]["completed_units"][0]))
+            elif mutation == "old-root": sealed[0]["dependencies"] = [self.snapshot["recovery_cursor"]["completed_units"][0]["unit_id"]]
+            elif mutation == "input-identity": altered["params"]["_h3_rerun_input"]["snapshot"]["recovery_job_id"] = "another-job"
+            elif mutation == "scene-map": altered["h3_scene_output_files"]["0"] = "repaired-scene.mp4"
+            else: (self.root / "repaired-scene.mp4").write_bytes(b"altered")
+            with self.subTest(mutation=mutation):
+                self.assertIsNone(self.namespace["_queue_recovery_completed_h3_graph"](altered, str(self.root)))
+        self.assertEqual(self.namespace["_director_h3_scene_repair_outputs"](job, str(self.root), []), [])
+
+    def test_repair_sidecars_restore_absolute_root_after_promotion_before_journal(self):
+        job = self.worker_job(); units, scene = self.seal_repair_scene(job)
+        job["recovery_cursor"]["completed_units"] = []
+        job["h3_scene_output_files"] = {}
+        self.namespace.update(_queue_recovery_reconcile_orphan_delivery=lambda *_args: None,
+            _quarantine_recovery_artifact=lambda *_args: self.fail("Verified repair media was quarantined"))
+        _launch_functions({"_queue_recovery_reconcile_cursor"}, self.namespace)
+        handoff = copy.deepcopy(job["recovery_cursor"]["h3_scene_repair_handoff"])
+        self.namespace["_queue_recovery_reconcile_cursor"](job, str(self.root))
+        restored = job["recovery_cursor"]["completed_units"]
+        self.assertEqual({unit["unit_id"] for unit in restored}, {unit["unit_id"] for unit in [*units, scene]})
+        self.assertEqual(job["recovery_cursor"]["h3_scene_repair_handoff"], handoff)
+        self.assertEqual(job["output_files"], ["repaired-scene.mp4"])
+        self.assertEqual(job["h3_scene_output_files"], {"1": "repaired-scene.mp4"})
+        self.assertNotIn("join_output_file", job)
+
+    def test_repair_admission_copies_fresh_input_and_keeps_provenance_private(self):
+        from services.director_h3_input_snapshot import validate_predecessor_snapshot
+        from services.queue_recovery_runtime import atomic_write_request_manifest, load_request_manifest, validate_manifest_inputs
+        job, packet = self.repair_job()
+        caller_params = job["params"]
+        before = copy.deepcopy(caller_params)
+        self.admit(job, packet)
+        self.assertEqual(caller_params, before)
+        admission = job["params"]["_h3_rerun_input"]
+        fresh = admission["snapshot"]
+        self.assertNotEqual(fresh["path"], admission["source"]["predecessor_path"])
+        self.assertEqual(Path(fresh["path"]).read_bytes(), (self.root / "original-0.mp4").read_bytes())
+        self.assertEqual(fresh["recovery_job_id"], job["id"])
+        self.assertNotIn("completed_units", admission)
+        inputs = self.namespace["_queue_recovery_input_descriptors"](job, self.owner)
+        self.assertEqual(inputs, [fresh])
+        pointer = atomic_write_request_manifest(self.root, job_id=job["id"], params=job["params"], inputs=inputs)
+        manifest = load_request_manifest(self.root, pointer, expected_job_id=job["id"])
+        validator = lambda item: validate_predecessor_snapshot(item, project_directory=self.root,
+            job_id=job["id"], owner_digest=self.owner, project_digest=self.project)
+        validate_manifest_inputs(manifest, validator)
+        manifest["job_id"] = "other-child"
+        with self.assertRaises(self.error): validate_manifest_inputs(manifest, validator)
+        _, public = self.namespace["_prepare_generation_sidecar_params"](job["params"])
+        self.assertNotIn("_h3_rerun_input", public)
+        self.assertNotIn("_h3_rerun_predecessor_path", public)
+
+    def test_opening_repair_admission_has_no_external_input(self):
+        self.prepared = director._prepare_director_h3_scene_rerun({}, committed=self.original,
+            scene_index=0, audio_origin_sec=2.013)
+        job, packet = self.repair_job()
+        self.admit(job, packet)
+        self.assertIsNone(job["params"]["_h3_rerun_input"]["snapshot"])
+        self.assertNotIn("_h3_rerun_predecessor_path", job["params"])
+        self.assertEqual(self.namespace["_queue_recovery_input_descriptors"](job, self.owner), [])
+
+    def test_repair_admission_rejects_missing_or_changed_private_operation_and_scope(self):
+        for mutation in ("missing", "scene", "digest", "parent", "owner", "project", "workspace"):
+            job, packet = self.repair_job()
+            owner, project = self.owner, self.project
+            if mutation == "missing": packet = None
+            elif mutation == "scene": packet["scene_index"] = 2
+            elif mutation == "digest": packet["original_plan_sha256"] = "a" * 64
+            elif mutation == "parent": packet["pipeline_id"] = "different-parent"
+            elif mutation == "owner": owner = "different-owner"
+            elif mutation == "project": project = "different-project"
+            else: job["workspace"] = "other-workspace"
+            before = copy.deepcopy(job)
+            with self.subTest(mutation=mutation), patch.object(director, "load_pipeline_state", return_value=self.state):
+                with self.assertRaises(self.error):
+                    self.namespace["_director_recovery_admit_h3_rerun_input"](job, packet,
+                        owner_digest=owner, project_digest=project)
+            self.assertEqual(job, before)
+        self.assertFalse((self.root / ".maestro-recovery" / "staging").exists())
+
+    def test_admission_rechecks_source_after_copy_before_authoring_params(self):
+        from services.director_h3_input_snapshot import snapshot_predecessor
+        job, packet = self.repair_job()
+        before = copy.deepcopy(job)
+        def change_after_copy(*args, **kwargs):
+            descriptor = snapshot_predecessor(*args, **kwargs)
+            (self.root / "original-0.mp4").write_bytes(b"changed original")
+            return descriptor
+        with patch("services.director_h3_input_snapshot.snapshot_predecessor", side_effect=change_after_copy):
+            with self.assertRaises(self.error): self.admit(job, packet)
+        self.assertEqual(job, before)
+
+    def test_completed_repair_attachment_checks_present_input_and_survives_consumption(self):
+        from services.director_h3_input_snapshot import validate_predecessor_snapshot
+        from services.queue_recovery_runtime import atomic_write_request_manifest
+        job = self.worker_job()
+        self.seal_repair_scene(job)
+        snapshot = job["params"]["_h3_rerun_input"]["snapshot"]
+        job.update(status="completed", _recovery_manifest_pointer=atomic_write_request_manifest(
+            self.root, job_id=job["id"], params=job["params"], inputs=[snapshot]))
+        checked = []
+        def validator(item, **kwargs):
+            checked.append(item)
+            return validate_predecessor_snapshot(item, project_directory=self.root, job_id=job["id"],
+                owner_digest=self.owner, project_digest=self.project)
+        self.namespace["_queue_recovery_manifest_validator"] = validator
+        _launch_functions({"_director_recovery_validate_h3_repair_attach"}, self.namespace)
+        validate = self.namespace["_director_recovery_validate_h3_repair_attach"]
+        self.assertTrue(validate(job))
+        self.assertEqual(len(checked), 1)
+        original = Path(snapshot["path"]).read_bytes()
+        Path(snapshot["path"]).write_bytes(b"changed admitted input")
+        self.assertFalse(validate(job))
+        Path(snapshot["path"]).write_bytes(original)
+        Path(snapshot["path"]).unlink()
+        self.assertTrue(validate(job))
+        (self.root / "repaired-scene.mp4").write_bytes(b"changed scene")
+        self.assertFalse(validate(job))
+
+    def test_blocked_repair_worker_start_failure_clears_active_lease_marker(self):
+        from services.director_h3_input_snapshot import validate_predecessor_snapshot
+        job, packet = self.repair_job()
+        self.admit(job, packet)
+        existing = copy.deepcopy(job)
+        existing.update(status="queued", recovery_state="blocked", _recovery_owner_digest=self.owner,
+            _recovery_project_digest=self.project)
+        self.namespace.update(_jobs={job["id"]: existing}, re=re, threading=threading,
+            _CREDIT_ACCOUNT_PARAM="account", _CREDIT_REALM_PARAM="realm",
+            _credit_runtime_policy=lambda: types.SimpleNamespace(enforcement_enabled=False),
+            _queue_recovery_revalidate_job=lambda candidate: validate_predecessor_snapshot(
+                candidate["params"]["_h3_rerun_input"]["snapshot"], project_directory=self.root,
+                job_id=candidate["id"], owner_digest=self.owner, project_digest=self.project),
+            _queue_recovery_delivery_pending=lambda *_: None,
+            _require_job_model_recipe_terms=lambda *_: None,
+            _queue_recovery_checkpoint=lambda candidate, **updates: candidate.update(updates),
+            update_queue_job=lambda *args, **kwargs: True, _run_generation=lambda *_: None)
+        _launch_functions({"_director_recovery_submit_child", "_director_recovery_validate_h3_repair_attach"}, self.namespace)
+        def before(candidate):
+            candidate["_director_scene_repair_worker_active"] = True
+            return True
+        with patch.object(threading.Thread, "start", side_effect=RuntimeError("cannot start")):
+            with self.assertRaisesRegex(self.error, "worker could not start"):
+                self.namespace["_director_recovery_submit_child"](job, self.state["pipeline_id"],
+                    {"kind": "video_scene_rerun", "index": 1}, 0,
+                    h3_scene_rerun_admission=packet, h3_scene_rerun_before_worker=before)
+        self.assertFalse(existing.get("_director_scene_repair_worker_active"))
+        self.assertEqual(existing["recovery_state"], "blocked")
+        self.assertTrue(existing["queue_held"])
+
+    def test_recovered_repair_cannot_attach_changed_plan_scope_or_snapshot(self):
+        from services.director_h3_input_snapshot import validate_predecessor_snapshot
+        job, packet = self.repair_job()
+        self.admit(job, packet)
+        existing = copy.deepcopy(job)
+        existing.update(status="queued", _recovery_owner_digest=self.owner,
+            _recovery_project_digest=self.project)
+        self.namespace.update(_jobs={job["id"]: existing},
+            _CREDIT_ACCOUNT_PARAM="account", _CREDIT_REALM_PARAM="realm",
+            _credit_runtime_policy=lambda: types.SimpleNamespace(enforcement_enabled=False),
+            _queue_recovery_revalidate_job=lambda candidate: validate_predecessor_snapshot(
+                candidate["params"]["_h3_rerun_input"]["snapshot"], project_directory=self.root,
+                job_id=candidate["id"], owner_digest=self.owner, project_digest=self.project))
+        _launch_functions({"_director_recovery_submit_child", "_director_recovery_validate_h3_repair_attach"}, self.namespace)
+        submit = lambda candidate, operation: self.namespace["_director_recovery_submit_child"](
+            candidate, self.state["pipeline_id"], {"kind": "video_scene_rerun", "index": 1}, 0,
+            h3_scene_rerun_admission=operation)
+        self.assertIs(submit(job, packet), existing)
+        for mutation in ("packet", "plan", "owner", "project", "input"):
+            candidate, operation = copy.deepcopy(job), copy.deepcopy(packet)
+            if mutation == "packet": operation = None
+            elif mutation == "plan": candidate["params"]["_h3_longform"]["scene_rerun"]["audio_origin_sec"] += 0.001
+            elif mutation == "owner": candidate["session_id"] = "other-owner"
+            elif mutation == "project": existing["_recovery_project_digest"] = "other-project"
+            else: Path(existing["params"]["_h3_rerun_predecessor_path"]).write_bytes(b"changed input")
+            with self.subTest(mutation=mutation), self.assertRaises(self.error): submit(candidate, operation)
+            existing["_recovery_project_digest"] = self.project
 
     def test_verified_original_variant_and_scene_local_geometry_are_provenance_only(self):
         before = copy.deepcopy(self.snapshot)

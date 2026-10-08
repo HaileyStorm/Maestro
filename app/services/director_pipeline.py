@@ -63,6 +63,7 @@ _recovery_remove_parent = None
 _recovery_submit_child = None
 _recovery_verify_child = None
 _recovery_validate_child = None
+_recovery_prepare_h3_scene_rerun = None
 _runtime_admission = None
 _director_native_gpu_slot_state = threading.local()
 
@@ -2396,6 +2397,9 @@ def _rerun_clip_video_impl(out_dir: str, pid: str, clip_index: int, prompt_overr
     validation_params["video_model"] = video_model
     _validate_director_models(validation_params, stages=("video",))
 
+    if isinstance(snapshot.get("_h3_longform"), dict):
+        return _rerun_h3_scene_video_impl(out_dir, pid, clip_index, state, prompt_override=prompt_override)
+
     # Determine the output directory
     pipeline_file = _find_pipeline_file(out_dir, pid)
     clip_out_dir = os.path.dirname(pipeline_file) if pipeline_file else out_dir
@@ -2639,6 +2643,114 @@ def _rerun_clip_video_impl(out_dir: str, pid: str, clip_index: int, prompt_overr
     _update_saved_pipeline(out_dir, pid, _update)
 
     return {"filename": new_filename, "clip_index": clip_index}
+
+
+def _rerun_h3_scene_video_impl(out_dir: str, pid: str, clip_index: int, state: dict, *, prompt_override=None) -> dict:
+    """Rerun one authored scene with its original absolute physical partition."""
+    if not callable(_recovery_prepare_h3_scene_rerun) or not callable(_recovery_submit_child):
+        raise RuntimeError("Director scene repair recovery is unavailable.")
+    filepath = _find_pipeline_file(out_dir, pid)
+    project_dir = os.path.dirname(filepath) if filepath else out_dir
+    snapshot = state["_params_snapshot"]
+    original = snapshot["_h3_longform"]
+    clip = state["clips"][clip_index]
+    repairs = (state.get("recovery") or {}).get("scene_repairs") or {}
+    prior = repairs.get(str(clip_index))
+    pending = prior if isinstance(prior, dict) and prior.get("state") == "submitted" else None
+    effective_override = prompt_override
+    if effective_override is None and pending is not None:
+        effective_override = pending.get("prompt_override")
+    elif effective_override is None and isinstance(clip.get("h3_scene_repair"), dict):
+        effective_override = clip.get("video_prompt")
+    origin = _audio_timeline_start([item.get("planned_clip") or {} for item in state["clips"]])
+    prepared = {}
+    plan = _prepare_director_h3_scene_rerun(prepared, committed=original,
+        scene_index=clip_index, audio_origin_sec=origin, prompt_override=effective_override)
+    request_digest = hashlib.sha256(json.dumps(plan, sort_keys=True, separators=(",", ":"),
+        ensure_ascii=False).encode()).hexdigest()
+    if pending is not None and pending.get("request_sha256") != request_digest:
+        raise RuntimeError("This scene has an unfinished repair with different inputs. Resolve that attempt before changing it.")
+    controls = _recovery_prepare_h3_scene_rerun(state, plan, project_dir, pending=pending)
+    if not isinstance(controls, dict):
+        raise RuntimeError("Director scene repair controls are unavailable.")
+    gen_params = copy.deepcopy(controls)
+    for key in list(gen_params):
+        if key.startswith(("_h3_rerun_", "_director_recovery_", "_director_repair_")):
+            gen_params.pop(key)
+    gen_params.update(prepared)
+    gen_params.update(_director_pipeline_id=pid, _director_detached_operation=True, repeat_generation=1,
+        _maestro_session_id=snapshot.get("_maestro_session_id"),
+        _maestro_access_policy=copy.deepcopy(snapshot.get("_maestro_access_policy") or {}))
+    with _pipeline_lock:
+        control = _pipeline_repairs.get(pid)
+        if control is not None:
+            gen_params["_director_repair_operation_id"] = control.get("operation_id")
+    if pending is None:
+        previous_revision = prior.get("revision", 0) if isinstance(prior, dict) else 0
+        if type(previous_revision) is not int or previous_revision < 0:
+            raise ValueError("Saved scene repair revision is invalid")
+        revision = previous_revision + 1
+        unit = {"kind": "video_scene_rerun", "variant": revision, "index": clip_index}
+        pending = {"version": 1, "revision": revision, "state": "submitted", "unit": unit,
+            "attempt": 0, "job_id": _director_child_job_id(pid, unit, 0),
+            "request_sha256": request_digest, "prompt_override": effective_override,
+            "original_plan_sha256": plan["scene_rerun"]["original_plan_sha256"]}
+        def save_intent(current):
+            existing = (current.get("recovery") or {}).get("scene_repairs") or {}
+            if existing.get(str(clip_index)) != prior:
+                raise RuntimeError("Scene repair intent changed before publication.")
+            current.setdefault("recovery", {}).setdefault("scene_repairs", {})[str(clip_index)] = copy.deepcopy(pending)
+        if _update_saved_pipeline(out_dir, pid, save_intent) is None:
+            raise RuntimeError("Scene repair intent could not be saved.")
+    else:
+        unit = _normalized_child_unit(pending.get("unit"))
+        if (unit is None or unit.get("kind") != "video_scene_rerun" or unit.get("index") != clip_index
+                or type(pending.get("revision")) is not int or unit.get("variant") != pending["revision"]
+                or pending.get("attempt") != 0 or pending.get("job_id") != _director_child_job_id(pid, unit, 0)):
+            raise ValueError("Saved scene repair intent is invalid")
+    gen_params.update(_director_recovery_unit=unit, _director_recovery_parent_id=pid,
+        _director_recovery_job_id=pending["job_id"], _director_recovery_attempt=0)
+    packet = {"pipeline_id": pid, "scene_index": clip_index,
+        "original_plan_sha256": plan["scene_rerun"]["original_plan_sha256"]}
+    try:
+        outputs = _submit_and_wait(gen_params, timeout_s=3600, workspace=state.get("workspace") or "default",
+            out_dir=project_dir, h3_scene_rerun_admission=packet)
+    except (DirectorChildGenerationError, GenerationCancelledError) as error:
+        outcome = "cancelled" if isinstance(error, GenerationCancelledError) else "failed"
+        def save_terminal(current):
+            saved = (current.get("recovery") or {}).get("scene_repairs") or {}
+            if saved.get(str(clip_index)) == pending:
+                saved[str(clip_index)] = dict(pending, state=outcome)
+        _update_saved_pipeline(out_dir, pid, save_terminal)
+        raise
+    scenes = getattr(outputs, "h3_scene_output_files", {})
+    physical = getattr(outputs, "clip_output_files", {})
+    filename = scenes.get(str(clip_index))
+    if (not filename or set(scenes) != {str(clip_index)}
+            or set(physical) != {str(index) for index in plan["scene_rerun"]["physical_indices"]}):
+        raise RuntimeError("Scene repair completed without exact selected scene ownership.")
+    projected = _director_clip_video_artifacts(outputs, gen_params, len(state["clips"]))
+    group = projected["_h3_clip_video_groups"][clip_index]
+    if any(not segment.get("filename") for segment in group):
+        raise RuntimeError("Scene repair has missing physical children.")
+    def save_result(current):
+        saved = (current.get("recovery") or {}).get("scene_repairs") or {}
+        if saved.get(str(clip_index)) != pending:
+            raise RuntimeError("Scene repair intent changed before replacement.")
+        selected = current["clips"][clip_index]
+        selected.setdefault("h3_original_video_segments", copy.deepcopy(selected["h3_video_segments"]))
+        selected.update(h3_video_segments=copy.deepcopy(group), video_filename=filename, video_stale=False,
+            h3_scene_repair={"version": 1, "revision": pending["revision"], "job_id": pending["job_id"],
+                "request_sha256": request_digest, "original_plan_sha256": packet["original_plan_sha256"]})
+        if effective_override is not None:
+            selected["video_prompt"] = effective_override
+        saved[str(clip_index)] = dict(pending, state="completed", filename=filename)
+        for name in outputs:
+            if name not in current.get("output_files", []):
+                current.setdefault("output_files", []).append(name)
+    if _update_saved_pipeline(out_dir, pid, save_result) is None:
+        raise RuntimeError("Verified scene replacement could not be saved.")
+    return {"filename": filename, "clip_index": clip_index, "job_id": pending["job_id"]}
 
 
 @_exclusive_pipeline_operation
@@ -3549,6 +3661,7 @@ def init(
     recovery_submit_child=None,
     recovery_verify_child=None,
     recovery_validate_child=None,
+    recovery_prepare_h3_scene_rerun=None,
     runtime_admission=None,
 ):
     """Called by launch.py to wire up shared references."""
@@ -3557,7 +3670,7 @@ def init(
     global _recovery_checkpoint_parent, _recovery_prepare_parent_delete
     global _recovery_remove_parent
     global _recovery_submit_child, _recovery_verify_child
-    global _recovery_validate_child, _runtime_admission
+    global _recovery_validate_child, _recovery_prepare_h3_scene_rerun, _runtime_admission
     _jobs = jobs_dict
     _run_generation = run_gen_fn
     _wgp = wgp_module
@@ -3571,6 +3684,7 @@ def init(
     _recovery_submit_child = recovery_submit_child
     _recovery_verify_child = recovery_verify_child
     _recovery_validate_child = recovery_validate_child
+    _recovery_prepare_h3_scene_rerun = recovery_prepare_h3_scene_rerun
     _runtime_admission = runtime_admission
 
 
@@ -3779,6 +3893,8 @@ def _submit_and_wait(
     workspace: str = None,
     out_dir: str = None,
     job_id: str = None,
+    *,
+    h3_scene_rerun_admission: dict | None = None,
 ) -> list[str]:
     """Submit a generation job and block until it completes.
 
@@ -3816,7 +3932,7 @@ def _submit_and_wait(
         external_attempt = 0
     recovery_entry = None
     recovery_attempt = 0
-    if pipeline_id and recovery_unit and out_dir:
+    if pipeline_id and recovery_unit and out_dir and not _detached_operation:
         recovered = _recovered_child_outputs(
             pipeline_id, recovery_unit, out_dir,
         )
@@ -3911,7 +4027,7 @@ def _submit_and_wait(
     _dir_pid = pipeline_id
     _skip_generation = False
 
-    def _run_tracked_generation() -> None:
+    def _run_tracked_generation(_job_id=None) -> None:
         try:
             # A repair cancellation may win before this newly published
             # child thread begins executing. Do not invoke generation for a
@@ -3922,6 +4038,8 @@ def _submit_and_wait(
                 return
             _run_generation(job_id)
         finally:
+            if h3_scene_rerun_admission is not None:
+                (_jobs.get(job_id) or job)["_director_scene_repair_worker_active"] = False
             if _dir_pid:
                 with _pipeline_lock:
                     child_jobs = _pipeline_child_jobs.get(_dir_pid)
@@ -3942,9 +4060,26 @@ def _submit_and_wait(
     )
     try:
         if recovery_managed:
+            private_options = {}
+            if h3_scene_rerun_admission is not None:
+                def lease_before_worker(candidate):
+                    with _pipeline_lock:
+                        _pipeline_child_jobs.setdefault(_dir_pid, set()).add(candidate["id"])
+                        repair_control = _pipeline_repairs.get(_dir_pid)
+                        if (_repair_operation_id and repair_control is not None
+                                and repair_control.get("operation_id") == _repair_operation_id
+                                and repair_control["cancel_event"].is_set()):
+                            request_cancel(candidate)
+                            return False
+                        candidate["_director_scene_repair_worker_active"] = True
+                        return True
+                private_options = {"h3_scene_rerun_admission": h3_scene_rerun_admission,
+                    "h3_scene_rerun_before_worker": lease_before_worker,
+                    "h3_scene_rerun_worker": _run_tracked_generation}
             attached = _recovery_submit_child(
                 job, pipeline_id or external_parent_id,
                 recovery_unit, recovery_attempt,
+                **private_options,
             )
             if not isinstance(attached, dict):
                 raise RuntimeError("Director child recovery registration failed")
@@ -3984,7 +4119,8 @@ def _submit_and_wait(
             _jobs[job_id] = job
             thread.start()
     except BaseException:
-        if _dir_pid:
+        if _dir_pid and not (h3_scene_rerun_admission is not None
+                and (_jobs.get(job_id) or {}).get("_director_scene_repair_worker_active") is True):
             with _pipeline_lock:
                 child_jobs = _pipeline_child_jobs.get(_dir_pid)
                 if child_jobs is not None:
@@ -4013,6 +4149,8 @@ def _submit_and_wait(
 
     def _release_managed_child() -> None:
         if not recovery_managed or not _dir_pid:
+            return
+        if h3_scene_rerun_admission is not None and job.get("_director_scene_repair_worker_active") is True:
             return
         with _pipeline_lock:
             child_jobs = _pipeline_child_jobs.get(_dir_pid)
@@ -4047,6 +4185,8 @@ def _submit_and_wait(
                 verified = _recovery_verify_child(j, out_dir)
                 if not isinstance(verified, dict):
                     _release_managed_child()
+                    if h3_scene_rerun_admission is not None:
+                        raise RuntimeError("Repaired scene completed without valid producer evidence; its attempt is retained.")
                     if recovery_attempt >= 2:
                         raise RuntimeError(
                             "Director child completed without valid recovery evidence"
@@ -4060,7 +4200,7 @@ def _submit_and_wait(
                         ),
                         "state": "invalid",
                     })
-                    if pipeline_id:
+                    if pipeline_id and not _detached_operation:
                         _checkpoint_child_entry(
                             pipeline_id, recovery_unit, retry_entry,
                             boundary=f"{recovery_unit['kind']}-retry",
@@ -4098,7 +4238,7 @@ def _submit_and_wait(
                     "evidence": verified,
                     "state": "completed",
                 })
-                if pipeline_id:
+                if pipeline_id and not _detached_operation:
                     _checkpoint_child_entry(
                         pipeline_id, recovery_unit, completed_entry,
                         boundary=f"{recovery_unit['kind']}-completed",

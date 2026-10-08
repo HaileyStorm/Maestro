@@ -169,6 +169,57 @@ def editor_retake_return_retained(job: Mapping[str, Any]) -> bool:
     return job.get("workspace") == origin["workspace"]
 
 
+def director_h3_source_job_ids(jobs: Mapping[str, Mapping[str, Any]]) -> frozenset[str]:
+    """Retain original H3 evidence and unadopted scene repairs for their parent.
+
+    Retention preserves evidence; it never grants generation or media reuse.
+    Removing the semantic parent releases this relationship automatically.
+    """
+    retained = set()
+    for parent_id, parent in jobs.items():
+        if not isinstance(parent, Mapping) or parent.get("kind") != "director_pipeline":
+            continue
+        cursor = parent.get("recovery_cursor")
+        if not isinstance(cursor, Mapping):
+            continue
+        pid, source_id = cursor.get("pipeline_id"), cursor.get("h3_original_video_job_id")
+        if (type(pid) is not str or not pid or parent_id != f"director-parent-{pid}"
+                or parent.get("id") != parent_id or type(source_id) is not str
+                or not source_id.startswith(f"director-{pid}-")):
+            continue
+        source = jobs.get(source_id)
+        if (not isinstance(source, Mapping) or source.get("id") != source_id
+                or source.get("kind") != "director_child"
+                or str(source.get("workspace") or "default") != str(parent.get("workspace") or "default")
+                or any(type(parent.get(key)) is not str or not parent[key]
+                       or parent[key] != source.get(key) for key in ("owner_principal", "project_instance"))):
+            continue
+        retained.add(source_id)
+        repairs = cursor.get("h3_pending_scene_repairs")
+        if not isinstance(repairs, list):
+            continue
+        for repair in repairs:
+            if (not isinstance(repair, Mapping) or type(repair.get("index")) is not int
+                    or repair["index"] < 0 or type(repair.get("revision")) is not int
+                    or repair["revision"] < 1 or type(repair.get("job_id")) is not str):
+                continue
+            repair_id = repair["job_id"]
+            # The latest recovery_unit becomes h3_segment/h3_scene at
+            # completion. Bind the immutable job id to the parent's intent.
+            unit = {"kind": "video_scene_rerun", "variant": repair["revision"], "index": repair["index"]}
+            identity = json.dumps({"parent": pid, "unit": unit, "attempt": 0},
+                                  sort_keys=True, separators=(",", ":"))
+            expected_id = f"director-{pid}-0-{hashlib.sha256(identity.encode('utf-8')).hexdigest()[:24]}"
+            child = jobs.get(repair_id)
+            if (repair_id != expected_id or not isinstance(child, Mapping)
+                    or child.get("id") != repair_id or child.get("kind") != "director_child"
+                    or str(child.get("workspace") or "default") != str(parent.get("workspace") or "default")
+                    or any(parent[key] != child.get(key) for key in ("owner_principal", "project_instance"))):
+                continue
+            retained.add(repair_id)
+    return frozenset(retained)
+
+
 _FORBIDDEN_KEY_PARTS = frozenset({
     "authorization", "capability", "cookie", "credential", "credentials",
     "password", "passphrase", "passwd", "secret", "secrets", "session",
@@ -2060,6 +2111,19 @@ class QueueRecoveryCoordinator:
                         != {key: value for key, value in current.items() if key != "h3_delivery_recovery_control"}):
                         raise QueueRecoveryAdapterError("H3 companion source metadata changed.")
                 accepted_manifests[job_id] = clean_manifest
+            # Queue dismissal may remove the visible child, but its original
+            # evidence remains needed by a repairable Director parent. Resolve
+            # retention after parent updates/deletions so explicit project
+            # deletion releases the relationship in the same transaction.
+            prospective_jobs = dict(self._snapshots)
+            prospective_jobs.update(serialized)
+            for job_id in tombstones:
+                if prospective_jobs.get(job_id, {}).get("kind") == "director_pipeline":
+                    prospective_jobs.pop(job_id, None)
+            retained_sources = director_h3_source_job_ids(prospective_jobs)
+            retained_tombstones = retained_sources.intersection(tombstones)
+            tombstones = tuple(job_id for job_id in tombstones
+                               if job_id not in retained_sources)
             admission_jobs = {r["job_id"] for r in self._global_state.get("studio_submissions", {}).get("records", {}).values()}
             clean_global = (
                 self._canonical_global_state(
@@ -2071,6 +2135,8 @@ class QueueRecoveryCoordinator:
             fence = getattr(proposal, "prompt_enhancement_gpu_fence", None)
             if fence is not None and fence() is not True:
                 raise PromptEnhancementGpuIntentConflict("GPU intent lifecycle predecessor changed before persistence")
+            if retained_tombstones and not changed_ids and clean_global is None:
+                return
             receipt = self.journal.commit_state(
                 jobs=serialized,
                 tombstones=tombstones,
@@ -2099,6 +2165,20 @@ class QueueRecoveryCoordinator:
         self._epoch = receipt.epoch
         self._job_revisions.update(receipt.job_revisions)
         self._global_revision = receipt.global_revision
+
+    def require_unregistered_job(self, job_id: str) -> None:
+        """Fence input creation against commits whose acknowledgement was lost.
+
+        Cached references cannot establish absence after an ambiguous append.
+        Read the journal without normalizing runtime state or repairing it.
+        Tombstoned identities also remain unavailable for reuse.
+        """
+        if not _valid_job_id(job_id):
+            raise QueueRecoveryAdapterError("Queue recovery job identity is invalid.")
+        with self._lock:
+            recovered = self.journal.recover()
+            if job_id in recovered.jobs or job_id in recovered.job_revisions:
+                raise QueueRecoveryAdapterError("Queue recovery job already has durable queue state.")
 
     def read_only_snapshot(self) -> tuple[dict[str, dict[str, Any]], frozenset[str]]:
         """Copy coordinator-owned references without journal repair or restore."""
@@ -2148,6 +2228,8 @@ class QueueRecoveryCoordinator:
                 raise QueueRecoveryAdapterError("Terminal publication or GPU cleanup is pending.")
             if editor_retake_return_retained(snapshot):
                 raise QueueRecoveryAdapterError("Editor Retake return is pending.")
+            if job_id in director_h3_source_job_ids(clean_jobs):
+                raise QueueRecoveryAdapterError("Director H3 evidence remains retained by its parent.")
             clean_global = self._canonical_global_state(
                 self._global_state, tombstones=(job_id,),
             )
@@ -2176,13 +2258,15 @@ class QueueRecoveryCoordinator:
                     clean_before_global["studio_submissions"], clean_before_jobs)
             # Supply sanitized state directly to the atomic replacement. This
             # works even when no append event/byte capacity remains.
+            director_sources = director_h3_source_job_ids(clean_before_jobs)
             compacted = self.journal.compact(
                 drop_terminal=True,
                 terminal_statuses=AUTOMATIC_RETIREMENT_STATUSES,
                 retain_job_ids=tuple(job_id for job_id, job in clean_before_jobs.items()
                                      if processed_tool_publication_pending(job) or prompt_enhancement_gpu_cleanup_pending(job)
                                      or composition_recovery_requests_retained(job)
-                                     or editor_retake_return_retained(job)),
+                                     or editor_retake_return_retained(job)
+                                     or job_id in director_sources),
                 replacement_jobs=clean_before_jobs,
                 replacement_global_state=(
                     clean_before_global if before.global_state is not None else None

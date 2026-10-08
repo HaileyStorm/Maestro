@@ -954,6 +954,57 @@ class QueueLaunchWiringTests(unittest.TestCase):
             self.assertFalse(observed["threads"])
             ns["_authorize_generation_media_inputs"].assert_not_called()
 
+    def test_director_private_admission_ack_loss_retains_fresh_input_and_manifest(self):
+        from services.director_h3_input_snapshot import snapshot_predecessor
+        from services.queue_recovery_adapter import QueueRecoveryAdapterError
+        with tempfile.TemporaryDirectory() as directory:
+            ns, _, coordinator, registry, observed, project = self._studio_submission_test_namespace(directory)
+            source = project / "predecessor.mp4"
+            source.write_bytes(b"original predecessor bytes")
+            packet = {"pipeline_id": "repair-parent", "scene_index": 1, "original_plan_sha256": "a" * 64}
+            def admit(job, operation, *, owner_digest, project_digest):
+                self.assertEqual(operation, packet)
+                self.assertFalse(registry)
+                self.assertFalse(coordinator.journal.recover().jobs)
+                descriptor = snapshot_predecessor(project, job_id=job["id"], source_path=str(source),
+                    source_artifact={"basename": source.name, "size": source.stat().st_size,
+                        "sha256": hashlib.sha256(source.read_bytes()).hexdigest()},
+                    owner_digest=owner_digest, project_digest=project_digest)
+                job["params"]["_h3_rerun_input"] = {"snapshot": descriptor}
+                job["params"]["_h3_rerun_predecessor_path"] = descriptor["path"]
+                observed["staging"].append(descriptor["path"])
+            ns["_director_recovery_admit_h3_rerun_input"] = admit
+            ns["_queue_recovery_input_descriptors"] = lambda job, _: [job["params"]["_h3_rerun_input"]["snapshot"]]
+            job = {"id": "director-repair-child", "workspace": "project-a", "session_id": "session-a",
+                "out_dir": str(project), "status": "queued", "params": {"_h3_longform": {"scene_rerun": {}}}}
+            commit = coordinator.journal.commit_state
+            def lost_ack(**kwargs):
+                commit(**kwargs)
+                raise OSError("injected Director ACK loss after fsync")
+            with mock.patch.object(coordinator.journal, "commit_state", side_effect=lost_ack):
+                with self.assertRaisesRegex(OSError, "Director ACK loss"):
+                    ns["_queue_recovery_register_and_publish"](job, recovery_kind="director_child",
+                        h3_scene_rerun_admission=packet)
+            record = coordinator.journal.recover().jobs[job["id"]]
+            manifest = load_request_manifest(project, record["request_manifest"], expected_job_id=job["id"])
+            self.assertEqual(manifest["inputs"][0]["path"], observed["staging"][0])
+            self.assertEqual(Path(observed["staging"][0]).read_bytes(), source.read_bytes())
+            self.assertEqual(len(coordinator.journal.recover().jobs), 1)
+            self.assertFalse(registry)
+            self.assertFalse(observed["threads"])
+            self.assertFalse(observed["release"])
+            manifest_path = project / record["request_manifest"]["path"]
+            frozen_manifest = manifest_path.read_bytes()
+            source.write_bytes(b"changed source before repeated submission")
+            with self.assertRaisesRegex(QueueRecoveryAdapterError, "durable queue state"):
+                ns["_queue_recovery_register_and_publish"](job, recovery_kind="director_child",
+                    h3_scene_rerun_admission=packet)
+            self.assertEqual(manifest_path.read_bytes(), frozen_manifest)
+            self.assertEqual(len(observed["staging"]), 1)
+            self.assertEqual(Path(observed["staging"][0]).read_bytes(), b"original predecessor bytes")
+            self.assertEqual(len(observed["credit"]), 1)
+            self.assertFalse(observed["threads"])
+
     def test_studio_legacy_caller_and_legacy_session_scope_remain_supported(self):
         from fastapi.responses import Response
         with tempfile.TemporaryDirectory() as directory:
@@ -6120,7 +6171,7 @@ class QueueLaunchWiringTests(unittest.TestCase):
                 "cleanup_orphan_request_manifests": lambda *_args: 0,
                 "cleanup_orphan_staged_outputs": lambda *_args: 0,
                 "_queue_recovery_coordinator": types.SimpleNamespace(
-                    compact=lambda: None,
+                    compact=lambda: None, read_only_snapshot=lambda: ({}, frozenset()),
                 ),
                 "_queue_recovery_worker": (
                     lambda _job: worker_calls.append(True)
@@ -9715,7 +9766,7 @@ class QueueLaunchWiringTests(unittest.TestCase):
                 "cleanup_orphan_request_manifests": lambda *_args: 0,
                 "cleanup_orphan_staged_outputs": lambda *_args: 0,
                 "_queue_recovery_coordinator": types.SimpleNamespace(
-                    compact=lambda: None,
+                    compact=lambda: None, read_only_snapshot=lambda: ({}, frozenset()),
                 ),
                 "threading": types.SimpleNamespace(Thread=FakeThread),
                 "_queue_recovery_worker": lambda _job: (
@@ -11939,19 +11990,29 @@ class QueueLaunchWiringTests(unittest.TestCase):
             root = Path(directory)
             failed_id = "a" * 32
             completed_id = "b" * 32
+            source_id = "director-pipeline-original"
             pointers = {
                 job_id: write_sealed_request_manifest(
                     root, job_id=job_id, params={"prompt": "synthetic"}, inputs=[],
-                ) for job_id in (failed_id, completed_id)
+                ) for job_id in (failed_id, completed_id, source_id)
             }
             staging = Path(ensure_recovery_staging_directory(root))
             partial = staging / f"unit-{failed_id}-t0-r0-w1.mp4"
             partial.write_bytes(b"synthetic partial media")
+            source_partial = staging / f"unit-{source_id}-t0-r0-w1.mp4"
+            source_partial.write_bytes(b"obsolete conditioning")
             snapshots = {
                 job_id: {
                     "id": job_id, "workspace": "synthetic-project", "status": status,
                     "request_manifest": pointers[job_id],
-                } for job_id, status in ((failed_id, "failed"), (completed_id, "completed"))
+                } for job_id, status in ((failed_id, "failed"), (completed_id, "completed"), (source_id, "completed"))
+            }
+            snapshots[source_id].update(kind="director_child", owner_principal="owner", project_instance="project")
+            canonical = dict(snapshots)
+            canonical["director-parent-pipeline"] = {
+                "id": "director-parent-pipeline", "kind": "director_pipeline", "workspace": "synthetic-project",
+                "owner_principal": "owner", "project_instance": "project",
+                "recovery_cursor": {"pipeline_id": "pipeline", "h3_original_video_job_id": source_id},
             }
             registry = Registry()
             namespace = _isolated_functions(
@@ -11967,7 +12028,8 @@ class QueueLaunchWiringTests(unittest.TestCase):
                     ),
                     "_jobs": registry,
                     "restore_scheduler_state": lambda *_args: None,
-                    "_queue_recovery_coordinator": types.SimpleNamespace(compact=lambda: None),
+                    "_queue_recovery_coordinator": types.SimpleNamespace(compact=lambda: None,
+                        read_only_snapshot=lambda: (canonical, frozenset())),
                     "cleanup_orphan_request_manifests": cleanup_orphan_request_manifests,
                     "cleanup_orphan_staged_outputs": cleanup_orphan_staged_outputs,
                 },
@@ -11976,6 +12038,8 @@ class QueueLaunchWiringTests(unittest.TestCase):
             self.assertTrue((root / pointers[failed_id]["path"]).is_file())
             self.assertTrue(partial.is_file())
             self.assertFalse((root / pointers[completed_id]["path"]).exists())
+            self.assertTrue((root / pointers[source_id]["path"]).is_file())
+            self.assertFalse(source_partial.exists())
             self.assertEqual(registry[failed_id]["status"], "failed")
 
     def test_completed_h3_graph_settlement_checkpoints_before_publication(self):
@@ -12006,7 +12070,7 @@ class QueueLaunchWiringTests(unittest.TestCase):
                 "_queue_recovery_materialize_job": lambda *_a: (completed, False),
                 "_queue_recovery_checkpoint": checkpoint,
                 "_jobs": registry, "restore_scheduler_state": lambda *_a: None,
-                "_queue_recovery_coordinator": types.SimpleNamespace(compact=lambda: None),
+                "_queue_recovery_coordinator": types.SimpleNamespace(compact=lambda: None, read_only_snapshot=lambda: ({}, frozenset())),
                 "cleanup_orphan_request_manifests": lambda *_a: None,
                 "cleanup_orphan_staged_outputs": lambda *_a: None,
             })
@@ -12103,7 +12167,7 @@ class QueueLaunchWiringTests(unittest.TestCase):
                         "cleanup_orphan_request_manifests": lambda *_args: 0,
                         "cleanup_orphan_staged_outputs": lambda *_args: 0,
                         "_queue_recovery_coordinator": types.SimpleNamespace(
-                            compact=lambda: None,
+                            compact=lambda: None, read_only_snapshot=lambda: ({}, frozenset()),
                         ),
                     },
                 )
@@ -12294,7 +12358,7 @@ class QueueLaunchWiringTests(unittest.TestCase):
                         "cleanup_orphan_request_manifests": lambda *_args: 0,
                         "cleanup_orphan_staged_outputs": lambda *_args: 0,
                         "_queue_recovery_coordinator": types.SimpleNamespace(
-                            compact=lambda: None,
+                            compact=lambda: None, read_only_snapshot=lambda: ({}, frozenset()),
                         ),
                     },
                 )

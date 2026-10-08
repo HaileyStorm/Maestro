@@ -48,6 +48,116 @@ def _serialize(job):
 
 
 class LogicalReferenceRecoveryTests(unittest.TestCase):
+    def test_fresh_identity_fence_reads_committed_and_tombstoned_journal_without_cache(self):
+        with tempfile.TemporaryDirectory() as directory:
+            journal = QueueRecoveryJournal(Path(directory) / "queue.jsonl")
+            coordinator = QueueRecoveryCoordinator(journal)
+            coordinator.require_unregistered_job("fresh-child")
+            frozen = _serialize({"id": "accepted-child", "kind": "director_child", "status": "queued"})
+            journal.commit_state(jobs={"accepted-child": frozen}, expected_epoch=journal.recover().epoch,
+                expected_job_revisions={"accepted-child": 0})
+            self.assertFalse(coordinator.read_only_snapshot()[0])
+            before = journal.path.read_bytes()
+            with self.assertRaises(QueueRecoveryAdapterError): coordinator.require_unregistered_job("accepted-child")
+            self.assertEqual(journal.path.read_bytes(), before)
+            self.assertFalse(coordinator.read_only_snapshot()[0])
+            recovered = journal.recover()
+            journal.commit_state(tombstones=("accepted-child",), expected_epoch=recovered.epoch,
+                expected_job_revisions={"accepted-child": recovered.job_revisions["accepted-child"]})
+            self.assertNotIn("accepted-child", journal.recover().jobs)
+            with self.assertRaises(QueueRecoveryAdapterError): coordinator.require_unregistered_job("accepted-child")
+            coordinator.require_unregistered_job("another-child")
+
+    def test_original_h3_source_survives_compaction_dismissal_and_restart_until_parent_delete(self):
+        for atomic_delete in (False, True):
+            with self.subTest(atomic_delete=atomic_delete), tempfile.TemporaryDirectory() as directory:
+                journal = QueueRecoveryJournal(Path(directory) / "queue.jsonl")
+                coordinator = QueueRecoveryCoordinator(journal)
+                source_id = "director-pipeline-original"
+                parent_id = "director-parent-pipeline"
+                parent = {"id": parent_id, "kind": "director_pipeline", "workspace": "project-a",
+                          "status": "queued", "recovery_state": "terminal", "queue_held": True,
+                          "recovery_cursor": {"pipeline_id": "pipeline", "h3_original_video_job_id": source_id}}
+                source = {"id": source_id, "kind": "director_child", "workspace": "project-a", "status": "completed"}
+                # Parent intent precedes registration of the original child.
+                for job in (parent, source, dict(source, id="director-pipeline-repair")):
+                    coordinator.register_job(job, owner_digest=OWNER, project_digest=PROJECT,
+                                             request_manifest={"kind": "test"})
+                self.assertEqual(set(coordinator.compact().jobs), {parent_id, source_id})
+                fresh = QueueRecoveryCoordinator(journal)
+                fresh.restore()
+                with self.assertRaises(QueueRecoveryAdapterError):
+                    fresh.tombstone_terminal(source_id)
+                fresh.prospective_transition(types.SimpleNamespace(jobs=(), tombstones=(source_id,), global_state=None))
+                self.assertIn(source_id, QueueRecoveryCoordinator(journal).restore().jobs)
+                tombstones = (parent_id, source_id) if atomic_delete else (parent_id,)
+                fresh.prospective_transition(types.SimpleNamespace(jobs=(), tombstones=tombstones, global_state=None))
+                self.assertEqual(fresh.compact().jobs, {})
+                self.assertEqual(QueueRecoveryCoordinator(journal).restore().jobs, {})
+
+    def test_unadopted_scene_repair_survives_compaction_until_replacement_is_saved(self):
+        with tempfile.TemporaryDirectory() as directory:
+            journal = QueueRecoveryJournal(Path(directory) / "queue.jsonl")
+            coordinator = QueueRecoveryCoordinator(journal)
+            from services.director_pipeline import _director_child_job_id
+            original_id, parent_id = "director-p-original", "director-parent-p"
+            repair_id = _director_child_job_id("p", {"kind": "video_scene_rerun", "index": 1, "variant": 2}, 0)
+            parent = {"id": parent_id, "kind": "director_pipeline", "status": "queued",
+                "workspace": "project-a", "recovery_cursor": {"pipeline_id": "p",
+                "h3_original_video_job_id": original_id,
+                "h3_pending_scene_repairs": [{"job_id": repair_id, "index": 1, "revision": 2}]}}
+            source = {"id": original_id, "kind": "director_child", "workspace": "project-a", "status": "completed"}
+            # Production replaces the submission intent with the latest
+            # completed producer before Director adopts the replacement.
+            repair = dict(source, id=repair_id, recovery_unit={"kind": "h3_scene",
+                "state": "completed", "index": 1, "variant": 0},
+                recovery_cursor={"completed_units": [{"kind": "h3_scene", "index": 1, "variant": 0}]})
+            for job in (parent, source, repair):
+                coordinator.register_job(job, owner_digest=OWNER, project_digest=PROJECT, request_manifest={"kind": "test"})
+            self.assertEqual(set(coordinator.compact().jobs), {parent_id, original_id, repair_id})
+            from copy import deepcopy
+            snapshots, _ = coordinator.read_only_snapshot()
+            for mutation in ("revision", "index", "id", "owner", "project", "workspace"):
+                changed = deepcopy(snapshots)
+                intent = changed[parent_id]["recovery_cursor"]["h3_pending_scene_repairs"][0]
+                if mutation == "revision": intent["revision"] += 1
+                elif mutation == "index": intent["index"] += 1
+                elif mutation == "id": intent["job_id"] = "director-p-0-guessed"
+                elif mutation == "owner": changed[repair_id]["owner_principal"] = "other-owner"
+                elif mutation == "project": changed[repair_id]["project_instance"] = "other-project"
+                else: changed[repair_id]["workspace"] = "other-workspace"
+                with self.subTest(mutation=mutation):
+                    self.assertEqual(recovery_adapter.director_h3_source_job_ids(changed), {original_id})
+            with self.assertRaises(QueueRecoveryAdapterError): coordinator.tombstone_terminal(repair_id)
+            parent["recovery_cursor"] = {"pipeline_id": "p", "h3_original_video_job_id": original_id}
+            coordinator.prospective_transition(types.SimpleNamespace(jobs=(parent,), tombstones=(), global_state=None))
+            self.assertEqual(set(coordinator.compact().jobs), {parent_id, original_id})
+
+    def test_original_h3_retention_requires_exact_parent_and_child_scope(self):
+        from copy import deepcopy
+        source_id, parent_id = "director-p-original", "director-parent-p"
+        parent = {"id": parent_id, "kind": "director_pipeline", "workspace": "project-a",
+                  "owner_principal": OWNER, "project_instance": PROJECT,
+                  "recovery_cursor": {"pipeline_id": "p", "h3_original_video_job_id": source_id}}
+        child = {"id": source_id, "kind": "director_child", "workspace": "project-a",
+                 "owner_principal": OWNER, "project_instance": PROJECT}
+        jobs = {parent_id: parent, source_id: child}
+        self.assertEqual(recovery_adapter.director_h3_source_job_ids(jobs), {source_id})
+        for target, key, value in ((parent_id, "id", "wrong"), (parent_id, "kind", "generation"),
+                (source_id, "id", "wrong"), (source_id, "kind", "generation"),
+                (source_id, "workspace", "other"), (source_id, "owner_principal", "other"),
+                (source_id, "project_instance", "other"), (parent_id, "owner_principal", "")):
+            with self.subTest(target=target, key=key):
+                changed = deepcopy(jobs)
+                changed[target][key] = value
+                self.assertEqual(recovery_adapter.director_h3_source_job_ids(changed), set())
+        for cursor in ({"pipeline_id": "other", "h3_original_video_job_id": source_id},
+                       {"pipeline_id": "p", "h3_original_video_job_id": [source_id]},
+                       {"pipeline_id": "p", "h3_original_video_job_id": "foreign-original"}):
+            changed = deepcopy(jobs)
+            changed[parent_id]["recovery_cursor"] = cursor
+            self.assertEqual(recovery_adapter.director_h3_source_job_ids(changed), set())
+
     def test_scene_map_round_trips_with_queue_checkpoint(self):
         with tempfile.TemporaryDirectory() as directory:
             journal = QueueRecoveryJournal(Path(directory) / "queue.jsonl")

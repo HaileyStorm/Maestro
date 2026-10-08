@@ -717,7 +717,11 @@ def validate_manifest_inputs(
     if not isinstance(inputs, list):
         raise QueueRecoveryRuntimeError("Recovery input manifest is invalid.")
     for descriptor in inputs:
-        if not isinstance(descriptor, Mapping) or not validator(descriptor):
+        if (not isinstance(descriptor, Mapping)
+                or (descriptor.get("scope") == "director_h3_predecessor"
+                    and (not manifest.get("job_id")
+                         or descriptor.get("recovery_job_id") != manifest["job_id"]))
+                or not validator(descriptor)):
             raise QueueRecoveryRuntimeError("A recovery input is missing or no longer authorized.")
 
 

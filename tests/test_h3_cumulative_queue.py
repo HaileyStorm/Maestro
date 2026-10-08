@@ -480,6 +480,7 @@ class H3CumulativeQueueTests(unittest.TestCase):
             namespace.update(
                 _h3_cumulative_dispatch=active,
                 _h3_control_dispatch=None,
+                _h3_face_refine_dispatch=None,
                 video_length=56,
                 current_video_length=56,
                 model_def=definition,

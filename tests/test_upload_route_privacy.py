@@ -1137,6 +1137,34 @@ class OrdinaryUploadDeletionTests(unittest.TestCase):
         self.assertEqual(caught.exception.detail, "This upload is still in use")
         self.assertTrue(self.media.exists())
 
+    def test_retained_original_h3_request_keeps_input_until_parent_delete(self):
+        from services.queue_recovery_runtime import atomic_write_request_manifest, cleanup_orphan_request_manifests
+        from services.queue_recovery_adapter import owner_principal_digest, project_instance_digest
+        source_id, parent_id = "director-p-original", "director-parent-p"
+        pointer = self.manifest(source_id)
+        parent_pointer = atomic_write_request_manifest(self.project, job_id=parent_id, params={}, inputs=[])
+        parent = {"id": parent_id, "kind": "director_pipeline", "workspace": "default",
+                  "status": "queued", "queue_held": True, "recovery_state": "terminal",
+                  "recovery_cursor": {"pipeline_id": "p", "h3_original_video_job_id": source_id}}
+        child = {"id": source_id, "kind": "director_child", "workspace": "default", "status": "completed"}
+        for job, manifest in ((parent, parent_pointer), (child, pointer)):
+            self.coordinator.register_job(job, owner_digest=owner_principal_digest(b"retention-secret", self.owner),
+                                          project_digest=project_instance_digest(b"retention-secret", "b" * 32),
+                                          request_manifest=manifest)
+        self.coordinator.restore()
+        with self.assertRaises(_HTTPException) as caught:
+            self.delete()
+        self.assertEqual(caught.exception.detail, "This upload is still in use")
+        self.assertTrue(self.media.exists())
+        self.coordinator.prospective_transition(types.SimpleNamespace(jobs=(), tombstones=(parent_id,), global_state=None))
+        self.assertFalse(self.ns["_upload_retained_input"](str(self.media)))
+        self.coordinator.compact()
+        # Compaction intentionally drops old revision fences. Normal startup
+        # cleanup retires the now-unreferenced private manifests; until then
+        # orphan manifests conservatively preserve uploads.
+        cleanup_orphan_request_manifests(self.project, [])
+        self.assertEqual(self.delete(), {"deleted": "song.wav"})
+
     def test_second_staging_failure_restores_media_and_sidecar(self):
         original = os.replace
         calls = []

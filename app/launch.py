@@ -4873,6 +4873,7 @@ _RECOVERABLE_INPUT_KEYS = frozenset({
     "hflip_source_path", "editor_source_path", "editor_audio_path", "editor_image_path", "browser_copy_source_path",
     "_tool_input_paths",
     "_h3_bridge_clip_a", "_h3_bridge_clip_b",
+    "_h3_rerun_predecessor_path",
 })
 
 
@@ -5113,6 +5114,18 @@ def _queue_recovery_input_descriptors(job: dict, owner_digest: str) -> list[dict
     job_id = str(job.get("id") or "")
     descriptors = []
     for field, path in _queue_recovery_file_values(params):
+        if field.startswith("_h3_rerun_predecessor_path:"):
+            from services.director_h3_input_snapshot import INPUT_FIELD, validate_predecessor_snapshot
+            admission = params.get("_h3_rerun_input")
+            descriptor = admission.get("snapshot") if isinstance(admission, dict) else None
+            if (job.get("kind") != "director_child" or field != INPUT_FIELD
+                    or not isinstance(descriptor, dict) or descriptor.get("path") != path
+                    or not validate_predecessor_snapshot(descriptor, project_directory=out_dir,
+                        job_id=job_id, owner_digest=owner_digest,
+                        project_digest=_queue_recovery_existing_project_identity(out_dir))):
+                raise QueueRecoveryRuntimeError("Director predecessor input identity changed.")
+            descriptors.append(copy.deepcopy(descriptor))
+            continue
         if field.startswith("hflip_source_path:") and job.get("kind") != "tool_hflip":
             raise QueueRecoveryRuntimeError("Unexpected transform input in this job.")
         if field.startswith(("editor_source_path:", "editor_audio_path:", "editor_image_path:")) and job.get("kind") != "tool_editor_export":
@@ -5228,6 +5241,12 @@ def _queue_recovery_manifest_validator(
         if size != descriptor.get("size") or digest != descriptor.get("sha256"):
             return False
         scope = descriptor.get("scope")
+        if scope == "director_h3_predecessor":
+            from services.director_h3_input_snapshot import validate_predecessor_snapshot
+            return validate_predecessor_snapshot(descriptor,
+                project_directory=project_dir, job_id=descriptor.get("recovery_job_id"),
+                owner_digest=owner_digest,
+                project_digest=_queue_recovery_existing_project_identity(project_dir))
         if scope in {"upload", "upload_audio"}:
             root = os.path.realpath(
                 os.path.join(_app_dir, "uploads", "audio")
@@ -5329,6 +5348,8 @@ def _queue_recovery_register_and_publish(
     recovery_kind: str = "studio_generation",
     thread_name: str | None = None,
     defer_worker: bool = False,
+    h3_scene_rerun_admission: dict | None = None,
+    before_worker=None,
 ) -> threading.Thread | None:
     """Durably register one Studio job before publication or thread start."""
     # Internal/direct callers share this pre-publication gate with HTTP
@@ -5368,6 +5389,17 @@ def _queue_recovery_register_and_publish(
         # project-relative pointer, schema, size, and SHA-256.
         request_manifest = None
         try:
+            params = prepared.get("params") or {}
+            plan = params.get("_h3_longform")
+            scene_rerun = plan.get("scene_rerun") if isinstance(plan, dict) else None
+            if h3_scene_rerun_admission is not None or scene_rerun is not None:
+                # An append may have committed before its ACK or live
+                # publication. Use the journal, not cached references, before
+                # creating any new input or replacing the frozen manifest.
+                _queue_recovery_coordinator.require_unregistered_job(job_id)
+                _director_recovery_admit_h3_rerun_input(prepared,
+                    h3_scene_rerun_admission, owner_digest=owner_digest,
+                    project_digest=project_digest)
             context = prepared.get("_studio_submission_context")
             if context is not None:
                 if (context.get("owner_digest") != owner_digest or context.get("project_digest") != project_digest
@@ -5423,6 +5455,11 @@ def _queue_recovery_register_and_publish(
             prepared["_recovery_manifest_pointer"] = dict(request_manifest)
             _jobs.publish_prepared(job_id, prepared)
         except Exception:
+            if h3_scene_rerun_admission is not None and request_manifest is not None:
+                # A Director append or publication acknowledgement may be
+                # ambiguous. Preserve the exact manifest and input snapshot;
+                # startup reconciles the deterministic child without resend.
+                raise
             context = prepared.get("_studio_submission_context")
             if context is not None:
                 # A durable append may have succeeded even if its ACK/cache or
@@ -5466,8 +5503,12 @@ def _queue_recovery_register_and_publish(
         name=thread_name or f"studio-generation-{job_id}",
     )
     try:
+        if before_worker is not None and before_worker(prepared) is False:
+            return None
         thread.start()
     except Exception as error:
+        if before_worker is not None:
+            prepared["_director_scene_repair_worker_active"] = False
         credit_release = globals().get("_credit_release_accounting")
         if callable(credit_release):
             credit_release(prepared, persist_baseline=True)
@@ -6281,6 +6322,46 @@ def _director_recovery_checkpoint_parent(
         "pause_reason": str(state.get("pause_reason") or ""),
     })
     cursor.pop("pending_state", None)
+    cursor.pop("h3_pending_scene_repairs", None)
+    params = state.get("_params_snapshot")
+    committed = params.get("_h3_longform") if isinstance(params, dict) else None
+    if isinstance(committed, dict):
+        from services.director_pipeline import (
+            _rehydrate_director_h3_longform, _child_unit_token, _director_child_job_id,
+        )
+        restored = {}
+        if _rehydrate_director_h3_longform(restored, committed,
+                h3_style_workflow=committed.get("h3_style_workflow")):
+            unit = {"kind": "video_generation", "variant": 0, "index": 0}
+            recovery = state.get("recovery")
+            children = recovery.get("children") if isinstance(recovery, dict) else None
+            entry = children.get(_child_unit_token(unit)) if isinstance(children, dict) else None
+            if (isinstance(entry, dict) and entry.get("unit") == unit
+                    and entry.get("state") in {"submitted", "completed", "failed"}
+                    and type(entry.get("attempt")) is int and entry["attempt"] >= 0
+                    and entry.get("job_id") == _director_child_job_id(pid, unit, entry["attempt"])):
+                # This intent is committed before child registration. A later
+                # compaction cannot drop a just-completed original before the
+                # parent records its verified outputs.
+                cursor["h3_original_video_job_id"] = entry["job_id"]
+            repairs = recovery.get("scene_repairs") if isinstance(recovery, dict) else None
+            retained_repairs = []
+            if isinstance(repairs, dict):
+                for scene, repair in repairs.items():
+                    if not isinstance(repair, dict) or repair.get("state") != "submitted":
+                        continue
+                    unit = repair.get("unit")
+                    if (not isinstance(unit, dict) or unit.get("kind") != "video_scene_rerun"
+                            or type(unit.get("index")) is not int or str(unit["index"]) != scene
+                            or not 0 <= unit["index"] < len(state.get("clips") or [])
+                            or type(repair.get("revision")) is not int or repair["revision"] < 1
+                            or unit.get("variant") != repair["revision"] or repair.get("attempt") != 0
+                            or repair.get("job_id") != _director_child_job_id(pid, unit, 0)):
+                        continue
+                    retained_repairs.append({"job_id": repair["job_id"], "index": unit["index"],
+                                             "revision": repair["revision"]})
+            if retained_repairs:
+                cursor["h3_pending_scene_repairs"] = retained_repairs
     _queue_recovery_checkpoint(
         parent,
         # The generic journal drops terminal statuses during compaction.
@@ -6380,6 +6461,10 @@ def _director_recovery_submit_child(
     pid: str,
     unit: dict,
     attempt: int,
+    *,
+    h3_scene_rerun_admission: dict | None = None,
+    h3_scene_rerun_before_worker=None,
+    h3_scene_rerun_worker=None,
 ) -> dict:
     """Attach to one deterministic child, or durably register it once."""
     try:
@@ -6420,6 +6505,26 @@ def _director_recovery_submit_child(
             raise QueueRecoveryRuntimeError(
                 "Director child identity conflicts with recovered queue state."
             )
+        incoming_plan = (job.get("params") or {}).get("_h3_longform")
+        existing_plan = (existing.get("params") or {}).get("_h3_longform")
+        if (h3_scene_rerun_admission is not None
+                or isinstance(incoming_plan, dict) and "scene_rerun" in incoming_plan
+                or isinstance(existing_plan, dict) and "scene_rerun" in existing_plan):
+            plan = _director_recovery_h3_rerun_plan(existing, h3_scene_rerun_admission)
+            session_id = str(job.get("session_id") or "")
+            admission = (existing.get("params") or {}).get("_h3_rerun_input")
+            source = admission.get("source") if isinstance(admission, dict) else None
+            if (not session_id or incoming_plan != plan
+                    or not isinstance(source, dict)
+                    or source.get("pipeline_id") != pid
+                    or source.get("scene_index") != h3_scene_rerun_admission["scene_index"]
+                    or source.get("original_plan_sha256") != h3_scene_rerun_admission["original_plan_sha256"]
+                    or not hmac.compare_digest(owner_principal_digest(_session_secret(), session_id),
+                        str(existing.get("_recovery_owner_digest") or ""))
+                    or not hmac.compare_digest(_queue_recovery_existing_project_identity(existing["out_dir"]),
+                        str(existing.get("_recovery_project_digest") or ""))
+                    or not _director_recovery_validate_h3_repair_attach(existing)):
+                raise QueueRecoveryRuntimeError("Director scene repair recovery identity changed.")
         if str(existing.get("recovery_state") or "") in {
             "blocked", "blocked_remote_reauth",
         }:
@@ -6456,14 +6561,18 @@ def _director_recovery_submit_child(
                 raise QueueRecoveryRuntimeError(
                     "Director child recovery could not be queued."
                 )
+            if h3_scene_rerun_before_worker is not None and h3_scene_rerun_before_worker(existing) is False:
+                return existing
             try:
                 threading.Thread(
-                    target=_run_generation,
+                    target=h3_scene_rerun_worker or _run_generation,
                     args=(job_id,),
                     daemon=False,
                     name=f"director-child-recovery-{job_id}",
                 ).start()
             except Exception as error:
+                if h3_scene_rerun_before_worker is not None:
+                    existing.pop("_director_scene_repair_worker_active", None)
                 _queue_recovery_checkpoint(
                     existing,
                     queue_held=True,
@@ -6487,6 +6596,9 @@ def _director_recovery_submit_child(
         job,
         recovery_kind="director_child",
         thread_name=f"director-child-{job_id}",
+        h3_scene_rerun_admission=h3_scene_rerun_admission,
+        before_worker=h3_scene_rerun_before_worker,
+        worker=h3_scene_rerun_worker,
     )
     return _jobs[job_id]
 
@@ -6647,6 +6759,18 @@ def _director_recovery_verified_child(job: dict, project_dir: str) -> dict | Non
     """Return only terminal outputs backed by completed queue safe units."""
     if str(job.get("status") or "") != "completed":
         return None
+    private_plan = (job.get("params") or {}).get("_h3_longform")
+    repair_selection = None
+    repair_graph = None
+    if isinstance(private_plan, dict) and private_plan.get("scene_rerun") is not None:
+        try:
+            repair_selection = _director_h3_scene_repair_selection(job)
+        except (QueueRecoveryRuntimeError, KeyError, TypeError, ValueError):
+            return None
+        repair_graph = _queue_recovery_completed_h3_graph(job, project_dir)
+        if (repair_graph is None or job.get("join_output_file")
+                or set(job.get("clip_output_files") or {}) != {str(index) for index in repair_selection["physical_indices"]}):
+            return None
     clip_outputs = {}
     for index, filename in dict(job.get("clip_output_files") or {}).items():
         try:
@@ -6942,6 +7066,306 @@ def _director_recovery_h3_rerun_source(
             "predecessor_path": os.path.join(existing, descriptor["basename"]) if descriptor else None,
             "boundary": copy.deepcopy(original["clip_boundaries"][selection["physical_indices"][0] - 1])
                         if predecessor else None}
+
+
+def _director_recovery_h3_rerun_plan(job: dict, packet: dict | None) -> dict:
+    """Bind a private server operation to its sealed repair selection."""
+    params = job.get("params")
+    plan = params.get("_h3_longform") if isinstance(params, dict) else None
+    selected = plan.get("scene_rerun") if isinstance(plan, dict) else None
+    if (job.get("kind") != "director_child" or not isinstance(packet, dict)
+            or set(packet) != {"pipeline_id", "scene_index", "original_plan_sha256"}
+            or type(packet.get("pipeline_id")) is not str or not packet["pipeline_id"]
+            or type(packet.get("scene_index")) is not int or packet["scene_index"] < 0
+            or type(packet.get("original_plan_sha256")) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", packet["original_plan_sha256"]) is None
+            or not isinstance(selected, dict)
+            or selected.get("scene_index") != packet["scene_index"]
+            or selected.get("original_plan_sha256") != packet["original_plan_sha256"]
+            or params.get("_director_pipeline_id") != packet["pipeline_id"]):
+        raise QueueRecoveryRuntimeError("Director scene repair admission is invalid.")
+    return plan
+
+
+def _director_recovery_prepare_h3_scene_rerun(state: dict, plan: dict, project_dir: str, *, pending=None) -> dict:
+    """Recover exact original controls, or attach a previously admitted attempt."""
+    from services.director_pipeline import _director_h3_rerun_source_identity
+    identity = _director_h3_rerun_source_identity(state, plan)
+    workspace = str(state.get("workspace") or "default")
+    session_id = str((state.get("_params_snapshot") or {}).get("_maestro_session_id") or "")
+    if not session_id:
+        raise QueueRecoveryRuntimeError("Director scene repair requires its saved owner scope.")
+    owner = owner_principal_digest(_session_secret(), session_id)
+    project = _queue_recovery_existing_project_identity(project_dir)
+    if isinstance(pending, dict):
+        existing = _jobs.get(pending.get("job_id"))
+        if isinstance(existing, dict):
+            if (existing.get("_recovery_owner_digest") != owner
+                    or existing.get("_recovery_project_digest") != project
+                    or str(existing.get("workspace") or "default") != workspace):
+                raise QueueRecoveryRuntimeError("Director repair attempt scope changed.")
+            manifest = load_request_manifest(project_dir, existing.get("_recovery_manifest_pointer") or {},
+                expected_job_id=existing["id"])
+            params = manifest["params"]
+            if params.get("_h3_longform") != plan or params.get("_director_pipeline_id") != identity["pipeline_id"]:
+                raise QueueRecoveryRuntimeError("Director repair attempt request changed.")
+            if existing.get("status") == "completed":
+                if _queue_recovery_completed_h3_graph(existing, project_dir) is None:
+                    raise QueueRecoveryRuntimeError("Completed scene repair evidence changed.")
+            else:
+                validate_manifest_inputs(manifest, lambda item: _queue_recovery_manifest_validator(
+                    dict(item), owner_digest=owner, workspace=workspace, project_dir=project_dir))
+            return copy.deepcopy(params)
+    source = _director_recovery_h3_rerun_source(state, plan, session_id=session_id, project_dir=project_dir)
+    manifest = load_request_manifest(project_dir, source["original_manifest"], expected_job_id=source["original_job_id"])
+    return copy.deepcopy(manifest["params"])
+
+
+def _director_recovery_validate_h3_repair_attach(job: dict) -> bool:
+    if job.get("status") != "completed":
+        return _queue_recovery_revalidate_job(job)
+    project_dir = str(job.get("out_dir") or "")
+    try:
+        manifest = load_request_manifest(project_dir, job.get("_recovery_manifest_pointer") or {}, expected_job_id=job["id"])
+        if manifest["params"] != job.get("params") or _queue_recovery_completed_h3_graph(job, project_dir) is None:
+            return False
+        # Completion never grants another dispatch. Missing consumed inputs
+        # are dispensable; bytes still present must retain their admitted hash.
+        for item in manifest["inputs"]:
+            if os.path.lexists(str(item.get("path") or "")) and not _queue_recovery_manifest_validator(
+                    dict(item), owner_digest=job["_recovery_owner_digest"],
+                    workspace=str(job.get("workspace") or "default"), project_dir=project_dir):
+                return False
+        return True
+    except (OSError, KeyError, TypeError, ValueError, QueueRecoveryRuntimeError):
+        return False
+
+
+def _director_recovery_admit_h3_rerun_input(
+    job: dict, packet: dict | None, *, owner_digest: str, project_digest: str,
+) -> None:
+    """Reverify original authority and author one fresh private manifest input.
+
+    The keyword packet comes from the server's repair operation, never params
+    or HTTP. Registration's workspace/upload guard owns this whole boundary.
+    """
+    from services import director_pipeline as director
+    from services.director_h3_input_snapshot import snapshot_predecessor
+    plan = _director_recovery_h3_rerun_plan(job, packet)
+    params = job["params"]
+    project_dir = str(job.get("out_dir") or "")
+    state = director.load_pipeline_state(project_dir, packet["pipeline_id"])
+    source = _director_recovery_h3_rerun_source(state, plan,
+        session_id=str(job.get("session_id") or ""), project_dir=project_dir)
+    if (source["owner_digest"] != owner_digest or source["project_digest"] != project_digest
+            or source["workspace"] != str(job.get("workspace") or "default")
+            or source["scene_index"] != packet["scene_index"]
+            or source["original_plan_sha256"] != packet["original_plan_sha256"]):
+        raise QueueRecoveryRuntimeError("Director scene repair scope changed.")
+    snapshot = None
+    if source["predecessor_index"] is not None:
+        snapshot = snapshot_predecessor(project_dir, job_id=str(job.get("id") or ""),
+            source_path=source["predecessor_path"], source_artifact=source["predecessor_artifact"],
+            owner_digest=owner_digest, project_digest=project_digest)
+    # Copying never freezes parent authority. Re-read state and producers before
+    # the request manifest can be persisted or the new child published.
+    current = director.load_pipeline_state(project_dir, packet["pipeline_id"])
+    refreshed = _director_recovery_h3_rerun_source(current, plan,
+        session_id=str(job.get("session_id") or ""), project_dir=project_dir)
+    if refreshed != source:
+        raise QueueRecoveryRuntimeError("Director scene repair source changed during admission.")
+    private_params = dict(params)
+    private_params.pop("_h3_rerun_predecessor_path", None)
+    private_params["_h3_rerun_input"] = {"version": 1, "source": source, "snapshot": snapshot}
+    if snapshot is not None:
+        private_params["_h3_rerun_predecessor_path"] = snapshot["path"]
+    job["params"] = private_params
+
+
+def _director_h3_scene_repair_selection(job: dict) -> dict | None:
+    """Read a sealed admitted repair without reopening original producers."""
+    params = job.get("params") or {}
+    plan = params.get("_h3_longform")
+    selection = plan.get("scene_rerun") if isinstance(plan, dict) else None
+    if selection is None:
+        return None
+    from services.director_pipeline import _rehydrate_director_h3_longform
+    admission = params.get("_h3_rerun_input")
+    source = admission.get("source") if isinstance(admission, dict) else None
+    restored = {}
+    if (job.get("kind") != "director_child" or not isinstance(selection, dict)
+            or not isinstance(admission, dict) or type(admission.get("version")) is not int or admission["version"] != 1
+            or not isinstance(source, dict) or type(source.get("version")) is not int or source["version"] != 1
+            or source.get("pipeline_id") != params.get("_director_pipeline_id")
+            or source.get("workspace") != str(job.get("workspace") or "default")
+            or source.get("owner_digest") != job.get("_recovery_owner_digest")
+            or source.get("project_digest") != job.get("_recovery_project_digest")
+            or any(source.get(key) != selection.get(key) for key in (
+                "original_plan_sha256", "scene_index", "physical_indices", "predecessor_index"))
+            or not _rehydrate_director_h3_longform(restored, plan,
+                h3_style_workflow=plan.get("h3_style_workflow"))):
+        raise QueueRecoveryRuntimeError("Director scene repair seal changed.")
+    indices = selection.get("physical_indices")
+    owners = plan["segment_source_indices"]
+    scene = selection.get("scene_index")
+    if (type(selection.get("version")) is not int or selection["version"] != 1
+            or type(scene) is not int or not isinstance(indices, list) or not indices
+            or any(type(index) is not int for index in indices)
+            or indices != [index for index, owner in enumerate(owners) if owner == scene]
+            or selection.get("predecessor_index") != (indices[0] - 1 if indices[0] else None)
+            or selection.get("published_start_frame") != sum(plan["clip_published_frames"][:indices[0]])
+            or selection.get("published_frames") != sum(plan["clip_published_frames"][index] for index in indices)
+            or type(selection.get("original_plan_sha256")) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", selection["original_plan_sha256"]) is None
+            or selection.get("audio_origin_sec") != params.get("multi_clip_audio_start_sec")
+            or selection.get("audio_start_sec") != selection["audio_origin_sec"] + selection["published_start_frame"] / 24.0):
+        raise QueueRecoveryRuntimeError("Director scene repair partition changed.")
+    snapshot = admission.get("snapshot")
+    if selection["predecessor_index"] is None:
+        if snapshot is not None or params.get("_h3_rerun_predecessor_path") is not None:
+            raise QueueRecoveryRuntimeError("Opening scene repair has an unexpected predecessor.")
+    elif (not isinstance(snapshot, dict) or snapshot.get("scope") != "director_h3_predecessor"
+            or snapshot.get("field") != "_h3_rerun_predecessor_path:0"
+            or snapshot.get("recovery_job_id") != job.get("id")
+            or snapshot.get("owner_principal") != source["owner_digest"]
+            or snapshot.get("project_instance") != source["project_digest"]
+            or snapshot.get("path") != params.get("_h3_rerun_predecessor_path")
+            or type(snapshot.get("size")) is not int or snapshot["size"] < 1
+            or type(snapshot.get("sha256")) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", snapshot["sha256"]) is None
+            or snapshot.get("size") != (source.get("predecessor_artifact") or {}).get("size")
+            or snapshot.get("sha256") != (source.get("predecessor_artifact") or {}).get("sha256")):
+        raise QueueRecoveryRuntimeError("Director scene repair input identity changed.")
+    return copy.deepcopy(selection)
+
+
+def _director_h3_scene_repair_input_identity(snapshot: dict) -> str:
+    return hashlib.sha256(json.dumps({key: snapshot[key] for key in (
+        "scope", "field", "recovery_job_id", "owner_principal", "project_instance", "size", "sha256")},
+        sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def _filter_director_h3_scene_repair_tasks(job: dict, manifest: list[dict]) -> list[dict]:
+    """Filter only after the full timeline has assigned prompts and clocks."""
+    selection = _director_h3_scene_repair_selection(job)
+    if selection is None:
+        return manifest
+    selected = []
+    positions = []
+    for task in manifest:
+        params = task.get("params") or {}
+        info = params.get("multi_clip_info") or {}
+        if (info.get("automatic_h3_longform") is not True
+                or type(info.get("index")) is not int
+                or info.get("total") != job["params"]["_h3_longform"]["clip_count"]
+                or info.get("output_index") != 0 or info.get("output_total") != 1):
+            raise QueueRecoveryRuntimeError("Director scene repair requires one sealed output variant.")
+        if info["index"] in selection["physical_indices"]:
+            private_task = dict(task, params=dict(params, multi_clip_info=dict(info, defer_concat=True)))
+            selected.append(private_task)
+            positions.append(info["index"])
+    if positions != selection["physical_indices"]:
+        raise QueueRecoveryRuntimeError("Director scene repair tasks are incomplete or reordered.")
+    return selected
+
+
+def _director_h3_scene_repair_handoff(job: dict, task: dict, project_dir: str) -> dict | None:
+    """Prepare or restore a new-job CPU handoff from the admitted input."""
+    selection = _director_h3_scene_repair_selection(job)
+    info = (task.get("params") or {}).get("multi_clip_info") or {}
+    if (selection is None or info.get("index") != selection["physical_indices"][0]
+            or selection["predecessor_index"] is None):
+        return None
+    from services.director_h3_input_snapshot import validate_predecessor_snapshot
+    admission = job["params"]["_h3_rerun_input"]
+    snapshot = admission.get("snapshot")
+    if not validate_predecessor_snapshot(snapshot, project_directory=project_dir,
+            job_id=str(job["id"]), owner_digest=job["_recovery_owner_digest"],
+            project_digest=job["_recovery_project_digest"]):
+        raise QueueRecoveryRuntimeError("Director predecessor input changed before use.")
+    identity = _director_h3_scene_repair_input_identity(snapshot)
+    cursor = dict(job.get("recovery_cursor") or {})
+    cached = cursor.get("h3_scene_repair_handoff")
+    if cached is not None:
+        if not isinstance(cached, dict) or cached.get("dependency") != identity:
+            raise QueueRecoveryRuntimeError("Director predecessor handoff identity changed.")
+        path = _queue_recovery_continuation_path(project_dir, cached)
+        if path:
+            size, digest = _recovery_sha256_file(path)
+            if size != cached.get("size") or digest != cached.get("sha256"):
+                raise QueueRecoveryRuntimeError("Director predecessor handoff changed.")
+        _restore_task_continuation(task, {"unit_id": identity, "continuation": cached}, project_dir)
+        return cached
+    params = task["params"]
+    if any(params.get(key) for key in ("_continuation", "_ref2va_continuation", "_h3_native_boundary_request")):
+        handoff = _prepare_task_continuation({"params": {"multi_clip_info": {"automatic_h3_longform": True}}},
+            task, snapshot["path"], out_dir=project_dir, task_no=info["index"],
+            recovery_staging_dir=ensure_recovery_staging_directory(project_dir),
+            recovery_output_prefix=f"unit-{job['id']}-repair-input")
+    else:
+        handoff = {"mode": "prompt_only", "path": None}
+    descriptor = _queue_recovery_continuation_descriptor(project_dir, handoff.get("path"),
+        mode=str(handoff.get("mode") or "prompt_only"), dependency=identity, metadata=handoff)
+    if not validate_predecessor_snapshot(snapshot, project_directory=project_dir,
+            job_id=str(job["id"]), owner_digest=job["_recovery_owner_digest"],
+            project_digest=job["_recovery_project_digest"]):
+        raise QueueRecoveryRuntimeError("Director predecessor input changed during boundary preparation.")
+    cursor["h3_scene_repair_handoff"] = descriptor
+    if _queue_recovery_checkpoint(job, message="Director predecessor boundary prepared", recovery_cursor=cursor) is not True:
+        raise QueueRecoveryRuntimeError("Director predecessor boundary checkpoint rejected.")
+    return descriptor
+
+
+def _director_h3_scene_repair_dependency(job: dict, segment_index: int) -> dict | None:
+    """Bind the first new segment to input provenance, never an old unit."""
+    selection = _director_h3_scene_repair_selection(job)
+    if (selection is None or segment_index != selection["physical_indices"][0]
+            or selection["predecessor_index"] is None):
+        return None
+    admission = job["params"]["_h3_rerun_input"]
+    snapshot = admission["snapshot"]
+    handoff = (job.get("recovery_cursor") or {}).get("h3_scene_repair_handoff")
+    if (not isinstance(handoff, dict)
+            or handoff.get("dependency") != _director_h3_scene_repair_input_identity(snapshot)
+            or handoff.get("mode") not in {"prompt_only", "last_frame", "semantic_still", "temporal_tail", "native_av_overlap"}):
+        raise QueueRecoveryRuntimeError("Director predecessor boundary is not checkpointed.")
+    return {"external_predecessor_input": {"version": 1,
+        "input_job_id": snapshot["recovery_job_id"], "size": snapshot["size"], "sha256": snapshot["sha256"],
+        "original_producer_unit_id": admission["source"]["predecessor_unit_id"],
+        "original_physical_index": selection["predecessor_index"],
+        "original_plan_sha256": selection["original_plan_sha256"],
+        "handoff": copy.deepcopy(handoff)}}
+
+
+def _director_h3_scene_repair_outputs(job: dict, project_dir: str, candidates) -> list[str]:
+    """Expose the selected scene only after its entire new producer chain seals."""
+    try:
+        selection = _director_h3_scene_repair_selection(job)
+        if selection is None:
+            return []
+        units = []
+        for index in selection["physical_indices"]:
+            unit = _queue_recovery_unit_matches(job, kind="h3_segment", variant=0,
+                index=index, project_dir=project_dir, quarantine_invalid=False)
+            if unit is None:
+                return []
+            if units and unit.get("dependencies") != [units[-1]["unit_id"]]:
+                return []
+            units.append(unit)
+        scene = _queue_recovery_unit_matches(job, kind="h3_scene", variant=0,
+            index=selection["scene_index"], project_dir=project_dir, quarantine_invalid=False)
+        if scene is None or scene.get("dependencies") != [unit["unit_id"] for unit in units]:
+            return []
+        artifacts = scene.get("artifacts") or []
+        if len(artifacts) != 1:
+            return []
+        name = artifacts[0]["basename"]
+        mapping = job.get("h3_scene_output_files") or {}
+        if mapping != {str(selection["scene_index"]): name} or name not in candidates:
+            return []
+        return [name]
+    except (QueueRecoveryRuntimeError, KeyError, TypeError, ValueError):
+        return []
 
 
 def _director_recovery_retire_preparation(
@@ -9382,6 +9806,9 @@ def _restore_queue_recovery_on_startup(
     # Failed tiles retain an executable Retry action. Their exact registration,
     # request and partial staging must survive the same startup cleanup.
     terminal_statuses = AUTOMATIC_RETIREMENT_STATUSES
+    from services.queue_recovery_adapter import director_h3_source_job_ids
+    current_snapshots, _ = _queue_recovery_coordinator.read_only_snapshot()
+    retained_director_sources = director_h3_source_job_ids(current_snapshots)
     if not unsettled_terminal_credit and (
         director_legacy_payloads or any(
             str(snapshot.get("status") or "").casefold() in terminal_statuses
@@ -9403,11 +9830,15 @@ def _restore_queue_recovery_on_startup(
             and not unsettled_terminal_credit
             and snapshot.get("id") not in pending_processed_tool_jobs
             and snapshot.get("id") not in retained_composition_jobs
+            and snapshot.get("id") not in retained_director_sources
         ):
             continue
         snapshot_workspace = str(snapshot.get("workspace") or "default")
         snapshot_job_id = snapshot.get("id")
-        if isinstance(snapshot_job_id, str):
+        if isinstance(snapshot_job_id, str) and (
+            str(snapshot.get("status") or "").casefold() not in terminal_statuses
+            or snapshot_job_id not in retained_director_sources
+        ):
             live_staging_jobs.setdefault(snapshot_workspace, []).append(
                 snapshot_job_id
             )
@@ -9424,11 +9855,15 @@ def _restore_queue_recovery_on_startup(
     for candidate in list(_jobs.values()):
         if (str(candidate.get("status") or "").casefold() in terminal_statuses
                 and candidate.get("id") not in pending_processed_tool_jobs
-                and candidate.get("id") not in retained_composition_jobs):
+                and candidate.get("id") not in retained_composition_jobs
+                and candidate.get("id") not in retained_director_sources):
             continue
         candidate_workspace = str(candidate.get("workspace") or "default")
         candidate_id = candidate.get("id")
-        if isinstance(candidate_id, str):
+        if isinstance(candidate_id, str) and (
+            str(candidate.get("status") or "").casefold() not in terminal_statuses
+            or candidate_id not in retained_director_sources
+        ):
             live_staging_jobs.setdefault(candidate_workspace, []).append(
                 candidate_id
             )
@@ -9893,6 +10328,23 @@ def _queue_recovery_unit_matches(
             or unit.get("state") != "completed"
         ):
             continue
+        private_plan = (job.get("params") or {}).get("_h3_longform")
+        if kind == "h3_segment" and isinstance(private_plan, dict) and private_plan.get("scene_rerun") is not None:
+            try:
+                selection = _director_h3_scene_repair_selection(job)
+                if variant != 0 or index not in selection["physical_indices"]:
+                    return None
+                external = _director_h3_scene_repair_dependency(job, index)
+                settings = unit.get("settings") or {}
+                if external is not None:
+                    if unit.get("dependencies") or settings.get("external_predecessor_input") != external["external_predecessor_input"]:
+                        return None
+                elif settings.get("external_predecessor_input") is not None:
+                    return None
+                if index == selection["physical_indices"][0] and unit.get("dependencies"):
+                    return None
+            except (QueueRecoveryRuntimeError, KeyError, TypeError, ValueError):
+                return None
         if unit.get("kind") == "h3_concat":
             from services.h3_audio_safety import (
                 DEFAULT_TARGET_DBTP,
@@ -10411,7 +10863,7 @@ def _queue_recovery_enrich_h3_continuation(
     ):
         raise QueueRecoveryRuntimeError("H3 continuation checkpoint identity changed.")
     proposed = dict(unit, continuation=dict(continuation))
-    check_job = dict(job, recovery_cursor={"completed_units": [proposed]})
+    check_job = dict(job, recovery_cursor=dict(job.get("recovery_cursor") or {}, completed_units=[proposed]))
     if continuation.get("mode") == "cumulative_append":
         # Verify AV plus the existing media before attaching the receipt; the
         # strict media+receipt gate runs again on the rebuilt descriptor below.
@@ -10981,8 +11433,22 @@ def _queue_recovery_completed_h3_graph(job: dict, project_dir: str) -> dict | No
         if unit.get("state") == "completed"
         and type(unit.get("unit_id")) is str
     }
-    finals = [unit for unit in sealed.values() if unit.get("kind") == "h3_delivery"]
-    finals = finals or [unit for unit in sealed.values() if unit.get("kind") == "h3_concat"]
+    private_plan = (job.get("params") or {}).get("_h3_longform")
+    repair_selection = None
+    if isinstance(private_plan, dict) and private_plan.get("scene_rerun") is not None:
+        try:
+            repair_selection = _director_h3_scene_repair_selection(job)
+        except (QueueRecoveryRuntimeError, KeyError, TypeError, ValueError):
+            return None
+        if any(unit.get("kind") not in {"h3_segment", "h3_scene"} for unit in sealed.values()):
+            return None
+        finals = [unit for unit in sealed.values() if unit.get("kind") == "h3_scene"
+                  and unit.get("variant") == 0 and unit.get("index") == repair_selection["scene_index"]]
+        if len(finals) != 1:
+            return None
+    else:
+        finals = [unit for unit in sealed.values() if unit.get("kind") == "h3_delivery"]
+        finals = finals or [unit for unit in sealed.values() if unit.get("kind") == "h3_concat"]
     if not finals:
         return None
     try:
@@ -11001,6 +11467,8 @@ def _queue_recovery_completed_h3_graph(job: dict, project_dir: str) -> dict | No
         for unit in sealed.values():
             if unit.get("kind") == "h3_scene" and len(unit.get("artifacts") or []) == 1:
                 scene_outputs.setdefault(str(unit["index"]), unit["artifacts"][0]["basename"])
+        if repair_selection is not None and set(scene_outputs) != {str(repair_selection["scene_index"])}:
+            return None
         if scene_outputs:
             if _director_recovery_scene_map(project_dir, scene_outputs, list(sealed.values())) is None:
                 return None
@@ -11060,15 +11528,20 @@ def _queue_recovery_completed_h3_graph(job: dict, project_dir: str) -> dict | No
                     return None
                 unit["artifacts"].append(descriptor)
                 if unit_id in final_ids:
-                    params = item.get("params")
-                    clip = params.get("multi_clip_info") if isinstance(params, dict) else None
-                    if not isinstance(clip, dict):
-                        return None
-                    total, position = clip.get("output_total"), clip.get("output_index")
+                    if repair_selection is not None:
+                        if kind != "h3_scene" or variant != 0 or index != repair_selection["scene_index"]:
+                            return None
+                        total, position = 1, 0
+                    else:
+                        params = item.get("params")
+                        clip = params.get("multi_clip_info") if isinstance(params, dict) else None
+                        if not isinstance(clip, dict):
+                            return None
+                        total, position = clip.get("output_total"), clip.get("output_index")
                     if (type(total) is not int or not 1 <= total <= 4096
                         or type(position) is not int or not 0 <= position < total
-                        or item.get("artifact_class") != "final"
-                        or item.get("producer_artifact_class") != "final"):
+                        or item.get("artifact_class") != ("component" if repair_selection is not None else "final")
+                        or item.get("producer_artifact_class") != ("component" if repair_selection is not None else "final")):
                         return None
                     positions.append((total, position))
                     outputs.append(name)
@@ -11101,12 +11574,12 @@ def _queue_recovery_completed_h3_graph(job: dict, project_dir: str) -> dict | No
         )
         verified = []
         for unit in units.values():
-            check = dict(job, recovery_cursor={"completed_units": (
+            check = dict(job, recovery_cursor=dict(cursor, completed_units=(
                 list(units.values())
-                if unit["kind"] == "h3_scene" or (isinstance(job.get("params"), dict)
+                if repair_selection is not None or unit["kind"] == "h3_scene" or (isinstance(job.get("params"), dict)
                     and job["params"].get("_h3_cumulative_append") is True)
                 else [unit]
-            )})
+            )))
             if _queue_recovery_unit_matches(
                 check, kind=unit["kind"], variant=unit["variant"], index=unit["index"],
                 project_dir=project_dir, quarantine_invalid=False,
@@ -11117,6 +11590,16 @@ def _queue_recovery_completed_h3_graph(job: dict, project_dir: str) -> dict | No
         closed = _h3_dependency_closed_recovery_units(verified)
         if {unit["unit_id"] for unit in closed} != set(units):
             return None
+        if repair_selection is not None:
+            segments = sorted((unit for unit in closed if unit["kind"] == "h3_segment"), key=lambda unit: unit["index"])
+            if (len(closed) != len(segments) + 1
+                    or [unit["index"] for unit in segments] != repair_selection["physical_indices"]
+                    or any(unit["variant"] != 0 for unit in closed)
+                    or finals[0]["dependencies"] != [unit["unit_id"] for unit in segments]
+                    or any(unit["dependencies"] != [segments[position - 1]["unit_id"]]
+                           for position, unit in enumerate(segments) if position)
+                    or set(sealed) != set(units)):
+                return None
         return {"completed_units": closed, "output_files": sorted(outputs), "h3_scene_output_files": scene_outputs}
     except (OSError, KeyError, TypeError, ValueError, QueueRecoveryRuntimeError):
         return None
@@ -11526,12 +12009,12 @@ def _queue_recovery_reconcile_cursor(job: dict, project_dir: str, *, adopt_stage
                 old_media, new_media = media_identity(original), media_identity(unit)
                 if old_media is None or new_media is None or old_media != new_media:
                     continue
-            check_job = dict(job, recovery_cursor={"completed_units": (
+            check_job = dict(job, recovery_cursor=dict(job.get("recovery_cursor") or {}, completed_units=(
                 [unit] + verified + [candidate for key, candidate in recovered_by_unit.items() if key != unit_id]
                 if unit["kind"] == "h3_scene" or (isinstance(job.get("params"), dict)
                     and job["params"].get("_h3_cumulative_append") is True)
                 else [unit]
-            )})
+            )))
             if _queue_recovery_unit_matches(
                 check_job, kind=unit["kind"], variant=unit["variant"],
                 index=unit["index"], project_dir=project_dir,
@@ -11642,6 +12125,12 @@ def _queue_recovery_reconcile_cursor(job: dict, project_dir: str, *, adopt_stage
                 unit for unit in verified_h3_units
                 if unit.get("kind") == "h3_concat"
             ]
+        private_plan = (job.get("params") or {}).get("_h3_longform")
+        repair_selection = None
+        if isinstance(private_plan, dict) and private_plan.get("scene_rerun") is not None:
+            repair_selection = _director_h3_scene_repair_selection(job)
+            final_units = [unit for unit in verified_h3_units if unit.get("kind") == "h3_scene"
+                           and unit.get("variant") == 0 and unit.get("index") == repair_selection["scene_index"]]
         verified_finals = []
         for unit in final_units:
             for artifact in unit.get("artifacts") or []:
@@ -11652,7 +12141,7 @@ def _queue_recovery_reconcile_cursor(job: dict, project_dir: str, *, adopt_stage
                 if isinstance(name, str) and name and name not in verified_finals:
                     verified_finals.append(name)
         job["output_files"] = verified_finals
-        if delivery_units or not verified_finals:
+        if repair_selection is not None or delivery_units or not verified_finals:
             job.pop("join_output_file", None)
         else:
             job["join_output_file"] = verified_finals[0]
@@ -12004,6 +12493,9 @@ def _h3_dependency_closed_recovery_prefix(job: dict) -> int | None:
 
 def _h3_incomplete_recovery_prefix(job: dict) -> int | None:
     """Return the exact sealed prefix when only the final segment is absent."""
+    plan = (job.get("params") or {}).get("_h3_longform")
+    if isinstance(plan, dict) and plan.get("scene_rerun") is not None:
+        return None
     prefix = _h3_dependency_closed_recovery_prefix(job)
     if prefix is None:
         return None
@@ -12902,12 +13394,20 @@ def _bind_h3_task_prompt_mapping(
     )):
         if index == 0:
             raise QueueRecoveryRuntimeError("H3 mapping continuation has no predecessor.")
-        predecessor = _queue_recovery_unit_matches(
-            job, kind="h3_segment", variant=variant, index=index - 1, project_dir=project_dir,
-        )
-        continuation = predecessor.get("continuation") if isinstance(predecessor, dict) else None
-        if not isinstance(continuation, dict) or continuation.get("dependency") != predecessor.get("unit_id"):
-            raise QueueRecoveryRuntimeError("H3 mapping continuation evidence is missing.")
+        private_plan = (job.get("params") or {}).get("_h3_longform")
+        selection = (_director_h3_scene_repair_selection(job)
+                     if isinstance(private_plan, dict) and private_plan.get("scene_rerun") is not None else None)
+        if selection is not None and index == selection["physical_indices"][0]:
+            continuation = (job.get("recovery_cursor") or {}).get("h3_scene_repair_handoff")
+            if not isinstance(continuation, dict):
+                raise QueueRecoveryRuntimeError("Director predecessor boundary is not checkpointed.")
+        else:
+            predecessor = _queue_recovery_unit_matches(
+                job, kind="h3_segment", variant=variant, index=index - 1, project_dir=project_dir,
+            )
+            continuation = predecessor.get("continuation") if isinstance(predecessor, dict) else None
+            if not isinstance(continuation, dict) or continuation.get("dependency") != predecessor.get("unit_id"):
+                raise QueueRecoveryRuntimeError("H3 mapping continuation evidence is missing.")
         path = _queue_recovery_continuation_path(project_dir, continuation)
 
     def validate_descriptor(descriptor):
@@ -14677,6 +15177,7 @@ def _init_pipeline():
             recovery_submit_child=_director_recovery_submit_child,
             recovery_verify_child=_director_recovery_verified_child,
             recovery_validate_child=_director_recovery_validate_child,
+            recovery_prepare_h3_scene_rerun=_director_recovery_prepare_h3_scene_rerun,
             runtime_admission=_director_recovery_runtime_admission,
         )
         _pipeline_initialized = True
@@ -17030,6 +17531,8 @@ def _prepare_generation_sidecar_params(source_params: dict):
     sidecar_params = source_params.copy()
     sidecar_params.pop("_project_asset_ref_provenance", None)
     sidecar_params.pop("_project_asset_ref_paths", None)
+    sidecar_params.pop("_h3_rerun_predecessor_path", None)
+    sidecar_params.pop("_h3_rerun_input", None)
     # Voice references are reusable only after the user attaches them again.
     # Publish their basenames, never the workspace-local paths used by the job.
     sidecar_params.pop("voice_clone_refs", None)
@@ -44718,6 +45221,7 @@ async def director_pipeline_start(request: Request):
     # from the authoritative consent/provider policy and literal request flag.
     body.pop(EXPLICIT_GUIDANCE_SNAPSHOT_KEY, None)
     try:
+        _reject_client_h3_internal_state(body)
         _reject_client_director_image_role_internals(body)
         body["_director_component_errors"] = True
         workspace = _authorize_director_media_inputs(request, body)
@@ -66977,8 +67481,11 @@ def _verified_h3_concat_output_names(
     project_dir: str,
     candidate_names,
 ) -> list[str]:
-    """Return candidate Finals backed by a verified concat checkpoint."""
+    """Return terminal media backed by the relevant verified producer graph."""
     candidates = set(candidate_names or ())
+    private_plan = (job.get("params") or {}).get("_h3_longform")
+    if isinstance(private_plan, dict) and private_plan.get("scene_rerun") is not None:
+        return _director_h3_scene_repair_outputs(job, project_dir, candidates)
     verified = []
     for unit in _queue_recovery_units(job):
         if unit.get("kind") != "h3_concat":
@@ -72389,6 +72896,10 @@ def _run_generation(
                     "plugin_data": {},
                 }]
 
+            h3_scene_repair = None
+            if isinstance(h3_longform, dict) and h3_longform.get("scene_rerun") is not None:
+                h3_scene_repair = _director_h3_scene_repair_selection(job)
+                manifest = _filter_director_h3_scene_repair_tasks(job, manifest)
             _apply_h3_loras_to_manifest(manifest, raw_params)
             _apply_h3_offload_plan_to_manifest(
                 manifest, sealed_h3_offload_plan,
@@ -73478,6 +73989,10 @@ def _run_generation(
             ) -> tuple[list[str], dict]:
                 if segment_index <= 0:
                     return [], {}
+                external_input = (_director_h3_scene_repair_dependency(job, segment_index)
+                                  if h3_scene_repair is not None else None)
+                if external_input is not None:
+                    return [], external_input
                 predecessor = _queue_recovery_unit_matches(
                     job,
                     kind="h3_segment",
@@ -73646,6 +74161,8 @@ def _run_generation(
                     if os.environ.get("MAESTRO_H3_CUMULATIVE_EXPERIMENTAL") != "1":
                         raise QueueRecoveryRuntimeError("Private H3 cumulative generation is disabled.")
                 mapping_receipt = None
+                if h3_scene_repair is not None:
+                    _director_h3_scene_repair_handoff(job, task, out_dir)
                 if h3_mapping_plan is not None:
                     task, task_sidecar_params = _bind_h3_task_prompt_mapping(
                         job, task, task_sidecar_params,
@@ -73700,10 +74217,11 @@ def _run_generation(
                             index=0,
                             project_dir=out_dir,
                         )
-                        if recovery_segment + 1 == recovery_total else None
+                        if h3_scene_repair is None and recovery_segment + 1 == recovery_total else None
                     )
                     if (
-                        recovered_segment is not None
+                        h3_scene_repair is None
+                        and recovered_segment is not None
                         and recovery_segment + 1 == recovery_total
                         and recovered_concat is None
                     ):
@@ -73716,7 +74234,8 @@ def _run_generation(
                     # Concat recovery above is deliberately standalone: a
                     # completed final native segment never re-enters denoising.
                     may_skip_segment = recovered_segment is not None and (
-                        recovery_segment + 1 < recovery_total
+                        h3_scene_repair is not None
+                        or recovery_segment + 1 < recovery_total
                         or recovered_concat is not None
                     )
                     if may_skip_segment:
@@ -75415,6 +75934,8 @@ def _run_generation(
                                 ):
                                     return False
                         _assemble_director_scene_outputs(h3_variant)
+                        if concat_names and h3_scene_repair is not None:
+                            raise QueueRecoveryRuntimeError("Scene repair unexpectedly concatenated the full timeline.")
                         if concat_names and not task_error:
                             concat_dependencies = []
                             clip_start_frames = []
@@ -76401,7 +76922,18 @@ def _run_generation(
                     _write_output_sidecars(new_files)
 
             h3_integrity_failed = False
-            if not defer_output_publication and requested_model in _H3_LONG_STUDIO_MODELS and not h3_delivery_request:
+            if h3_scene_repair is not None and not defer_output_publication:
+                # Scene assembly already checked frame geometry, exact soundtrack
+                # position and final audio. Its component role remains unchanged.
+                scene_results = _director_h3_scene_repair_outputs(job, out_dir, new_files)
+                if success and len(scene_results) != 1:
+                    raise QueueRecoveryRuntimeError("The repaired scene has no complete verified producer graph.")
+                h3_integrity_passed = True
+                if scene_results:
+                    published = record_job_outputs(job, scene_results, final_output_files=scene_results)
+                    if published != scene_results:
+                        raise QueueRecoveryRuntimeError("Repaired scene publication was rejected.")
+            if h3_scene_repair is None and not defer_output_publication and requested_model in _H3_LONG_STUDIO_MODELS and not h3_delivery_request:
                 h3_expected = {}
                 h3_final_names = []
                 for name in new_files:
@@ -83859,7 +84391,7 @@ async def upload_image(
 def _upload_retained_input(path: str) -> bool:
     """Census durable references, including crash manifests and Director rejoin."""
     from services.queue_recovery_runtime import discover_request_manifest_pointers
-    from services.queue_recovery_adapter import prompt_enhancement_gpu_cleanup_pending
+    from services.queue_recovery_adapter import prompt_enhancement_gpu_cleanup_pending, director_h3_source_job_ids
     from services.win_safe_files import safe_direct_file_under
 
     target = os.path.normcase(os.path.realpath(path))
@@ -83877,11 +84409,13 @@ def _upload_retained_input(path: str) -> bool:
             raise ValueError("Incomplete project census")
         roots[project["name"]] = root
     snapshots, tombstoned = _queue_recovery_coordinator.read_only_snapshot()
+    retained_director_sources = director_h3_source_job_ids(snapshots)
     retired = set(tombstoned)
     for snapshot in snapshots.values():
         if (snapshot.get("status") in {"completed", "cancelled", "canceled"}
                 and not processed_tool_publication_pending(snapshot)
                 and not prompt_enhancement_gpu_cleanup_pending(snapshot)
+                and snapshot.get("id") not in retained_director_sources
                 and snapshot.get("kind") not in {"director_pipeline", "director_preparation"}):
             retired.add(snapshot["id"])
             continue

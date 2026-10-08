@@ -652,7 +652,7 @@ class TestMiniMaxH3Definition(unittest.TestCase):
         align = mock.Mock(wraps=_load_frame_aligner())
         scope = {"video_length": 125, "current_video_length": 125, "model_def": definition,
                  "align_model_frame_count": align, "_h3_cumulative_dispatch": None,
-                 "_h3_control_dispatch": None}
+                 "_h3_control_dispatch": None, "_h3_face_refine_dispatch": None}
         self.assertEqual(eval(compile(ast.Expression(video_length), str(_WGP_PATH), "eval"), scope), 141)
         align.assert_called_once_with(125, definition)
         for expression in frame_counts:
@@ -2163,7 +2163,7 @@ class TestMiniMaxH3TimelineStillGuide(unittest.TestCase):
         align = _load_frame_aligner()
         frame_namespace = {"current_video_length": 124, "model_def": {"frame_alignment_modulus": 17, "frame_alignment_remainder": 5, "frames_minimum": 124},
                            "align_model_frame_count": align, "_h3_cumulative_dispatch": None,
-                           "_h3_control_dispatch": None}
+                           "_h3_control_dispatch": None, "_h3_face_refine_dispatch": None}
         exec(compile(ast.Module(body=[sampling], type_ignores=[]), str(_WGP_PATH), "exec"), frame_namespace)
         self.assertEqual(eval(compile(ast.Expression(frame_expression), str(_WGP_PATH), "eval"),
                               frame_namespace), 124)
