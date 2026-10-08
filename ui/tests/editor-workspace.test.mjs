@@ -1,9 +1,12 @@
 import assert from 'node:assert/strict'
-import test, { after } from 'node:test'
+import test, { after, beforeEach } from 'node:test'
 import { fileURLToPath } from 'node:url'
+import { readFile } from 'node:fs/promises'
+import ts from 'typescript'
+import { requestQueueView, subscribeQueueView } from '../src/lib/mainViewNavigation.ts'
 import { createServer } from 'vite'
 
-import { addEditorAudio, addEditorImage, addEditorTake, switchEditorTake, appendEditorClip, exportEditorProject, isBackendJobId, getEditorRetakes, dismissEditorRetake, openOutputInEditor, saveEditorProject } from '../src/api/client.ts'
+import { addEditorAudio, addEditorImage, addEditorTake, switchEditorTake, appendEditorClip, EditorExportSubmissionError, ProjectAssetRequestError, exportEditorProject, isBackendJobId, getEditorRetakes, dismissEditorRetake, openOutputInEditor, saveEditorProject } from '../src/api/client.ts'
 
 // Expose the component's actual draft transformations only in this test loader.
 // Production exports remain the component, and no duplicate implementation is tested.
@@ -16,13 +19,22 @@ const server = await createServer({
     name: 'editor-test-transforms',
     transform(code, id) {
       if (id.endsWith('/src/editor/EditorWorkspace.tsx')) {
-        return `${code}\nexport { changeTrim, moveClip, removeClip, availableVideos, addText, changeText, textLayers, renderedDuration, availableAudio, audioLayer, changeAudio, audioGain, imageLayers, changeImage, availableImages, imageLayout, retakeSelectedCut, prepareRetakeReview, readRetakeReview, returnRetakeResult };`
+        return `${code}\nexport { changeTrim, moveClip, removeClip, availableVideos, addText, changeText, textLayers, renderedDuration, availableAudio, audioLayer, changeAudio, audioGain, imageLayers, changeImage, availableImages, imageLayout, retakeSelectedCut, prepareRetakeReview, readRetakeReview, returnRetakeResult, confirmEditorExportReceipt, editorExportKey, readEditorExport, writeEditorExport, useStore };`
       }
     },
   }],
 })
-const { changeTrim, moveClip, removeClip, availableVideos, addText, changeText, textLayers, renderedDuration, availableAudio, audioLayer, changeAudio, audioGain, imageLayers, changeImage, availableImages, imageLayout, retakeSelectedCut, prepareRetakeReview, readRetakeReview, returnRetakeResult } = await server.ssrLoadModule('/src/editor/EditorWorkspace.tsx')
+const { changeTrim, moveClip, removeClip, availableVideos, addText, changeText, textLayers, renderedDuration, availableAudio, audioLayer, changeAudio, audioGain, imageLayers, changeImage, availableImages, imageLayout, retakeSelectedCut, prepareRetakeReview, readRetakeReview, returnRetakeResult, confirmEditorExportReceipt, editorExportKey, readEditorExport, writeEditorExport, useStore: editorTestStore } = await server.ssrLoadModule('/src/editor/EditorWorkspace.tsx')
 after(() => server.close())
+beforeEach(() => {
+  const entries = new Map()
+  globalThis.sessionStorage = {
+    getItem: key => entries.get(key) ?? null,
+    setItem: (key, value) => entries.set(key, value),
+    removeItem: key => entries.delete(key),
+  }
+  editorTestStore.setState({ accountContext: { enabled: false } })
+})
 
 function sequenceProject() {
   return {
@@ -266,11 +278,11 @@ test('Editor export submits only the saved project revision to its project route
   const calls = []
   globalThis.fetch = async (url, init) => {
     calls.push({ url, init })
-    return { ok: true, json: async () => ({ job_id: 'export-1', status: 'queued' }) }
+    return { ok: true, json: async () => ({ job_id: 'e'.repeat(32), status: 'queued' }) }
   }
   try {
     assert.deepEqual(await exportEditorProject('scene a', { id: 'cut #1', revision: 4 }), {
-      job_id: 'export-1', status: 'queued',
+      job_id: 'e'.repeat(32), status: 'queued',
     })
     assert.match(calls[0].url, /\/projects\/scene%20a\/editor\/projects\/cut%20%231\/exports$/)
     assert.equal(calls[0].init.method, 'POST')
@@ -291,6 +303,236 @@ test('Editor export reports a changed draft as an actionable conflict', async ()
   } finally {
     globalThis.fetch = previous
   }
+})
+
+async function editorExportHandlers(state) {
+  const source = await readFile(new URL('../src/editor/EditorWorkspace.tsx', import.meta.url), 'utf8')
+  const ast = ts.createSourceFile('EditorWorkspace.tsx', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX)
+  const declarations = new Map()
+  const visit = node => {
+    if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name)
+      && ['handleExport', 'refreshExportQueue', 'restoreExport', 'handleExportAnotherCopy'].includes(node.name.text)) declarations.set(node.name.text, node.getText(ast))
+    ts.forEachChild(node, visit)
+  }
+  visit(ast)
+  assert.equal(declarations.size, 4)
+  const code = ts.transpileModule(`
+    const { source, project, scope, editVersion, saving, exporting, appending, acceptedExport, queueConfirmation, isCurrent, useStore, exportEditorProject, EditorExportSubmissionError, ProjectAssetRequestError, confirmEditorExportReceipt, editorExportKey, readEditorExport, writeEditorExport } = context
+    const useCallback = callback => callback
+    const resetExport = () => { setExportState('idle'); acceptedExport.current = null; setExportNotice('') }
+    const canTrim = true, titlesOutOfRange = false, titlesTooShort = false, audioOutOfRange = false, imageInvalidRange = false, saveState = 'saved'
+    let exportState = context.exportState
+    const setExportState = value => { exportState = value; context.exportState = value }
+    const setExportError = value => { context.error = value }
+    const setExportNotice = value => { context.notice = value }
+    const setQueueRefreshPending = value => { context.pending = value }
+    const projectReferenceSafeErrorMessage = error => error.message
+    const ${declarations.get('restoreExport')}
+    const ${declarations.get('refreshExportQueue')}
+    const ${declarations.get('handleExport')}
+    const ${declarations.get('handleExportAnotherCopy')}
+  `, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText
+  return new Function('context', `${code}\nreturn { handleExport, refreshExportQueue, restoreExport, handleExportAnotherCopy }`)(state)
+}
+
+function exportStateFixture() {
+  const state = {
+    source: { workspace: 'scene' }, project: sequenceProject(), scope: { current: 1 },
+    editVersion: { current: 0 }, saving: { current: false }, exporting: { current: false }, appending: { current: false },
+    acceptedExport: { current: null }, queueConfirmation: { current: 0 }, exportState: 'idle',
+    exportEditorProject, EditorExportSubmissionError, ProjectAssetRequestError, editorExportKey, readEditorExport, writeEditorExport,
+    confirmEditorExportReceipt: (...args) => confirmEditorExportReceipt(...args, 5),
+    jobs: [], reconnectCount: 0,
+  }
+  state.isCurrent = epoch => epoch === state.scope.current
+  state.useStore = { getState: () => ({ jobs: state.jobs, reconnectJobs: async () => { state.reconnectCount += 1 } }) }
+  return state
+}
+
+test('accepted Editor export retains its job through missing discovery and refreshes without another POST', async t => {
+  const previous = globalThis.fetch
+  let posts = 0
+  const jobId = 'e'.repeat(32)
+  globalThis.fetch = async (_url, init) => { assert.equal(init.method, 'POST'); posts += 1; return Response.json({ job_id: jobId, status: 'queued' }) }
+  t.after(() => { globalThis.fetch = previous })
+  const state = exportStateFixture()
+  const handlers = await editorExportHandlers(state)
+  await handlers.handleExport()
+  await new Promise(resolve => setTimeout(resolve, 10))
+  assert.equal(state.exportState, 'queued')
+  assert.equal(state.acceptedExport.current.jobId, jobId)
+  assert.equal(state.pending, false)
+  assert.match(state.notice, /was accepted.*has not confirmed/)
+  await handlers.handleExport()
+  assert.equal(posts, 1)
+  state.jobs = [{ id: jobId }]
+  await handlers.refreshExportQueue(state.acceptedExport.current)
+  assert.equal(state.notice, '')
+  assert.equal(state.reconnectCount, 2)
+  assert.equal(posts, 1)
+})
+
+test('Editor Queue confirmation expires and ignores changed editor/account scope or newer edits', async () => {
+  assert.equal(await confirmEditorExportReceipt('e'.repeat(32), () => new Promise(() => {}), () => [], () => true, 5), false)
+  assert.equal(await confirmEditorExportReceipt('e'.repeat(32), async () => {}, () => [{ id: 'f'.repeat(32) }], () => true, 5), false)
+  for (const change of ['scope', 'editVersion', 'acceptedExport']) {
+    const state = exportStateFixture()
+    let finish
+    state.useStore = { getState: () => ({ jobs: [{ id: 'e'.repeat(32) }], reconnectJobs: () => new Promise(resolve => { finish = resolve }) }) }
+    const handlers = await editorExportHandlers(state)
+    const receipt = { jobId: 'e'.repeat(32), epoch: 1, version: 0 }
+    state.acceptedExport.current = receipt
+    state.notice = 'Current draft notice'
+    const pending = handlers.refreshExportQueue(receipt)
+    if (change === 'acceptedExport') state.acceptedExport.current = null
+    else state[change].current += 1
+    finish()
+    await pending
+    assert.equal(state.notice, 'Current draft notice')
+  }
+})
+
+test('uncertain Editor submission stays blocked while a definite rejection permits correction', async t => {
+  const previous = globalThis.fetch
+  t.after(() => { globalThis.fetch = previous })
+  for (const reply of [() => { throw new Error('network lost') }, () => Response.json({}, { status: 503 }), () => Response.json({ job_id: '../bad', status: 'queued' }), () => ({ ok: true, json: async () => { throw new Error('broken body') } })]) {
+    sessionStorage.removeItem(editorExportKey(sequenceProject()))
+    let posts = 0
+    globalThis.fetch = async () => { posts += 1; return reply() }
+    const state = exportStateFixture()
+    const { handleExport } = await editorExportHandlers(state)
+    await handleExport()
+    assert.equal(state.exportState, 'unconfirmed')
+    assert.match(state.notice, /Check Queue before exporting/)
+    assert.equal(state.reconnectCount, 0)
+    await handleExport()
+    assert.equal(posts, 1)
+  }
+  sessionStorage.removeItem(editorExportKey(sequenceProject()))
+  globalThis.fetch = async () => Response.json({}, { status: 409 })
+  const rejected = exportStateFixture()
+  await (await editorExportHandlers(rejected)).handleExport()
+  assert.equal(rejected.exportState, 'idle')
+  assert.match(rejected.error, /reopen the video/)
+})
+
+test('Queue navigation survives the Editor replacing MainContent and consumes the pending request once', async t => {
+  const previous = globalThis.window
+  globalThis.window = new EventTarget()
+  t.after(() => { globalThis.window = previous })
+  // Editor has unmounted MainContent, so no listener exists at activation time.
+  requestQueueView()
+  let opens = 0
+  const unsubscribe = subscribeQueueView(() => { opens += 1 })
+  assert.equal(opens, 1)
+  requestQueueView()
+  assert.equal(opens, 2)
+  unsubscribe()
+  const unsubscribeAgain = subscribeQueueView(() => { opens += 1 })
+  assert.equal(opens, 2, 'remount must not repeat a consumed navigation')
+  unsubscribeAgain()
+  const source = await readFile(new URL('../src/editor/EditorWorkspace.tsx', import.meta.url), 'utf8')
+  const ast = ts.createSourceFile('EditorWorkspace.tsx', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX)
+  let click
+  const visit = node => {
+    if (ts.isJsxAttribute(node) && node.name.getText(ast) === 'onClick'
+      && node.initializer?.getText(ast).includes('requestQueueView()')) click = node.initializer.expression
+    ts.forEachChild(node, visit)
+  }
+  visit(ast)
+  assert.ok(click)
+  const actualClick = ts.transpileModule(`const click = ${click.getText(ast)}`, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText
+  let current = false, closed = 0
+  const activate = new Function('isCurrent', 'scope', 'closeEditor', 'requestQueueView', `${actualClick}; return click`)(
+    () => current, { current: 1 }, () => { closed += 1 }, requestQueueView)
+  activate()
+  assert.equal(closed, 0)
+  current = true
+  activate()
+  assert.equal(closed, 1)
+  const mounted = subscribeQueueView(() => { opens += 1 })
+  assert.equal(opens, 3)
+  mounted()
+})
+
+test('lost export reply remains fenced after reopening the same saved cut, including after server completion', async t => {
+  const previous = globalThis.fetch
+  t.after(() => { globalThis.fetch = previous })
+  let posts = 0
+  globalThis.fetch = async () => {
+    posts += 1
+    assert.ok(readEditorExport(editorExportKey(sequenceProject())), 'intent must precede POST')
+    throw new Error('accepted on server, reply lost')
+  }
+  const original = exportStateFixture()
+  await (await editorExportHandlers(original)).handleExport()
+  const reopened = exportStateFixture()
+  reopened.jobs = [{ id: 'e'.repeat(32), status: 'completed' }]
+  const handlers = await editorExportHandlers(reopened)
+  handlers.restoreExport(reopened.project, reopened.scope.current)
+  assert.equal(reopened.exportState, 'unconfirmed')
+  await handlers.handleExport()
+  handlers.handleExportAnotherCopy()
+  await handlers.handleExport()
+  assert.equal(posts, 1, 'an unrelated terminal card cannot resolve an ambiguous receipt')
+  reopened.project = { ...reopened.project, revision: reopened.project.revision + 1 }
+  const edited = exportStateFixture()
+  edited.project = reopened.project
+  await (await editorExportHandlers(edited)).handleExport()
+  assert.equal(posts, 2, 'an actual new saved revision can be exported')
+})
+
+test('accepted receipt survives navigation before the reply and allows an explicit copy only after its exact job terminates', async t => {
+  const previous = globalThis.fetch
+  t.after(() => { globalThis.fetch = previous })
+  let finish, posts = 0
+  globalThis.fetch = async () => { posts += 1; return new Promise(resolve => { finish = resolve }) }
+  const original = exportStateFixture()
+  const pending = (await editorExportHandlers(original)).handleExport()
+  original.scope.current += 1
+  finish(Response.json({ job_id: 'e'.repeat(32), status: 'queued' }))
+  await pending
+  const reopened = exportStateFixture()
+  const handlers = await editorExportHandlers(reopened)
+  handlers.restoreExport(reopened.project, 1)
+  assert.equal(reopened.exportState, 'queued')
+  assert.equal(reopened.acceptedExport.current.jobId, 'e'.repeat(32))
+  reopened.jobs = [{ id: 'f'.repeat(32), status: 'completed' }, { id: 'e'.repeat(32), status: 'running' }]
+  handlers.handleExportAnotherCopy()
+  await handlers.handleExport()
+  assert.equal(posts, 1)
+  reopened.jobs[1].status = 'completed'
+  handlers.handleExportAnotherCopy()
+  assert.equal(readEditorExport(editorExportKey(reopened.project)), null)
+  globalThis.fetch = async () => { posts += 1; return Response.json({ job_id: 'f'.repeat(32), status: 'queued' }) }
+  await handlers.handleExport()
+  assert.equal(posts, 2)
+  await new Promise(resolve => setTimeout(resolve, 10))
+})
+
+test('export receipts isolate accounts and projects and refuse unreadable or unwritable recovery before POST', async t => {
+  const previous = globalThis.fetch
+  t.after(() => { globalThis.fetch = previous })
+  const project = sequenceProject()
+  const local = editorExportKey(project)
+  assert.equal(writeEditorExport(local, null, { token: 'intent', jobId: null }), true)
+  assert.equal(readEditorExport(editorExportKey({ ...project, workspace: 'other' })), null)
+  editorTestStore.setState({ accountContext: { enabled: true, authenticated: true, account: { id: 'owner-a' } } })
+  assert.equal(readEditorExport(editorExportKey(project)), null)
+  editorTestStore.setState({ accountContext: { enabled: false } })
+  let posts = 0
+  globalThis.fetch = async () => { posts += 1; throw new Error('must not submit') }
+  for (const storage of [
+    { getItem: () => '{malformed', setItem: () => {} },
+    { getItem: () => null, setItem: () => { throw new Error('quota') } },
+    { getItem: () => { throw new Error('denied') } },
+  ]) {
+    globalThis.sessionStorage = storage
+    const state = exportStateFixture()
+    await (await editorExportHandlers(state)).handleExport()
+    assert.equal(state.exportState, 'unconfirmed')
+  }
+  assert.equal(posts, 0)
 })
 
 

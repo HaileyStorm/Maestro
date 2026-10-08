@@ -5277,13 +5277,24 @@ export async function addEditorImage(project: string, timeline: EditorProject, n
   return (await res.json()).project as EditorProject
 }
 
+export class EditorExportSubmissionError extends Error {
+  constructor() {
+    super('Maestro could not confirm this submission. Check Queue before exporting this cut again; it may already be queued.')
+    this.name = 'EditorExportSubmissionError'
+  }
+}
+
 export async function exportEditorProject(project: string, timeline: EditorProject): Promise<{ job_id: string; status: string }> {
-  const res = await fetch(`${BASE}/api/v1/projects/${encodeURIComponent(project)}/editor/projects/${encodeURIComponent(timeline.id)}/exports`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ expected_revision: timeline.revision }),
-  })
+  let res: Response
+  try {
+    res = await fetch(`${BASE}/api/v1/projects/${encodeURIComponent(project)}/editor/projects/${encodeURIComponent(timeline.id)}/exports`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ expected_revision: timeline.revision }),
+    })
+  } catch { throw new EditorExportSubmissionError() }
   if (!res.ok) {
+    if (res.status >= 500) throw new EditorExportSubmissionError()
     const messages: Partial<Record<number, string>> = {
       401: 'Sign in again to export this cut',
       403: 'You do not have permission to export from this project',
@@ -5291,11 +5302,17 @@ export async function exportEditorProject(project: string, timeline: EditorProje
       409: 'The draft or source changed. Return to Gallery and reopen the video',
       422: 'Check the video cuts and layer times. Text must last at least one frame, and text and audio must end within the exported cut',
       423: 'Unlock this project before exporting',
-      503: 'Editor export is temporarily unavailable',
     }
     throw new ProjectAssetRequestError(res.status, `${messages[res.status] ?? 'Unable to queue this export'} (HTTP ${res.status})`)
   }
-  return await res.json() as { job_id: string; status: string }
+  let value: unknown
+  try { value = await res.json() } catch { throw new EditorExportSubmissionError() }
+  if (!value || typeof value !== 'object' || !('job_id' in value) || !('status' in value)
+    || typeof value.job_id !== 'string' || !isBackendJobId(value.job_id)
+    || typeof value.status !== 'string' || !['queued', 'running', 'held', 'registering', 'preparing'].includes(value.status)) {
+    throw new EditorExportSubmissionError()
+  }
+  return { job_id: value.job_id, status: value.status }
 }
 
 const CHARACTER_SHEET_WORKFLOW_CONTRACT = [

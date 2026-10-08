@@ -1,6 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { ArrowLeft, ArrowRight, Download, Eye, Film, Loader2, Pause, Play, Plus, RotateCcw, Save, Trash2 } from 'lucide-react'
-import { addEditorAudio, addEditorImage, addEditorTake, switchEditorTake, appendEditorClip, exportEditorProject, getEditorPreviewUrl, getEditorRetakes, addEditorRetake, dismissEditorRetake, openOutputInEditor, projectReferenceSafeErrorMessage, saveEditorProject, type EditorProject, type EditorRetakeReview } from '../api/client'
+import { addEditorAudio, addEditorImage, addEditorTake, switchEditorTake, appendEditorClip, EditorExportSubmissionError, ProjectAssetRequestError, isBackendJobId, exportEditorProject, getEditorPreviewUrl, getEditorRetakes, addEditorRetake, dismissEditorRetake, openOutputInEditor, projectReferenceSafeErrorMessage, saveEditorProject, type EditorProject, type EditorRetakeReview } from '../api/client'
+import { confirmReconnectedJobWithin } from '../lib/referenceQueue'
+import { requestQueueView } from '../lib/mainViewNavigation'
+import { terminalJobScope } from '../lib/terminalJobMemory'
 import { hidePrivatePreview, privatePreviewIdentity, privatePreviewWasRevealed, revealPrivatePreview, subscribePrivatePreviewReveal } from '../lib/privatePreview'
 import { currentAccountIdentityEpoch, useStore } from '../stores/useStore'
 import type { OutputFile } from '../types'
@@ -8,6 +11,40 @@ import { MixedAudioPreview } from './MixedAudioPreview'
 import { audioLayerGain as audioGain } from './audioPreviewClock'
 
 type SaveState = 'saved' | 'unsaved' | 'saving' | 'error'
+type ExportSubmission = { token: string; jobId: string | null }
+
+function editorExportKey(project: EditorProject): string | null {
+  const state = useStore.getState()
+  const account = terminalJobScope(state.accountContext ?? state.accessContext?.accounts)
+  return account ? `maestro:editor-export-v1:${JSON.stringify([account, project.workspace, project.id, project.revision])}` : null
+}
+
+// Tab storage preserves ambiguous attempts through Editor remounts and reloads.
+// Never evict an unresolved attempt or treat unreadable storage as an empty ledger.
+function readEditorExport(key: string | null): ExportSubmission | null | 'unavailable' {
+  if (!key) return 'unavailable'
+  try {
+    const raw = sessionStorage.getItem(key)
+    if (raw === null) return null
+    if (raw.length > 512) return 'unavailable'
+    const value = JSON.parse(raw)
+    return value && typeof value.token === 'string' && value.token.length > 0 && value.token.length <= 64
+      && (value.jobId === null || (typeof value.jobId === 'string' && isBackendJobId(value.jobId)))
+      ? { token: value.token, jobId: value.jobId } : 'unavailable'
+  } catch { return 'unavailable' }
+}
+
+function writeEditorExport(key: string | null, expected: ExportSubmission | null, next: ExportSubmission | null): boolean {
+  if (!key) return false
+  try {
+    const current = readEditorExport(key)
+    if (current === 'unavailable' || current?.token !== expected?.token || current?.jobId !== expected?.jobId) return false
+    if (next) sessionStorage.setItem(key, JSON.stringify(next))
+    else sessionStorage.removeItem(key)
+    const stored = readEditorExport(key)
+    return stored !== 'unavailable' && stored?.token === next?.token && stored?.jobId === next?.jobId
+  } catch { return false }
+}
 type TextLayer = EditorProject['tracks'][number]['items'][number] & { text: string; position: 'top' | 'center' | 'bottom' }
 
 function textLayers(project: EditorProject): TextLayer[] {
@@ -419,10 +456,21 @@ async function returnRetakeResult(
   return current() ? result.project : null
 }
 
+async function confirmEditorExportReceipt(
+  jobId: string, reconnect: () => Promise<void>, getJobs: () => readonly { id: string }[],
+  current: () => boolean, timeoutMs = 2_500,
+): Promise<boolean | null> {
+  if (!current()) return null
+  const confirmed = await confirmReconnectedJobWithin(jobId, reconnect, getJobs, timeoutMs)
+  return current() ? confirmed : null
+}
+
 export function EditorWorkspace({ source }: { source: OutputFile }) {
   const closeEditor = useStore(state => state.closeEditor)
   const openRetakeDialog = useStore(state => state.openRetakeDialog)
   const outputs = useStore(state => state.outputs)
+  const jobs = useStore(state => state.jobs)
+  const exportAccountScope = useStore(state => terminalJobScope(state.accountContext ?? state.accessContext?.accounts))
   const [draft, setProject] = useState<EditorProject | null>(null)
   const [loadedSource, setLoadedSource] = useState('')
   const sourceKey = privatePreviewIdentity(source.workspace, source.name, source.revision)
@@ -448,8 +496,31 @@ export function EditorWorkspace({ source }: { source: OutputFile }) {
   const [playbackError, setPlaybackError] = useState(false)
   const [loading, setLoading] = useState(true)
   const [playing, setPlaying] = useState(false)
-  const [exportState, setExportState] = useState<'idle' | 'submitting' | 'queued'>('idle')
+  const [exportState, setExportState] = useState<'idle' | 'submitting' | 'queued' | 'unconfirmed'>('idle')
   const [exportError, setExportError] = useState('')
+  const [exportNotice, setExportNotice] = useState('')
+  const [queueRefreshPending, setQueueRefreshPending] = useState(false)
+  const acceptedExport = useRef<{ jobId: string; epoch: number; version: number } | null>(null)
+  const queueConfirmation = useRef(0)
+  const resetExport = useCallback(() => {
+    setExportState('idle')
+    setExportError('')
+    setExportNotice('')
+    acceptedExport.current = null
+    queueConfirmation.current += 1
+    setQueueRefreshPending(false)
+  }, [])
+  const restoreExport = useCallback((opened: EditorProject, epoch: number) => {
+    const stored = readEditorExport(editorExportKey(opened))
+    if (!stored) return
+    setExportState(stored !== 'unavailable' && stored.jobId ? 'queued' : 'unconfirmed')
+    setExportNotice(stored !== 'unavailable' && stored.jobId
+      ? 'This cut was already accepted for export. Refresh Queue to check its status.'
+      : stored === 'unavailable'
+        ? 'Export recovery could not be read in this tab. Check Queue before trying this cut again.'
+        : new EditorExportSubmissionError().message)
+    if (stored !== 'unavailable' && stored.jobId) acceptedExport.current = { jobId: stored.jobId, epoch, version: editVersion.current }
+  }, [])
   const preview = useRef<HTMLVideoElement>(null)
   const saving = useRef(false)
   const savingPromise = useRef<Promise<{ project: EditorProject; allEditsSaved: boolean } | null> | null>(null)
@@ -539,8 +610,7 @@ export function EditorWorkspace({ source }: { source: OutputFile }) {
     setSaveState('saved')
     setSavePending(false)
     setError('')
-    setExportState('idle')
-    setExportError('')
+    resetExport()
     setPlaybackError(false)
     setPlaying(false)
     setLoading(true)
@@ -552,6 +622,7 @@ export function EditorWorkspace({ source }: { source: OutputFile }) {
         setLoadedSource(privatePreviewIdentity(source.workspace, source.name, source.revision))
         selectedClip.current = sequenceClips(opened)[0]?.id ?? ''
         setActiveClipId(selectedClip.current)
+        restoreExport(opened, epoch)
         setLoading(false)
       },
       reason => {
@@ -561,7 +632,14 @@ export function EditorWorkspace({ source }: { source: OutputFile }) {
       },
     )
     return () => { scope.current += 1 }
-  }, [source.workspace, source.name, source.revision, isCurrent])
+  }, [source.workspace, source.name, source.revision, isCurrent, resetExport, restoreExport])
+
+  useEffect(() => {
+    const opened = projectRef.current
+    if (!opened || exporting.current || !isCurrent(scope.current)) return
+    resetExport()
+    restoreExport(opened, scope.current)
+  }, [exportAccountScope, isCurrent, resetExport, restoreExport])
 
   const save = useCallback((snapshot: EditorProject) => {
     const epoch = scope.current
@@ -580,6 +658,7 @@ export function EditorWorkspace({ source }: { source: OutputFile }) {
         setProject(next)
         savedVersion.current = version
         const allEditsSaved = editVersion.current === version
+        if (allEditsSaved) restoreExport(saved, epoch)
         setSaveState(allEditsSaved ? 'saved' : 'unsaved')
         setError('')
         // Back stays open if a newer trim needs its follow-up save.
@@ -599,7 +678,7 @@ export function EditorWorkspace({ source }: { source: OutputFile }) {
     })()
     savingPromise.current = pending
     return pending
-  }, [source.workspace, isCurrent])
+  }, [source.workspace, isCurrent, restoreExport])
 
   useEffect(() => {
     if (!project || saveState !== 'unsaved' || saving.current || appendPending) return
@@ -613,8 +692,7 @@ export function EditorWorkspace({ source }: { source: OutputFile }) {
     editVersion.current += 1
     setSaveState('unsaved')
     setError('')
-    setExportState('idle')
-    setExportError('')
+    resetExport()
     setAppendError('')
     preview.current?.pause()
     setPlaying(false)
@@ -715,8 +793,7 @@ export function EditorWorkspace({ source }: { source: OutputFile }) {
       setSaveState('saved')
       setAppendName('')
       setTakeName('')
-      setExportState('idle')
-      setExportError('')
+      resetExport()
     } catch (reason) {
       if (isCurrent(epoch)) setAppendError(projectReferenceSafeErrorMessage(reason, `This ${kind} could not be added. Try again.`))
     } finally {
@@ -756,8 +833,7 @@ export function EditorWorkspace({ source }: { source: OutputFile }) {
       setPreviewTime(0)
       setPlaybackError(false)
       setSaveState('saved')
-      setExportState('idle')
-      setExportError('')
+      resetExport()
     } catch (reason) {
       if (isCurrent(epoch)) setAppendError(projectReferenceSafeErrorMessage(reason, 'This take could not be selected. Try again.'))
     } finally {
@@ -784,31 +860,74 @@ export function EditorWorkspace({ source }: { source: OutputFile }) {
   const busy = appendPending || exportState === 'submitting'
   const canReorder = !busy && !savePending
 
+  const refreshExportQueue = async (receipt: NonNullable<typeof acceptedExport.current>) => {
+    const sequence = ++queueConfirmation.current
+    const current = () => sequence === queueConfirmation.current && acceptedExport.current === receipt
+      && isCurrent(receipt.epoch) && editVersion.current === receipt.version
+    if (!current()) return
+    setQueueRefreshPending(true)
+    const confirmed = await confirmEditorExportReceipt(receipt.jobId,
+      () => useStore.getState().reconnectJobs(), () => useStore.getState().jobs, current)
+    if (!current()) return
+    setQueueRefreshPending(false)
+    setExportNotice(confirmed ? '' : 'Your export was accepted, but Queue has not confirmed its status yet. Refresh Queue to check it; this will not submit another export.')
+  }
+
   const handleExport = async () => {
     const epoch = scope.current
-    if (!project || !canTrim || titlesOutOfRange || titlesTooShort || audioOutOfRange || imageInvalidRange || saveState !== 'saved' || saving.current || exporting.current || appending.current || !isCurrent(epoch)) return
+    if (!project || exportState !== 'idle' || !canTrim || titlesOutOfRange || titlesTooShort || audioOutOfRange || imageInvalidRange || saveState !== 'saved' || saving.current || exporting.current || appending.current || !isCurrent(epoch)) return
+    const key = editorExportKey(project)
+    const submission = { token: crypto.randomUUID(), jobId: null }
+    if (!writeEditorExport(key, null, submission)) {
+      if (readEditorExport(key)) restoreExport(project, epoch)
+      else {
+        setExportState('unconfirmed')
+        setExportNotice('This tab could not record a new export safely. Check Queue before trying again.')
+      }
+      return
+    }
     exporting.current = true
     const version = editVersion.current
     setExportState('submitting')
     setExportError('')
+    setExportNotice('')
     try {
-      await exportEditorProject(source.workspace, project)
+      const result = await exportEditorProject(source.workspace, project)
+      // Persist acceptance even if navigation or an account change retired this UI.
+      writeEditorExport(key, submission, { ...submission, jobId: result.job_id })
       if (!isCurrent(epoch)) return
-      // The Queue renders cards from /jobs; its /queue poll only updates cards
-      // already in the store. Discover this newly submitted job before sending
-      // the user there, including when the global queue is paused.
-      await useStore.getState().reconnectJobs()
-      if (!isCurrent(epoch)) return
-      setExportState(editVersion.current === version ? 'queued' : 'idle')
+      if (editVersion.current !== version) return
+      const receipt = { jobId: result.job_id, epoch, version }
+      acceptedExport.current = receipt
+      setExportState('queued')
+      setExportNotice('Your export was accepted. Checking its status in Queue…')
+      // Acceptance survives failed or stalled discovery. Later refreshes are GET-only.
+      void refreshExportQueue(receipt)
     } catch (reason) {
+      const rejected = reason instanceof ProjectAssetRequestError && reason.status >= 400 && reason.status < 500
+      const cleared = rejected && writeEditorExport(key, submission, null)
       if (!isCurrent(epoch)) return
-      setExportState('idle')
       if (editVersion.current === version) {
-        setExportError(projectReferenceSafeErrorMessage(reason, 'Could not queue this export. Try again.'))
+        const uncertain = !cleared
+        setExportState(uncertain ? 'unconfirmed' : 'idle')
+        if (uncertain) setExportNotice(new EditorExportSubmissionError().message)
+        else setExportError(projectReferenceSafeErrorMessage(reason, 'Could not queue this export. Try again.'))
       }
     } finally {
       if (isCurrent(epoch)) exporting.current = false
     }
+  }
+
+  const canExportAnotherCopy = exportState === 'queued' && jobs.some(job => job.id === acceptedExport.current?.jobId
+    && ['completed', 'failed', 'cancelled'].includes(job.status))
+  const handleExportAnotherCopy = () => {
+    if (!project || !isCurrent(scope.current) || exporting.current || saveState !== 'saved') return
+    const key = editorExportKey(project)
+    const stored = readEditorExport(key)
+    if (!stored || stored === 'unavailable' || !stored.jobId || stored.jobId !== acceptedExport.current?.jobId) return
+    const job = useStore.getState().jobs.find(item => item.id === stored.jobId)
+    if (!job || !['completed', 'failed', 'cancelled'].includes(job.status)) return
+    if (writeEditorExport(key, stored, null)) resetExport()
   }
 
   const retakeKey = project && clip ? JSON.stringify([sourceKey, project.id, project.revision, clip.id, clipSequence.current, scope.current]) : ''
@@ -867,8 +986,7 @@ export function EditorWorkspace({ source }: { source: OutputFile }) {
         projectRef.current = returned
         setProject(returned)
         setSaveState('saved')
-        setExportState('idle')
-        setExportError('')
+        resetExport()
       }
       if (current()) setRetakeRefresh(value => value + 1)
     } catch (reason) {
@@ -1020,14 +1138,28 @@ export function EditorWorkspace({ source }: { source: OutputFile }) {
                 disabled={!canTrim || titlesOutOfRange || titlesTooShort || audioOutOfRange || imageInvalidRange || saveState !== 'saved' || exportState !== 'idle' || appendPending}
                 className="mt-5 flex min-h-11 w-full items-center justify-center gap-2 rounded-lg border border-border bg-bg-primary px-4 text-sm font-medium text-text-primary hover:bg-bg-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:opacity-50">
                 {exportState === 'submitting' ? <Loader2 size={16} className="animate-spin motion-reduce:animate-none" aria-hidden="true" /> : <Download size={16} aria-hidden="true" />}
-                {exportState === 'submitting' ? 'Queuing export…' : exportState === 'queued' ? 'Export queued' : 'Export MP4'}
+                {exportState === 'submitting' ? 'Queuing export…' : exportState === 'queued' ? 'Export queued' : exportState === 'unconfirmed' ? 'Check Queue' : 'Export MP4'}
               </button>
               <button type="button" onClick={() => { void handleRetake() }} disabled={!clip || busy || saveState === 'error'}
                 className="mt-3 min-h-11 w-full rounded-lg border border-border px-4 text-sm font-medium hover:bg-bg-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:opacity-50">
                 Retake selected cut
               </button>
-              {exportState === 'queued' && <p className="mt-3 text-xs leading-relaxed text-text-secondary" role="status">Track the export in Queue. The finished MP4 will appear in Gallery.</p>}
+              {exportState === 'queued' && !exportNotice && <p className="mt-3 text-xs leading-relaxed text-text-secondary" role="status">Track the export in Queue. The finished MP4 will appear in Gallery.</p>}
+              {exportNotice && <p className="mt-3 text-xs leading-relaxed text-amber-200" role="status">{exportNotice}</p>}
+              {(exportState === 'queued' || exportState === 'unconfirmed') && <div className="mt-3 flex flex-wrap gap-2">
+                <button type="button" onClick={() => {
+                  if (!isCurrent(scope.current)) return
+                  closeEditor()
+                  requestQueueView()
+                }} className="min-h-11 rounded-lg border border-border px-3 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue">Open Queue</button>
+                {exportState === 'queued' && exportNotice && <button type="button" disabled={queueRefreshPending} onClick={() => {
+                  const receipt = acceptedExport.current
+                  if (receipt) void refreshExportQueue(receipt)
+                }} className="min-h-11 rounded-lg border border-border px-3 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:opacity-50">{queueRefreshPending ? 'Refreshing Queue…' : 'Refresh Queue'}</button>}
+              </div>}
               {exportError && <p className="mt-3 text-sm text-red-400" role="alert">{exportError}</p>}
+              {canExportAnotherCopy && <button type="button" onClick={handleExportAnotherCopy}
+                className="mt-3 min-h-11 rounded-lg border border-border px-3 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue">Export another copy</button>}
               {audioOutOfRange && <p className="mt-3 text-sm text-red-400" role="alert">Audio ends after this cut. Shorten the audio layer or move its timeline start before export.</p>}
               {titlesOutOfRange && <p className="mt-3 text-sm text-red-400" role="alert">Text ends after this cut. Shorten or remove those text layers before export.</p>}
               {titlesTooShort && <p className="mt-3 text-sm text-red-400" role="alert">Text must last at least one video frame ({(1 / titleFps).toFixed(3)} seconds). Move its start or end before export.</p>}
