@@ -2311,5 +2311,179 @@ class DirectorSceneAssemblyTests(unittest.TestCase):
             crossings = sum(a <= 0 < b for a, b in zip(samples, samples[1:]))
             self.assertAlmostEqual(crossings / (len(samples) / 32000), frequency, delta=10)
 
+
+class DirectorH3RerunSourceTests(unittest.TestCase):
+    """Real manifest/media seals with model-free original producer graphs."""
+
+    def setUp(self):
+        from tests.test_director_h3_invariants import TestDirectorH3Invariants
+        from services.queue_recovery_runtime import (
+            QueueRecoveryRuntimeError, atomic_write_request_manifest, load_request_manifest,
+            validate_manifest_inputs, artifact_descriptor, validate_artifact_descriptor, recovery_unit_id,
+        )
+        from services.queue_recovery_adapter import owner_principal_digest
+        self.fixture = TestDirectorH3Invariants()
+        self.fixture.setUp()
+        self.addCleanup(self.fixture.tearDown)
+        self.root = Path(self.fixture.temp_dir.name)
+        self.state, self.prepared = self.fixture._rerun_source_state()
+        self.original = self.state["_params_snapshot"]["_h3_longform"]
+        self.job_id = next(iter(self.state["recovery"]["children"].values()))["job_id"]
+        self.owner = owner_principal_digest(b"rerun-test-session-secret", "owner")
+        self.project = "b" * 64
+        self.error = QueueRecoveryRuntimeError
+        self.namespace = _launch_functions({"_director_recovery_h3_rerun_source",
+            "_queue_recovery_completed_h3_graph", "_queue_recovery_unit_matches",
+            "_h3_dependency_closed_recovery_units", "_director_recovery_scene_map",
+            "_h3_true_peak_policy_identity"}, {
+            "os": os, "copy": copy, "hmac": hmac,
+            "QueueRecoveryRuntimeError": QueueRecoveryRuntimeError,
+            "owner_principal_digest": owner_principal_digest,
+            "_session_secret": lambda: b"rerun-test-session-secret",
+            "_existing_workspace_dir": lambda workspace: str(self.root),
+            "_queue_recovery_existing_project_identity": lambda root: self.project,
+            "load_request_manifest": load_request_manifest,
+            "validate_manifest_inputs": validate_manifest_inputs,
+            "_queue_recovery_manifest_validator": lambda *args, **kwargs: True,
+            "_recovery_artifact_descriptor": artifact_descriptor,
+            "validate_artifact_descriptor": validate_artifact_descriptor,
+            "recovery_unit_id": recovery_unit_id,
+            "_queue_recovery_units": lambda job: job["recovery_cursor"]["completed_units"],
+        })
+        units = []
+        for index, shot in enumerate(self.original["shot_plan"]["shots"]):
+            settings = {"generated_frames": self.original["clip_frames"][index],
+                "published_frames": self.original["clip_published_frames"][index],
+                "trim_tail_frames": self.original["clip_trim_tail_frames"][index],
+                "discard_prefix_frames": self.original["segment_models"][index]["discard_frames"],
+                "native_boundary_conditioning": True,
+                "semantic_execution": {"version": 2,
+                    **{key: shot[key] for key in ("semantic_shot_index", "physical_segment_index",
+                        "physical_segment_count", "predecessor_segment_index", "execution_cursor_frame")},
+                    "start_frame": shot["execution_slice"]["start_frame"],
+                    "end_frame_exclusive": shot["execution_slice"]["end_frame_exclusive"]}}
+            dependencies = [units[-1]["unit_id"]] if units else []
+            if units:
+                settings["predecessor_artifact_hashes"] = [units[-1]["artifacts"][0]["sha256"]]
+                settings["predecessor_continuation_sha256"] = ""
+            unit_id = recovery_unit_id(self.job_id, "h3_segment", variant=3, index=index,
+                settings=settings, dependencies=dependencies)
+            producer = {"unit_id": unit_id, "kind": "h3_segment", "variant": 3, "index": index,
+                "settings": settings, "dependencies": dependencies, "state": "completed",
+                "continuation": {"dependency": unit_id, "mode": "prompt_only"}}
+            self.write_unit(producer, f"original-{index}.mp4")
+            units.append(producer)
+        self.policy = self.namespace["_h3_true_peak_policy_identity"]()
+        settings = {"component_hashes": [u["artifacts"][0]["sha256"] for u in units],
+            "clip_start_frames": [u["settings"]["discard_prefix_frames"] for u in units],
+            "clip_tail_frames": self.original["clip_trim_tail_frames"], "source_prefix": None,
+            "h3_audio_true_peak_policy": self.policy}
+        dependencies = [unit["unit_id"] for unit in units]
+        unit_id = recovery_unit_id(self.job_id, "h3_concat", variant=3, index=0,
+            settings=settings, dependencies=dependencies)
+        final = {"unit_id": unit_id, "kind": "h3_concat", "variant": 3, "index": 0,
+            "settings": settings, "dependencies": dependencies, "state": "completed",
+            "attestation": {"h3_audio_true_peak": {**self.policy, "verified": True}}}
+        self.write_unit(final, "film.mp4")
+        params = {"_director_pipeline_id": self.state["pipeline_id"],
+                  "_h3_longform": self.original, "multi_clip_audio_start_sec": 2.013}
+        pointer = atomic_write_request_manifest(self.root, job_id=self.job_id, params=params, inputs=[])
+        self.snapshot = {"id": self.job_id, "status": "completed", "kind": "director_child",
+            "workspace": "default", "owner_principal": self.owner, "project_instance": self.project,
+            "request_manifest": pointer, "recovery_cursor": {"completed_units": [*units, final]}}
+        self.namespace["_queue_recovery_coordinator"] = types.SimpleNamespace(
+            read_only_snapshot=lambda: ({self.job_id: copy.deepcopy(self.snapshot)}, frozenset()))
+
+    def write_unit(self, unit, name):
+        from services.queue_recovery_runtime import artifact_descriptor
+        data = ("sealed:" + name).encode()
+        (self.root / name).write_bytes(data)
+        role = "final" if unit["kind"] == "h3_concat" else "component"
+        meta = {"job_id": self.job_id, "workspace": "default", "output_filename": name,
+            "producer_unit_id": unit["unit_id"], "producer_unit_kind": unit["kind"],
+            "producer_unit_index": unit["index"], "producer_unit_variant": unit["variant"],
+            "producer_unit_settings": unit["settings"], "producer_unit_dependencies": unit["dependencies"],
+            "producer_unit_artifact_names": [name], "producer_media_size": len(data),
+            "producer_media_sha256": hashlib.sha256(data).hexdigest(),
+            "artifact_class": role, "producer_artifact_class": role,
+            "params": {"multi_clip_info": {"output_index": 0, "output_total": 1}}}
+        if "continuation" in unit:
+            meta["producer_unit_continuation"] = unit["continuation"]
+        if "attestation" in unit:
+            meta["producer_unit_attestation"] = unit["attestation"]
+        sidecar = Path(name).stem + ".meta.json"
+        (self.root / sidecar).write_text(json.dumps(meta))
+        unit["artifacts"] = [artifact_descriptor(self.root, basename=name,
+            sidecar_basename=sidecar, producer_unit_id=unit["unit_id"])]
+
+    def resolve(self, **kwargs):
+        return self.namespace["_director_recovery_h3_rerun_source"](
+            self.state, self.prepared, **({"session_id": "owner", "project_dir": str(self.root)} | kwargs))
+
+    def test_verified_original_variant_and_scene_local_geometry_are_provenance_only(self):
+        before = copy.deepcopy(self.snapshot)
+        result = self.resolve()
+        self.assertEqual(result["original_variant"], 3)
+        self.assertEqual(result["physical_indices"], [1, 2])
+        self.assertEqual(result["predecessor_index"], 0)
+        self.assertEqual(result["predecessor_path"], str(self.root / "original-0.mp4"))
+        self.assertEqual(result["predecessor_artifact"]["producer_unit_id"], result["predecessor_unit_id"])
+        self.assertNotIn("completed_units", result)
+        self.assertEqual(self.snapshot, before)
+
+    def test_opening_scene_has_no_predecessor_but_still_requires_original_authority(self):
+        self.prepared = director._prepare_director_h3_scene_rerun({}, committed=self.original,
+            scene_index=0, audio_origin_sec=2.013)
+        result = self.resolve()
+        self.assertIsNone(result["predecessor_path"])
+        self.assertIsNone(result["predecessor_artifact"])
+        self.assertIsNone(result["boundary"])
+        self.snapshot["owner_principal"] = "different-owner"
+        with self.assertRaises(self.error): self.resolve()
+
+    def test_recreated_project_changed_owner_and_path_are_rejected(self):
+        for field, value in (("owner_principal", "other-owner"), ("project_instance", "other-project"),
+            ("workspace", "other"), ("kind", "studio_generation"), ("status", "failed"),
+            ("cancel_requested", True)):
+            old = copy.deepcopy(self.snapshot)
+            self.snapshot[field] = value
+            with self.subTest(field=field), self.assertRaises(self.error): self.resolve()
+            self.snapshot = old
+        with self.assertRaises(self.error): self.resolve(session_id="")
+        with self.assertRaises(self.error): self.resolve(project_dir=str(self.root / "other"))
+
+    def test_newly_sealed_wrong_song_origin_cannot_self_authorize(self):
+        self.prepared = director._prepare_director_h3_scene_rerun({}, committed=self.original,
+            scene_index=1, audio_origin_sec=2.0)
+        with self.assertRaises(self.error): self.resolve()
+
+    def test_missing_manifest_changed_media_and_changed_sidecar_fail_without_mutation(self):
+        original = copy.deepcopy(self.snapshot)
+        for name in ("original-0.mp4", "original-2.meta.json"):
+            path = self.root / name; data = path.read_bytes()
+            path.write_bytes(data + b"changed")
+            with self.subTest(path=name), self.assertRaises(self.error): self.resolve()
+            self.assertEqual(self.snapshot, original)
+            path.write_bytes(data)
+        manifest = self.root / self.snapshot["request_manifest"]["path"]
+        manifest.unlink()
+        with self.assertRaises(self.error): self.resolve()
+        self.assertEqual(self.snapshot, original)
+
+    def test_original_input_validator_is_mandatory_even_for_completed_graph(self):
+        from services.queue_recovery_runtime import atomic_write_request_manifest
+        params = {"_director_pipeline_id": self.state["pipeline_id"],
+                  "_h3_longform": self.original, "multi_clip_audio_start_sec": 2.013}
+        self.snapshot["request_manifest"] = atomic_write_request_manifest(self.root,
+            job_id=self.job_id, params=params, inputs=[{"field": "original-input"}])
+        self.namespace["_queue_recovery_manifest_validator"] = lambda *args, **kwargs: False
+        with self.assertRaises(self.error): self.resolve()
+
+    def test_missing_canonical_snapshot_cannot_fall_back_to_live_job_or_saved_filenames(self):
+        self.namespace["_queue_recovery_coordinator"] = types.SimpleNamespace(
+            read_only_snapshot=lambda: ({}, frozenset({self.job_id})))
+        director._jobs[self.job_id] = copy.deepcopy(self.snapshot)
+        with self.assertRaises(self.error): self.resolve()
+
 if __name__ == "__main__":
     unittest.main()

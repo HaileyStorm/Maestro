@@ -6825,6 +6825,125 @@ def _remove_director_preparation_state(
             os.close(directory)
 
 
+def _director_recovery_h3_rerun_source(
+    state: dict,
+    prepared_plan: dict,
+    *,
+    session_id: str,
+    project_dir: str,
+) -> dict:
+    """Verify original H3 producers as input provenance, without adopting them.
+
+    This server-only result contains private source paths. It must be consumed
+    under the registration guard when creating a fresh sealed input snapshot;
+    it is neither public request data nor a new job's recovery cursor.
+    """
+    from services.director_pipeline import (
+        _director_h3_rerun_source_identity, _rehydrate_director_h3_longform,
+    )
+
+    identity = _director_h3_rerun_source_identity(state, prepared_plan)
+    workspace = str(state.get("workspace") or "default")
+    if not isinstance(session_id, str) or not session_id:
+        raise QueueRecoveryRuntimeError("Director H3 rerun requires an owner.")
+    existing = _existing_workspace_dir(workspace)
+    if os.path.normcase(os.path.realpath(existing)) != os.path.normcase(os.path.realpath(project_dir)):
+        raise QueueRecoveryRuntimeError("Director H3 source project changed.")
+    owner_digest = owner_principal_digest(_session_secret(), session_id)
+    project_digest = _queue_recovery_existing_project_identity(existing)
+    snapshots, _ = _queue_recovery_coordinator.read_only_snapshot()
+    snapshot = snapshots.get(identity["job_id"])
+    if (not isinstance(snapshot, dict) or snapshot.get("id") != identity["job_id"]
+            or snapshot.get("kind") != "director_child"
+            or snapshot.get("status") != "completed" or snapshot.get("cancel_requested")
+            or str(snapshot.get("workspace") or "default") != workspace
+            or not hmac.compare_digest(str(snapshot.get("owner_principal") or ""), owner_digest)
+            or not hmac.compare_digest(str(snapshot.get("project_instance") or ""), project_digest)):
+        raise QueueRecoveryRuntimeError("Director H3 original generation is unavailable or changed.")
+    manifest = load_request_manifest(existing, snapshot.get("request_manifest") or {},
+                                     expected_job_id=identity["job_id"])
+    validate_manifest_inputs(manifest, lambda descriptor: _queue_recovery_manifest_validator(
+        dict(descriptor), owner_digest=owner_digest, workspace=workspace, project_dir=existing))
+    params = manifest["params"]
+    original = params.get("_h3_longform")
+    origin = params.get("multi_clip_audio_start_sec", 0.0)
+    if (params.get("_director_pipeline_id") != identity["pipeline_id"]
+            or original != identity["original_plan"]
+            or type(origin) not in {int, float}
+            or origin != identity["selection"]["audio_origin_sec"]):
+        raise QueueRecoveryRuntimeError("Director H3 original request disagrees with saved provenance.")
+    restored = {}
+    if not _rehydrate_director_h3_longform(restored, original,
+            h3_style_workflow=original.get("h3_style_workflow")):
+        raise QueueRecoveryRuntimeError("Director H3 original plan is unsupported.")
+    original = restored["_h3_longform"]
+    # Construct a read-only verifier input. Materialization/reconciliation can
+    # mutate or quarantine state and must not be used for source discovery.
+    original_job = copy.deepcopy(snapshot)
+    original_job.update(params=copy.deepcopy(params), out_dir=existing)
+    graph = _queue_recovery_completed_h3_graph(original_job, existing)
+    if not isinstance(graph, dict):
+        raise QueueRecoveryRuntimeError("Director H3 original completed media could not be verified.")
+    units = graph["completed_units"]
+    selection = identity["selection"]
+    needed = list(selection["physical_indices"])
+    if selection["predecessor_index"] is not None:
+        needed.insert(0, selection["predecessor_index"])
+    selected = []
+    for index in needed:
+        name = identity["clip_output_files"][str(index)]
+        candidates = [unit for unit in units if unit.get("kind") == "h3_segment"
+                      and type(unit.get("index")) is int and unit["index"] == index
+                      and len(unit.get("artifacts") or []) == 1
+                      and unit["artifacts"][0].get("basename") == name]
+        if len(candidates) != 1:
+            raise QueueRecoveryRuntimeError("Director H3 original producer is ambiguous.")
+        producer = candidates[0]
+        settings = producer.get("settings") or {}
+        expected = {"generated_frames": original["clip_frames"][index],
+                    "published_frames": original["clip_published_frames"][index],
+                    "trim_tail_frames": original["clip_trim_tail_frames"][index],
+                    "discard_prefix_frames": original["segment_models"][index].get("discard_frames", 0),
+                    "native_boundary_conditioning": original.get("native_boundary_conditioning") is True}
+        execution = settings.get("semantic_execution")
+        shot = original["shot_plan"]["shots"][index]
+        expected_execution = {
+            "version": 2,
+            **{key: shot[key] for key in ("semantic_shot_index", "physical_segment_index",
+                "physical_segment_count", "predecessor_segment_index", "execution_cursor_frame")},
+            "start_frame": shot["execution_slice"]["start_frame"],
+            "end_frame_exclusive": shot["execution_slice"]["end_frame_exclusive"],
+        }
+        if (type(producer.get("variant")) is not int or producer["variant"] < 0
+                or any(type(settings.get(key)) is not type(value) or settings[key] != value
+                       for key, value in expected.items())
+                or execution != expected_execution
+                or any(type(execution[key]) is not type(value) for key, value in expected_execution.items())):
+            raise QueueRecoveryRuntimeError("Director H3 original producer geometry disagrees.")
+        selected.append(producer)
+    variants = {unit["variant"] for unit in selected}
+    if len(variants) != 1:
+        raise QueueRecoveryRuntimeError("Director H3 original scene mixes output variants.")
+    predecessor = selected[0] if selection["predecessor_index"] is not None else None
+    descriptor = copy.deepcopy(predecessor["artifacts"][0]) if predecessor else None
+    # Copy only provenance, not completed units. Admission will revalidate and
+    # snapshot this exact descriptor before publishing the new child job.
+    return {"version": 1, "pipeline_id": identity["pipeline_id"],
+            "original_job_id": identity["job_id"], "workspace": workspace,
+            "owner_digest": owner_digest, "project_digest": project_digest,
+            "original_manifest": copy.deepcopy(snapshot["request_manifest"]),
+            "original_plan_sha256": selection["original_plan_sha256"],
+            "scene_index": selection["scene_index"],
+            "physical_indices": list(selection["physical_indices"]),
+            "original_variant": next(iter(variants)),
+            "predecessor_index": selection["predecessor_index"],
+            "predecessor_unit_id": predecessor["unit_id"] if predecessor else None,
+            "predecessor_artifact": descriptor,
+            "predecessor_path": os.path.join(existing, descriptor["basename"]) if descriptor else None,
+            "boundary": copy.deepcopy(original["clip_boundaries"][selection["physical_indices"][0] - 1])
+                        if predecessor else None}
+
+
 def _director_recovery_retire_preparation(
     request_id: str,
     project_dir: str,

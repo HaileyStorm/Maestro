@@ -1140,3 +1140,25 @@ wired into rerun submission: the new job still needs verified original
 predecessor input admission, selected-segment dispatch and recovery, scene-only
 completion, and persisted replacement provenance. The combined runtime rollout
 and native generation/listening acceptance remain pending.
+
+### 2026-10-08 — Original producer verification for H3 scene repair
+
+The source resolver now identifies the completed original Director child from
+its saved scheduling record and exact physical membership. It verifies the
+current owner and project instance, original private request manifest and input
+seals, completed producer graph, output variant and generated/published geometry.
+Execution slices are compared in their authored scene's coordinates; soundtrack
+timing remains bound to the original manifest's fractional origin. Replaced
+scene files can retain their original physical membership separately.
+
+The returned predecessor descriptor is private input provenance. It does not
+adopt an old producer into the new job's completed work. Missing canonical queue
+evidence, changed media or sidecars, shifted soundtrack origin and changed scope
+are rejected. The nine focused source checks pass using real manifest and media
+seals with a model-free completed graph; independent review is clear.
+
+This is source verification, not a dispatched scene repair. Registration still
+needs to revalidate and snapshot the predecessor as a fresh sealed input, retain
+original provenance across terminal compaction, and bind selected-segment
+dispatch/recovery to scene-only completion. Runtime rollout and native quality,
+LAN workflow and human listening acceptance remain pending.

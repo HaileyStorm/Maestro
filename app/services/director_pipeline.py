@@ -8873,6 +8873,98 @@ def _prepare_director_h3_scene_rerun(
     return gen_params["_h3_longform"]
 
 
+def _director_h3_rerun_source_identity(state: dict, prepared_plan: dict) -> dict:
+    """Resolve original scheduling/membership without granting media authority.
+
+    Queue admission must independently verify this identity against the private
+    original manifest, current owner/project and completed producer graph.
+    """
+    if not isinstance(state, dict) or not isinstance(prepared_plan, dict):
+        raise ValueError("Director H3 rerun source is invalid")
+    snapshot = state.get("_params_snapshot")
+    original = snapshot.get("_h3_longform") if isinstance(snapshot, dict) else None
+    selection = prepared_plan.get("scene_rerun")
+    if not isinstance(original, dict) or not isinstance(selection, dict):
+        raise ValueError("Director H3 rerun source plan is missing")
+    restored = {}
+    if not _rehydrate_director_h3_longform(restored, prepared_plan,
+            h3_style_workflow=prepared_plan.get("h3_style_workflow")):
+        raise ValueError("Director H3 rerun plan is unsupported")
+    expected = _prepare_director_h3_scene_rerun({}, committed=original,
+        scene_index=selection.get("scene_index"),
+        audio_origin_sec=selection.get("audio_origin_sec"))
+    if selection != expected["scene_rerun"]:
+        raise ValueError("Director H3 rerun selection changed")
+    for key in ("clip_frames", "clip_published_frames", "clip_trim_tail_frames",
+                "segment_source_indices", "segment_models", "clip_boundaries"):
+        if prepared_plan.get(key) != expected.get(key):
+            raise ValueError("Director H3 rerun partition changed")
+    if ([shot["physical_segment_id"] for shot in prepared_plan["shot_plan"]["shots"]]
+            != [shot["physical_segment_id"] for shot in expected["shot_plan"]["shots"]]):
+        raise ValueError("Director H3 rerun physical identities changed")
+
+    pid = state.get("pipeline_id")
+    unit = {"kind": "video_generation", "variant": 0, "index": 0}
+    recovery = state.get("recovery")
+    children = recovery.get("children") if isinstance(recovery, dict) else None
+    entry = children.get(_child_unit_token(unit)) if isinstance(children, dict) else None
+    if (not isinstance(pid, str) or not pid or not isinstance(entry, dict)
+            or entry.get("unit") != unit or entry.get("state") != "completed"
+            or type(entry.get("attempt")) is not int or entry["attempt"] < 0
+            or entry.get("job_id") != _director_child_job_id(pid, unit, entry["attempt"])
+            or not isinstance(entry.get("evidence"), dict)):
+        raise ValueError("Director H3 original generation identity is unavailable")
+
+    clips = state.get("clips")
+    owners = expected["segment_source_indices"]
+    if not isinstance(clips, list) or len(clips) != max(owners) + 1:
+        raise ValueError("Director H3 original physical membership is incomplete")
+    for owner, clip in enumerate(clips):
+        members = (clip.get("h3_original_video_segments", clip.get("h3_video_segments"))
+                   if isinstance(clip, dict) else None)
+        expected_indices = [index for index, value in enumerate(owners) if value == owner]
+        if (not isinstance(members, list) or len(members) != len(expected_indices)
+                or any(not isinstance(member, dict) or type(member.get("physical_index")) is not int
+                       for member in members)
+                or sorted(member["physical_index"] for member in members) != expected_indices):
+            raise ValueError("Director H3 original physical membership is ambiguous")
+    physical = {}
+    cursor = 0
+    for index, owner in enumerate(owners):
+        clip = clips[owner]
+        members = (clip.get("h3_original_video_segments", clip.get("h3_video_segments"))
+                   if isinstance(clip, dict) else None)
+        matches = [member for member in members if isinstance(member, dict)
+                   and type(member.get("physical_index")) is int
+                   and member["physical_index"] == index] if isinstance(members, list) else []
+        expected_member = {
+            "physical_index": index,
+            "generated_frames": expected["clip_frames"][index],
+            "published_frames": expected["clip_published_frames"][index],
+            "trim_tail_frames": expected["clip_trim_tail_frames"][index],
+            "boundary_discard_frames": expected["segment_models"][index].get("discard_frames", 0),
+            "published_start_frame": cursor,
+            "model_type": expected["segment_models"][index]["model_type"],
+        }
+        if len(matches) != 1:
+            raise ValueError("Director H3 original physical membership is ambiguous")
+        member = matches[0]
+        name = member.get("filename")
+        if (not isinstance(name, str) or not name or os.path.basename(name) != name
+                or os.path.splitext(name)[1].lower() not in {".mp4", ".webm", ".mkv", ".mov"}
+                or any(type(member.get(key)) is not type(value) or member[key] != value
+                       for key, value in expected_member.items())):
+            raise ValueError("Director H3 original physical membership changed")
+        physical[str(index)] = name
+        cursor += expected["clip_published_frames"][index]
+    evidence_map = entry["evidence"].get("clip_output_files")
+    if not isinstance(evidence_map, dict) or evidence_map != physical:
+        raise ValueError("Director H3 saved child and physical membership disagree")
+    return {"pipeline_id": pid, "job_id": entry["job_id"],
+            "original_plan": copy.deepcopy(original), "selection": copy.deepcopy(selection),
+            "clip_output_files": physical, "evidence": copy.deepcopy(entry["evidence"])}
+
+
 def _rehydrate_director_h3_longform(
     gen_params: dict,
     plan: dict,

@@ -233,6 +233,54 @@ non_diegetic_music: N/A"""
         self.assertTrue(pipeline._rehydrate_director_h3_longform(restored, repaired))
         self.assertEqual(restored["per_clip_prompts"], executable)
 
+    def _rerun_source_state(self):
+        original = self._rerun_partition_fixture(native=True)
+        files = {str(i): f"original-{i}.mp4" for i in range(original["clip_count"])}
+        projected = pipeline._director_clip_video_artifacts(
+            pipeline._DirectorOutputs(list(files.values()), files), {"_h3_longform": original}, 3)
+        unit = {"kind": "video_generation", "variant": 0, "index": 0}
+        state = {"pipeline_id": "original-pipeline", "workspace": "default",
+                 "_params_snapshot": {"_h3_longform": original},
+                 "clips": [{"h3_video_segments": group} for group in projected["_h3_clip_video_groups"]],
+                 "recovery": {"children": {pipeline._child_unit_token(unit): {
+                     "unit": unit, "attempt": 1, "state": "completed",
+                     "job_id": pipeline._director_child_job_id("original-pipeline", unit, 1),
+                     "evidence": {"clip_output_files": files}}}}}
+        repaired = pipeline._prepare_director_h3_scene_rerun({}, committed=original,
+            scene_index=1, audio_origin_sec=2.013, prompt_override="An adult courier carries a red case.")
+        return state, repaired
+
+    def test_rerun_source_identity_is_absolute_and_keeps_original_membership(self):
+        state, repaired = self._rerun_source_state()
+        before = copy.deepcopy(state)
+        result = pipeline._director_h3_rerun_source_identity(state, repaired)
+        self.assertEqual(result["selection"]["physical_indices"], [1, 2])
+        self.assertEqual(result["selection"]["predecessor_index"], 0)
+        self.assertEqual(result["clip_output_files"]["2"], "original-2.mp4")
+        self.assertEqual(state, before)
+        for clip in state["clips"]:
+            clip["h3_original_video_segments"] = copy.deepcopy(clip["h3_video_segments"])
+            for member in clip["h3_video_segments"]:
+                member["filename"] = "replacement.mp4"
+        self.assertEqual(pipeline._director_h3_rerun_source_identity(state, repaired), result)
+
+    def test_rerun_source_rejects_guessed_child_and_ambiguous_membership(self):
+        state, repaired = self._rerun_source_state()
+        entry = next(iter(state["recovery"]["children"].values()))
+        for mutate in (
+            lambda s: next(iter(s["recovery"]["children"].values())).__setitem__("job_id", "guessed"),
+            lambda s: next(iter(s["recovery"]["children"].values())).__setitem__("attempt", True),
+            lambda s: next(iter(s["recovery"]["children"].values())).__setitem__("state", "submitted"),
+            lambda s: s["clips"][1]["h3_video_segments"].append(s["clips"][1]["h3_video_segments"][0]),
+            lambda s: s["clips"][1]["h3_video_segments"][0].__setitem__("published_start_frame", 0),
+            lambda s: s["clips"][1]["h3_video_segments"][0].__setitem__("filename", "../outside.mp4"),
+            lambda s: next(iter(s["recovery"]["children"].values()))["evidence"]["clip_output_files"].__setitem__("2", "changed.mp4"),
+        ):
+            changed = copy.deepcopy(state); mutate(changed)
+            with self.assertRaises(ValueError):
+                pipeline._director_h3_rerun_source_identity(changed, repaired)
+        self.assertEqual(entry["state"], "completed")
+
     def test_scene_rerun_without_edit_reuses_canonical_sources_and_cut_policy(self):
         original = self._rerun_partition_fixture()
         params = {}
