@@ -14959,6 +14959,8 @@ def list_models(request: Request):
             "architecture": architecture,
             "retake_engines": _retake_engines_for_architecture(architecture),
             "h3_gallery_av_guides": mt == "minimax_h3" and os.environ.get("MAESTRO_H3_TIMELINE_GUIDES_EXPERIMENTAL") == "1",
+            **({"h3_face_refine": True}
+               if mt == "minimax_h3" and _face_refine_available() else {}),
             "is_i2v": wgp.test_class_i2v(mt),
             "is_t2v": wgp.test_class_t2v(mt),
             "guidance_max_phases": md.get("guidance_max_phases", 1),
@@ -67508,6 +67510,52 @@ def _run_tool_h3_face_refine(job_id):
         finally:
             job.pop("_face_refine_provenance",None)
             unregister_abort_state(job_id,_active_gen_states,abort_state)
+
+
+def _authorize_face_refine_preview_source(request, workspace, name, revision):
+    """Recheck current authority and exact final Gallery identity per read."""
+    from services.h3_face_refine_reads import FacePreviewAccess
+
+    if not _face_refine_available():
+        raise HTTPException(status_code=409, detail="Face repair is not available yet")
+    # Middleware resolved this session before CPU work. Resolve it again here
+    # so expiry, revocation and account changes also apply before pixel return.
+    _attach_account_request_state(
+        request,
+        str(getattr(request.state, "maestro_account_session_id", "") or ""),
+        remote=bool(getattr(request.state, "maestro_remote", False)),
+    )
+    workspace = _request_project_workspace(request, workspace)
+    _require_remote_visible_models(request, ["minimax_h3"])
+    _require_h3_legal_execution(["minimax_h3"])
+    _require_model_recipe_terms(["minimax_h3"])
+    with _reserve_workspace_operations(workspace):
+        out_dir = _require_project_access(
+            request, workspace, existing_only=True, permission="project.generate",
+        )
+        with _output_lineage_mutation_guard(out_dir):
+            selected_dir, path, _ = _require_authorized_output(request, workspace, name)
+            try:
+                source, metadata = _h3_gallery_av_source_state(
+                    workspace, out_dir, name, revision,
+                )
+                if (source != path
+                        or os.path.realpath(selected_dir) != os.path.realpath(out_dir)):
+                    raise ValueError("Source project changed")
+            except (ValueError, OSError, KeyError, TypeError):
+                raise HTTPException(
+                    status_code=409,
+                    detail="The source changed. Refresh Gallery and review the clip.",
+                ) from None
+            return FacePreviewAccess(
+                workspace=workspace, name=name, revision=revision, path=source,
+                private=metadata.get("private", False),
+                explicit=metadata.get("explicit", False),
+            )
+
+
+from services.h3_face_refine_reads import register_face_preview_reads
+register_face_preview_reads(api, authorize_source=_authorize_face_refine_preview_source)
 
 
 @api.post("/api/v1/tools/h3-face-refine")
