@@ -528,10 +528,12 @@ function _directorAdmissionScope(state = useStore.getState()): string | null {
 const _directorAdmissionLedger = new DirectorQueueAdmissionLedger(() => _directorAdmissionScope())
 const _directorAdmissionBusy = new Map<string, 'preparing' | 'sending'>()
 let _directorQueueRefreshSequence = 0
+let _directorQueueOpenSequence = 0
 let _directorAdmissionBoundary = 0
 function _directorAdmissionIdentity(state = useStore.getState()): string {
   return JSON.stringify([currentAccountIdentityEpoch(), _directorAdmissionScope(state), state.activeWorkspace])
 }
+export function currentDirectorQueueScope(): string { return _directorAdmissionKey() }
 function _directorAdmissionKey(state = useStore.getState()): string {
   return `${_directorAdmissionBoundary}:${_directorAdmissionIdentity(state)}`
 }
@@ -568,6 +570,15 @@ async function _sendDirectorAdmission(intent: DirectorQueueAdmission, scope: str
     _directorAdmissionBusy.delete(key)
     if (_directorAdmissionKey() === key) useStore.setState({ directorQueueAdmission: _directorAdmissionView() })
   }
+}
+
+async function _mutateDirectorQueue(mutate: (workspace: string) => Promise<unknown>): Promise<void> {
+  const workspace = useStore.getState().activeWorkspace
+  const key = currentDirectorQueueScope()
+  ++_directorQueueRefreshSequence // Retire any read begun before this mutation.
+  await mutate(workspace)
+  if (currentDirectorQueueScope() !== key) return
+  await useStore.getState().loadDirectorQueue() // Read canonical state; never replay a mutation.
 }
 
 function _isBrowserAbort(error: unknown): boolean {
@@ -3535,7 +3546,7 @@ interface AppState {
   dashboardLoading: boolean
   setDashboardOpen: (open: boolean) => void
   loadPipelineList: () => Promise<void>
-  loadSavedPipeline: (pid: string) => Promise<void>
+  loadSavedPipeline: (pid: string) => Promise<boolean>
   tagClip: (pid: string, clipIndex: number, tag: string | null) => Promise<void>
   startPipelineRepair: (pid: string) => Promise<PipelineRepairState>
   cancelPipelineRepair: (pid: string) => Promise<PipelineRepairState>
@@ -3774,7 +3785,7 @@ interface AppState {
   directorQueue: api.DirectorQueueState | null
   directorQueueLoading: boolean
   loadDirectorQueue: () => Promise<void>
-  loadDirectorQueueEntry: (entryId: string) => Promise<void>
+  loadDirectorQueueEntry: (entryId: string) => Promise<boolean>
   startDirectorQueue: () => Promise<void>
   pauseDirectorQueue: () => Promise<void>
   removeDirectorQueueEntry: (entryId: string) => Promise<void>
@@ -7284,19 +7295,23 @@ export const useStore = create<AppState>((set, get) => ({
     }
   },
   loadSavedPipeline: async (pid) => {
+    const workspace = get().activeWorkspace
+    const key = currentDirectorQueueScope()
     const loadToken = ++_dashboardPipelineLoadToken
     set({ dashboardLoading: true })
     try {
-      const pipeline = await api.fetchSavedPipeline(pid, get().activeWorkspace)
-      if (loadToken !== _dashboardPipelineLoadToken) return
+      const pipeline = await api.fetchSavedPipeline(pid, workspace)
+      if (loadToken !== _dashboardPipelineLoadToken || currentDirectorQueueScope() !== key) return false
       set({ dashboardSelectedPipeline: pipeline, dashboardLoading: false })
       if (_repairNeedsPolling(pipeline.repair)) {
         get().pollPipelineRepair(pid, pipeline.repair!.operation_id)
       }
+      return true
     } catch (e) {
-      if (loadToken !== _dashboardPipelineLoadToken) return
+      if (loadToken !== _dashboardPipelineLoadToken || currentDirectorQueueScope() !== key) return false
       console.error('Failed to load pipeline:', e)
       set({ dashboardLoading: false })
+      return false
     }
   },
   deletePipeline: async (pid) => {
@@ -10780,27 +10795,31 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   loadDirectorQueueEntry: async (entryId) => {
-    const entry = await api.fetchDirectorQueueEntry(entryId)
+    const workspace = get().activeWorkspace
+    const key = currentDirectorQueueScope()
+    const openSequence = ++_directorQueueOpenSequence
+    const loadToken = ++_dashboardPipelineLoadToken // Retire a previous Open's pipeline lookup immediately.
+    set({ dashboardLoading: false })
+    const current = () => currentDirectorQueueScope() === key && openSequence === _directorQueueOpenSequence
+    const entry = await api.fetchDirectorQueueEntry(entryId, workspace)
+    if (!current() || loadToken !== _dashboardPipelineLoadToken) return false
     const pipelineId = typeof entry?.pipeline_id === 'string' ? entry.pipeline_id : ''
-    if (pipelineId) {
-      await get().loadSavedPipeline(pipelineId)
-    }
+    if (pipelineId && !await get().loadSavedPipeline(pipelineId)) return false
+    if (!current()) return false
     await get().loadDirectorQueue()
+    return current()
   },
 
   startDirectorQueue: async () => {
-    const directorQueue = await api.startDirectorQueue()
-    set({ directorQueue })
+    await _mutateDirectorQueue(workspace => api.startDirectorQueue(workspace))
   },
 
   pauseDirectorQueue: async () => {
-    const directorQueue = await api.pauseDirectorQueue()
-    set({ directorQueue })
+    await _mutateDirectorQueue(workspace => api.pauseDirectorQueue(workspace))
   },
 
   removeDirectorQueueEntry: async (entryId) => {
-    await api.deleteDirectorQueueEntry(entryId)
-    await get().loadDirectorQueue()
+    await _mutateDirectorQueue(workspace => api.deleteDirectorQueueEntry(entryId, workspace))
   },
 
   moveDirectorQueueEntry: async (entryId, direction) => {
@@ -10812,8 +10831,7 @@ export const useStore = create<AppState>((set, get) => ({
     const ids = entries.map(entry => entry.id)
     const [moved] = ids.splice(index, 1)
     ids.splice(next, 0, moved)
-    const directorQueue = await api.reorderDirectorQueue(ids)
-    set({ directorQueue })
+    await _mutateDirectorQueue(workspace => api.reorderDirectorQueue(ids, workspace))
   },
 
   stopGeneration: (jobId) => {
@@ -19940,5 +19958,6 @@ useStore.subscribe(() => {
   ++_directorAdmissionBoundary
   ++_directorQueueRefreshSequence
   useStore.setState({ directorQueue: null, directorQueueLoading: false, directorError: null, directorComponentError: null,
+    dashboardSelectedPipeline: null, dashboardLoading: false,
     directorQueueAdmission: _directorAdmissionView() })
 })

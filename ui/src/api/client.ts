@@ -864,8 +864,8 @@ export async function fetchDirectorQueue(workspace?: string): Promise<DirectorQu
   return res.json()
 }
 
-export async function fetchDirectorQueueEntry(entryId: string) {
-  const res = await fetch(`${BASE}/api/v1/director/queue/${encodeURIComponent(entryId)}`)
+export async function fetchDirectorQueueEntry(entryId: string, workspace: string) {
+  const res = await fetch(`${BASE}/api/v1/director/queue/${encodeURIComponent(entryId)}?workspace=${encodeURIComponent(workspace)}`)
   if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || 'Director queue entry failed')
   return res.json()
 }
@@ -880,20 +880,20 @@ export async function enqueueDirectorPipeline(params: Record<string, unknown>, r
   return res.json()
 }
 
-export async function startDirectorQueue() {
-  const res = await fetch(`${BASE}/api/v1/director/queue/start`, { method: 'POST' })
+export async function startDirectorQueue(workspace: string) {
+  const res = await fetch(`${BASE}/api/v1/director/queue/start?workspace=${encodeURIComponent(workspace)}`, { method: 'POST' })
   if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || 'Start Director queue failed')
   return res.json()
 }
 
-export async function pauseDirectorQueue() {
-  const res = await fetch(`${BASE}/api/v1/director/queue/pause`, { method: 'POST' })
+export async function pauseDirectorQueue(workspace: string) {
+  const res = await fetch(`${BASE}/api/v1/director/queue/pause?workspace=${encodeURIComponent(workspace)}`, { method: 'POST' })
   if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || 'Pause Director queue failed')
   return res.json()
 }
 
-export async function reorderDirectorQueue(entryIds: string[]) {
-  const res = await fetch(`${BASE}/api/v1/director/queue/reorder`, {
+export async function reorderDirectorQueue(entryIds: string[], workspace: string) {
+  const res = await fetch(`${BASE}/api/v1/director/queue/reorder?workspace=${encodeURIComponent(workspace)}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ entry_ids: entryIds }),
@@ -912,8 +912,8 @@ export async function updateDirectorQueueEntry(entryId: string, params: Record<s
   return res.json()
 }
 
-export async function deleteDirectorQueueEntry(entryId: string) {
-  const res = await fetch(`${BASE}/api/v1/director/queue/${encodeURIComponent(entryId)}`, { method: 'DELETE' })
+export async function deleteDirectorQueueEntry(entryId: string, workspace: string) {
+  const res = await fetch(`${BASE}/api/v1/director/queue/${encodeURIComponent(entryId)}?workspace=${encodeURIComponent(workspace)}`, { method: 'DELETE' })
   if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || 'Remove Director queue failed')
   return res.json()
 }

@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
 import test from 'node:test'
+import ts from 'typescript'
 
 const generateButton = await readFile(
   new URL('../src/components/Sidebar/GenerateButton.tsx', import.meta.url),
@@ -96,7 +97,7 @@ test('submitGeneration posts Continuum _queue_mode held or now', () => {
   assert.match(submit, /_queue_mode: holdForQueue \? 'held' : 'now'/)
 })
 
-test('Director Add to Queue calls enqueueDirectorPipeline', () => {
+test('Director Add to Queue uses the held submission action', () => {
   assert.match(directorChat, /queueCurrentDirectorPipeline\(\)/)
   assert.match(
     directorChat,
@@ -108,12 +109,7 @@ test('Director Add to Queue calls enqueueDirectorPipeline', () => {
     'startDirectorPipeline: async',
   )
   assert.match(queueEntry, /startDirectorPipeline\('queue'\)/)
-  const pipeline = slice(
-    store,
-    "startDirectorPipeline: async (mode = 'now') => {",
-    'const { pipeline_id } = await api.startPipeline(pipelineParams)',
-  )
-  assert.match(pipeline, /await api\.enqueueDirectorPipeline\(pipelineParams\)/)
+
 })
 
 test('queue badge uses Continuum held flag instead of status held', () => {
@@ -252,4 +248,64 @@ test('projectLogicalQueue counts queued Continuum holds via job.held', () => {
   const completedHold = projectHeldSummary([job({ id: 'done-1', status: 'completed', held: true })])
   assert.equal(completedHold.held, 0)
   assert.equal(completedHold.active_total, 0)
+})
+
+// Execute the actual handlers; keep their asynchronous scope checks observable.
+function popoverHandler(name, bindings) {
+  const ast = ts.createSourceFile('GlobalQueuePopover.tsx', globalQueuePopover, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX)
+  let declaration
+  function visit(node) {
+    if (ts.isVariableDeclaration(node) && node.name.getText(ast) === name) declaration = node
+    ts.forEachChild(node, visit)
+  }
+  visit(ast)
+  assert.ok(declaration, name)
+  const js = ts.transpileModule(`const ${declaration.getText(ast)}; return ${name}`, {
+    compilerOptions: { target: ts.ScriptTarget.ES2022 },
+  }).outputText
+  return new Function(...Object.keys(bindings), js)(...Object.values(bindings))
+}
+function deferred() {
+  let resolve
+  const promise = new Promise(done => { resolve = done })
+  return { promise, resolve }
+}
+
+test('Popover Start preserves ordering and never starts another project after Studio awaits', async () => {
+  for (const changed of [false, true]) {
+    let scope = 'project-a'
+    const calls = []
+    const hold = deferred()
+    const start = popoverHandler('startAllQueues', {
+      startingAll: false, studioHeldCount: 1, startableDirectorCount: 1,
+      directorQueue: { running: false, paused: true },
+      currentDirectorQueueScope: () => scope,
+      setStartingAll: value => calls.push(value),
+      startStudioQueue: async () => { calls.push('studio'); await hold.promise },
+      startDirectorQueue: async () => calls.push('director'),
+    })
+    const pending = start()
+    if (changed) scope = 'project-b'
+    hold.resolve(); await pending
+    assert.deepEqual(calls, changed ? [true, 'studio', false] : [true, 'studio', 'director', false])
+  }
+})
+
+test('Popover Open requires successful current-project loading before navigation', async () => {
+  for (const [changed, loaded] of [[false, true], [true, true], [false, false]]) {
+    let scope = 'project-a'
+    const calls = []
+    const hold = deferred()
+    const open = popoverHandler('openDirectorEntry', {
+      currentDirectorQueueScope: () => scope,
+      loadDirectorQueueEntry: async id => { calls.push(id); await hold.promise; return loaded },
+      setOpen: value => calls.push(['popover', value]),
+      setSidebarOpen: value => calls.push(['sidebar', value]),
+    })
+    const pending = open('abcd1234')
+    if (changed) scope = 'project-b'
+    hold.resolve(); await pending
+    assert.deepEqual(calls, !changed && loaded
+      ? ['abcd1234', ['popover', false], ['sidebar', true]] : ['abcd1234'])
+  }
 })

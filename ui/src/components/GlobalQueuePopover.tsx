@@ -15,7 +15,7 @@ import {
 } from 'lucide-react'
 import { closeModalIfTop, installModalFocus } from '../lib/modalFocus'
 import { isActiveLogicalQueueJob, projectLogicalQueue } from '../lib/queueProjection'
-import { useStore } from '../stores/useStore'
+import { currentDirectorQueueScope, useStore } from '../stores/useStore'
 
 const ACTIVE_DIRECTOR_STATUSES = new Set(['held', 'queued', 'running'])
 const ACTIVE_PIPELINE_STATUSES = new Set(['running', 'paused'])
@@ -169,18 +169,21 @@ export function GlobalQueuePopover({
   }
 
   const openDirectorEntry = async (entryId: string) => {
-    await loadDirectorQueueEntry(entryId)
+    const scope = currentDirectorQueueScope()
+    if (!await loadDirectorQueueEntry(entryId) || currentDirectorQueueScope() !== scope) return
     setOpen(false)
     setSidebarOpen(true)
   }
 
   const startAllQueues = async () => {
     if (startingAll) return
+    const scope = currentDirectorQueueScope()
     setStartingAll(true)
     try {
       // Release Studio first. Director's existing GPU gate sees those jobs
       // as queued/running and waits, so one click safely starts both systems.
       if (studioHeldCount > 0) await startStudioQueue()
+      if (currentDirectorQueueScope() !== scope) return
       if (
         startableDirectorCount > 0
         && (!directorQueue?.running || directorQueue.paused)

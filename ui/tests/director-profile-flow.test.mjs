@@ -94,6 +94,14 @@ async function withStore(action, { legacyRoles = false, storage = new StorageFak
       if (control.beforeUpload) await control.beforeUpload.promise
       return json({ path: '/job/uploaded.png' })
     }
+    if (url.pathname.startsWith('/api/v1/director/queue/')) {
+      if (queueControl.operation) return queueControl.operation(url, init, requests)
+      return json({ entries: [], admissions: [], project_instance: PROJECT_INSTANCE, pipeline_id: 'pipeline-a' })
+    }
+    if (url.pathname.startsWith('/api/v1/director/pipelines/')) {
+      if (queueControl.pipeline) return queueControl.pipeline(url, init, requests)
+      return json({ pipeline_id: 'pipeline-a', clips: [] })
+    }
     if (url.pathname === '/api/v1/director/queue') {
       if (method === 'GET' && !queueControl.get) return json({ project_instance: PROJECT_INSTANCE, entries: [], admissions: [] })
       if (queueControl.handle) return queueControl.handle(url, init, requests)
@@ -696,4 +704,151 @@ test('Director replacement project retires only a verified old receipt and never
     assert.match(store.getState().directorError, /earlier project/)
     assert.equal(requests.filter(r => r.method === 'POST' && r.url.endsWith('/queue')).length, 0)
   }, { storage, queueControl: { get: true, handle: async () => json({ entries: [], admissions: [], project_instance: 'project:v1:' + 'b'.repeat(64) }) } })
+})
+
+
+test('Director controls route explicit original project and retire late results after project/account/ABA changes', async () => {
+  const actions = [
+    ['start', store => store.getState().startDirectorQueue()],
+    ['pause', store => store.getState().pauseDirectorQueue()],
+    ['remove', store => store.getState().removeDirectorQueueEntry('abcd1234')],
+    ['move', store => store.getState().moveDirectorQueueEntry('abcd1234', 1)],
+    ['open', store => store.getState().loadDirectorQueueEntry('abcd1234')],
+  ]
+  for (const [name, action] of actions) for (const change of ['project', 'account', 'ABA']) {
+    const hold = deferred()
+    await withStore(async (store, { requests }) => {
+      store.setState({ directorQueue: { entries: [{ id: 'abcd1234', status: 'held' }, { id: 'bbbb1234', status: 'held' }] } })
+      const pending = action(store)
+      if (change === 'account') store.setState({ accountContext: { enabled: true, authenticated: true, account: { id: 'other' } } })
+      else {
+        store.setState({ activeWorkspace: 'project-b' })
+        if (change === 'ABA') store.setState({ activeWorkspace: 'project-a' })
+      }
+      hold.resolve(); await pending
+      assert.equal(store.getState().directorQueue, null, name + '/' + change)
+      const request = requests.find(r => r.url.startsWith('/api/v1/director/queue/'))
+      assert.ok(request.search.includes('workspace=project-a'), name)
+      assert.equal(requests.filter(r => r.url === '/api/v1/director/queue').length, 0, 'no follow-up refresh after retirement')
+      assert.equal(requests.some(r => r.url.startsWith('/api/v1/director/pipelines/')), false, 'no mismatched pipeline follow-up')
+    }, { queueControl: { operation: async () => { await hold.promise; return json({ entries: [{ id: 'abcd1234', status: 'held' }], pipeline_id: 'pipeline-a' }) } } })
+  }
+})
+
+test('Director pre-mutation GET cannot overwrite the later canonical mutation refresh', async () => {
+  const oldRead = deferred()
+  let reads = 0
+  await withStore(async store => {
+    const pending = store.getState().loadDirectorQueue()
+    await store.getState().pauseDirectorQueue()
+    oldRead.resolve(); await pending
+    assert.equal(store.getState().directorQueue.paused, true)
+  }, { queueControl: { get: true, handle: async () => {
+    if (++reads === 1) { await oldRead.promise; return json({ entries: [], paused: false }) }
+    return json({ entries: [], paused: true })
+  }, operation: async () => json({ entries: [], paused: false }) } })
+})
+
+
+test('Director Open retires a pipeline response after its project changes', async () => {
+  const hold = deferred()
+  const entered = deferred()
+  await withStore(async (store, { requests }) => {
+    const pending = store.getState().loadDirectorQueueEntry('abcd1234')
+    await entered.promise
+    store.setState({ activeWorkspace: 'project-b' })
+    hold.resolve()
+    assert.equal(await pending, false)
+    assert.equal(store.getState().dashboardSelectedPipeline, null)
+    assert.equal(store.getState().dashboardLoading, false)
+    const request = requests.find(r => r.url.startsWith('/api/v1/director/pipelines/'))
+    assert.ok(request.search.includes('workspace=project-a'))
+    assert.equal(requests.filter(r => r.url === '/api/v1/director/queue').length, 0)
+  }, { queueControl: { pipeline: async () => {
+    entered.resolve(); await hold.promise
+    return json({ pipeline_id: 'pipeline-a', clips: [] })
+  } } })
+})
+
+test('Director Open loads its project pipeline and refreshes canonical queue before returning success', async () => {
+  await withStore(async (store, { requests }) => {
+    assert.equal(await store.getState().loadDirectorQueueEntry('abcd1234'), true)
+    assert.equal(store.getState().dashboardSelectedPipeline.pipeline_id, 'pipeline-a')
+    const reads = requests.filter(r => r.url.startsWith('/api/v1/director/'))
+    assert.deepEqual(reads.map(r => r.url), ['/api/v1/director/queue/abcd1234', '/api/v1/director/pipelines/pipeline-a', '/api/v1/director/queue'])
+    assert.ok(reads.every(r => r.search.includes('workspace=project-a')))
+  })
+})
+
+
+test('Director newer Open wins over an older entry lookup in the same project', async () => {
+  const oldRead = deferred()
+  await withStore(async (store, { requests }) => {
+    const older = store.getState().loadDirectorQueueEntry('abcd1234')
+    assert.equal(await store.getState().loadDirectorQueueEntry('bbbb1234'), true)
+    oldRead.resolve()
+    assert.equal(await older, false)
+    assert.equal(store.getState().dashboardSelectedPipeline.pipeline_id, 'pipeline-b')
+    assert.equal(requests.some(r => r.url.endsWith('/pipelines/pipeline-a')), false)
+  }, { queueControl: {
+    operation: async url => {
+      if (url.pathname.endsWith('/abcd1234')) { await oldRead.promise; return json({ pipeline_id: 'pipeline-a' }) }
+      return json({ pipeline_id: 'pipeline-b' })
+    }, pipeline: async () => json({ pipeline_id: 'pipeline-b', clips: [] }),
+  } })
+})
+
+test('Director newer Open immediately retires an older pipeline lookup in the same project', async () => {
+  const oldPipeline = deferred()
+  const entered = deferred()
+  const newEntry = deferred()
+  await withStore(async store => {
+    const older = store.getState().loadDirectorQueueEntry('abcd1234')
+    await entered.promise
+    const newer = store.getState().loadDirectorQueueEntry('bbbb1234')
+    oldPipeline.resolve()
+    assert.equal(await older, false)
+    assert.equal(store.getState().dashboardSelectedPipeline, null)
+    newEntry.resolve()
+    assert.equal(await newer, true)
+    assert.equal(store.getState().dashboardSelectedPipeline.pipeline_id, 'pipeline-b')
+  }, { queueControl: {
+    operation: async url => {
+      if (url.pathname.endsWith('/bbbb1234')) await newEntry.promise
+      return json({ pipeline_id: url.pathname.endsWith('/abcd1234') ? 'pipeline-a' : 'pipeline-b' })
+    }, pipeline: async url => {
+      if (url.pathname.endsWith('/pipeline-a')) { entered.resolve(); await oldPipeline.promise }
+      return json({ pipeline_id: url.pathname.split('/').pop(), clips: [] })
+    },
+  } })
+})
+
+
+test('Director newer entry without a pipeline or failed entry clears retired pipeline loading', async () => {
+  for (const failed of [false, true]) {
+    const oldPipeline = deferred()
+    const entered = deferred()
+    await withStore(async store => {
+      const older = store.getState().loadDirectorQueueEntry('abcd1234')
+      await entered.promise
+      assert.equal(store.getState().dashboardLoading, true)
+      const newer = store.getState().loadDirectorQueueEntry('bbbb1234')
+      if (failed) await assert.rejects(newer, /missing entry/)
+      else assert.equal(await newer, true)
+      assert.equal(store.getState().dashboardLoading, false)
+      oldPipeline.resolve()
+      assert.equal(await older, false)
+      assert.equal(store.getState().dashboardSelectedPipeline, null)
+      assert.equal(store.getState().dashboardLoading, false)
+    }, { queueControl: {
+      operation: async url => {
+        if (url.pathname.endsWith('/abcd1234')) return json({ pipeline_id: 'pipeline-a' })
+        if (failed) throw new Error('missing entry')
+        return json({ pipeline_id: null })
+      }, pipeline: async () => {
+        entered.resolve(); await oldPipeline.promise
+        return json({ pipeline_id: 'pipeline-a', clips: [] })
+      },
+    } })
+  }
 })
