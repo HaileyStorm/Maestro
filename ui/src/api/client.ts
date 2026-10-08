@@ -2278,6 +2278,11 @@ export interface AccessContext {
   project_password_required: boolean
   project_names_visible: boolean
   machine_controls: boolean
+  remote_owner_controls?: {
+    enabled: boolean
+    requires_recent_reauthentication: boolean
+    available_routes: { method: string; path: string }[]
+  }
   custom_model_sources: boolean
   catalog_model_downloads: boolean
   classic_ui: boolean
@@ -2286,6 +2291,29 @@ export interface AccessContext {
   share_flow: string
   /** Optional for compatibility with hosts predating the account layer. */
   accounts?: AccountContext
+}
+
+/** A remote action needs a matching current account and an explicit server route. */
+export function canUseQueueOwnerAction(
+  context: AccessContext | null,
+  account: AccountContext | null,
+  path: '/api/v1/queue/{job_id}/priority' | '/api/v1/queue/{job_id}/start-next'
+    | '/api/v1/queue/pause-after-output' | '/api/v1/queue/resume',
+): boolean {
+  if (context?.remote !== true && context?.machine_controls === true) return true
+  const projected = context?.accounts
+  return context?.remote === true
+    && context.remote_owner_controls?.enabled === true
+    && account?.authenticated === true
+    && account.account?.role === 'owner'
+    && account.reauthenticated === true
+    && account.capabilities.includes('owner.remote_parity')
+    && projected?.authenticated === true
+    && projected.account?.id === account.account.id
+    && projected.reauthenticated === true
+    && context.remote_owner_controls.available_routes.some(
+      route => route.method === 'POST' && route.path === path,
+    )
 }
 
 /**
@@ -2339,6 +2367,12 @@ export function isDirectLoopbackHostname(hostname: string): boolean {
 }
 
 let accessContextRequest: Promise<AccessContext> | null = null
+
+export function retireAccessContextRequest(): void {
+  // Existing subscribers finish under their store request fences. The next
+  // subscriber must use the cookies after the account authority transition.
+  accessContextRequest = null
+}
 
 export async function fetchAccessContext(): Promise<AccessContext> {
   // React StrictMode and independent capability refreshes may ask for this at

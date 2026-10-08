@@ -1699,6 +1699,10 @@ class AccountAuthStoreTests(unittest.TestCase):
 class AccountCapabilityTests(unittest.TestCase):
     @staticmethod
     def _launch_subset(*names, constants=()):
+        if {"_maestro_session_middleware", "_remote_local_only_denial"} & set(names):
+            names = (*names, "_remote_owner_reauth_route")
+            constants = (*constants, "_REMOTE_OWNER_REAUTH_ALLOWED_EXACT",
+                         "_REMOTE_OWNER_REAUTH_ALLOWED_TEMPLATES")
         path = APP / "launch.py"
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         body = []
@@ -3242,6 +3246,21 @@ class AccountCapabilityTests(unittest.TestCase):
             deny(request({"owner.remote_parity"}, False)).status_code, 403,
         )
         self.assertEqual(deny(request(set(), True)).status_code, 403)
+        candidate = namespace["_remote_owner_reauth_route"]
+        for action in ("priority", "start-next"):
+            route = f"/api/v1/queue/job-a/{action}"
+            self.assertTrue(candidate("POST", route))
+            self.assertIsNone(deny(request({"owner.remote_parity"}, True, "POST", route)))
+            for method, malformed in (
+                ("GET", route), ("PUT", route),
+                ("POST", f"/api/v1/queue//{action}"),
+                ("POST", f"/api/v1/queue/a/b/{action}"),
+                ("POST", f"/api/v1/queue/../{action}"),
+                ("POST", route + "/"),
+                ("POST", "/api/v1/queue/job-a/hold"),
+            ):
+                self.assertFalse(candidate(method, malformed), (method, malformed))
+
 
     def test_remote_owner_route_matrix_denies_before_body_or_side_effects(self):
         route_matrix = (
@@ -3316,6 +3335,10 @@ class AccountCapabilityTests(unittest.TestCase):
             "owner-stale": {
                 "id": "owner", "role": "owner", "disabled": False,
                 "recently_reauthenticated": False,
+            },
+            "disabled": {
+                "id": "owner", "role": "owner", "disabled": True,
+                "recently_reauthenticated": True,
             },
             "user-fresh": {
                 "id": "user", "role": "user", "disabled": False,
@@ -3442,7 +3465,11 @@ class AccountCapabilityTests(unittest.TestCase):
             return response, receive_count, dispatch_count
 
         async def exercise():
-            for method, route in route_matrix:
+            dynamic_routes = (
+                ("POST", "/api/v1/queue/job-a/priority"),
+                ("POST", "/api/v1/queue/job-a/start-next"),
+            )
+            for method, route in (*route_matrix, *dynamic_routes):
                 with self.subTest(method=method, route=route, identity="owner-fresh"):
                     response, reads, side_effects = await request(
                         method, route, "owner-fresh", remote=True, valid_body=True,
@@ -3450,7 +3477,7 @@ class AccountCapabilityTests(unittest.TestCase):
                     self.assertEqual(response.status_code, 200)
                     self.assertEqual((reads, side_effects), (1, 1))
 
-                for identity in ("owner-stale", "user-fresh", ""):
+                for identity in ("owner-stale", "user-fresh", "revoked", "disabled", ""):
                     with self.subTest(method=method, route=route, identity=identity or "anonymous"):
                         response, reads, side_effects = await request(
                             method, route, identity, remote=True, valid_body=False,
@@ -3472,7 +3499,7 @@ class AccountCapabilityTests(unittest.TestCase):
     def test_access_context_truthfully_bounds_remote_owner_controls(self):
         module, path = self._launch_subset(
             "get_access_context",
-            constants=("_REMOTE_OWNER_REAUTH_ALLOWED_EXACT",),
+            constants=("_REMOTE_OWNER_REAUTH_ALLOWED_EXACT", "_REMOTE_OWNER_REAUTH_ALLOWED_TEMPLATES"),
         )
         projected_accounts = {
             "authenticated": True,
@@ -3501,14 +3528,18 @@ class AccountCapabilityTests(unittest.TestCase):
         self.assertTrue(controls["enabled"])
         self.assertEqual(
             {(item["method"], item["path"]) for item in controls["available_routes"]},
-            namespace["_REMOTE_OWNER_REAUTH_ALLOWED_EXACT"],
+            namespace["_REMOTE_OWNER_REAUTH_ALLOWED_EXACT"]
+            | namespace["_REMOTE_OWNER_REAUTH_ALLOWED_TEMPLATES"],
         )
         self.assertTrue(all(item["reason"] for item in controls["unavailable"]))
+        self.assertNotIn("global_queue_ordering", {
+            item["control"] for item in controls["unavailable"]
+        })
 
     def test_access_context_reports_registered_cloudflare_without_process_flag(self):
         module, path = self._launch_subset(
             "get_access_context",
-            constants=("_REMOTE_OWNER_REAUTH_ALLOWED_EXACT",),
+            constants=("_REMOTE_OWNER_REAUTH_ALLOWED_EXACT", "_REMOTE_OWNER_REAUTH_ALLOWED_TEMPLATES"),
         )
         namespace = {
             "Request": object,
@@ -3536,7 +3567,7 @@ class AccountCapabilityTests(unittest.TestCase):
     def test_access_context_fallback_has_disabled_account_activation_state(self):
         module, path = self._launch_subset(
             "get_access_context",
-            constants=("_REMOTE_OWNER_REAUTH_ALLOWED_EXACT",),
+            constants=("_REMOTE_OWNER_REAUTH_ALLOWED_EXACT", "_REMOTE_OWNER_REAUTH_ALLOWED_TEMPLATES"),
         )
         namespace = {
             "Request": object,

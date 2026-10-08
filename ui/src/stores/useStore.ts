@@ -5829,6 +5829,7 @@ function _scrubAccountBoundProjectUi(state: AppState): Partial<AppState> {
 }
 
 function _invalidateAccountRequests(): void {
+  api.retireAccessContextRequest()
   _accessContextRequestSequence += 1
   _accountContextRequestSequence += 1
   _accountSessionsRequestSequence += 1
@@ -12317,7 +12318,13 @@ export const useStore = create<AppState>((set, get) => ({
     const next = accountProjectionCurrent ? context.accounts ?? null : previous
     const projectedAccessContext = accountProjectionCurrent
       ? context
-      : { ...context, accounts: next ?? undefined }
+      : {
+        ...context,
+        accounts: next ?? undefined,
+        remote_owner_controls: context.remote_owner_controls
+          ? { ...context.remote_owner_controls, enabled: false }
+          : undefined,
+      }
     const accountIdentityChanged = _accountIdentity(previous) !== _accountIdentity(next)
     if (accountIdentityChanged) _advanceAccountIdentityEpoch()
     const projectUiScrub = accountIdentityChanged ? _scrubAccountBoundProjectUi(get()) : {}
@@ -12455,6 +12462,10 @@ export const useStore = create<AppState>((set, get) => ({
       if (requestSequence !== _accountContextRequestSequence) return null
       const previous = get().accountContext
       const accountIdentityChanged = _accountIdentity(previous) !== _accountIdentity(context)
+      const queueAuthorityChanged = accountIdentityChanged
+        || previous?.account?.role !== context.account?.role
+        || previous?.reauthenticated !== context.reauthenticated
+        || previous?.capabilities.includes('owner.remote_parity') !== context.capabilities.includes('owner.remote_parity')
       if (accountIdentityChanged) _advanceAccountIdentityEpoch()
       const projectUiScrub = accountIdentityChanged ? _scrubAccountBoundProjectUi(get()) : {}
       const supportIdentityChanged = previous?.account?.id !== context.account?.id
@@ -12486,7 +12497,17 @@ export const useStore = create<AppState>((set, get) => ({
           accountContext: context,
           accountContextLoading: false,
           accessContext: state.accessContext
-            ? { ...state.accessContext, accounts: context }
+            ? {
+              ...state.accessContext,
+              accounts: context,
+              remote_owner_controls: state.accessContext.remote_owner_controls
+                ? {
+                  ...state.accessContext.remote_owner_controls,
+                  enabled: state.accessContext.remote_owner_controls.enabled
+                    && !queueAuthorityChanged,
+                }
+                : undefined,
+            }
             : state.accessContext,
           ...(identityChanged || selfUnavailable ? {
             accountSessions: [],
@@ -12512,6 +12533,21 @@ export const useStore = create<AppState>((set, get) => ({
           } : {}),
         }
       })
+      if (
+        get().accessContext?.remote === true
+        && (queueAuthorityChanged || (
+          context.authenticated === true
+          && context.account?.role === 'owner'
+          && context.reauthenticated === true
+          && context.capabilities.includes('owner.remote_parity')
+          && get().accessContext?.remote_owner_controls?.enabled !== true
+        ))
+      ) {
+        // Only a fresh server projection can enable remote owner actions.
+        api.retireAccessContextRequest()
+        await get().loadAccessContext(false).catch(() => null)
+        if (requestSequence !== _accountContextRequestSequence) return null
+      }
       if (accountIdentityChanged && refreshProjectsOnIdentityChange) {
         await get().loadWorkspaces()
         const modelType = get().params.model_type

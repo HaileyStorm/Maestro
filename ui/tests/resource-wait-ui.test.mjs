@@ -96,7 +96,8 @@ async function loadJobPlaceholder() {
             ` }
           }
           if (args.path === 'api') {
-            return { contents: `
+            return { resolveDir: uiRoot.pathname, contents: `
+              export { canUseQueueOwnerAction } from './src/api/client.ts'
               const record = (name, ...args) => globalThis.__resourceWaitApiCalls?.push([name, ...args])
               export const isBackendJobId = jobId => /^[0-9a-f]{8}$/i.test(jobId)
               export const isAccountProjectAccessActive = (context, migration = null) => {
@@ -2112,4 +2113,35 @@ test('queue API preserves the existing request and adds explicit immediate admis
   ])
   globalThis.fetch = async () => ({ ok: true, json: async () => ({ paused: false, pause_after_current: true }) })
   await assert.rejects(pauseQueueAfterOutput(true, true), /did not pause.*Restart Maestro/)
+})
+
+
+test('queue owner controls render by action and retain project permissions', async t => {
+  const previous = globalThis.__resourceWaitStore
+  t.after(() => { globalThis.__resourceWaitStore = previous })
+  const account = { enabled: true, authenticated: true, account: { id: 'owner-a', role: 'owner' }, reauthenticated: true, capabilities: ['owner.remote_parity'] }
+  const routes = ['/api/v1/queue/{job_id}/priority', '/api/v1/queue/{job_id}/start-next', '/api/v1/queue/pause-after-output', '/api/v1/queue/resume'].map(path => ({ method: 'POST', path }))
+  const access = { remote: true, machine_controls: false, accounts: account, remote_owner_controls: { enabled: true, available_routes: routes } }
+  const job = { id: 'abcd1234', workspace: 'project-a', status: 'queued', outputFiles: [], progress: 0 }
+  const queue = { paused: false, pause_after_current: false, jobs: [{ job_id: job.id, status: 'queued', priority: 0, requested_outputs: 1, produced_outputs: 0, held: false }], summary: { running: 0, waiting: 1, held: 0, registering: 0, preparing: 0, approval_waiting: 0, active_total: 1 } }
+  const { QueuePanel } = await loadJobPlaceholder()
+  const buttons = () => flattenElements(QueuePanel({ jobs: [job], sampleCampaignPairs: [], onStop() {}, onDismiss() {}, queue, queueError: null, queueLastSuccessAt: Date.now(), async refreshQueue() {} })).filter(element => element.type === 'button')
+  const hasStart = () => buttons().some(button => elementText(button).trim() === 'Start next')
+  const priorities = () => buttons().filter(button => ['Lower priority', 'Raise priority'].includes(button.props.title)).length
+  globalThis.__resourceWaitStore = { accessContext: access, accountContext: account, activeWorkspace: 'project-a', workspaces: [{ name: 'project-a', project_permissions: ['project.read', 'project.generate'] }] }
+  assert.equal(hasStart(), true)
+  assert.equal(priorities(), 2)
+  assert.ok(buttons().some(button => elementText(button).trim() === 'Pause queue'))
+  globalThis.__resourceWaitStore.accessContext = { ...access, remote_owner_controls: { enabled: true, available_routes: [routes[0]] } }
+  assert.equal(hasStart(), false)
+  assert.equal(priorities(), 2)
+  globalThis.__resourceWaitStore.workspaces[0].project_permissions = ['project.read']
+  assert.equal(priorities(), 0)
+  globalThis.__resourceWaitStore.workspaces[0].project_permissions.push('project.generate')
+  globalThis.__resourceWaitStore.accessContext = access
+  for (const current of [null, { ...account, reauthenticated: false }, { ...account, account: { id: 'member', role: 'user' } }]) {
+    globalThis.__resourceWaitStore.accountContext = current
+    assert.equal(hasStart(), false)
+    assert.equal(priorities(), 0)
+  }
 })

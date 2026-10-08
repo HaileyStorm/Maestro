@@ -2150,7 +2150,14 @@ function QueuePanel({
   queueLastSuccessAt: number | null
   refreshQueue: () => Promise<void>
 }) {
-  const machineControls = useStore(s => s.accessContext?.machine_controls === true)
+  const queueAccessContext = useStore(s => s.accessContext)
+  const queueAccountContext = useStore(s => s.accountContext)
+  const queueOwnerAction = (path: Parameters<typeof api.canUseQueueOwnerAction>[2]) =>
+    api.canUseQueueOwnerAction(queueAccessContext, queueAccountContext, path)
+  const canStartNext = queueOwnerAction('/api/v1/queue/{job_id}/start-next')
+  const canSetPriority = queueOwnerAction('/api/v1/queue/{job_id}/priority')
+  const canPauseQueue = queueOwnerAction('/api/v1/queue/pause-after-output')
+  const canResumeQueue = queueOwnerAction('/api/v1/queue/resume')
   const workspaces = useStore(s => s.workspaces ?? [])
   const resumeJobRecovery = useStore(s => s.resumeJobRecovery)
   const retryJobRecovery = useStore(s => s.retryJobRecovery)
@@ -2315,7 +2322,7 @@ function QueuePanel({
               </div>
             </details>
           </div>
-          {machineControls && queue && <div className="flex items-center gap-2">
+          {queue && (queue.paused ? canResumeQueue : canPauseQueue) && <div className="flex items-center gap-2">
             {queue?.paused ? (
               <button className="rounded-md bg-accent-green/15 px-2.5 py-1 text-[10px] text-accent-green" onClick={() => void act(api.resumeQueue)}>
                 Resume queue
@@ -2478,10 +2485,10 @@ function QueuePanel({
                         </>}
                         <button className="rounded border border-border px-1.5 py-0.5 hover:bg-bg-hover" onClick={() => void toggleLog(effectiveJob)}>Log</button>
                         {canManageGeneration && info.status === 'queued' && <>
-                          {machineControls && <>
-                            <button className="rounded bg-accent-green/15 px-2 py-0.5 text-accent-green hover:bg-accent-green/25" onClick={() => void act(() => api.startQueueJobNext(schedulerJobId))}>
+                          {canStartNext && <button className="rounded bg-accent-green/15 px-2 py-0.5 text-accent-green hover:bg-accent-green/25" onClick={() => void act(() => api.startQueueJobNext(schedulerJobId))}>
                               Start next
-                            </button>
+                            </button>}
+                          {canSetPriority && <>
                             <button title="Lower priority" className="rounded p-1 hover:bg-bg-hover" onClick={() => void act(() => api.setQueuePriority(schedulerJobId, info.priority - 1))}><ArrowDown size={12} /></button>
                             <button title="Raise priority" className="rounded p-1 hover:bg-bg-hover" onClick={() => void act(() => api.setQueuePriority(schedulerJobId, info.priority + 1))}><ArrowUp size={12} /></button>
                           </>}

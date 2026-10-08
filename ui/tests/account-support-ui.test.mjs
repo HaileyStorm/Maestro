@@ -6,6 +6,7 @@ import test from 'node:test'
 import { build } from 'esbuild'
 import {
   AccountApiError,
+  canUseQueueOwnerAction,
   acceptResponsibleUse,
   bootstrapAccount,
   changeAccountPassword,
@@ -45,6 +46,28 @@ import {
   verifiedDevelopmentCostRecovery,
   visibleSupportProviders,
 } from '../src/components/AccountSupport/supportPresentation.ts'
+
+test('remote queue authority requires the current owner and the exact advertised action', () => {
+  const path = '/api/v1/queue/{job_id}/priority'
+  const account = {
+    enabled: true, authenticated: true, account: { id: 'owner-a', role: 'owner' },
+    reauthenticated: true, capabilities: ['owner.remote_parity'],
+  }
+  const context = {
+    remote: true, machine_controls: false, accounts: account,
+    remote_owner_controls: { enabled: true, available_routes: [{ method: 'POST', path }] },
+  }
+  assert.equal(canUseQueueOwnerAction(context, account, path), true)
+  assert.equal(canUseQueueOwnerAction(context, account, '/api/v1/queue/{job_id}/start-next'), false)
+  for (const denied of [
+    null, { ...account, authenticated: false }, { ...account, reauthenticated: false },
+    { ...account, capabilities: [] }, { ...account, account: { id: 'member', role: 'user' } },
+    { ...account, account: { id: 'owner-b', role: 'owner' } },
+  ]) assert.equal(canUseQueueOwnerAction(context, denied, path), false)
+  assert.equal(canUseQueueOwnerAction({ ...context, remote_owner_controls: undefined }, account, path), false)
+  assert.equal(canUseQueueOwnerAction({ ...context, machine_controls: true }, null, path), false)
+  assert.equal(canUseQueueOwnerAction({ remote: false, machine_controls: true }, null, path), true)
+})
 
 test('supporter tier labels humanize server identifiers for account and welcome copy', () => {
   assert.deepEqual(supporterTierLabels({
@@ -563,7 +586,7 @@ test('account loaders ignore reverse-order and post-logout responses from a stal
   assert.equal(workspaceRequests, 2, 'a passive account identity change refreshes project visibility')
   assert.equal(useStore.getState().activeWorkspace, 'project-b')
   accessRequests[1].resolve(jsonResponse({
-    remote: false,
+    remote: true,
     project_password_required: false,
     project_names_visible: true,
     machine_controls: true,
@@ -574,10 +597,12 @@ test('account loaders ignore reverse-order and post-logout responses from a stal
     share_url: '',
     share_flow: '',
     accounts: context(accountA),
+    remote_owner_controls: { enabled: true, available_routes: [{ method: "POST", path: "/api/v1/queue/{job_id}/priority" }] },
   }))
   await staleAccess
   assert.equal(useStore.getState().accountContext.account.id, accountB.id)
   assert.equal(useStore.getState().accessContext.accounts.account.id, accountB.id)
+  assert.equal(useStore.getState().accessContext.remote_owner_controls.enabled, false)
   contextRequests.length = 0
 
   useStore.setState({
@@ -4007,4 +4032,45 @@ test('account tab skips the scroll region while keeping the first sign-in field 
   const signInForm = source.match(/<h3 className="text-xs font-semibold text-text-primary">Sign in<\/h3>[^]*?<\/form>/)?.[0]
   assert.ok(signInForm, 'the account sign-in form must remain present')
   assert.match(signInForm.match(/<Field\b[^>]*\/>/)?.[0] || '', /label="Username"/)
+})
+
+
+test('remote reauthentication retires old access requests and refreshes queue authority', async t => {
+  const previousWindow = globalThis.window
+  const previousDocument = globalThis.document
+  const previousStorage = globalThis.localStorage
+  const previousFetch = globalThis.fetch
+  globalThis.window = Object.assign(new EventTarget(), { setTimeout, clearTimeout, setInterval, clearInterval, location: { hostname: 'localhost' } })
+  globalThis.document = Object.assign(new EventTarget(), { hidden: false })
+  globalThis.localStorage = { getItem() { return null }, setItem() {}, removeItem() {} }
+  t.after(() => { globalThis.window = previousWindow; globalThis.document = previousDocument; globalThis.localStorage = previousStorage; globalThis.fetch = previousFetch })
+  const bundled = await build({ stdin: { contents: "export { useStore } from './src/stores/useStore.ts'", resolveDir: uiRoot, loader: 'js' }, bundle: true, format: 'esm', logLevel: 'silent', platform: 'node', treeShaking: true, write: false })
+  const { useStore } = await import(`${asDataModule(bundled.outputFiles[0].text)}#remote-queue-refresh`)
+  const account = { enabled: true, authenticated: true, account: { id: 'owner-a', role: 'owner' }, reauthenticated: true, capabilities: ['owner.remote_parity'] }
+  const stale = { ...account, reauthenticated: false }
+  const path = '/api/v1/queue/{job_id}/start-next'
+  const projection = (enabled, current) => ({ remote: true, machine_controls: false, accounts: current, remote_owner_controls: { enabled, available_routes: [{ method: 'POST', path }] } })
+  const oldResponse = deferred()
+  let accessReads = 0
+  globalThis.fetch = async url => {
+    if (String(url).endsWith('/access-context')) {
+      accessReads += 1
+      if (accessReads === 1) return oldResponse.promise
+      if (accessReads === 2) throw new Error('temporary access failure')
+      return jsonResponse(projection(true, account))
+    }
+    if (String(url).endsWith('/account/context')) return jsonResponse(account)
+    throw new Error('unexpected request ' + url)
+  }
+  useStore.setState({ accessContext: projection(false, stale), accountContext: stale })
+  const oldAccess = useStore.getState().loadAccessContext(false)
+  await useStore.getState().loadAccountContext(false)
+  assert.equal(accessReads, 2, 'post-reauth access must not join the older in-flight response')
+  assert.equal(canUseQueueOwnerAction(useStore.getState().accessContext, useStore.getState().accountContext, path), false, 'failed fresh projection stays closed')
+  await useStore.getState().loadAccountContext(false)
+  assert.equal(accessReads, 3, 'the next existing account refresh retries missing owner authority')
+  assert.equal(canUseQueueOwnerAction(useStore.getState().accessContext, useStore.getState().accountContext, path), true)
+  oldResponse.resolve(jsonResponse(projection(false, stale)))
+  await oldAccess
+  assert.equal(canUseQueueOwnerAction(useStore.getState().accessContext, useStore.getState().accountContext, path), true, 'older response cannot undo fresh authority')
 })

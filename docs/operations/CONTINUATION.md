@@ -361,6 +361,22 @@ changes the separate, existing recent-password-reauthentication gate for the
 account/project migration action or permits a historical SQLite tracker
 mutation.
 
+## Remote owner queue controls
+
+A signed-in owner who has recently confirmed their password can pause or resume
+the global queue and change priority or choose **Start next** for an authorized
+queued job over LAN or Cloudflare. Start next resumes admission without
+interrupting work already running. Per-job ordering also requires current
+project generation permission, browser/job ownership, and the same existing
+project instance. Blocked recovery and held sample campaigns retain their
+dedicated actions. Account ownership does not expose another session's jobs.
+
+The access-context projection advertises the exact permitted action routes;
+remote owners do not gain the general machine-controls capability. Queue controls
+refresh after sign-in or password confirmation and disappear when current account
+or project permission no longer permits them. Source and model-free tests do not
+establish authenticated LAN/browser or human acceptance.
+
 ## Start Maestro Continuum
 
 Start Continuum from Pinokio's **Start** action (`start.js`). Do not launch

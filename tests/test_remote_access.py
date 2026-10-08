@@ -2267,8 +2267,9 @@ class LaunchSecurityContractTests(unittest.TestCase):
             ROOT / "ui/src/components/MainContent/MainContent.tsx"
         ).read_text(encoding="utf-8")
         self.assertIn("accessContext?.machine_controls === true", queue)
-        self.assertIn("{machineControls && queue && <div", queue)
-        self.assertIn("{machineControls && <>", queue)
+        self.assertIn("queue.paused ? canResumeQueue : canPauseQueue", queue)
+        self.assertIn("{canStartNext && <button", queue)
+        self.assertIn("{canSetPriority && <>", queue)
         self.assertIn("info.held ? api.resumeQueueJob", queue)
         self.assertIn("job.recoveryActions?.includes(action)", queue)
         self.assertIn("job.logEvents", queue)

@@ -105,6 +105,10 @@ def _function(tree: ast.AST, name: str):
 
 def _isolated_functions(tree: ast.Module, names: tuple[str, ...], namespace: dict):
     namespace.setdefault("AUTOMATIC_RETIREMENT_STATUSES", AUTOMATIC_RETIREMENT_STATUSES)
+    if {"set_job_queue_priority", "start_queued_job_next"} & set(names):
+        names = (*names, "_require_remote_queue_generation_permission", "_require_queue_ordering_authority",
+                 "_request_has_account_capability", "_request_has_recent_account_reauth")
+
     dependencies = {"_h3_segment_uses_native_boundary_history"} if "_run_generation" in names else set()
     if "_restore_queue_recovery_on_startup" in names:
         dependencies.add("_restore_h3_prompt_rewriter_cleanup")
@@ -12766,6 +12770,85 @@ class RestoredHeldWorkerTests(unittest.TestCase):
             namespace["start_queued_job_next"]("held-h3", object(), object())
         self.assertIn("experimental H3 mode", str(raised.exception))
         self.assertEqual(self.job, original)
+
+
+class RemoteQueueOrderingTests(unittest.TestCase):
+    def test_remote_ordering_keeps_authority_and_job_fences_before_effects(self):
+        class Denied(Exception):
+            def __init__(self, *, status_code, detail):
+                self.status_code, self.detail = status_code, detail
+
+        for route in ("set_job_queue_priority", "start_queued_job_next"):
+            for scenario, status in (
+                ("anonymous", 403), ("member", 403), ("stale", 403),
+                ("foreign-session", 404), ("project-denied", 404), ("read-only", 404),
+                ("blocked-recovery", 409), ("sample", 409), ("owner", 200),
+            ):
+                with self.subTest(route=route, scenario=scenario):
+                    effects = []
+                    job = {"kind": "sample_campaign_generation" if scenario == "sample" else "studio_generation",
+                           "status": "queued", "queue_priority": 0, "queue_held": True}
+                    original = copy.deepcopy(job)
+                    async def body():
+                        effects.append("body")
+                        return {"priority": 7}
+                    request = types.SimpleNamespace(state=types.SimpleNamespace(
+                        maestro_remote=True,
+                        maestro_account_capabilities=frozenset(
+                            () if scenario in {"anonymous", "member"} else ("owner.remote_parity",)),
+                        maestro_account_principal={"recently_reauthenticated": scenario != "stale"},
+                    ), json=body)
+                    def owned(*_args):
+                        effects.append("ownership")
+                        if scenario in {"foreign-session", "project-denied"}:
+                            raise Denied(status_code=404, detail="Job not found")
+                        return job
+                    def permission(_request, _directory, permission):
+                        self.assertEqual(permission, "project.generate")
+                        if scenario == "read-only":
+                            raise Denied(status_code=404, detail="Project not found")
+                    def mutate(target, **kwargs):
+                        effects.append("scheduler")
+                        target["queue_priority"] = kwargs.get("priority", 8)
+                        return True
+                    namespace = _isolated_functions(_tree("app/launch.py"), (
+                        route, "_require_generic_queue_control_job",
+                        "_reject_generic_sample_campaign_release",
+                    ), {
+                        "Request": object, "Response": object, "Mapping": dict,
+                        "HTTPException": Denied,
+                        "api": types.SimpleNamespace(post=lambda *_args: lambda fn: fn),
+                        "_set_recovery_no_store": lambda _response: None,
+                        "_require_owned_job": owned,
+                        "_existing_workspace_dir": lambda _workspace: "existing-project",
+                        "_require_account_project_permission": permission,
+                        "_queue_recovery_is_blocked": lambda _job: scenario == "blocked-recovery",
+                        "_queue_recovery_delivery_pending": lambda _job: None,
+                        "_require_job_runtime_model_admission": lambda _job: effects.append("admission"),
+                        "update_queue_job": mutate, "promote_queued_job": mutate,
+                        "_start_restored_held_generation_worker": lambda _job: effects.append("worker"),
+                        "_queue_wait_reason_for_job": lambda _job: None,
+                        "queue_control_state": lambda: {},
+                    })
+                    def invoke():
+                        result = namespace[route]("job-a", request, object())
+                        return asyncio.run(result) if route == "set_job_queue_priority" else result
+                    if status != 200:
+                        with self.assertRaises(Denied) as raised:
+                            invoke()
+                        self.assertEqual(raised.exception.status_code, status)
+                        self.assertEqual(job, original)
+                        self.assertNotIn("body", effects)
+                        self.assertNotIn("admission", effects)
+                        self.assertNotIn("scheduler", effects)
+                        self.assertNotIn("worker", effects)
+                        if status == 403:
+                            self.assertEqual(effects, [])
+                    else:
+                        self.assertEqual(invoke()["job_id"], "job-a")
+                        self.assertEqual(effects.count("scheduler"), 1)
+                        if route == "start_queued_job_next":
+                            self.assertEqual(effects, ["ownership", "admission", "scheduler", "worker"])
 
 
 if __name__ == "__main__":

@@ -960,6 +960,23 @@ _REMOTE_OWNER_REAUTH_ALLOWED_EXACT = frozenset({
     ("GET", "/api/v1/krea/owner-policy"),
     ("PUT", "/api/v1/krea/owner-policy"),
 })
+_REMOTE_OWNER_REAUTH_ALLOWED_TEMPLATES = frozenset({
+    ("POST", "/api/v1/queue/{job_id}/priority"),
+    ("POST", "/api/v1/queue/{job_id}/start-next"),
+})
+
+
+def _remote_owner_reauth_route(method: str, path: str) -> bool:
+    if (method, path) in _REMOTE_OWNER_REAUTH_ALLOWED_EXACT:
+        return True
+    segments = path.split("/")
+    return bool(
+        len(segments) == 6
+        and segments[:4] == ["", "api", "v1", "queue"]
+        and segments[4] not in {"", ".", ".."}
+        and (method, f"/api/v1/queue/{{job_id}}/{segments[5]}")
+        in _REMOTE_OWNER_REAUTH_ALLOWED_TEMPLATES
+    )
 
 
 def _request_has_account_capability(request: Request, capability: str) -> bool:
@@ -977,6 +994,21 @@ def _request_has_recent_account_reauth(request: Request) -> bool:
     )
 
 
+def _require_queue_ordering_authority(request: Request) -> None:
+    """Remote queue ordering affects global admission, even for an owned job."""
+    if not bool(getattr(getattr(request, "state", None), "maestro_remote", False)):
+        return
+    if (
+        _request_has_account_capability(request, "owner.remote_parity")
+        and _request_has_recent_account_reauth(request)
+    ):
+        return
+    raise HTTPException(
+        status_code=403,
+        detail="Queue ordering requires an owner sign-in and recent password confirmation",
+    )
+
+
 def _remote_local_only_denial(request: Request) -> JSONResponse | None:
     """Fail closed on host-global/admin surfaces for Cloudflare clients."""
     if not _request_is_cloudflare_remote(request):
@@ -986,10 +1018,11 @@ def _remote_local_only_denial(request: Request) -> JSONResponse | None:
     remote_owner_exact = globals().get(
         "_REMOTE_OWNER_REAUTH_ALLOWED_EXACT", frozenset(),
     )
+    owner_route = globals().get("_remote_owner_reauth_route")
     has_capability = globals().get("_request_has_account_capability")
     has_reauth = globals().get("_request_has_recent_account_reauth")
     if (
-        (method, path) in remote_owner_exact
+        (owner_route(method, path) if callable(owner_route) else (method, path) in remote_owner_exact)
         and callable(has_capability)
         and callable(has_reauth)
         and has_capability(request, "owner.remote_parity")
@@ -1031,7 +1064,7 @@ def _remote_local_only_denial(request: Request) -> JSONResponse | None:
         path.endswith("/priority") or path.endswith("/start-next")
     ):
         return JSONResponse(
-            {"detail": "Global queue ordering is available locally only"},
+            {"detail": "Queue ordering requires an owner sign-in and recent password confirmation"},
             status_code=403,
         )
     return None
@@ -1608,9 +1641,13 @@ async def _maestro_session_middleware(request: Request, call_next):
     # Most host-control denials do not admit an account override and retain
     # the historical pre-session fast path. Only the small explicit owner
     # parity allowlist needs the authenticated principal resolved first.
+    owner_route = globals().get("_remote_owner_reauth_route")
     remote_owner_candidate = (
-        request.method.upper(), request.url.path,
-    ) in globals().get("_REMOTE_OWNER_REAUTH_ALLOWED_EXACT", frozenset())
+        owner_route(request.method.upper(), request.url.path)
+        if callable(owner_route) else (
+            request.method.upper(), request.url.path,
+        ) in globals().get("_REMOTE_OWNER_REAUTH_ALLOWED_EXACT", frozenset())
+    )
     if not remote_owner_candidate:
         remote_denial = _remote_local_only_denial(request)
         if remote_denial is not None:
@@ -27588,7 +27625,9 @@ def get_access_context(request: Request):
     )
     remote_owner_routes = [
         {"method": method, "path": path}
-        for method, path in sorted(remote_owner_exact)
+        for method, path in sorted(remote_owner_exact | globals().get(
+            "_REMOTE_OWNER_REAUTH_ALLOWED_TEMPLATES", frozenset(),
+        ))
     ]
     return {
         "remote": remote,
@@ -27644,10 +27683,6 @@ def get_access_context(request: Request):
                 {
                     "control": "research_and_recovery",
                     "reason": "Research and break-glass recovery surfaces require direct local-machine access.",
-                },
-                {
-                    "control": "global_queue_ordering",
-                    "reason": "Priority and force-start controls are not yet account-authorized remotely.",
                 },
                 {
                     "control": "host_telemetry",
@@ -80022,6 +80057,18 @@ def _require_generic_queue_control_job(
     return job
 
 
+def _require_remote_queue_generation_permission(job: dict, request: Request) -> None:
+    if not bool(getattr(getattr(request, "state", None), "maestro_remote", False)):
+        return
+    try:
+        workspace_dir = _existing_workspace_dir(str(job.get("workspace") or "default"))
+        _require_account_project_permission(request, workspace_dir, "project.generate")
+    except HTTPException as error:
+        if error.status_code in {403, 404, 423}:
+            raise HTTPException(status_code=404, detail="Job not found") from error
+        raise
+
+
 def _require_h3_delivery_recovery_job(
     job_id: str,
     request: Request,
@@ -80431,8 +80478,10 @@ async def set_job_queue_priority(
     job_id: str, request: Request, response: Response,
 ):
     _set_recovery_no_store(response)
+    _require_queue_ordering_authority(request)
     job = _require_generic_queue_control_job(job_id, request)
     _reject_generic_sample_campaign_release(job)
+    _require_remote_queue_generation_permission(job, request)
     body = await request.json()
     try:
         priority = int(body.get("priority", 0))
@@ -82061,16 +82110,12 @@ def retry_recovered_job(
 def start_queued_job_next(job_id: str, request: Request, response: Response):
     """Resume admission and promote one queued job without interrupting GPU work."""
     _set_recovery_no_store(response)
+    _require_queue_ordering_authority(request)
     job = _require_generic_queue_control_job(job_id, request)
     _reject_generic_sample_campaign_release(job)
+    _require_remote_queue_generation_permission(job, request)
     if _queue_recovery_delivery_pending(job) is None:
         _require_job_runtime_model_admission(job)
-    remote = bool(getattr(request.state, "maestro_remote", False))
-    if remote:
-        raise HTTPException(
-            status_code=403,
-            detail="Global queue ordering is available locally only",
-        )
     promoted = promote_queued_job(job)
     if not promoted:
         raise HTTPException(status_code=409, detail="Only queued jobs can be started next")
