@@ -115,8 +115,7 @@ class ResourceReleaseTests(unittest.TestCase):
         director._pipelines = {"p": {"status": "running"}}
         director._ACTIVE_PIPELINE_STATUSES = ("queued", "planning", "running", "paused")
         director._director_queue_lock = threading.RLock()
-        director._director_queue_state = {"paused": True, "entries": []}
-        director._director_queue_base = "/test/project"
+        director._director_queues = {"/test/project": {"paused": True, "entries": []}}
         jobs = {
             "a": {"status": "running"},
             "b": {"status": "queued", "queue_held": True},
@@ -160,15 +159,14 @@ class ResourceReleaseTests(unittest.TestCase):
         director._pipelines = {}
         director._ACTIVE_PIPELINE_STATUSES = ("queued", "planning", "running", "paused")
         director._director_queue_lock = threading.RLock()
-        director._director_queue_base = "/test/project"
-        director._director_queue_state = {
+        director._director_queues = {"/test/project": {
             "paused": False,
             "entries": [{"id": "entry-a", "status": "running", "pipeline_id": None}],
-        }
+        }}
         namespace = isolated(
-            "_resource_release_activity",
+            "_resource_release_activity", "_resource_release_pause_director_queue",
             globals_={
-                "Mapping": Mapping,
+                "Mapping": Mapping, "Any": object, "HTTPException": HttpError,
                 "_jobs": {},
                 "_RESOURCE_RELEASE_ACTIVE_STATUSES": frozenset({
                     "queued", "running", "preparing", "waiting_for_plan_approval",
@@ -181,14 +179,35 @@ class ResourceReleaseTests(unittest.TestCase):
         services = types.ModuleType("services")
         services.__path__ = []
         services.director_pipeline = director
+        paused = []
+        def pause(base):
+            paused.append(base)
+            director._director_queues[base]["paused"] = True
+        director.pause_director_queue = pause
         with mock.patch.dict("sys.modules", {
             "services": services, "services.director_pipeline": director,
         }):
             before = namespace["_resource_release_activity"]()
             self.assertEqual(before["director_running"], 1)
+            director._director_queues["/test/other"] = {
+                "paused": False, "entries": [{"id": "entry-b", "status": "held"}],
+            }
+            both = namespace["_resource_release_activity"]()
+            self.assertNotEqual(before["activity_token"], both["activity_token"])
+            self.assertEqual(both["queued"], 1)
+            self.assertEqual(both["director_running"], 1)
             director._pipelines["p"] = {"status": "planning"}
-            director._director_queue_state["entries"][0]["pipeline_id"] = "p"
+            director._director_queues["/test/project"]["entries"][0]["pipeline_id"] = "p"
             after = namespace["_resource_release_activity"]()
+            namespace["_resource_release_pause_director_queue"](after)
+            self.assertEqual(set(paused), {"/test/project", "/test/other"})
+            current = namespace["_resource_release_activity"]()
+            self.assertTrue(current["director_queue_paused"])
+            director._director_queues["/test/new"] = {"paused": False, "entries": []}
+            with self.assertRaises(HttpError) as raised:
+                namespace["_resource_release_pause_director_queue"](current)
+            self.assertEqual(raised.exception.status_code, 409)
+            self.assertFalse(director._director_queues["/test/new"]["paused"])
         self.assertNotEqual(before["activity_token"], after["activity_token"])
         self.assertEqual(after["director_running"], 1)
 

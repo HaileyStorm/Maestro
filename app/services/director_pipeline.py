@@ -20,11 +20,13 @@ import math
 import copy
 import hashlib
 import shutil
+import stat
 import threading
 import traceback
 from contextlib import nullcontext
 from functools import wraps
 from typing import Optional
+from services.queue_recovery_adapter import ensure_project_instance_marker
 
 from services.job_lifecycle import (
     GENERATED_MEDIA_EXTENSIONS,
@@ -70,9 +72,10 @@ _director_native_gpu_slot_state = threading.local()
 _pipelines: dict = {}
 
 _director_queue_lock = threading.RLock()
-_director_queue_state = None
-_director_queue_base = None
+_director_queues: dict[str, dict] = {}
+_director_queue_bindings: dict[str, tuple | None] = {}
 _director_queue_worker = None
+_director_queue_worker_base = None
 _DIRECTOR_QUEUE_FILENAME = "_director_queue.json"
 _DIRECTOR_QUEUE_VERSION = 1
 _DIRECTOR_QUEUE_TERMINAL = {"completed", "failed", "cancelled"}
@@ -4739,18 +4742,55 @@ def _resolve_director_asset_path(value: object, out_dir: str) -> Optional[str]:
 def _director_queue_path(base_out_dir: str) -> str:
     return os.path.join(base_out_dir, _DIRECTOR_QUEUE_FILENAME)
 
+def _director_queue_binding(base_out_dir: str) -> tuple | None:
+    """Distinguish project recreation without creating a project marker."""
+    try:
+        directory = os.stat(base_out_dir)
+    except FileNotFoundError:
+        return None
+    marker = None
+    try:
+        descriptor = os.open(os.path.join(base_out_dir, ".maestro-project-instance"),
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+    except FileNotFoundError:
+        pass  # Legacy/default output directories need no new marker.
+    else:
+        try:
+            info = os.fstat(descriptor)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > 64:
+                raise ValueError("Director project identity is invalid")
+            marker = os.read(descriptor, 65).strip()
+            current = os.stat(os.path.join(base_out_dir, ".maestro-project-instance"), follow_symlinks=False)
+            if ((current.st_dev, current.st_ino) != (info.st_dev, info.st_ino)
+                    or re.fullmatch(rb"[0-9a-f]{32}", marker) is None):
+                raise ValueError("Director project identity changed")
+        finally:
+            os.close(descriptor)
+    return directory.st_dev, directory.st_ino, marker
+
+def discard_director_queue(base_out_dir: str) -> None:
+    """Retire cached state after authorized deletion of this exact project."""
+    resolved_base = os.path.realpath(base_out_dir)
+    with _director_queue_lock:
+        _director_queues.pop(resolved_base, None)
+        _director_queue_bindings.pop(resolved_base, None)
+
 def _write_director_queue_locked(base_out_dir: str, state: dict) -> None:
-    os.makedirs(base_out_dir, exist_ok=True)
-    _write_pipeline_json_unlocked(_director_queue_path(base_out_dir), state)
+    resolved_base = os.path.realpath(base_out_dir)
+    os.makedirs(resolved_base, exist_ok=True)
+    # Bind queued work before dispatch can create its first child/recovery receipt.
+    ensure_project_instance_marker(resolved_base)
+    _write_pipeline_json_unlocked(_director_queue_path(resolved_base), state)
+    _director_queue_bindings[resolved_base] = _director_queue_binding(resolved_base)
 
 def _load_director_queue_locked(base_out_dir: str) -> dict:
-    global _director_queue_state, _director_queue_base
     resolved_base = os.path.realpath(base_out_dir)
-    if (
-        _director_queue_state is not None
-        and _director_queue_base == resolved_base
-    ):
-        return _director_queue_state
+    binding = _director_queue_binding(resolved_base)
+    if resolved_base in _director_queues and _director_queue_bindings.get(resolved_base) == binding:
+        return _director_queues[resolved_base]
+    if (resolved_base in _director_queues and _director_queue_worker_base == resolved_base
+            and _director_queue_worker is not None and _director_queue_worker.is_alive()):
+        raise ValueError("This Director project changed while its batch was active. Stop the batch before reopening it.")
 
     state = {
         "version": _DIRECTOR_QUEUE_VERSION,
@@ -4785,8 +4825,8 @@ def _load_director_queue_locked(base_out_dir: str) -> dict:
     state["paused"] = True
     state["running"] = False
     state["version"] = _DIRECTOR_QUEUE_VERSION
-    _director_queue_state = state
-    _director_queue_base = resolved_base
+    _director_queues[resolved_base] = state
+    _director_queue_bindings[resolved_base] = binding
     if interrupted:
         _write_director_queue_locked(resolved_base, state)
     return state
@@ -4921,7 +4961,7 @@ def _set_director_queue_entry(
     return None
 
 def _run_director_queue(base_out_dir: str) -> None:
-    global _director_queue_worker
+    global _director_queue_worker, _director_queue_worker_base
     try:
         while True:
             wait_for_active_pipeline = False
@@ -5039,10 +5079,15 @@ def _run_director_queue(base_out_dir: str) -> None:
             _write_director_queue_locked(base_out_dir, state)
             if _director_queue_worker is threading.current_thread():
                 _director_queue_worker = None
+                _director_queue_worker_base = None
 
 def start_director_queue(base_out_dir: str) -> dict:
-    global _director_queue_worker
+    global _director_queue_worker, _director_queue_worker_base
     with _director_queue_lock:
+        resolved_base = os.path.realpath(base_out_dir)
+        if (_director_queue_worker is not None and _director_queue_worker.is_alive()
+                and _director_queue_worker_base != resolved_base):
+            raise ValueError("Another project's Director batch is active. Pause it and wait for its current render to finish before starting this batch.")
         state = _load_director_queue_locked(base_out_dir)
         state["paused"] = False
         for entry in state.get("entries") or []:
@@ -5060,10 +5105,11 @@ def start_director_queue(base_out_dir: str) -> dict:
         ):
             _director_queue_worker = threading.Thread(
                 target=_run_director_queue,
-                args=(base_out_dir,),
+                args=(resolved_base,),
                 daemon=False,
                 name="maestro-director-queue",
             )
+            _director_queue_worker_base = resolved_base
             _director_queue_worker.start()
         return _public_director_queue_state(state)
 

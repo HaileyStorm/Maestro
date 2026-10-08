@@ -25498,10 +25498,13 @@ def _resource_release_activity() -> dict:
     )
     pipeline_ids = {pid for pid, _ in pipelines}
     with director._director_queue_lock:
-        queue_state = director._director_queue_state or {}
-        director_queue_base = str(director._director_queue_base or "")
-        director_queue_paused = bool(
-            director_queue_base and queue_state.get("paused", True)
+        queue_states = dict(director._director_queues)
+        director_queue_bases = tuple(sorted(
+            (base, bool(state.get("paused", True)))
+            for base, state in queue_states.items()
+        ))
+        director_queue_paused = bool(director_queue_bases) and all(
+            paused for _, paused in director_queue_bases
         )
         director_queue_worker = getattr(director, "_director_queue_worker", None)
         director_worker_alive = bool(
@@ -25509,12 +25512,14 @@ def _resource_release_activity() -> dict:
         )
         director_queue = sorted(
             (
+                base,
                 str(entry.get("id") or ""),
                 "pending" if entry.get("status") in {"held", "queued"}
                 else str(entry.get("status") or ""),
                 str(entry.get("pipeline_id") or ""),
             )
-            for entry in queue_state.get("entries") or []
+            for base, state in queue_states.items()
+            for entry in state.get("entries") or []
             if isinstance(entry, Mapping)
             and entry.get("status") in {"held", "queued", "running"}
         )
@@ -25522,7 +25527,7 @@ def _resource_release_activity() -> dict:
         {
             "jobs": jobs,
             "pipelines": pipelines,
-            "director_queue": [director_queue_base, director_queue],
+            "director_queue": director_queue,
             "director_worker_alive": director_worker_alive,
         },
         separators=(",", ":"),
@@ -25537,11 +25542,11 @@ def _resource_release_activity() -> dict:
         "queued": sum(
             status in {"queued", "waiting_for_plan_approval"}
             for _, status in jobs
-        ) + sum(status == "pending" for _, status, _ in director_queue),
+        ) + sum(status == "pending" for _, _, status, _ in director_queue),
         "preparing": sum(status == "preparing" for _, status in jobs),
         "director_running": len(pipelines) + sum(
             status == "running" and pipeline_id not in pipeline_ids
-            for _, status, pipeline_id in director_queue
+            for _, _, status, pipeline_id in director_queue
         ) + int(director_worker_alive and not director_queue and not pipelines),
         "queue_paused": bool(queue_control_state().get("paused")),
         "director_queue_paused": director_queue_paused,
@@ -25550,8 +25555,7 @@ def _resource_release_activity() -> dict:
             if status in {"running", "preparing"}
         ),
         "_pipeline_ids": tuple(pid for pid, _ in pipelines),
-        "_director_queue_base": director_queue_base,
-        "_director_queue_paused": director_queue_paused,
+        "_director_queue_bases": director_queue_bases,
     }
 
 
@@ -25630,18 +25634,24 @@ def _resource_release_stop_running(confirmed: Mapping[str, Any]) -> tuple[int, i
 
 
 def _resource_release_pause_director_queue(confirmed: Mapping[str, Any]) -> None:
-    """Pause the exact in-process Director queue before stopping its work."""
-    base = confirmed["_director_queue_base"]
-    if not base or confirmed["_director_queue_paused"]:
+    """Pause the confirmed in-process Director queues before stopping work."""
+    bases = confirmed["_director_queue_bases"]
+    if not bases:
         return
     from services import director_pipeline as director
     with director._director_queue_lock:
-        if str(director._director_queue_base or "") != base:
+        current = tuple(sorted(
+            (base, bool(state.get("paused", True)))
+            for base, state in director._director_queues.items()
+        ))
+        if current != bases:
             raise HTTPException(
                 status_code=409,
                 detail="Director queue activity changed. Review the current work again.",
             )
-        director.pause_director_queue(base)
+        for base, paused in bases:
+            if not paused:
+                director.pause_director_queue(base)
 
 
 def _resource_release_unload(targets: frozenset[str]) -> tuple[list[str], list[str]]:
@@ -28338,6 +28348,11 @@ def _workspace_has_busy_director_pipeline(
         from services import director_pipeline as pipeline_service
     except ImportError:
         return False
+    with pipeline_service._director_queue_lock:
+        worker = pipeline_service._director_queue_worker
+        if (worker is not None and worker.is_alive()
+                and _path_targets_workspace(pipeline_service._director_queue_worker_base, workspace_dir)):
+            return True
     active_statuses = {"queued", "planning", "running", "paused"}
     with pipeline_service._pipeline_lock:
         for pid, pipeline in list(pipeline_service._pipelines.items()):
@@ -28517,6 +28532,9 @@ def delete_workspace(name: str, request: Request):
 
             from services.win_safe_files import safe_delete_dir
             result = safe_delete_dir(ws_dir)
+            if result["removed"]:
+                from services.director_pipeline import discard_director_queue
+                discard_director_queue(ws_dir)
             deletion_destructive = deletion_destructive or bool(result["removed"])
             with _remote_active_projects_lock:
                 for session_id, active_name in list(_remote_active_projects.items()):
@@ -45167,7 +45185,12 @@ async def director_queue_add(request: Request, workspace: str = ""):
 def director_queue_start(request: Request, workspace: str = ""):
     _init_pipeline()
     from services.director_pipeline import start_director_queue
-    return start_director_queue(_director_queue_base(request, workspace))
+    workspace = _request_project_workspace(request, workspace)
+    try:
+        with _reserve_workspace_operations(workspace):
+            return start_director_queue(_director_queue_base(request, workspace))
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @api.post("/api/v1/director/queue/pause")

@@ -440,8 +440,9 @@ class TestProviderApiKey(unittest.TestCase):
         originals = (
             pipeline._wgp,
             pipeline._pipelines,
-            pipeline._director_queue_state,
-            pipeline._director_queue_base,
+            pipeline._director_queues,
+            pipeline._director_queue_bindings,
+            pipeline._director_queue_worker_base,
             pipeline._director_queue_worker,
         )
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -451,8 +452,9 @@ class TestProviderApiKey(unittest.TestCase):
                     server_config={"services": services},
                 )
                 pipeline._pipelines = {}
-                pipeline._director_queue_state = None
-                pipeline._director_queue_base = None
+                pipeline._director_queues = {}
+                pipeline._director_queue_bindings = {}
+                pipeline._director_queue_worker_base = None
                 pipeline._director_queue_worker = None
                 source_params = {
                     "scene_description": "held project",
@@ -499,8 +501,9 @@ class TestProviderApiKey(unittest.TestCase):
                     "held-revision",
                 )
 
-                pipeline._director_queue_state = None
-                pipeline._director_queue_base = None
+                pipeline._director_queues = {}
+                pipeline._director_queue_bindings = {}
+                pipeline._director_queue_worker_base = None
                 restored = pipeline.get_director_queue_entry(
                     temp_dir,
                     persisted["entries"][0]["id"],
@@ -551,8 +554,9 @@ class TestProviderApiKey(unittest.TestCase):
                 (
                     pipeline._wgp,
                     pipeline._pipelines,
-                    pipeline._director_queue_state,
-                    pipeline._director_queue_base,
+                    pipeline._director_queues,
+                    pipeline._director_queue_bindings,
+                    pipeline._director_queue_worker_base,
                     pipeline._director_queue_worker,
                 ) = originals
 
@@ -646,14 +650,16 @@ class TestProviderApiKey(unittest.TestCase):
         }
         durable_queue = copy.deepcopy(queue_state)
         originals = (
-            pipeline._director_queue_state,
-            pipeline._director_queue_base,
+            pipeline._director_queues,
+            pipeline._director_queue_bindings,
+            pipeline._director_queue_worker_base,
             pipeline._director_queue_worker,
         )
         with tempfile.TemporaryDirectory() as temp_dir:
             try:
-                pipeline._director_queue_state = queue_state
-                pipeline._director_queue_base = os.path.realpath(temp_dir)
+                pipeline._director_queues = {os.path.realpath(temp_dir): queue_state}
+                pipeline._director_queue_bindings = {os.path.realpath(temp_dir): pipeline._director_queue_binding(temp_dir)}
+                pipeline._director_queue_worker_base = None
                 pipeline._director_queue_worker = None
                 public_list = pipeline.list_director_queue(temp_dir)
                 public_single = pipeline.get_director_queue_entry(
@@ -662,8 +668,9 @@ class TestProviderApiKey(unittest.TestCase):
                 )
             finally:
                 (
-                    pipeline._director_queue_state,
-                    pipeline._director_queue_base,
+                    pipeline._director_queues,
+                    pipeline._director_queue_bindings,
+                    pipeline._director_queue_worker_base,
                     pipeline._director_queue_worker,
                 ) = originals
 

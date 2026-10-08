@@ -5,11 +5,13 @@ from __future__ import annotations
 import ast
 import json
 import os
+import shutil
 import sys
 import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
+from contextlib import nullcontext
 
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -63,21 +65,24 @@ class TestDirectorProjectRevisionsAndQueue(unittest.TestCase):
         self.originals = {
             "pipelines": pipeline._pipelines,
             "wgp": pipeline._wgp,
-            "queue_state": pipeline._director_queue_state,
-            "queue_base": pipeline._director_queue_base,
+            "queues": pipeline._director_queues,
+            "bindings": pipeline._director_queue_bindings,
+            "worker_base": pipeline._director_queue_worker_base,
             "queue_worker": pipeline._director_queue_worker,
         }
         pipeline._pipelines = {}
         pipeline._wgp = SimpleNamespace(save_path=self.temp_dir.name)
-        pipeline._director_queue_state = None
-        pipeline._director_queue_base = None
+        pipeline._director_queues = {}
+        pipeline._director_queue_bindings = {}
+        pipeline._director_queue_worker_base = None
         pipeline._director_queue_worker = None
 
     def tearDown(self):
         pipeline._pipelines = self.originals["pipelines"]
         pipeline._wgp = self.originals["wgp"]
-        pipeline._director_queue_state = self.originals["queue_state"]
-        pipeline._director_queue_base = self.originals["queue_base"]
+        pipeline._director_queues = self.originals["queues"]
+        pipeline._director_queue_bindings = self.originals["bindings"]
+        pipeline._director_queue_worker_base = self.originals["worker_base"]
         pipeline._director_queue_worker = self.originals["queue_worker"]
         self.temp_dir.cleanup()
 
@@ -88,8 +93,9 @@ class TestDirectorProjectRevisionsAndQueue(unittest.TestCase):
         return path
 
     def _forget_director_queue_cache(self) -> None:
-        pipeline._director_queue_state = None
-        pipeline._director_queue_base = None
+        pipeline._director_queues = {}
+        pipeline._director_queue_bindings = {}
+        pipeline._director_queue_worker_base = None
         pipeline._director_queue_worker = None
 
     def _queue_path(self) -> str:
@@ -309,6 +315,9 @@ class TestDirectorProjectRevisionsAndQueue(unittest.TestCase):
         def fake_start(params):
             pid = f"render-{len(started) + 1}"
             started.append((pid, params["scene_description"]))
+            # A read from another owner tab/project must not fabricate restart
+            # recovery for this batch or stop its next entry.
+            pipeline.list_director_queue(os.path.join(self.temp_dir.name, "other"))
             return pid
 
         with (
@@ -328,6 +337,105 @@ class TestDirectorProjectRevisionsAndQueue(unittest.TestCase):
             [entry["status"] for entry in queue["entries"]],
             ["completed", "completed"],
         )
+
+    def test_other_project_read_preserves_running_entry_and_pipeline_binding(self):
+        queued = pipeline.enqueue_director_pipeline(self.temp_dir.name, {
+            "scene_description": "Live batch",
+        })
+        entry_id = queued["entries"][0]["id"]
+        with pipeline._director_queue_lock:
+            state = pipeline._load_director_queue_locked(self.temp_dir.name)
+            state.update(paused=False, running=True)
+        pipeline._set_director_queue_entry(self.temp_dir.name, entry_id,
+            status="running", pipeline_id="live-parent", message="Rendering")
+        before = self._read_queue_file()
+        pipeline.list_director_queue(os.path.join(self.temp_dir.name, "other"))
+        current = pipeline.list_director_queue(self.temp_dir.name)
+        self.assertFalse(current["paused"])
+        self.assertTrue(current["running"])
+        self.assertEqual(current["entries"][0]["status"], "running")
+        self.assertEqual(current["entries"][0]["pipeline_id"], "live-parent")
+        self.assertEqual(self._read_queue_file(), before)
+        pipeline._set_director_queue_entry(self.temp_dir.name, entry_id, message="Encoding")
+        self.assertEqual(pipeline.get_director_queue_entry(self.temp_dir.name, entry_id)["pipeline_id"], "live-parent")
+
+    def test_other_project_cannot_claim_running_without_its_own_worker(self):
+        other = os.path.join(self.temp_dir.name, "other")
+        pipeline.enqueue_director_pipeline(self.temp_dir.name, {"scene_description": "First"})
+        pipeline.enqueue_director_pipeline(other, {"scene_description": "Second"})
+        alive = [True]
+        fake_thread = SimpleNamespace(is_alive=lambda: alive[0], start=lambda: None)
+        with patch.object(pipeline.threading, "Thread", return_value=fake_thread) as factory:
+            pipeline.start_director_queue(self.temp_dir.name)
+            before = pipeline.list_director_queue(other)
+            with self.assertRaisesRegex(ValueError, "Another project's Director batch"):
+                pipeline.start_director_queue(other)
+            class HttpError(Exception):
+                def __init__(self, *, status_code, detail):
+                    super().__init__(detail)
+                    self.status_code = status_code
+            resolver = _load_isolated_function("_request_project_workspace", {
+                "Request": object, "HTTPException": HttpError,
+                "_get_active_workspace": lambda: "first",
+            })
+            base_resolver = _load_isolated_function("_director_queue_base", {
+                "Request": object, "_request_project_workspace": resolver,
+                "_require_project_access": lambda _request, workspace: {"first": self.temp_dir.name, "other": other}[workspace],
+            })
+            reserved = []
+            route = _load_isolated_function("director_queue_start", {
+                "api": SimpleNamespace(post=lambda _url: lambda fn: fn),
+                "Request": object, "HTTPException": HttpError,
+                "_init_pipeline": lambda: None,
+                "_request_project_workspace": resolver,
+                "_reserve_workspace_operations": lambda workspace: reserved.append(workspace) or nullcontext(),
+                "_director_queue_base": base_resolver,
+            })
+            local = SimpleNamespace(state=SimpleNamespace(maestro_remote=False))
+            remote = SimpleNamespace(state=SimpleNamespace(maestro_remote=True))
+            self.assertTrue(route(local)["running"])
+            with self.assertRaises(HttpError) as raised:
+                route(remote, "other")
+            self.assertEqual(raised.exception.status_code, 409)
+            with self.assertRaises(HttpError) as missing:
+                route(remote)
+            self.assertEqual(missing.exception.status_code, 400)
+            self.assertEqual(reserved, ["first", "other"])
+            self.assertEqual(pipeline.list_director_queue(other), before)
+            self.assertEqual(factory.call_count, 1)
+            self.assertEqual(pipeline._director_queue_worker_base, os.path.realpath(self.temp_dir.name))
+            alive[0] = False
+            started = pipeline.start_director_queue(other)
+            self.assertTrue(started["running"])
+            self.assertFalse(started["paused"])
+            self.assertEqual(factory.call_count, 2)
+            self.assertEqual(pipeline._director_queue_worker_base, os.path.realpath(other))
+
+    def test_recreated_project_cannot_inherit_cached_queue(self):
+        for explicit_discard in (False, True):
+            with self.subTest(explicit_discard=explicit_discard):
+                base = os.path.join(self.temp_dir.name, str(explicit_discard))
+                queued = pipeline.enqueue_director_pipeline(base, {"scene_description": "Prior owner's private draft"})
+                entry_id = queued["entries"][0]["id"]
+                shutil.rmtree(base)
+                if explicit_discard:
+                    pipeline.discard_director_queue(base)
+                    self.assertNotIn(os.path.realpath(base), pipeline._director_queues)
+                os.makedirs(base)
+                pipeline.ensure_project_instance_marker(base)
+                current = pipeline.list_director_queue(base)
+                self.assertEqual(current["entries"], [])
+                self.assertIsNone(pipeline.get_director_queue_entry(base, entry_id))
+                self.assertFalse(pipeline.start_director_queue(base)["running"])
+
+    def test_project_delete_busy_check_includes_its_waiting_queue_worker(self):
+        pipeline._director_queue_worker = SimpleNamespace(is_alive=lambda: True)
+        pipeline._director_queue_worker_base = os.path.realpath(self.temp_dir.name)
+        check = _load_isolated_function("_workspace_has_busy_director_pipeline", {
+            "_path_targets_workspace": lambda path, base: bool(path) and os.path.realpath(path) == os.path.realpath(base),
+        })
+        self.assertTrue(check("project-a", self.temp_dir.name))
+        self.assertFalse(check("project-b", os.path.join(self.temp_dir.name, "other")))
 
     def test_queue_waits_behind_direct_pipeline_before_dispatch(self):
         queued = pipeline.enqueue_director_pipeline(self.temp_dir.name, {
