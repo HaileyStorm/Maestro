@@ -67469,7 +67469,7 @@ def _run_tool_h3_face_refine(job_id):
                     # Parsing never receives tensors or a private sink. The
                     # worker appends them only to the one prepared invocation.
                     task=queue[0];call=dict(task["params"])
-                    call.update(state=state,model_type="minimax_h3",mode="generate",
+                    call.update(state=state,model_type="minimax_h3",mode="generate",image_refs=[],
                                 video_length=frames,resolution=f"{width}x{height}",multi_prompts_gen_type=0,
                                 _h3_face_refine_dispatch=dispatch,_h3_face_refine_output=sink)
                     expected=set(inspect.signature(wgp.generate_video).parameters)

@@ -216,11 +216,23 @@ class FaceJobBoundaryTests(unittest.TestCase):
         self.fixture.manifests[job['id']]['params']=copy.deepcopy(job['params'])
         admission=Mock();parity=Mock(return_value={'sealed':True});apply=Mock()
         calls=[]
-        def generate(task,send_cmd,plugin_data,state,model_type,mode,video_length,resolution,
+        def generate(task,send_cmd,plugin_data,state,model_type,mode,video_length,resolution,image_refs,
                      _h3_face_refine_dispatch,_h3_face_refine_output):
             calls.append((_h3_face_refine_dispatch,_h3_face_refine_output,video_length,resolution))
-            self.assertEqual((model_type,mode),('minimax_h3','generate'));return True
-        parser=Mock(side_effect=lambda manifest,state,cwd:(manifest,None))
+            self.assertEqual((model_type,mode),('minimax_h3','generate'))
+            self.assertEqual(image_refs,[]);return True
+        # The real attachment loader removes an empty reference-image list.
+        # The worker must restore the required no-reference invocation value.
+        tree=ast.parse((ROOT/'app/wgp.py').read_text())
+        loader=next(n for n in tree.body if isinstance(n,ast.FunctionDef)
+                    and n.name=='_load_task_attachments')
+        attachment_ns={'ATTACHMENT_KEYS':{'image_refs'}}
+        exec(compile(ast.Module(body=[loader],type_ignores=[]),'wgp.py','exec'),attachment_ns)
+        def parse(manifest,state,cwd):
+            attachment_ns['_load_task_attachments'](manifest[0]['params'],cwd)
+            self.assertNotIn('image_refs',manifest[0]['params'])
+            return manifest,None
+        parser=Mock(side_effect=parse)
         self.ns.update(wgp=types.SimpleNamespace(task_id=0,get_default_settings=lambda _: {},
                 _parse_task_manifest=parser,generate_video=generate,save_path='unchanged'),
             _GENERATION_MEDIA_INPUTS={'image_refs','video_source','audio_source'},
