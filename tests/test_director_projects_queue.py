@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import ast
 import json
+import re
+import hmac
 import os
 import shutil
 import sys
@@ -20,6 +22,7 @@ _APP_DIR = os.path.join(_ROOT, "app")
 if _APP_DIR not in sys.path:
     sys.path.insert(0, _APP_DIR)
 
+from services.queue_recovery_adapter import QueueRecoveryAdapterError
 from services import director_pipeline as pipeline  # noqa: E402
 from services.job_lifecycle import (  # noqa: E402
     _reset_queue_state_for_tests,
@@ -268,11 +271,13 @@ class TestDirectorProjectRevisionsAndQueue(unittest.TestCase):
             def __init__(self, params, request_id):
                 self.params, self.request_id = params, request_id
             async def json(self):
-                return {"params": self.params, "request_id": self.request_id}
+                return {"params": self.params, "request_id": self.request_id, "project_instance": "project:v1:" + "a" * 64}
         reserved = []
         route = _load_isolated_function("director_queue_add", {
             "api": SimpleNamespace(post=lambda _url: lambda fn: fn), "Request": object,
-            "HTTPException": HttpError, "_init_pipeline": lambda: None,
+            "HTTPException": HttpError, "_init_pipeline": lambda: None, "re": re, "hmac": hmac,
+            "QueueRecoveryAdapterError": QueueRecoveryAdapterError,
+            "_queue_recovery_existing_project_identity": lambda base: "project:v1:" + "a" * 64,
             "_request_project_workspace": lambda request, workspace: "album-a",
             "_director_queue_base": lambda request, workspace: self.temp_dir.name,
             "_reserve_workspace_operations": lambda workspace: reserved.append(workspace) or nullcontext(),
@@ -289,6 +294,62 @@ class TestDirectorProjectRevisionsAndQueue(unittest.TestCase):
         self.assertEqual(wrong_project.exception.status_code, 400)
         self.assertEqual(len(pipeline.list_director_queue(self.temp_dir.name)["entries"]), 1)
 
+    def test_original_admission_cannot_enter_recreated_project(self):
+        import asyncio
+        from services.queue_recovery_adapter import project_instance_digest
+        class HttpError(Exception):
+            def __init__(self, *, status_code, detail):
+                super().__init__(detail)
+                self.status_code = status_code
+        identity = _load_isolated_function("_queue_recovery_existing_project_identity", {
+            "os": os, "stat": __import__("stat"), "re": re,
+            "QueueRecoveryAdapterError": QueueRecoveryAdapterError,
+            "project_instance_digest": project_instance_digest, "_session_secret": lambda: b"fixture-secret-32-bytes-not-live!!",
+        })
+        base = os.path.join(self.temp_dir.name, "album")
+        os.mkdir(base)
+        pipeline.ensure_project_instance_marker(base)
+        original_instance = identity(base)
+        async def to_thread(fn, *args, **kwargs):
+            return fn(*args, **kwargs)
+        class Request:
+            def __init__(self, token, request_id="old-admission"):
+                self.token, self.request_id = token, request_id
+            async def json(self):
+                return {"params": {"scene_description": "Text-only original"}, "request_id": self.request_id, "project_instance": self.token}
+        namespace = {
+            "api": SimpleNamespace(post=lambda url: lambda fn: fn, get=lambda url: lambda fn: fn),
+            "Request": object, "HTTPException": HttpError, "_init_pipeline": lambda: None,
+            "_request_project_workspace": lambda request, workspace: "album",
+            "_director_queue_base": lambda request, workspace: base,
+            "_reserve_workspace_operations": lambda workspace: nullcontext(),
+            "upload_usage": SimpleNamespace(to_thread=to_thread, create_task=asyncio.create_task), "asyncio": asyncio,
+            "re": re, "hmac": hmac, "QueueRecoveryAdapterError": QueueRecoveryAdapterError,
+            "_queue_recovery_existing_project_identity": identity,
+        }
+        route = _load_isolated_function("director_queue_add", namespace)
+        get_queue = _load_isolated_function("director_queue_list", namespace)
+        self.assertEqual(get_queue(Request(original_instance))["project_instance"], original_instance)
+        original = asyncio.run(route(Request(original_instance)))
+        self.assertEqual(original["project_instance"], original_instance)
+        shutil.rmtree(base)
+        pipeline.discard_director_queue(base)
+        os.mkdir(base)
+        pipeline.ensure_project_instance_marker(base)
+        replacement_instance = get_queue(Request(original_instance))["project_instance"]
+        self.assertNotEqual(replacement_instance, original_instance)
+        with patch.object(pipeline, "_materialize_director_assets") as materialize:
+            with self.assertRaises(HttpError) as stale:
+                asyncio.run(route(Request(original_instance)))
+            self.assertEqual(stale.exception.status_code, 409)
+            materialize.assert_not_called()
+        self.assertEqual(pipeline.list_director_queue(base)["entries"], [])
+        self.assertFalse(asyncio.run(route(Request(replacement_instance, "new-admission")))["admission"]["reused"])
+        legacy = asyncio.run(route(Request(None, None)))
+        self.assertNotIn("admission", legacy)
+        self.assertEqual(legacy["project_instance"], replacement_instance)
+        self.assertEqual(len(legacy["entries"]), 2)
+
     def test_cancelled_queue_add_waiter_keeps_project_reserved_until_executor_drain(self):
         import asyncio
         import threading
@@ -303,7 +364,9 @@ class TestDirectorProjectRevisionsAndQueue(unittest.TestCase):
         operations = {}
         namespace = {
             "api": SimpleNamespace(post=lambda _url: lambda fn: fn, delete=lambda _url: lambda fn: fn),
-            "Request": object, "HTTPException": HttpError, "asyncio": asyncio, "os": os,
+            "Request": object, "HTTPException": HttpError, "asyncio": asyncio, "os": os, "re": re, "hmac": hmac,
+            "QueueRecoveryAdapterError": QueueRecoveryAdapterError,
+            "_queue_recovery_existing_project_identity": lambda base: "project:v1:" + "a" * 64,
             "_init_pipeline": lambda: None, "upload_usage": upload_usage,
             "_workspace_lifecycle_lock": threading.RLock(), "_workspace_creation_lock": threading.RLock(),
             "_workspace_operations": operations, "_workspaces_deleting": set(),
@@ -323,7 +386,7 @@ class TestDirectorProjectRevisionsAndQueue(unittest.TestCase):
         exec(compile(ast.Module(body=nodes, type_ignores=[]), "app/launch.py", "exec"), namespace)
         class Request:
             async def json(self):
-                return {"params": {"scene_description": "Original"}, "request_id": "queue-cancelled"}
+                return {"params": {"scene_description": "Original"}, "request_id": "queue-cancelled", "project_instance": "project:v1:" + "a" * 64}
         blocked = threading.Event()
         drain = threading.Event()
         def occupy_executor():

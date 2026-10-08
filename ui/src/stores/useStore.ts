@@ -1,3 +1,4 @@
+import { DirectorQueueAdmissionLedger, confirmedDirectorAdmission, type DirectorQueueAdmission, type DirectorQueueAdmissionView } from '../lib/directorQueueAdmission'
 import { isCurrentH3PromptRewritePreview, type H3PromptRewriteApplySelection } from '../lib/h3PromptRewritePreview'
 import { supportsPromptPreparation } from '../lib/promptEnhancement'
 import { H3_GALLERY_STILL_GUIDE_RESTORE_MESSAGE, isH3GalleryStillGuideOutput } from '../lib/h3GalleryStillGuide'
@@ -498,12 +499,17 @@ function _beginDirectorPreviewRequest(workspace: string, recoveryToken?: symbol)
 }
 
 function _beginDirectorPipelineLifecycle(workspace: string) {
+  const accountEpoch = currentAccountIdentityEpoch()
+  const accountScope = _directorAdmissionScope()
+  const accountBoundary = _directorAdmissionBoundary
   const token = Symbol('director-pipeline-lifecycle')
   _directorPipelineLifecycleToken = token
   const lifecycle = _beginWorkspaceLlmRequest(workspace)
   return {
     ownsWorkspace: () => (
       lifecycle.ownsWorkspace() && _directorPipelineLifecycleToken === token
+      && accountEpoch === currentAccountIdentityEpoch() && accountScope === _directorAdmissionScope()
+      && accountBoundary === _directorAdmissionBoundary
     ),
     dispose: () => {
       if (_directorPipelineLifecycleToken === token) {
@@ -511,6 +517,56 @@ function _beginDirectorPipelineLifecycle(workspace: string) {
       }
       lifecycle.dispose()
     },
+  }
+}
+
+function _directorAdmissionScope(state = useStore.getState()): string | null {
+  const context = state.accountContext ?? state.accessContext?.accounts
+  return terminalJobScope(context) ?? (context?.enabled === true && context.authenticated === false
+    && state.accessContext?.account_project_access_active === false ? 'legacy-project-access' : null)
+}
+const _directorAdmissionLedger = new DirectorQueueAdmissionLedger(() => _directorAdmissionScope())
+const _directorAdmissionBusy = new Map<string, 'preparing' | 'sending'>()
+let _directorQueueRefreshSequence = 0
+let _directorAdmissionBoundary = 0
+function _directorAdmissionIdentity(state = useStore.getState()): string {
+  return JSON.stringify([currentAccountIdentityEpoch(), _directorAdmissionScope(state), state.activeWorkspace])
+}
+function _directorAdmissionKey(state = useStore.getState()): string {
+  return `${_directorAdmissionBoundary}:${_directorAdmissionIdentity(state)}`
+}
+function _directorAdmissionView(): DirectorQueueAdmissionView | null {
+  const state = useStore.getState()
+  const stored = _directorAdmissionLedger.current(_directorAdmissionScope(state), state.activeWorkspace)
+  const phase = _directorAdmissionBusy.get(_directorAdmissionKey())
+  if (phase) return { phase, checking: false, message: phase === 'preparing'
+    ? 'Preparing this project for the queue…' : 'Adding this project to the queue…' }
+  if (stored === undefined) return { phase: 'unavailable', checking: false,
+    message: 'Submission recovery could not be read in this tab. Check the queue before trying again.' }
+  return stored ? { phase: 'unconfirmed', checking: false,
+    message: 'This project may already be in the queue. Check its submission, or retry the original saved inputs.' } : null
+}
+async function _sendDirectorAdmission(intent: DirectorQueueAdmission, scope: string | null, key: string): Promise<void> {
+  if (_directorAdmissionKey() !== key || _directorAdmissionBusy.get(key) === 'sending') return
+  const sequence = ++_directorQueueRefreshSequence
+  _directorAdmissionBusy.set(key, 'sending')
+  useStore.setState({ directorQueueAdmission: _directorAdmissionView(), directorError: null })
+  try {
+    const response = await api.enqueueDirectorPipeline(intent.params, intent.requestId, intent.workspace, intent.projectInstance)
+    if (_directorAdmissionKey() !== key) return
+    const confirmed = confirmedDirectorAdmission(intent, response, true)
+    if (!confirmed) throw new Error('The queue response did not confirm this submission. Check before retrying.')
+    if (!_directorAdmissionLedger.settle(scope, intent)
+      && _directorAdmissionLedger.current(scope, intent.workspace) !== null) throw new Error('The submission was confirmed, but this tab could not retain the confirmation. Check again before retrying.')
+    useStore.setState({ ...(sequence === _directorQueueRefreshSequence ? { directorQueue: confirmed.queue, directorQueueLoading: false } : {}),
+      directorLoading: false, directorError: null, directorComponentError: null })
+    window.alert(confirmed.removed ? 'This submission was previously added to the queue and then removed.'
+      : 'Added to Queue. Open the queue in the top bar when ready.')
+  } catch (error) {
+    if (_directorAdmissionKey() === key) useStore.setState({ directorError: error instanceof Error ? error.message : 'Queue submission could not be confirmed.' })
+  } finally {
+    _directorAdmissionBusy.delete(key)
+    if (_directorAdmissionKey() === key) useStore.setState({ directorQueueAdmission: _directorAdmissionView() })
   }
 }
 
@@ -3712,6 +3768,8 @@ interface AppState {
   cancelH3Plan: () => Promise<void>
   startGeneration: (mode?: 'now' | 'queue') => Promise<void>
   queueCurrentDirectorPipeline: () => Promise<void>
+  retryDirectorQueueAdmission: () => Promise<void>
+  directorQueueAdmission: DirectorQueueAdmissionView | null
   startStudioQueue: () => Promise<void>
   directorQueue: api.DirectorQueueState | null
   directorQueueLoading: boolean
@@ -8864,6 +8922,7 @@ export const useStore = create<AppState>((set, get) => ({
 
   jobs: [],
   directorQueue: null,
+  directorQueueAdmission: null,
   directorQueueLoading: false,
   isGenerating: false,
   studioSubmissions: [],
@@ -10684,13 +10743,40 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   loadDirectorQueue: async () => {
+    const state = get()
+    const workspace = state.activeWorkspace
+    const scope = _directorAdmissionScope(state)
+    const key = _directorAdmissionKey(state)
+    const sequence = ++_directorQueueRefreshSequence
+    const current = () => _directorAdmissionKey() === key && sequence === _directorQueueRefreshSequence
+    const view = _directorAdmissionView()
+    set({ directorQueueLoading: true, directorQueueAdmission: view ? { ...view, checking: true } : null })
     try {
-      const directorQueue = await api.fetchDirectorQueue()
-      set({ directorQueue, directorQueueLoading: false })
+      const directorQueue = await api.fetchDirectorQueue(workspace)
+      if (!current()) return
+      if (!Array.isArray(directorQueue?.entries)) throw new Error('The queue response could not be read.')
+      const intent = _directorAdmissionLedger.current(scope, workspace)
+      const replaced = intent && typeof directorQueue.project_instance === 'string'
+        && /^project:v1:[a-f0-9]{64}$/.test(directorQueue.project_instance) && directorQueue.project_instance !== intent.projectInstance
+      const confirmed = intent ? confirmedDirectorAdmission(intent, directorQueue) : null
+      if (replaced && _directorAdmissionLedger.settle(scope, intent)) {
+        set({ directorError: 'The saved submission belongs to an earlier project and cannot be retried here. It was not sent to this project.' })
+      } else if (confirmed && _directorAdmissionLedger.settle(scope, intent!)) {
+        set({ directorError: confirmed.removed ? 'This submission was previously added to the queue and then removed.' : null })
+      }
+      set({ directorQueue, directorQueueLoading: false, directorQueueAdmission: _directorAdmissionView() })
     } catch (error) {
-      console.error('Director queue load failed:', error)
-      set({ directorQueueLoading: false })
+      if (current()) set({ directorQueueLoading: false, directorQueueAdmission: _directorAdmissionView(),
+        directorError: error instanceof Error ? error.message : 'Director queue could not be checked.' })
     }
+  },
+
+  retryDirectorQueueAdmission: async () => {
+    const key = _directorAdmissionKey()
+    if (_directorAdmissionBusy.has(key)) return
+    const scope = _directorAdmissionScope()
+    const intent = _directorAdmissionLedger.current(scope, get().activeWorkspace)
+    if (intent) await _sendDirectorAdmission(intent, scope, key)
   },
 
   loadDirectorQueueEntry: async (entryId) => {
@@ -19194,6 +19280,19 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   startDirectorPipeline: async (mode = 'now') => {
+    const queueKey = _directorAdmissionKey()
+    const queueScope = _directorAdmissionScope()
+    if (mode === 'queue') {
+      if (_directorAdmissionBusy.has(queueKey)) return
+      const existing = _directorAdmissionLedger.current(queueScope, get().activeWorkspace)
+      if (existing !== null) {
+        set({ directorQueueAdmission: _directorAdmissionView(), directorError: existing === undefined
+          ? 'Submission recovery could not be read in this tab. Check the queue before trying again.' : null })
+        return
+      }
+      _directorAdmissionBusy.set(queueKey, 'preparing')
+      set({ directorQueueAdmission: _directorAdmissionView() })
+    }
     const state = get()
     let expectedState = state
     const requestWorkspace = state.activeWorkspace
@@ -19218,7 +19317,16 @@ export const useStore = create<AppState>((set, get) => ({
         throw new Error('Director settings changed while preparing. Review your setup and submit again.')
       }
     }
+    let queueProjectInstance: string | null = null
     try {
+    if (mode === 'queue') {
+      const queue = await api.fetchDirectorQueue(requestWorkspace)
+      assertCurrent()
+      if (typeof queue.project_instance !== 'string' || !/^project:v1:[a-f0-9]{64}$/.test(queue.project_instance)) {
+        throw new Error('The project identity could not be confirmed. Restart Maestro and reopen this project before adding it to the queue.')
+      }
+      queueProjectInstance = queue.project_instance
+    }
     // Model visibility writes are serialized. Await the current tail before
     // and after the catalog refresh so an immediate Director submission
     // cannot race a just-enabled exact recipe or a one-time visibility write.
@@ -19499,21 +19607,11 @@ export const useStore = create<AppState>((set, get) => ({
 
       assertCurrent()
       if (mode === 'queue') {
-        const queued = await api.enqueueDirectorPipeline(pipelineParams)
-        if (!lifecycle.ownsWorkspace()) return
-        set({
-          directorQueue: queued,
-          directorQueueLoading: false,
-          directorLoading: false,
-          directorError: null,
-          directorComponentError: null,
-        })
-        const waiting = queued.entries?.filter(entry => (
-          entry.status === 'held' || entry.status === 'queued'
-        )).length || 0
-        window.alert(
-          `Added to Queue · ${waiting} Director project(s) waiting. Open the queue in the top bar when ready.`,
-        )
+        const requestId = crypto.randomUUID()
+        const intent = _directorAdmissionLedger.reserve(queueScope, requestWorkspace, {
+          requestId, workspace: requestWorkspace, projectInstance: queueProjectInstance, params: pipelineParams,
+        }) as DirectorQueueAdmission
+        await _sendDirectorAdmission(intent, queueScope, queueKey)
         return
       }
       const { pipeline_id } = await api.startPipeline(pipelineParams)
@@ -19551,6 +19649,10 @@ export const useStore = create<AppState>((set, get) => ({
       })
     } finally {
       lifecycle.dispose()
+      if (mode === 'queue') {
+        _directorAdmissionBusy.delete(queueKey)
+        if (_directorAdmissionKey() === queueKey) set({ directorQueueAdmission: _directorAdmissionView() })
+      }
     }
   },
 
@@ -19827,4 +19929,16 @@ useStore.subscribe((state, previous) => {
   if (state.editMasksPath !== null || state.editMaskPreview !== null || state.editDetectedTarget !== '') {
     useStore.setState({ editMasksPath: null, editMaskPreview: null, editDetectedTarget: '' })
   }
+})
+
+
+let _directorAdmissionVisibleKey = _directorAdmissionIdentity()
+useStore.subscribe(() => {
+  const key = _directorAdmissionIdentity()
+  if (key === _directorAdmissionVisibleKey) return
+  _directorAdmissionVisibleKey = key
+  ++_directorAdmissionBoundary
+  ++_directorQueueRefreshSequence
+  useStore.setState({ directorQueue: null, directorQueueLoading: false, directorError: null, directorComponentError: null,
+    directorQueueAdmission: _directorAdmissionView() })
 })

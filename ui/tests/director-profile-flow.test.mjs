@@ -3,6 +3,7 @@ import ts from 'typescript'
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { build } from 'esbuild'
+import { createRequire } from 'node:module'
 
 const bundled = build({
   stdin: { contents: "export { useStore } from './src/stores/useStore.ts'", resolveDir: new URL('..', import.meta.url).pathname, loader: 'js' },
@@ -23,9 +24,10 @@ function deferred() {
   return { promise, resolve }
 }
 const videoDefaults = { resolution: '640x480', video_length: 81, num_inference_steps: 8, guidance_scale: 4, seed: -1, image_mode: 0, repeat_generation: 1, settings_version: 2.52, guidance_phases: 0 }
+const PROJECT_INSTANCE = 'project:v1:' + 'a'.repeat(64)
 const ready = model_type => ({ model_type, compatible: true, ready: true, reasons: [], actions: [], enabled: true, downloaded: true })
 
-async function withStore(action, { legacyRoles = false } = {}) {
+async function withStore(action, { legacyRoles = false, storage = new StorageFake(), queueControl = {} } = {}) {
   const names = ['fetch', 'window', 'document', 'localStorage', 'sessionStorage']
   const originals = Object.fromEntries(names.map(name => [name, globalThis[name]]))
   const records = new Map()
@@ -36,7 +38,7 @@ async function withStore(action, { legacyRoles = false } = {}) {
     schema_version: 1, creator_model_override: '', editor_model_override: 'editor_a',
     creator_loras: [{ id: 'look.safetensors', multiplier: 0 }], editor_loras: [],
   }))
-  globalThis.sessionStorage = new StorageFake()
+  globalThis.sessionStorage = storage
   globalThis.window = Object.assign(new EventTarget(), {
     setTimeout, clearTimeout, setInterval, clearInterval, alert() {},
     location: { hostname: '127.0.0.1' },
@@ -46,7 +48,7 @@ async function withStore(action, { legacyRoles = false } = {}) {
   globalThis.fetch = async (input, init = {}) => {
     const url = new URL(String(input), 'http://localhost')
     const method = init.method || 'GET'
-    requests.push({ url: url.pathname, method, body: init.body })
+    requests.push({ url: url.pathname, search: url.search, method, body: init.body })
     if (url.pathname === '/api/v1/presets' && method === 'GET') {
       if (control.beforePresets) await control.beforePresets.promise
       return json({ presets: [...records.values()], director_profiles_supported: true })
@@ -92,7 +94,14 @@ async function withStore(action, { legacyRoles = false } = {}) {
       if (control.beforeUpload) await control.beforeUpload.promise
       return json({ path: '/job/uploaded.png' })
     }
-    if (url.pathname === '/api/v1/director/queue') return json({ entries: [] })
+    if (url.pathname === '/api/v1/director/queue') {
+      if (method === 'GET' && !queueControl.get) return json({ project_instance: PROJECT_INSTANCE, entries: [], admissions: [] })
+      if (queueControl.handle) return queueControl.handle(url, init, requests)
+      const requestId = init.body ? JSON.parse(init.body).request_id : null
+      const receipt = { request_id: requestId, entry_id: 'abcd1234', removed: false }
+      return json({ project_instance: PROJECT_INSTANCE, entries: requestId ? [{ id: 'abcd1234', status: 'held' }] : [],
+        admissions: requestId ? [receipt] : [], ...(requestId ? { admission: { ...receipt, reused: false } } : {}) })
+    }
     if (url.pathname === '/api/v1/director/preflight') {
       const body = JSON.parse(init.body)
       return json({ status: 'ready', resolved: {
@@ -108,7 +117,7 @@ async function withStore(action, { legacyRoles = false } = {}) {
   try {
     const { useStore } = await import(`data:text/javascript;base64,${Buffer.from(await bundled).toString('base64')}#director-profile-${++realm}`)
     useStore.setState(state => ({
-      sidebarMode: 'director', generationMode: 'audio', activeWorkspace: 'project-a', modelsLoaded: true,
+      sidebarMode: 'director', generationMode: 'audio', activeWorkspace: 'project-a', modelsLoaded: true, accountContext: { enabled: false },
       models: [ready('video_a'), ready('creator_a'), ready('editor_a')],
       params: { ...state.params, model_type: 'audio_a', prompt: 'Keep this audio prompt', seed: 999 },
       selectedModelPerMode: { audio: 'audio_a', video: 'video_a' },
@@ -317,12 +326,12 @@ test('Director submission retains the newest settings when metadata finishes lat
     store.setState({ directorAudioScale: 3 })
     control.beforeOptions.resolve()
     await pending
-    assert.equal(requests.some(r => r.url === '/api/v1/director/queue'), false)
+    assert.equal(requests.some(r => r.url === '/api/v1/director/queue' && r.method === 'POST'), false)
     assert.match(store.getState().directorError, /settings changed/)
     assert.equal(store.getState().directorAudioScale, 3)
     control.beforeOptions = null
     await store.getState().startDirectorPipeline('queue')
-    const queued = requests.find(r => r.url === '/api/v1/director/queue')
+    const queued = requests.find(r => r.url === '/api/v1/director/queue' && r.method === 'POST')
     assert.ok(queued, store.getState().directorError)
     assert.equal(JSON.parse(queued.body).params.audio_scale, 3)
   })
@@ -342,7 +351,7 @@ test('a reference changed during upload is not overwritten or submitted', async 
     await pending
     assert.equal(store.getState().directorReferenceImage, replacement)
     assert.equal(store.getState().directorReferenceImagePath, '/job/new.png')
-    assert.equal(requests.some(r => r.url === '/api/v1/director/queue'), false)
+    assert.equal(requests.some(r => r.url === '/api/v1/director/queue' && r.method === 'POST'), false)
   })
 })
 
@@ -354,10 +363,10 @@ test('changed video LoRA phase counts require confirmation before saving or subm
     await assert.rejects(store.getState().savePreset('Old phases', 'director'), /weights/)
     await store.getState().startDirectorPipeline('queue')
     assert.match(store.getState().directorError, /weights/)
-    assert.equal(requests.some(r => r.url === '/api/v1/director/queue'), false)
+    assert.equal(requests.some(r => r.url === '/api/v1/director/queue' && r.method === 'POST'), false)
     store.getState().directorSetLora('video', control.videoLoras, '0;0', { 'video-look.safetensors': [0, 0] }, control.videoLoras, 'video_a')
     await store.getState().startDirectorPipeline('queue')
-    const queued = requests.find(r => r.url === '/api/v1/director/queue')
+    const queued = requests.find(r => r.url === '/api/v1/director/queue' && r.method === 'POST')
     assert.ok(queued, store.getState().directorError)
     assert.equal(JSON.parse(queued.body).params.video_loras.loras_multipliers, '0;0')
   })
@@ -396,7 +405,7 @@ test('a real admission catalog refresh preserves working video settings and subm
     await store.getState().startDirectorPipeline('queue')
     assert.equal(store.getState().savedParamsPerMode.video, snapshot)
     assert.ok(requests.some(r => r.url === '/api/v1/models'))
-    const queued = requests.find(r => r.url === '/api/v1/director/queue')
+    const queued = requests.find(r => r.url === '/api/v1/director/queue' && r.method === 'POST')
     assert.ok(queued, store.getState().directorError)
     assert.equal(JSON.parse(queued.body).params.video_params.guidance_scale, 0)
     assert.equal(JSON.parse(queued.body).params.video_params.seed, 0)
@@ -449,8 +458,242 @@ test('a video model with zero CFG phases preserves its one LoRA multiplier', asy
     assert.equal(store.getState().presets[0].params.guidance_phases, 0)
     assert.equal(store.getState().presets[0].loras_multipliers, '0')
     await store.getState().startDirectorPipeline('queue')
-    const queued = requests.find(r => r.url === '/api/v1/director/queue')
+    const queued = requests.find(r => r.url === '/api/v1/director/queue' && r.method === 'POST')
     assert.ok(queued, store.getState().directorError)
     assert.equal(JSON.parse(queued.body).params.video_loras.loras_multipliers, '0')
   })
+})
+
+
+test('lost Director acknowledgement survives fresh store reload, Check adopts exact admission without POST', async () => {
+  const storage = new StorageFake()
+  let original
+  await withStore(async (store, { requests }) => {
+    await store.getState().queueCurrentDirectorPipeline()
+    original = JSON.parse(requests.find(r => r.method === 'POST' && r.url.endsWith('/queue')).body)
+    assert.ok(original.request_id)
+    assert.equal(store.getState().directorQueueAdmission.phase, 'unconfirmed')
+  }, { storage, queueControl: { handle: async (url, init) => {
+    const body = JSON.parse(init.body)
+    assert.equal(url.searchParams.get('workspace'), 'project-a')
+    assert.deepEqual(JSON.parse(storage.getItem('maestro:director-queue-admissions-v1:local'))['project-a'].payload,
+      { requestId: body.request_id, workspace: 'project-a', projectInstance: PROJECT_INSTANCE, params: body.params })
+    throw new TypeError('lost response')
+  } } })
+  await withStore(async (store, { requests }) => {
+    assert.equal(store.getState().directorQueueAdmission.phase, 'unconfirmed')
+    await store.getState().loadDirectorQueue()
+    assert.equal(requests.filter(r => r.method === 'POST' && r.url.endsWith('/queue')).length, 0)
+    assert.equal(store.getState().directorQueueAdmission, null)
+    assert.ok(requests.find(r => r.url.endsWith('/queue')).search.includes('workspace=project-a'))
+  }, { storage, queueControl: { get: true, handle: async () => json({ project_instance: PROJECT_INSTANCE, entries: [{ id: 'abcdef12', status: 'held' }],
+    admissions: [{ request_id: original.request_id, entry_id: 'abcdef12', removed: false }] }) } })
+})
+
+test('Director explicit retry retains original body despite edited settings and coalesces double click', async () => {
+  const storage = new StorageFake()
+  const hold = deferred()
+  let firstBody, retryBody
+  let posts = 0
+  await withStore(async (store, { requests }) => {
+    await store.getState().queueCurrentDirectorPipeline()
+    firstBody = requests.find(r => r.method === 'POST' && r.url.endsWith('/queue')).body
+    store.setState({ directorSceneDescription: 'Edited scene', directorAudioScale: 99 })
+    await store.getState().queueCurrentDirectorPipeline()
+    assert.equal(posts, 1)
+    const one = store.getState().retryDirectorQueueAdmission()
+    const two = store.getState().retryDirectorQueueAdmission()
+    hold.resolve()
+    await Promise.all([one, two])
+    assert.equal(posts, 2)
+    assert.equal(retryBody, firstBody)
+    assert.equal(store.getState().directorQueueAdmission, null)
+  }, { storage, queueControl: { handle: async (_url, init) => {
+    posts++
+    if (posts === 1) return json({ project_instance: PROJECT_INSTANCE, entries: [] }) // Malformed acknowledgement remains uncertain.
+    retryBody = init.body
+    await hold.promise
+    const body = JSON.parse(init.body)
+    return json({ project_instance: PROJECT_INSTANCE, entries: [{ id: 'abcd1234', status: 'held' }], admissions: [{ request_id: body.request_id, entry_id: 'abcd1234', removed: false }],
+      admission: { request_id: body.request_id, entry_id: 'abcd1234', removed: false, reused: true } })
+  } } })
+})
+
+test('Director storage failure prevents POST and stale GET cannot publish across projects', async () => {
+  const storage = new StorageFake()
+  storage.setItem = () => { throw new Error('read-only') }
+  await withStore(async (store, { requests }) => {
+    await store.getState().queueCurrentDirectorPipeline()
+    assert.equal(requests.filter(r => r.method === 'POST' && r.url.endsWith('/queue')).length, 0)
+    assert.match(store.getState().directorError, /retain/)
+  }, { storage })
+  const hold = deferred()
+  await withStore(async store => {
+    const pending = store.getState().loadDirectorQueue()
+    store.setState({ activeWorkspace: 'project-b' })
+    hold.resolve()
+    await pending
+    assert.equal(store.getState().directorQueue, null)
+  }, { queueControl: { get: true, handle: async () => { await hold.promise; return json({ project_instance: PROJECT_INSTANCE, entries: [{ id: 'abcd1234', status: 'held' }], admissions: [] }) } } })
+})
+
+
+test('Director recovery controls show waiting, checking and original retry with their actual handlers', async () => {
+  const source = await readFile(new URL('../src/components/Sidebar/DirectorChat.tsx', import.meta.url), 'utf8')
+  const ast = ts.createSourceFile('DirectorChat.tsx', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX)
+  const fn = ast.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === 'DirectorQueueAdmissionNotice')
+  assert.ok(fn)
+  const compiled = ts.transpileModule(fn.getText(ast) + '\nexports.notice = DirectorQueueAdmissionNotice', {
+    compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX },
+  }).outputText
+  const exported = {}
+  new Function('require', 'exports', compiled)(createRequire(import.meta.url), exported)
+  const flatten = value => value && typeof value === 'object' ? [value, ...[value.props?.children].flat(Infinity).flatMap(flatten)] : []
+  let checks = 0, retries = 0
+  const render = (phase, checking = false) => flatten(exported.notice({ queueAdmission: { phase, checking, message: 'Saved original inputs' },
+    checkQueueAdmission: async () => { checks++ }, retryQueueAdmission: async () => { retries++ } }))
+  const buttons = render('unconfirmed').filter(v => v.type === 'button')
+  assert.deepEqual(buttons.map(v => v.props.children), ['Check submission', 'Retry original submission'])
+  buttons[0].props.onClick(); buttons[1].props.onClick()
+  assert.equal(checks, 1); assert.equal(retries, 1)
+  assert.ok(render('unconfirmed', true).filter(v => v.type === 'button').every(v => v.props.disabled))
+  assert.deepEqual(render('unavailable').filter(v => v.type === 'button').map(v => v.props.children), ['Check submission'])
+  assert.equal(render('sending').filter(v => v.type === 'button').length, 0)
+})
+
+test('removed Director admission is confirmed without recreating it, unrelated and malformed receipts remain fenced', async () => {
+  const storage = new StorageFake()
+  let original
+  await withStore(async (store, { requests }) => {
+    await store.getState().queueCurrentDirectorPipeline()
+    original = JSON.parse(requests.find(r => r.method === 'POST' && r.url.endsWith('/queue')).body)
+  }, { storage, queueControl: { handle: async () => { throw new TypeError('lost') } } })
+  for (const receipt of [
+    { request_id: 'unrelated', entry_id: 'abcd1234', removed: true },
+    { request_id: original.request_id, entry_id: 'bad-id', removed: true },
+    { request_id: original.request_id, entry_id: 'abcd1234', removed: false },
+  ]) await withStore(async (store, { requests }) => {
+    await store.getState().loadDirectorQueue()
+    assert.equal(store.getState().directorQueueAdmission.phase, 'unconfirmed')
+    assert.equal(requests.filter(r => r.method === 'POST' && r.url.endsWith('/queue')).length, 0)
+  }, { storage, queueControl: { get: true, handle: async () => json({ project_instance: PROJECT_INSTANCE, entries: [], admissions: [receipt] }) } })
+  await withStore(async store => {
+    await store.getState().loadDirectorQueue()
+    assert.equal(store.getState().directorQueueAdmission, null)
+    assert.match(store.getState().directorError, /then removed/)
+  }, { storage, queueControl: { get: true, handle: async () => json({ project_instance: PROJECT_INSTANCE, entries: [], admissions: [{ request_id: original.request_id, entry_id: 'abcd1234', removed: true }] }) } })
+})
+
+test('Director stable account retirement hides receipt and rejects late POST and GET even with unchanged numeric epoch', async () => {
+  const hold = deferred()
+  let sent
+  await withStore(async store => {
+    store.setState({ accountContext: { enabled: true, authenticated: true, account: { id: 'owner-a' } } })
+    const pending = store.getState().queueCurrentDirectorPipeline()
+    while (!sent) await new Promise(resolve => setTimeout(resolve, 0))
+    store.setState({ accountContext: { enabled: true, authenticated: true, account: { id: 'owner-b' } } })
+    assert.equal(store.getState().directorQueueAdmission, null)
+    hold.resolve(); await pending
+    assert.equal(store.getState().directorQueue, null)
+    store.setState({ accountContext: { enabled: true, authenticated: true, account: { id: 'owner-a' } } })
+    assert.equal(store.getState().directorQueueAdmission.phase, 'unconfirmed')
+  }, { queueControl: { handle: async (_url, init) => {
+    sent = JSON.parse(init.body); await hold.promise
+    const receipt = { request_id: sent.request_id, entry_id: 'abcd1234', removed: false }
+    return json({ project_instance: PROJECT_INSTANCE, entries: [{ id: 'abcd1234', status: 'held' }], admissions: [receipt], admission: { ...receipt, reused: false } })
+  } } })
+  const getHold = deferred()
+  await withStore(async store => {
+    const pending = store.getState().loadDirectorQueue()
+    store.setState({ accountContext: { enabled: true, authenticated: true, account: { id: 'other' } } })
+    getHold.resolve(); await pending
+    assert.equal(store.getState().directorQueue, null)
+  }, { queueControl: { get: true, handle: async () => { await getHold.promise; return json({ project_instance: PROJECT_INSTANCE, entries: [{ id: 'abcd1234', status: 'held' }], admissions: [] }) } } })
+})
+
+
+test('Director ABA project and account changes retire pending acknowledgements', async () => {
+  for (const boundary of ['project', 'account']) {
+    const hold = deferred()
+    let sent
+    await withStore(async store => {
+      const pending = store.getState().queueCurrentDirectorPipeline()
+      while (!sent) await new Promise(resolve => setTimeout(resolve, 0))
+      if (boundary === 'project') {
+        store.setState({ activeWorkspace: 'project-b' }); store.setState({ activeWorkspace: 'project-a' })
+      } else {
+        store.setState({ accountContext: { enabled: true, authenticated: true, account: { id: 'other' } } })
+        store.setState({ accountContext: { enabled: false } })
+      }
+      hold.resolve(); await pending
+      assert.equal(store.getState().directorQueue, null)
+      assert.equal(store.getState().directorQueueAdmission.phase, 'unconfirmed')
+    }, { queueControl: { handle: async (_url, init) => {
+      sent = JSON.parse(init.body); await hold.promise
+      const receipt = { request_id: sent.request_id, entry_id: 'abcd1234', removed: false }
+      return json({ project_instance: PROJECT_INSTANCE, entries: [{ id: 'abcd1234', status: 'held' }], admissions: [receipt], admission: { ...receipt, reused: false } })
+    } } })
+  }
+})
+
+test('Director unknown identity and malformed durable receipt block fresh submission', async () => {
+  await withStore(async (store, { requests }) => {
+    store.setState({ accountContext: null, accessContext: null })
+    await store.getState().queueCurrentDirectorPipeline()
+    assert.equal(store.getState().directorQueueAdmission.phase, 'unavailable')
+    assert.equal(requests.filter(r => r.method === 'POST' && r.url.endsWith('/queue')).length, 0)
+  })
+  const storage = new StorageFake()
+  storage.setItem('maestro:director-queue-admissions-v1:local', '{broken')
+  await withStore(async (store, { requests }) => {
+    await store.getState().queueCurrentDirectorPipeline()
+    await store.getState().retryDirectorQueueAdmission()
+    assert.equal(store.getState().directorQueueAdmission.phase, 'unavailable')
+    assert.equal(requests.filter(r => r.method === 'POST' && r.url.endsWith('/queue')).length, 0)
+    assert.equal(storage.getItem('maestro:director-queue-admissions-v1:local'), '{broken')
+  }, { storage })
+})
+
+test('Director failed confirmation storage keeps receipt even after exact acceptance', async () => {
+  const storage = new StorageFake()
+  await withStore(async store => {
+    await store.getState().queueCurrentDirectorPipeline()
+    assert.equal(store.getState().directorQueueAdmission.phase, 'unconfirmed')
+    assert.match(store.getState().directorError, /confirmation/)
+  }, { storage, queueControl: { handle: async (_url, init) => {
+    const body = JSON.parse(init.body)
+    storage.setItem = () => { throw new Error('read-only') }
+    const receipt = { request_id: body.request_id, entry_id: 'abcd1234', removed: false }
+    return json({ project_instance: PROJECT_INSTANCE, entries: [{ id: 'abcd1234', status: 'held' }], admissions: [receipt], admission: { ...receipt, reused: false } })
+  } } })
+})
+
+test('Director preparation double click captures and uploads only once', async () => {
+  await withStore(async (store, { requests, control }) => {
+    const hold = deferred()
+    control.beforeOptions = hold
+    const one = store.getState().queueCurrentDirectorPipeline()
+    const two = store.getState().queueCurrentDirectorPipeline()
+    hold.resolve(); await Promise.all([one, two])
+    assert.equal(requests.filter(r => r.method === 'POST' && r.url.endsWith('/queue')).length, 1)
+  })
+})
+
+
+test('Director replacement project retires only a verified old receipt and never resends it', async () => {
+  const storage = new StorageFake()
+  await withStore(async store => { await store.getState().queueCurrentDirectorPipeline() },
+    { storage, queueControl: { handle: async () => { throw new TypeError('lost') } } })
+  const original = storage.getItem('maestro:director-queue-admissions-v1:local')
+  for (const token of [null, 'bad', undefined]) await withStore(async store => {
+    await store.getState().loadDirectorQueue()
+    assert.equal(store.getState().directorQueueAdmission.phase, 'unconfirmed')
+    assert.equal(storage.getItem('maestro:director-queue-admissions-v1:local'), original)
+  }, { storage, queueControl: { get: true, handle: async () => json({ entries: [], admissions: [], project_instance: token }) } })
+  await withStore(async (store, { requests }) => {
+    await store.getState().loadDirectorQueue()
+    assert.equal(store.getState().directorQueueAdmission, null)
+    assert.match(store.getState().directorError, /earlier project/)
+    assert.equal(requests.filter(r => r.method === 'POST' && r.url.endsWith('/queue')).length, 0)
+  }, { storage, queueControl: { get: true, handle: async () => json({ entries: [], admissions: [], project_instance: 'project:v1:' + 'b'.repeat(64) }) } })
 })

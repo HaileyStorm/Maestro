@@ -45157,7 +45157,16 @@ def director_queue_list(request: Request, workspace: str = ""):
     """Return the persistent, project-level Director render queue."""
     _init_pipeline()
     from services.director_pipeline import list_director_queue
-    return list_director_queue(_director_queue_base(request, workspace))
+    selected_workspace = _request_project_workspace(request, workspace)
+    base = _director_queue_base(request, selected_workspace)
+    with _reserve_workspace_operations(selected_workspace):
+        try:
+            project_instance = _queue_recovery_existing_project_identity(base)
+        except QueueRecoveryAdapterError as exc:
+            raise HTTPException(status_code=409, detail="Project identity could not be verified. Reopen the project before adding to the queue.") from exc
+        result = list_director_queue(base)
+        result["project_instance"] = project_instance
+        return result
 
 
 @api.post("/api/v1/director/queue")
@@ -45178,7 +45187,22 @@ async def director_queue_add(request: Request, workspace: str = ""):
         base = _director_queue_base(request, selected_workspace)
         reservation = _reserve_workspace_operations(selected_workspace)
         reservation.__enter__()
-        work = upload_usage.to_thread(enqueue_director_pipeline, base, params, request_id=request_id)
+        def admit():
+            if request_id is not None:
+                expected_instance = body.get("project_instance")
+                if not isinstance(expected_instance, str) or not re.fullmatch(r"project:v1:[0-9a-f]{64}", expected_instance):
+                    raise ValueError("Director queue project identity is required")
+                try:
+                    current_instance = _queue_recovery_existing_project_identity(base)
+                except QueueRecoveryAdapterError as exc:
+                    raise DirectorQueueAdmissionConflict("The original project is no longer available. Check the queue before submitting a new project.") from exc
+                if not hmac.compare_digest(expected_instance, current_instance):
+                    raise DirectorQueueAdmissionConflict("This saved submission belongs to an earlier project and cannot be retried here.")
+            result = enqueue_director_pipeline(base, params, request_id=request_id)
+            result["project_instance"] = _queue_recovery_existing_project_identity(base)
+            return result
+
+        work = upload_usage.to_thread(admit)
         try:
             task = upload_usage.create_task(work)
         except BaseException:

@@ -426,6 +426,34 @@ function DirectorPreviewTelemetry() {
   )
 }
 
+function DirectorQueueAdmissionNotice({ queueAdmission, checkQueueAdmission, retryQueueAdmission }: {
+  queueAdmission: ReturnType<typeof useStore.getState>['directorQueueAdmission']
+  checkQueueAdmission: () => Promise<void>
+  retryQueueAdmission: () => Promise<void>
+}) {
+  return queueAdmission ? (
+          <div role="status" className="space-y-2 rounded-lg border border-border bg-bg-tertiary p-3 text-xs text-text-secondary">
+            <p>{queueAdmission.message}</p>
+            {(queueAdmission.phase === 'unconfirmed' || queueAdmission.phase === 'unavailable') && (
+              <div className="flex flex-wrap gap-2">
+                <button type="button" disabled={queueAdmission.checking}
+                  onClick={() => { void checkQueueAdmission() }}
+                  className="mobile-control-target rounded-md border border-border px-3 py-2 disabled:opacity-50">
+                  {queueAdmission.checking ? 'Checking submission…' : 'Check submission'}
+                </button>
+                {queueAdmission.phase === 'unconfirmed' && (
+                  <button type="button" disabled={queueAdmission.checking}
+                    onClick={() => { void retryQueueAdmission() }}
+                    className="mobile-control-target rounded-md border border-border px-3 py-2 disabled:opacity-50">
+                    Retry original submission
+                  </button>
+                )}
+              </div>
+            )}
+          </div>
+  ) : null
+}
+
 export function DirectorChat() {
   const step = useStore(s => s.directorStep)
   const loading = useStore(s => s.directorLoading)
@@ -466,6 +494,9 @@ export function DirectorChat() {
   const applyToClips = useStore(s => s.directorApplyToClips)
   const directorGenerate = useStore(s => s.directorGenerate)
   const queueCurrentDirectorPipeline = useStore(s => s.queueCurrentDirectorPipeline)
+  const queueAdmission = useStore(s => s.directorQueueAdmission)
+  const checkQueueAdmission = useStore(s => s.loadDirectorQueue)
+  const retryQueueAdmission = useStore(s => s.retryDirectorQueueAdmission)
   const editClipPlan = useStore(s => s.directorEditClipPlan)
   const reset = useStore(s => s.directorReset)
   const speakers = useStore(s => s.directorSpeakers)
@@ -722,6 +753,9 @@ export function DirectorChat() {
             )}
           </div>
         </div>
+
+        <DirectorQueueAdmissionNotice queueAdmission={queueAdmission}
+          checkQueueAdmission={checkQueueAdmission} retryQueueAdmission={retryQueueAdmission} />
 
         {/* Welcome message */}
         <SystemBubble>
@@ -1163,6 +1197,7 @@ export function DirectorChat() {
               planVideoPrompts={isShortFilm ? shortFilmPlanVideoPrompts : planVideoPrompts}
               directorGenerate={directorGenerate}
               queueCurrentDirectorPipeline={queueCurrentDirectorPipeline}
+              queueAdmissionPending={queueAdmission !== null}
               applyToClips={applyToClips}
               loading={loading}
               isShortFilm={isShortFilm}
@@ -3324,7 +3359,7 @@ function ImageGenView({
 function VideoPromptsReview({
   clipPlans, plannedClips, clipImages, speakerMappings, editClipPlan,
   planVideoPrompts, directorGenerate, queueCurrentDirectorPipeline, applyToClips, loading, isShortFilm,
-  isGenerating, isAutoGenerating,
+  isGenerating, isAutoGenerating, queueAdmissionPending,
 }: {
   clipPlans: ReturnType<typeof useStore.getState>['directorClipPlans']
   plannedClips: ReturnType<typeof useStore.getState>['directorPlannedClips']
@@ -3334,6 +3369,7 @@ function VideoPromptsReview({
   planVideoPrompts: () => Promise<void>
   directorGenerate: () => void
   queueCurrentDirectorPipeline: () => Promise<void>
+  queueAdmissionPending: boolean
   applyToClips: () => void
   loading: boolean
   isShortFilm?: boolean
@@ -3453,6 +3489,7 @@ function VideoPromptsReview({
             <button
               type="button"
               onClick={() => { void queueCurrentDirectorPipeline() }}
+              disabled={queueAdmissionPending}
               title="Hold this complete project in the persistent queue without starting it"
               aria-label="Hold this complete project in the persistent queue without starting it"
               className="mobile-control-target touch-manipulation rounded-lg border border-border px-3 py-2.5 text-text-secondary transition-colors hover:bg-bg-hover hover:text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"

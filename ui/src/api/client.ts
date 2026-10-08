@@ -848,14 +848,18 @@ export type DirectorQueueEntry = {
   params?: Record<string, unknown>
 }
 
+export type DirectorQueueAdmissionReceipt = { request_id: string; entry_id: string; removed: boolean }
 export type DirectorQueueState = {
+  project_instance?: string
+  admissions?: DirectorQueueAdmissionReceipt[]
+  admission?: DirectorQueueAdmissionReceipt & { reused: boolean }
   paused?: boolean
   running?: boolean
   entries: DirectorQueueEntry[]
 }
 
-export async function fetchDirectorQueue(): Promise<DirectorQueueState> {
-  const res = await fetch(`${BASE}/api/v1/director/queue`)
+export async function fetchDirectorQueue(workspace?: string): Promise<DirectorQueueState> {
+  const res = await fetch(`${BASE}/api/v1/director/queue${workspace ? `?workspace=${encodeURIComponent(workspace)}` : ''}`)
   if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || 'Director queue failed')
   return res.json()
 }
@@ -866,11 +870,11 @@ export async function fetchDirectorQueueEntry(entryId: string) {
   return res.json()
 }
 
-export async function enqueueDirectorPipeline(params: Record<string, unknown>): Promise<DirectorQueueState> {
-  const res = await fetch(`${BASE}/api/v1/director/queue`, {
+export async function enqueueDirectorPipeline(params: Record<string, unknown>, requestId: string, workspace: string, projectInstance: string): Promise<DirectorQueueState> {
+  const res = await fetch(`${BASE}/api/v1/director/queue?workspace=${encodeURIComponent(workspace)}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ params }),
+    body: JSON.stringify({ params, request_id: requestId, project_instance: projectInstance }),
   })
   if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || 'Queue Director project failed')
   return res.json()
