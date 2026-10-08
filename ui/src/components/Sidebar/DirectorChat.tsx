@@ -2756,16 +2756,16 @@ function DirectorCandidateReadiness({ candidate }: { candidate: DirectorImageRol
           <p>{requirement.notice}</p>
           <div className="mt-1 flex flex-wrap gap-2">
             <a href={requirement.license_url} target="_blank" rel="noreferrer" className="text-accent-blue hover:underline">Review terms</a>
-            <button type="button" disabled={hostTermsLoading || !hostTerms || !machineControls} onClick={() => {
+            <button type="button" disabled={hostTermsLoading || !hostTerms} onClick={() => {
               const epoch = ++actionEpoch.current
               const workspace = activeWorkspace
               const explicit = explicitOutput
               void acceptHostTerm(requirement.term)
                 .then(() => refresh(epoch, workspace, explicit))
                 .catch(() => {
-                  if (actionIsCurrent(epoch, workspace, explicit)) setActionError('The terms could not be accepted. Try again from Maestro on this computer.')
+                  if (actionIsCurrent(epoch, workspace, explicit)) setActionError('The terms could not be accepted. Refresh the notice, then try again.')
                 })
-            }} className="rounded border border-amber-400/40 px-1.5 py-0.5 disabled:opacity-40">Accept on this computer</button>
+            }} className="rounded border border-amber-400/40 px-1.5 py-0.5 disabled:opacity-40">Accept for this Maestro installation</button>
           </div>
         </div>
       ))}
@@ -2787,7 +2787,7 @@ function DirectorCandidateReadiness({ candidate }: { candidate: DirectorImageRol
         {candidate.actions.includes('enable_model') && machineControls && (
           <button type="button" onClick={openDirectorModelVisibility} className="inline-flex items-center gap-1 rounded border border-amber-400/40 px-1.5 py-0.5"><Settings size={9} /> Enable model</button>
         )}
-        {candidate.actions.includes('download_model') && machineControls && catalogDownloads && (
+        {candidate.actions.includes('download_model') && catalogDownloads && (
           <button type="button" disabled={busy !== ''} onClick={() => {
             const epoch = ++actionEpoch.current
             const workspace = activeWorkspace
@@ -2804,11 +2804,11 @@ function DirectorCandidateReadiness({ candidate }: { candidate: DirectorImageRol
                   })),
                 })
                 if (terminal.status === 'cancelled') return
-                if (terminal.status === 'failed') throw new Error('Model download failed. Check Maestro on this computer, then try again.')
+                if (terminal.status === 'failed') throw new Error('Model download failed.')
               }
               await refresh(epoch, workspace, explicit)
             })().catch(() => {
-              if (actionIsCurrent(epoch, workspace, explicit)) setActionError('The model download could not finish. Check Maestro on this computer, then try again.')
+              if (actionIsCurrent(epoch, workspace, explicit)) setActionError('The model download could not finish. Check the download status, then try again.')
             }).finally(() => {
               if (actionIsCurrent(epoch, workspace, explicit)) setBusy('')
             })
@@ -2831,7 +2831,9 @@ function DirectorCandidateReadiness({ candidate }: { candidate: DirectorImageRol
         )}
       </div>
       {accessState === 'loading' && candidate.actions.length > 0 && <p>Checking which setup actions are available…</p>}
-      {accessState === 'lan' && candidate.actions.length > 0 && <p>Open Maestro on this computer to finish model setup or accept model terms. Remote sessions can view these models but cannot change the computer's model setup.</p>}
+      {accessState === 'lan' && pendingTerms.length > 0 && <p>You can accept model terms here for your authorized project.</p>}
+      {accessState === 'lan' && catalogDownloads && candidate.actions.includes('download_model') && <p>Available catalog models can be downloaded here for your authorized project.</p>}
+      {accessState === 'lan' && candidate.actions.some(action => action === 'enable_model' || action === 'verify_manual_checkpoint') && <p>Open Maestro on the computer where it runs to enable hidden models or check manually installed files.</p>}
       {hostTermsError && <p className="text-red-300">{hostTermsError}</p>}
       {actionError && <p className="text-red-300">{actionError}</p>}
     </div>

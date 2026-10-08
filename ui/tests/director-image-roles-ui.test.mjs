@@ -276,6 +276,67 @@ function flattenElements(value, result = []) {
   return result
 }
 
+let candidateReadinessPromise
+function loadCandidateReadiness() {
+  if (candidateReadinessPromise) return candidateReadinessPromise
+  candidateReadinessPromise = readFile(new URL('../src/components/Sidebar/DirectorChat.tsx', import.meta.url), 'utf8')
+    .then(source => build({
+      stdin: {
+        // Exercise the component's actual controls and handlers without loading unrelated Director panels.
+        contents: `
+          import { downloadModel, getDirectorHostActionAccessState, verifyManualCheckpoint, waitForModelDownloadTerminal } from './src/api/client'
+          import { formatManualInstallationBytes, manualInstallationDestination } from './src/lib/manualInstallation'
+          let state, cells = [], cursor = 0
+          const useStore = selector => selector(state)
+          useStore.getState = () => state
+          const useRef = initial => cells[cursor++] ??= { current: initial }
+          const useState = initial => {
+            const index = cursor++
+            cells[index] ??= { value: initial }
+            return [cells[index].value, value => { cells[index].value = value }]
+          }
+          const useEffect = (effect, dependencies) => {
+            const index = cursor++
+            const prior = cells[index]
+            if (prior && dependencies.every((value, i) => Object.is(value, prior.dependencies[i]))) return
+            prior?.cleanup?.()
+            cells[index] = { dependencies, cleanup: effect() }
+          }
+          const Download = 'Download', HardDrive = 'HardDrive', Settings = 'Settings'
+          ${source.slice(source.indexOf('const DIRECTOR_READINESS_COPY:'), source.indexOf('function DirectorImageRoleControl('))}
+          export function resetCandidateReadiness(value) {
+            for (const cell of cells) cell?.cleanup?.()
+            state = value; cells = []
+          }
+          export function renderCandidateReadiness(candidate) {
+            cursor = 0
+            return DirectorCandidateReadiness({ candidate })
+          }
+        `,
+        resolveDir: UI_ROOT,
+        loader: 'tsx',
+      },
+      bundle: true,
+      format: 'esm',
+      jsx: 'automatic',
+      logLevel: 'silent',
+      platform: 'node',
+      write: false,
+      plugins: [{
+        name: 'candidate-readiness-elements',
+        setup(bundle) {
+          bundle.onResolve({ filter: /^react\/jsx-runtime$/ }, () => ({ path: 'jsx', namespace: 'readiness' }))
+          bundle.onLoad({ filter: /.*/, namespace: 'readiness' }, () => ({ contents: `
+            export const jsx = (type, props, key) => ({ type, key, props: props || {} })
+            export const jsxs = jsx
+          ` }))
+        },
+      }],
+    }))
+    .then(result => import(asDataModule(result.outputFiles[0].text)))
+  return candidateReadinessPromise
+}
+
 test('role LoRA helper emits exact strength-only and schema-sealed rows', () => {
   const simple = lora('grain.safetensors')
   const sealed = lora('finish.safetensors', schema)
@@ -1608,6 +1669,88 @@ test('Director admission refresh waits for the latest enabled-model persistence'
   }))
   await refresh
   assert.deepEqual(phases, ['catalog', 'catalog'])
+})
+
+test('Director LAN readiness offers project downloads and terms while keeping file checks local', async t => {
+  const runtime = await loadCandidateReadiness()
+  const candidate = {
+    model_type: 'catalog-model', ready: false,
+    reasons: ['model_not_downloaded', 'model_terms_required'],
+    actions: ['download_model', 'accept_terms', 'enable_model', 'verify_manual_checkpoint'],
+  }
+  const calls = []
+  const state = {
+    accessContext: { remote: true, machine_controls: false, catalog_model_downloads: true },
+    models: [{ model_type: candidate.model_type, required_host_terms: [{ term: 'flux1_dev', notice: 'Review this model notice', license_url: 'https://example.test/license' }] }],
+    activeWorkspace: 'project one', explicitOutput: false,
+    hostTerms: { flux1_dev: { accepted: false } }, hostTermsLoading: false, hostTermsError: null,
+    acceptHostTerm: async term => { calls.push(['terms', term]); return true },
+    loadModels: async () => { calls.push(['models']) },
+    loadDirectorCapabilities: async options => { calls.push(['capabilities', options]) },
+    openDirectorModelVisibility: () => assert.fail('LAN must not open machine settings'),
+  }
+  const buttons = () => flattenElements(runtime.renderCandidateReadiness(candidate)).filter(element => element.type === 'button')
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async (input, init) => {
+    assert.equal(String(input), '/api/v1/models/catalog-model/download?workspace=project+one')
+    assert.equal(init.method, 'POST')
+    calls.push(['download'])
+    return Response.json({ status: 'completed', model_type: candidate.model_type })
+  }
+  t.after(() => { globalThis.fetch = originalFetch })
+  runtime.resetCandidateReadiness(state)
+  let controls = buttons()
+  assert.equal(controls.length, 2)
+  assert.equal(controls[0].props.children, 'Accept for this Maestro installation')
+  assert.equal(controls[0].props.disabled, false)
+  await Promise.resolve()
+  controls[0].props.onClick()
+  await waitForCondition(() => calls.some(call => call[0] === 'capabilities'), 'term acceptance refresh')
+  assert.deepEqual(calls[0], ['terms', 'flux1_dev'])
+  calls.length = 0
+  controls[1].props.onClick()
+  await waitForCondition(() => calls.some(call => call[0] === 'capabilities'), 'download refresh')
+  assert.deepEqual(calls, [['download'], ['models'], ['capabilities', { explicitOutput: false, force: true }]])
+
+  for (const context of [null, { ...state.accessContext, catalog_model_downloads: false }]) {
+    runtime.resetCandidateReadiness({ ...state, accessContext: context, hostTerms: null })
+    controls = buttons()
+    assert.equal(controls.length, 1)
+    assert.equal(controls[0].props.disabled, true)
+  }
+  runtime.resetCandidateReadiness({ ...state, hostTermsLoading: true })
+  assert.equal(buttons()[0].props.disabled, true)
+  runtime.resetCandidateReadiness({ ...state, accessContext: { ...state.accessContext, remote: false, machine_controls: true } })
+  const localText = JSON.stringify(buttons().map(button => button.props.children))
+  assert.match(localText, /Enable model/)
+  assert.match(localText, /Check model file/)
+})
+
+test('Director download never refreshes a different project or explicit-output selection', async t => {
+  const runtime = await loadCandidateReadiness()
+  const originalFetch = globalThis.fetch
+  t.after(() => { globalThis.fetch = originalFetch })
+  for (const change of [{ activeWorkspace: 'project two' }, { explicitOutput: true }]) {
+    const reply = deferred()
+    let requested = false
+    globalThis.fetch = async () => { requested = true; return reply.promise }
+    const state = {
+      accessContext: { remote: true, machine_controls: false, catalog_model_downloads: true },
+      models: [], hostTerms: {}, activeWorkspace: 'project one', explicitOutput: false,
+      loadModels: () => assert.fail('Old download must not refresh new selection'),
+      loadDirectorCapabilities: () => assert.fail('Old download must not refresh new capabilities'),
+    }
+    const candidate = { model_type: 'catalog-model', ready: false, reasons: ['model_not_downloaded'], actions: ['download_model'] }
+    runtime.resetCandidateReadiness(state)
+    const control = flattenElements(runtime.renderCandidateReadiness(candidate)).find(element => element.type === 'button')
+    await Promise.resolve()
+    control.props.onClick()
+    assert.equal(requested, true)
+    Object.assign(state, change)
+    runtime.renderCandidateReadiness(candidate)
+    reply.resolve(Response.json({ status: 'completed', model_type: candidate.model_type }))
+    await new Promise(resolve => setTimeout(resolve, 0))
+  }
 })
 
 test('Director host actions distinguish loading, local authority, and LAN sessions', () => {

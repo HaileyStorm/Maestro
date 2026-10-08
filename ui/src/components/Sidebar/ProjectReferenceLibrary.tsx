@@ -3573,7 +3573,7 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                 {enabledMissingMoodyModels.length > 0 && (
                   <div role="status" className="mt-2 rounded border border-amber-500/30 bg-amber-500/10 px-2 py-1.5 text-[9px] text-amber-100">
                     <p>{enabledMissingMoodyModels.map(modelType => MOODY_MODEL_NAMES[modelType]).join(', ')} {enabledMissingMoodyModels.length === 1 ? 'is' : 'are'} enabled on this computer but not available in Reference Studio yet.</p>
-                    <p className="mt-1">Refresh Reference Studio after the model list finishes loading. From a LAN session, accept terms, install, and verify models at localhost; those computer-wide controls are hidden remotely.</p>
+                    <p className="mt-1">Refresh Reference Studio after the model list finishes loading. You can accept model terms here for your authorized project. To enable hidden models or install and check manual model files, open Maestro on the computer where it runs.</p>
                   </div>
                 )}
                 {modelLoadError && <p role="status" className="mt-2 text-[10px] text-red-300">{modelLoadError}</p>}
