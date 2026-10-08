@@ -45164,19 +45164,41 @@ def director_queue_list(request: Request, workspace: str = ""):
 async def director_queue_add(request: Request, workspace: str = ""):
     """Freeze a Director project revision in the held queue."""
     _init_pipeline()
-    from services.director_pipeline import enqueue_director_pipeline
+    from services.director_pipeline import enqueue_director_pipeline, DirectorQueueAdmissionConflict
     body = await request.json()
     params = body.get("params") if isinstance(body, dict) else None
     if not isinstance(params, dict):
         raise HTTPException(status_code=400, detail="Director queue params are required")
-    if not params.get("workspace"):
-        params["workspace"] = _request_project_workspace(request, workspace)
+    selected_workspace = _request_project_workspace(request, workspace)
+    if params.get("workspace") and params["workspace"] != selected_workspace:
+        raise HTTPException(status_code=400, detail="Director queue project does not match the selected project")
+    params["workspace"] = selected_workspace
+    request_id = body.get("request_id")
     try:
-        return await upload_usage.to_thread(
-            enqueue_director_pipeline,
-            _director_queue_base(request, workspace),
-            params,
-        )
+        base = _director_queue_base(request, selected_workspace)
+        reservation = _reserve_workspace_operations(selected_workspace)
+        reservation.__enter__()
+        work = upload_usage.to_thread(enqueue_director_pipeline, base, params, request_id=request_id)
+        try:
+            task = upload_usage.create_task(work)
+        except BaseException:
+            work.close()
+            reservation.__exit__(None, None, None)
+            raise
+
+        def drained(done):
+            try:
+                if not done.cancelled():
+                    done.exception()  # Consume a failure even if the HTTP waiter disconnected.
+            finally:
+                reservation.__exit__(None, None, None)
+
+        task.add_done_callback(drained)
+        # The task owns the reservation through actual executor completion.
+        # Repeated waiter cancellation cannot release a queued project writer.
+        return await asyncio.shield(task)
+    except DirectorQueueAdmissionConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

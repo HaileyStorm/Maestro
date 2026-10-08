@@ -522,6 +522,10 @@ class PipelineBusyError(RuntimeError):
     """Raised when a Dashboard mutation conflicts with active pipeline work."""
 
 
+class DirectorQueueAdmissionConflict(ValueError):
+    """One durable queue admission ID cannot be rebound to different inputs."""
+
+
 class DirectorModelCompatibilityError(ValueError):
     """Raised before Director submits work to an incompatible model."""
 
@@ -4803,14 +4807,16 @@ def _load_director_queue_locked(base_out_dir: str) -> dict:
         try:
             with open(path, "r", encoding="utf-8") as handle:
                 loaded = repair_payload(json.load(handle))
-            if isinstance(loaded, dict):
-                state.update(loaded)
+            if not isinstance(loaded, dict):
+                raise ValueError("Saved Director queue is not an object")
+            state.update(loaded)
         except Exception as exc:
-            print(f"[Director Queue] Could not load saved queue: {exc}")
+            raise ValueError("Saved Director queue could not be read. Restore it before adding or starting work.") from exc
 
     entries = state.get("entries")
     if not isinstance(entries, list):
-        entries = []
+        raise ValueError("Saved Director queue entries are invalid")
+    _director_queue_admissions(state)
     # A process restart cannot retain the parent worker.  Preserve the entry
     # but put it back in the held queue; the user can restart the batch without
     # losing its inputs or accidentally launching work during app startup.
@@ -4849,6 +4855,10 @@ def _public_director_queue_state(state: dict) -> dict:
         "paused": bool(state.get("paused", True)),
         "running": bool(state.get("running", False)),
         "entries": entries,
+        "admissions": [{
+            "request_id": request_id, "entry_id": record["entry_id"],
+            "removed": not any(entry.get("id") == record["entry_id"] for entry in entries),
+        } for request_id, record in _director_queue_admissions(state).items()],
     }
 
 def list_director_queue(base_out_dir: str) -> dict:
@@ -4865,36 +4875,86 @@ def get_director_queue_entry(base_out_dir: str, entry_id: str) -> Optional[dict]
                 return scrub_director_public_credentials(entry)
     return None
 
-def enqueue_director_pipeline(base_out_dir: str, params: dict) -> dict:
-    """Freeze one complete Director request in the held render queue."""
+def _director_queue_admissions(state: dict) -> dict:
+    """Keep admission identities after entry removal; never expire uncertain retries."""
+    records = state.get("admissions", {})
+    if not isinstance(records, dict) or len(records) > 4096:
+        raise ValueError("Saved Director queue admission history is invalid")
+    for request_id, record in records.items():
+        if (not isinstance(request_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", request_id)
+                or not isinstance(record, dict)
+                or not isinstance(record.get("params_sha256"), str)
+                or not re.fullmatch(r"[0-9a-f]{64}", record["params_sha256"])
+                or not isinstance(record.get("entry_id"), str)
+                or not re.fullmatch(r"[0-9a-f]{8}", record["entry_id"])):
+            raise ValueError("Saved Director queue admission history is invalid")
+    return records
 
-    entry_id = uuid.uuid4().hex[:8]
-    frozen = copy.deepcopy(params)
-    frozen["auto_mode"] = True  # queued work must not wait for browser review
-    frozen["_director_queue_entry_id"] = entry_id
-    _bind_director_llm_selection(frozen)
-    _materialize_director_assets(
-        frozen,
-        base_out_dir,
-        entry_id,
-        container="_director_queue_assets",
-    )
-    entry = {
-        "id": entry_id,
-        "status": "held",
-        "message": "Ready",
-        "created_at": time.time(),
-        "started_at": None,
-        "completed_at": None,
-        "pipeline_id": None,
-        "error": None,
-        "params": frozen,
+
+def _director_queue_admission_result(state: dict, request_id: str, *, reused: bool) -> dict:
+    record = _director_queue_admissions(state)[request_id]
+    result = _public_director_queue_state(state)
+    result["admission"] = {
+        "request_id": request_id, "entry_id": record["entry_id"],
+        "removed": not any(entry.get("id") == record["entry_id"] for entry in result["entries"]),
+        "reused": reused,
     }
+    return result
+
+
+def enqueue_director_pipeline(base_out_dir: str, params: dict, *, request_id: Optional[str] = None) -> dict:
+    """Freeze one held request; the same admission ID never creates another entry."""
+    if request_id is not None and (not isinstance(request_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", request_id)):
+        raise ValueError("Director queue request ID is invalid")
+    params_digest = hashlib.sha256(json.dumps(params, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")).hexdigest()
     with _director_queue_lock:
         state = _load_director_queue_locked(base_out_dir)
-        state.setdefault("entries", []).append(entry)
-        _write_director_queue_locked(base_out_dir, state)
-        return _public_director_queue_state(state)
+        records = _director_queue_admissions(state)
+        if request_id is not None and request_id in records:
+            if records[request_id]["params_sha256"] != params_digest:
+                raise DirectorQueueAdmissionConflict("This Director queue request was already used with different settings.")
+            return _director_queue_admission_result(state, request_id, reused=True)
+        if request_id is not None and len(records) >= 4096:
+            raise ValueError("This project's Director queue admission history is full. Existing requests can still be confirmed.")
+        entry_id = uuid.uuid4().hex[:8]
+        while any(entry.get("id") == entry_id for entry in state.get("entries", []) if isinstance(entry, dict)) or any(record["entry_id"] == entry_id for record in records.values()):
+            entry_id = uuid.uuid4().hex[:8]
+        frozen = copy.deepcopy(params)
+        frozen["auto_mode"] = True  # queued work must not wait for browser review
+        frozen["_director_queue_entry_id"] = entry_id
+        _bind_director_llm_selection(frozen)
+        _materialize_director_assets(frozen, base_out_dir, entry_id, container="_director_queue_assets")
+        entry = {
+            "id": entry_id, "status": "held", "message": "Ready",
+            "created_at": time.time(), "started_at": None, "completed_at": None,
+            "pipeline_id": None, "error": None, "params": frozen,
+        }
+        if request_id is not None:
+            entry["admission_request_id"] = request_id
+        # Publish cache state only after the complete entry and receipt commit.
+        next_state = copy.deepcopy(state)
+        next_state.setdefault("entries", []).append(entry)
+        if request_id is not None:
+            next_state.setdefault("admissions", {})[request_id] = {"entry_id": entry_id, "params_sha256": params_digest}
+        resolved_base = os.path.realpath(base_out_dir)
+        try:
+            _write_director_queue_locked(base_out_dir, next_state)
+        except Exception:
+            # Directory fsync may fail after atomic replacement. Recognize the
+            # exact durable payload without running restart recovery on a live worker.
+            try:
+                with open(_director_queue_path(resolved_base), "rb") as handle:
+                    committed = handle.read() == _pipeline_state_payload(next_state)
+                if committed:
+                    _director_queues[resolved_base] = next_state
+                    _director_queue_bindings[resolved_base] = _director_queue_binding(resolved_base)
+            except OSError:
+                pass
+            raise
+        _director_queues[resolved_base] = next_state
+        if request_id is not None:
+            return _director_queue_admission_result(next_state, request_id, reused=False)
+        return _public_director_queue_state(next_state)
 
 def update_director_queue_entry(
     base_out_dir: str,

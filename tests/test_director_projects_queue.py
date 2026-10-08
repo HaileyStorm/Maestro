@@ -163,6 +163,214 @@ class TestDirectorProjectRevisionsAndQueue(unittest.TestCase):
             os.path.relpath(owned_reference, self.temp_dir.name).replace(os.sep, "/"),
         )
 
+    def test_queue_admission_retry_survives_reload_without_copying_assets_twice(self):
+        params = {"scene_description": "Sensitive creative subject matter", "reference_image_path": self._asset()}
+        with patch.object(pipeline, "_materialize_director_assets", wraps=pipeline._materialize_director_assets) as materialize:
+            first = pipeline.enqueue_director_pipeline(self.temp_dir.name, params, request_id="queue-original")
+            # The persisted admission succeeded; its response did not reach the caller.
+            pipeline._director_queues = {}
+            pipeline._director_queue_bindings = {}
+            retry = pipeline.enqueue_director_pipeline(self.temp_dir.name, dict(params), request_id="queue-original")
+        self.assertEqual(materialize.call_count, 1)
+        self.assertEqual(len(retry["entries"]), 1)
+        self.assertEqual(retry["entries"][0]["id"], first["entries"][0]["id"])
+        self.assertTrue(retry["admission"]["reused"])
+        self.assertEqual(retry["admission"]["request_id"], "queue-original")
+        self.assertEqual(pipeline.list_director_queue(self.temp_dir.name)["admissions"], [{
+            "request_id": "queue-original", "entry_id": first["entries"][0]["id"], "removed": False,
+        }])
+
+    def test_queue_admission_conflicting_inputs_fail_but_deliberate_distinct_ids_survive(self):
+        params = {"scene_description": "Same film"}
+        first = pipeline.enqueue_director_pipeline(self.temp_dir.name, params, request_id="queue-one")
+        with self.assertRaises(ValueError):
+            pipeline.enqueue_director_pipeline(self.temp_dir.name, {"scene_description": "Changed film"}, request_id="queue-one")
+        second = pipeline.enqueue_director_pipeline(self.temp_dir.name, params, request_id="queue-two")
+        self.assertEqual(len(second["entries"]), 2)
+        self.assertNotEqual(first["admission"]["entry_id"], second["admission"]["entry_id"])
+        other = os.path.join(self.temp_dir.name, "other")
+        separate = pipeline.enqueue_director_pipeline(other, params, request_id="queue-one")
+        self.assertFalse(separate["admission"]["reused"])
+        self.assertEqual(len(separate["entries"]), 1)
+
+    def test_removed_queue_admission_never_recreates_work_or_assets(self):
+        params = {"reference_image_path": self._asset(), "scene_description": "Original"}
+        first = pipeline.enqueue_director_pipeline(self.temp_dir.name, params, request_id="queue-removed")
+        entry_id = first["admission"]["entry_id"]
+        self.assertTrue(pipeline.remove_director_queue_entry(self.temp_dir.name, entry_id))
+        pipeline._director_queues = {}
+        pipeline._director_queue_bindings = {}
+        with patch.object(pipeline, "_materialize_director_assets") as materialize:
+            replay = pipeline.enqueue_director_pipeline(self.temp_dir.name, params, request_id="queue-removed")
+        materialize.assert_not_called()
+        self.assertEqual(replay["entries"], [])
+        self.assertEqual(replay["admission"], {"request_id": "queue-removed", "entry_id": entry_id, "removed": True, "reused": True})
+        self.assertFalse(os.path.exists(os.path.join(self.temp_dir.name, "_director_queue_assets", entry_id)))
+
+    def test_queue_admission_failed_atomic_write_does_not_confirm_cached_entry(self):
+        with patch.object(pipeline, "_write_director_queue_locked", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                pipeline.enqueue_director_pipeline(self.temp_dir.name, {"scene_description": "Original"}, request_id="queue-write")
+        self.assertEqual(pipeline.list_director_queue(self.temp_dir.name)["entries"], [])
+        retry = pipeline.enqueue_director_pipeline(self.temp_dir.name, {"scene_description": "Original"}, request_id="queue-write")
+        self.assertEqual(len(retry["entries"]), 1)
+        self.assertFalse(retry["admission"]["reused"])
+
+    def test_concurrent_exact_queue_admissions_create_one_asset_snapshot(self):
+        from concurrent.futures import ThreadPoolExecutor
+        params = {"reference_image_path": self._asset()}
+        with patch.object(pipeline, "_materialize_director_assets", wraps=pipeline._materialize_director_assets) as materialize:
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                results = list(pool.map(lambda _: pipeline.enqueue_director_pipeline(self.temp_dir.name, params, request_id="queue-concurrent"), range(8)))
+        self.assertEqual(materialize.call_count, 1)
+        self.assertEqual(len({result["admission"]["entry_id"] for result in results}), 1)
+        self.assertEqual(sum(not result["admission"]["reused"] for result in results), 1)
+
+    def test_queue_admission_post_replace_error_recognizes_durable_commit(self):
+        pipeline.enqueue_director_pipeline(self.temp_dir.name, {"scene_description": "Existing"})
+        write = pipeline._write_director_queue_locked
+        def commit_then_fail(base, state):
+            write(base, state)
+            raise OSError("directory fsync failed after replace")
+        params = {"scene_description": "Exact admission"}
+        with patch.object(pipeline, "_write_director_queue_locked", side_effect=commit_then_fail):
+            with self.assertRaises(OSError):
+                pipeline.enqueue_director_pipeline(self.temp_dir.name, params, request_id="queue-fsync")
+        with patch.object(pipeline, "_materialize_director_assets") as materialize:
+            retry = pipeline.enqueue_director_pipeline(self.temp_dir.name, params, request_id="queue-fsync")
+        materialize.assert_not_called()
+        self.assertTrue(retry["admission"]["reused"])
+        self.assertEqual(len(retry["entries"]), 2)
+        self.assertEqual(len(self._read_queue_file()["entries"]), 2)
+
+    def test_corrupt_queue_and_admission_history_fail_closed_without_overwrite(self):
+        for contents in ('{malformed', '{"entries": {}}', '{"entries": [], "admissions": []}'):
+            with self.subTest(contents=contents):
+                self._forget_director_queue_cache()
+                with open(self._queue_path(), "w", encoding="utf-8") as handle:
+                    handle.write(contents)
+                with patch.object(pipeline, "_materialize_director_assets") as materialize:
+                    with self.assertRaises(ValueError):
+                        pipeline.enqueue_director_pipeline(self.temp_dir.name, {}, request_id="queue-unknown")
+                materialize.assert_not_called()
+                with open(self._queue_path(), encoding="utf-8") as handle:
+                    self.assertEqual(handle.read(), contents)
+
+    def test_queue_add_route_binds_admission_project_and_conflict_status(self):
+        import asyncio
+        class HttpError(Exception):
+            def __init__(self, *, status_code, detail):
+                super().__init__(detail)
+                self.status_code = status_code
+        async def to_thread(fn, *args, **kwargs):
+            return fn(*args, **kwargs)
+        class Request:
+            def __init__(self, params, request_id):
+                self.params, self.request_id = params, request_id
+            async def json(self):
+                return {"params": self.params, "request_id": self.request_id}
+        reserved = []
+        route = _load_isolated_function("director_queue_add", {
+            "api": SimpleNamespace(post=lambda _url: lambda fn: fn), "Request": object,
+            "HTTPException": HttpError, "_init_pipeline": lambda: None,
+            "_request_project_workspace": lambda request, workspace: "album-a",
+            "_director_queue_base": lambda request, workspace: self.temp_dir.name,
+            "_reserve_workspace_operations": lambda workspace: reserved.append(workspace) or nullcontext(),
+            "upload_usage": SimpleNamespace(to_thread=to_thread, create_task=asyncio.create_task), "asyncio": asyncio,
+        })
+        result = asyncio.run(route(Request({"scene_description": "Original"}, "queue-route")))
+        self.assertEqual(result["admission"]["request_id"], "queue-route")
+        self.assertEqual(reserved, ["album-a"])
+        with self.assertRaises(HttpError) as conflict:
+            asyncio.run(route(Request({"scene_description": "Different"}, "queue-route")))
+        self.assertEqual(conflict.exception.status_code, 409)
+        with self.assertRaises(HttpError) as wrong_project:
+            asyncio.run(route(Request({"workspace": "album-b"}, "other-id")))
+        self.assertEqual(wrong_project.exception.status_code, 400)
+        self.assertEqual(len(pipeline.list_director_queue(self.temp_dir.name)["entries"]), 1)
+
+    def test_cancelled_queue_add_waiter_keeps_project_reserved_until_executor_drain(self):
+        import asyncio
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+        from services import upload_usage
+        class HttpError(Exception):
+            def __init__(self, *, status_code, detail):
+                super().__init__(detail)
+                self.status_code = status_code
+        project = os.path.join(self.temp_dir.name, "album-a")
+        os.mkdir(project)
+        operations = {}
+        namespace = {
+            "api": SimpleNamespace(post=lambda _url: lambda fn: fn, delete=lambda _url: lambda fn: fn),
+            "Request": object, "HTTPException": HttpError, "asyncio": asyncio, "os": os,
+            "_init_pipeline": lambda: None, "upload_usage": upload_usage,
+            "_workspace_lifecycle_lock": threading.RLock(), "_workspace_creation_lock": threading.RLock(),
+            "_workspace_operations": operations, "_workspaces_deleting": set(),
+            "_require_workspace_not_deleting": lambda workspace: None,
+            "_existing_workspace_dir": lambda workspace: project,
+            "_request_project_workspace": lambda request, workspace: "album-a",
+            "_director_queue_base": lambda request, workspace: project,
+            "wgp": SimpleNamespace(server_config={"save_path": self.temp_dir.name}),
+            "_safe_join": lambda base, name: os.path.join(base, name),
+            "_account_project_access_state": lambda: {"enforced": False},
+            "_require_account_project_permission": lambda *args, **kwargs: None,
+            "_require_remote_project_mutation_access": lambda *args: SimpleNamespace(unlocked=True),
+        }
+        tree = _parse_launch()
+        names = {"_WorkspaceOperationReservation", "_reserve_workspace_operations", "director_queue_add", "delete_workspace"}
+        nodes = [node for node in tree.body if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in names]
+        exec(compile(ast.Module(body=nodes, type_ignores=[]), "app/launch.py", "exec"), namespace)
+        class Request:
+            async def json(self):
+                return {"params": {"scene_description": "Original"}, "request_id": "queue-cancelled"}
+        blocked = threading.Event()
+        drain = threading.Event()
+        def occupy_executor():
+            blocked.set()
+            if not drain.wait(5):
+                raise RuntimeError("test executor did not drain")
+        async def scenario():
+            loop = asyncio.get_running_loop()
+            loop.set_default_executor(ThreadPoolExecutor(max_workers=1))
+            occupying = loop.run_in_executor(None, occupy_executor)
+            while not blocked.is_set():
+                await asyncio.sleep(.001)
+            with upload_usage.reader([]):
+                task = asyncio.create_task(namespace["director_queue_add"](Request()))
+                for _ in range(100):
+                    if operations.get("album-a") == 1:
+                        break
+                    await asyncio.sleep(.001)
+                await asyncio.sleep(.01)  # admission is genuinely queued behind the occupied worker
+                task.cancel(); task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+                try:
+                    self.assertEqual(operations.get("album-a"), 1, "HTTP cancellation cannot release a queued project writer")
+                    with self.assertRaises(HttpError) as refused:
+                        namespace["delete_workspace"]("album-a", SimpleNamespace())
+                    self.assertEqual(refused.exception.status_code, 409)
+                    self.assertTrue(os.path.isdir(project))
+                finally:
+                    drain.set()
+                    await occupying
+                    for _ in range(100):
+                        if operations.get("album-a", 0) == 0:
+                            break
+                        await asyncio.sleep(.01)
+                self.assertEqual(operations, {})
+                self.assertEqual(len(pipeline.list_director_queue(project)["entries"]), 1)
+                with patch.object(upload_usage, "create_task", side_effect=OSError("task scheduling failed")):
+                    with self.assertRaises(OSError):
+                        await namespace["director_queue_add"](Request())
+                self.assertEqual(operations, {}, "failed scheduling must release exactly its own reservation")
+                self.assertEqual(len(pipeline.list_director_queue(project)["entries"]), 1)
+        try:
+            asyncio.run(scenario())
+        finally:
+            drain.set()
+
     def test_held_queue_owns_assets_reorders_and_removes(self):
         first = pipeline.enqueue_director_pipeline(self.temp_dir.name, {
             "scene_description": "First project",
