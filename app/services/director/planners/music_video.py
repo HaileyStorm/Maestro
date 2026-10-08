@@ -10,6 +10,7 @@ Outputs: ProductionPlan with ShotPlan objects (NOT final prompts).
 from __future__ import annotations
 import os
 import re
+import math
 from typing import Optional, Any
 
 from ..schema import (
@@ -537,6 +538,43 @@ class MusicVideoPlanner(BasePlanner):
                     "any visible vocalist explicitly lip-syncs every syllable "
                     "to it without quoting, transcribing, or inventing words"
                 )
+                # Diarization may leave several turns (including overlaps)
+                # inside one shot. Keep their source timing without supplying
+                # transcript words as new dialogue or inventing a performer.
+                timed_voices = []
+                for line in lyrics or []:
+                    if "start" not in line or "end" not in line:
+                        continue
+                    try:
+                        voice_start = float(line["start"])
+                        voice_end = float(line["end"])
+                    except (TypeError, ValueError):
+                        continue
+                    if not math.isfinite(voice_start) or not math.isfinite(voice_end):
+                        continue
+                    local_start = max(voice_start, start_sec) - start_sec
+                    local_end = min(voice_end, end_sec) - start_sec
+                    if local_end <= local_start:
+                        continue
+                    mapping = (speaker_mappings or {}).get(line.get("speaker"), {})
+                    name = mapping.get("name") or "unmapped source voice"
+                    role = mapping.get("role")
+                    if role:
+                        name += f" ({role})"
+                    timed_voices.append((local_start, local_end, name))
+                if timed_voices:
+                    turns = "; ".join(
+                        f"{start:.3f}–{end:.3f}s: {voice}"
+                        for start, end, voice in sorted(timed_voices, key=lambda turn: turn[0])
+                    )
+                    vocal_info += (
+                        f". Transcribed voice intervals relative to shot start: {turns}. "
+                        "These identify audible source parts; lip-sync only the "
+                        "assigned person when visible, and this does not require "
+                        "them on screen. Unmapped voices have no assigned visual "
+                        "identity. Missing transcript coverage does not establish "
+                        "silence; follow the supplied audio through gaps"
+                    )
             else:
                 vocal_info = (
                     f'lyrics excerpt: "{lyrics_snippet}"'

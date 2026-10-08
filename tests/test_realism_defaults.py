@@ -294,6 +294,49 @@ class VisualStylePolicyTests(unittest.TestCase):
             "",
         )
 
+    def test_supplied_music_audio_keeps_clip_local_speaker_turns_without_dialogue(self):
+        for model in ("ltx2_25", "minimax_h3"):
+            with self.subTest(model=model):
+                music = MusicVideoPlanner()
+                captured = {}
+
+                def capture(**kwargs):
+                    captured.update(kwargs)
+                    return [{}]
+
+                music._plan_with_llm = capture
+                plan = music.plan(
+                    [{"start": 10.0, "end": 15.0, "label": "verse",
+                      "dominant_speaker": "a"}],
+                    "an empty stage while the supplied vocals continue off screen",
+                    video_model=model,
+                    speaker_mappings=[
+                        {"speakerId": "a", "name": "Ada", "role": "lead"},
+                        {"speakerId": "b", "name": "Bo", "role": "guest"},
+                    ],
+                    lyrics=[
+                        {"start": 13.0, "end": 16.0, "speaker": "b", "text": "secret later lyric"},
+                        {"start": 9.0, "end": 12.0, "speaker": "a", "text": "secret early lyric"},
+                        {"start": 11.0, "end": 11.5, "speaker": "b", "text": "secret overlapping lyric"},
+                        {"start": 12.5, "end": 12.8, "speaker": "unknown", "text": "secret unknown lyric"},
+                        {"start": 15.0, "end": 17.0, "speaker": "outside", "text": "secret boundary lyric"},
+                        {"end": 12.0, "speaker": "b", "text": "secret incomplete lyric"},
+                    ],
+                )
+                context = captured["clip_contexts"][0]
+                self.assertIn("0.000–2.000s: Ada (lead)", context)
+                self.assertIn("1.000–1.500s: Bo (guest)", context)
+                self.assertIn("3.000–5.000s: Bo (guest)", context)
+                self.assertLess(context.index("0.000–2.000s"), context.index("3.000–5.000s"))
+                self.assertIn("2.500–2.800s: unmapped source voice", context)
+                self.assertNotIn("0.000–2.000s: Bo", context)
+                self.assertNotIn("outside", context)
+                self.assertNotIn("secret", context)
+                self.assertIn("does not establish silence", context)
+                self.assertIn("does not require them on screen", context)
+                self.assertFalse(plan.shots[0].dialogue_beats)
+                self.assertFalse(plan.shots[0].subjects_on_screen)
+
     def test_music_and_short_film_planners_keep_structured_style_authoritative(self):
         music = MusicVideoPlanner()
         music._plan_with_llm = lambda **_kwargs: [{
