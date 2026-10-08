@@ -1587,6 +1587,20 @@ export interface ModelFolderCandidate {
   linked: boolean
 }
 
+export interface RecordedFinishingHistory {
+  version?: number
+  omitted_steps?: number
+  steps?: Array<{ step?: string; outcome?: string; method?: string }>
+  branches?: Array<{
+    name?: string
+    revision?: string
+    source_in?: number
+    duration?: number
+    history?: RecordedFinishingHistory
+  }>
+  omitted_branches?: number
+}
+
 export interface OutputMetadata {
   source: 'sidecar' | 'embedded' | 'none'
   params: Record<string, unknown> | null
@@ -1597,15 +1611,7 @@ export interface OutputMetadata {
     input?: MeasuredVideoFacts
     output?: MeasuredVideoFacts
   }
-  postprocessing?: {
-    version?: number
-    omitted_steps?: number
-    steps?: Array<{
-      step?: string
-      outcome?: string
-      method?: string
-    }>
-  }
+  postprocessing?: RecordedFinishingHistory
   private?: boolean
   explicit?: boolean
   upload_filenames?: Record<string, string | string[]>

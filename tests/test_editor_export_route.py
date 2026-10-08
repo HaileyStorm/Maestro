@@ -937,6 +937,81 @@ class EditorExportRouteTests(unittest.TestCase):
         self.assertTrue(sidecar["private"])
         self.assertEqual(self.source.read_bytes(), b"original-video")
 
+    def test_trim_preserves_nested_history_and_sealed_publication_without_reencoding(self):
+        nested = {'version':2,'steps':[{'step':'upscale','outcome':'applied','method':'lanczos2'}], 'branches':[
+            {'name':'earlier.mp4','revision':'sha256:'+'a'*64,'source_in':2,'duration':1,
+             'history':{'version':1,'steps':[{'step':'voice_clone','outcome':'unconfirmed'}]}},
+            {'name':'legacy.mp4','revision':'sha256:'+'b'*64,'source_in':0,'duration':1},
+        ]}
+        source_meta = self.source.with_suffix('.meta.json')
+        metadata = json.loads(source_meta.read_text()); metadata['postprocessing'] = nested
+        source_meta.write_text(json.dumps(metadata))
+        self.timeline['assets']['source-video']['output_revision'] = self.source_revision()
+        self.timeline = save_editor_project(str(self.outputs), 'scene', self.timeline, expected_revision=1)
+        job = self.worker_namespace()
+        completion = self.ns['finish_job']
+        def finish(current, status, **kw):
+            return False if status == 'completed' else completion(current, status, **kw)
+        self.ns['finish_job'] = finish
+        with mock.patch('services.editor_export.render_single_source_cut', side_effect=lambda src,dst,**kw:Path(dst).write_bytes(b'rendered')), \
+             mock.patch('services.editor_projects.probe_media', return_value={'type':'video','duration':3,'size':8,'has_audio':True}):
+            self.assertFalse(self.ns['_run_tool_editor_export'](job['id']))
+        output = self.project / f"editor_cut_{job['id']}.mp4"
+        sealed = output.with_suffix('.meta.json').read_bytes()
+        history = json.loads(sealed)['postprocessing']
+        self.assertEqual(history['branches'][0]['history'], nested)
+        self.assertEqual(history['steps'], [])
+        source_bytes, metadata_bytes = self.source.read_bytes(), source_meta.read_bytes()
+        source_meta.unlink(); self.source.unlink()
+        job.update(status='queued',queue_held=False)
+        self.ns['finish_job'] = completion
+        with mock.patch('services.editor_export.render_single_source_cut') as encoder:
+            self.assertFalse(self.ns['_run_tool_editor_export'](job['id']))
+        encoder.assert_not_called()
+        self.assertEqual(output.with_suffix('.meta.json').read_bytes(), sealed)
+        # Editor's existing source-authority requirement still applies.
+        self.source.write_bytes(source_bytes); source_meta.write_bytes(metadata_bytes)
+        job.update(status='queued',queue_held=False)
+        with mock.patch('services.editor_export.render_single_source_cut') as encoder, \
+             mock.patch('services.recorded_finishing.read_admitted_history', side_effect=AssertionError('sealed history must be adopted')):
+            self.assertTrue(self.ns['_run_tool_editor_export'](job['id']))
+        encoder.assert_not_called()
+        self.assertEqual(output.with_suffix('.meta.json').read_bytes(), sealed)
+
+    def test_editor_finishing_keeps_repeated_clip_histories_and_trims_separate(self):
+        second = self.sequence()
+        histories = {
+            self.source.name: {"version": 1, "steps": [{"step": "film_grain", "outcome": "applied", "private_path": str(self.root)}]},
+            second.name: {"version": 1, "steps": [{"step": "voice_clone", "outcome": "not_applied"}]},
+        }
+        for source in (self.source, second):
+            sidecar = source.with_suffix('.meta.json')
+            metadata = json.loads(sidecar.read_text()); metadata['postprocessing'] = histories[source.name]
+            sidecar.write_text(json.dumps(metadata))
+        # Save the exact updated source revisions, then append A a second time.
+        current = copy.deepcopy(self.timeline)
+        for asset in current['assets'].values():
+            asset['output_revision'] = self.source_revision(self.project / asset['output_id'])
+        current = append_output_video_clip(current, output_name=self.source.name,
+            output_revision=self.source_revision(), media={"type":"video","duration":3,"width":128,"height":72,"fps":24,"has_audio":True,"private":True})
+        proposed = copy.deepcopy(current)
+        proposed['tracks'][0]['items'][-1].update(source_in=1, duration=1)
+        current = apply_output_video_trim(current, proposed)
+        self.timeline = save_editor_project(str(self.outputs), 'scene', current, expected_revision=self.timeline['revision'])
+        job = self.worker_namespace()
+        with mock.patch('services.editor_export.render_video_sequence', side_effect=lambda clips, dst, **kw: Path(dst).write_bytes(b'rendered')), \
+             mock.patch('services.editor_projects.probe_media', return_value={'type':'video','duration':6,'size':8,'has_audio':True,'width':128,'height':72,'fps':24}):
+            self.assertTrue(self.ns['_run_tool_editor_export'](job['id']))
+        sidecar = json.loads((self.project / job['output_files'][0]).with_suffix('.meta.json').read_text())
+        history = sidecar['postprocessing']
+        self.assertEqual(history['steps'], [])
+        self.assertEqual([b['name'] for b in history['branches']], ['source.mp4','second.mp4','source.mp4'])
+        self.assertEqual([b['source_in'] for b in history['branches']], [0,0,1])
+        self.assertEqual(history['branches'][0]['history']['steps'], [{'step':'film_grain','outcome':'applied'}])
+        self.assertEqual(history['branches'][1]['history'], histories[second.name])
+        self.assertEqual(history['branches'][2]['history'], history['branches'][0]['history'])
+        self.assertNotIn(str(self.root), json.dumps(history))
+
     def test_sequence_worker_rechecks_second_source_before_atomic_publication(self):
         second = self.sequence()
         job = self.worker_namespace()

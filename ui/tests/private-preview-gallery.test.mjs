@@ -1022,6 +1022,36 @@ test('private audio and retry images acquire no media URL before reveal', async 
   }
   assert.equal(JSON.stringify(render(generatedVideo)).includes('Finishing details'), false)
 
+  const branch = (name, source_in, history) => ({ name, revision: 'sha256:' + 'a'.repeat(64), source_in, duration: 1, ...(history ? { history } : {}) })
+  const grain = { version: 1, steps: [{ step: 'film_grain', outcome: 'applied' }] }
+  const voice = { version: 1, steps: [{ step: 'voice_clone', outcome: 'not_applied' }] }
+  globalThis.__mediaFeedTestMeta = { source: 'sidecar', params: null, postprocessing: {
+    version: 2, steps: [{ step: 'upscale', outcome: 'applied', method: 'lanczos2' }], branches: [
+      branch('A.mp4', 0, grain), branch('B.mp4', 1, voice), branch('A.mp4', 2, grain), branch('legacy.mp4', 0),
+    ],
+  } }
+  const branchesTree = render(generatedVideo)
+  const branchesList = findElements(branchesTree, element => element.type === 'ol' && element.props?.['aria-label'] === 'Source clip finishing histories')[0]
+  assert.ok(branchesList)
+  assert.equal(findElements(branchesList, element => element.type === 'ol' && element.props?.['aria-label'] === 'Recorded work on source clip').length, 3)
+  assert.equal(findElements(branchesList, element => element.type === 'li').length, 7)
+  const branchText = JSON.stringify(branchesTree)
+  assert.match(branchText, /No recorded finishing work/)
+  assert.match(branchText, /Recorded finishing work on this output/)
+  assert.match(branchText, /2.00.*3.00/)
+  globalThis.__mediaFeedRevealed.delete(privatePreviewIdentity('private-media', generatedVideo.name, 'r1'))
+  assert.equal(JSON.stringify(render(generatedVideo)).includes('A.mp4'), false)
+  globalThis.__mediaFeedRevealed.add(privatePreviewIdentity('private-media', generatedVideo.name, 'r1'))
+  globalThis.__mediaFeedTestMeta.source = 'embedded'
+  assert.equal(JSON.stringify(render(generatedVideo)).includes('Source clip finishing histories'), false)
+  globalThis.__mediaFeedTestMeta.source = 'sidecar'
+  let nested = { version: 2, steps: [], branches: Array.from({ length: 8 }, (_, i) => branch(`legacy-${i}.mp4`, 0)) }
+  for (let depth = 0; depth < 5; depth++) nested = { version: 2, steps: [], branches: Array.from({ length: 8 }, (_, i) => branch(`nested-${depth}-${i}.mp4`, 0, nested)) }
+  globalThis.__mediaFeedTestMeta.postprocessing = nested
+  const boundedBranches = render(generatedVideo)
+  assert.ok(findElements(boundedBranches, element => element.type === 'li').length <= 64)
+  assert.match(JSON.stringify(boundedBranches), /Source histories omitted/)
+
   globalThis.__mediaFeedTestMeta = {
     source: 'embedded', tool: 'upscale', params: { method: 'lanczos2' },
     postprocessing: { version: 1, steps: [{ step: 'upscale', outcome: 'applied' }] },

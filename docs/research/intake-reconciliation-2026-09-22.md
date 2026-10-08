@@ -338,6 +338,18 @@ modules pass 61 checks; the Gallery module passes 14 checks, with TypeScript,
 scoped lint and a production build also passing. These establish source and
 CPU behavior; runtime activation and owner acceptance remain separate gates.
 
+The October 8 Editor slice carries each admitted video clip's recorded finishing
+history into its export sidecar. Ordered source names, revisions and trims keep
+repeated A/B/A clips distinct; earlier Editor exports retain bounded nested
+source histories. Later Tools operations append observed work on the whole
+output separately. Gallery shows source histories after private reveal, names
+missing records plainly, and reports omitted source histories. The same sealed
+sidecar publication and recovery boundaries apply; Editor retains its existing
+source revalidation requirement. The affected CPU checks pass 165 checks,
+including processing crashes and actual Gallery rendering, with production
+build, lint and repository guard passing. Browser, Windows and owner acceptance
+remain separate; unrecorded legacy operations are not reconstructed.
+
 Legacy ordinary remux retains its existing behavior. Grain and voice jobs keep
 the manual-recoverable native-move route. At that finishing checkpoint, manual
 copy-on-write recovery still needed a separate publication-intent implementation;

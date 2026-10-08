@@ -140,6 +140,7 @@ class FlipRouteTests(unittest.TestCase):
             '_resume_processed_tool_output': lambda _j: None,
             '_recovery_sha256_file': sha256_file,
             'recovery_unit_id': recovery_unit_id, 'hashlib': hashlib, 'hmac': hmac,
+            '_ToolInputChanged': ValueError,
             'QueueRecoveryRuntimeError': QueueRecoveryRuntimeError,
             'QueueRecoveryAdapterError': QueueRecoveryAdapterError,
             'processed_tool_publication_pending': processed_tool_publication_pending,

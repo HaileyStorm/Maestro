@@ -139,6 +139,11 @@ class ToolProcessCrashTests(unittest.TestCase):
             {'step': 'upscale', 'outcome': 'applied', 'method': 'lanczos2'},
             {'step': 'voice_clone', 'outcome': 'not_applied'},
         ]}
+        self.finishing_history = {'version': 2, 'steps': [], 'branches': [
+            {'name': 'first.mp4', 'revision': 'sha256:' + 'a' * 64, 'source_in': 1, 'duration': 2,
+             'history': self.finishing_history},
+            {'name': 'legacy.mp4', 'revision': 'sha256:' + 'b' * 64, 'source_in': 0, 'duration': 1},
+        ]}
         self.fixture.video.with_suffix('.meta.json').write_text(json.dumps({
             'workspace': 'project-a', 'private': True, 'postprocessing': self.finishing_history,
         }))

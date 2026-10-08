@@ -80,13 +80,16 @@ function finishedToolDetails(metadata: OutputMetadata | null) {
   }
 }
 
-function recordedGenerationFinishing(metadata: OutputMetadata | null) {
-  const empty = { steps: [], omittedSteps: 0 }
-  if (metadata?.source !== 'sidecar' || metadata.postprocessing?.version !== 1) return empty
-  const steps = metadata.postprocessing.steps
-  const omitted = metadata.postprocessing.omitted_steps ?? 0
-  if (!Array.isArray(steps) || !Number.isSafeInteger(omitted) || omitted < 0 || omitted > 1_000_000
-      || steps.length + omitted > 1_000_032) return empty
+interface FinishingHistoryView {
+  steps: Array<{ label: string; outcome: string }>
+  omittedSteps: number
+  omittedBranches: number
+  branches: Array<{ name: string; sourceIn: number; duration: number; history: FinishingHistoryView }>
+}
+
+function recordedGenerationFinishing(metadata: OutputMetadata | null): FinishingHistoryView {
+  const empty = (): FinishingHistoryView => ({ steps: [], omittedSteps: 0, branches: [], omittedBranches: 0 })
+  if (metadata?.source !== 'sidecar') return empty()
   const labels = new Map([
     ['upscale', 'Upscale'],
     ['delivery_fit', 'Delivery fit'],
@@ -99,15 +102,61 @@ function recordedGenerationFinishing(metadata: OutputMetadata | null) {
     ['not_applied', 'Not applied'],
     ['unconfirmed', 'Outcome unconfirmed'],
   ])
-  const records = steps.slice(-32).flatMap(record => {
-    if (!record || typeof record !== 'object') return []
-    const label = labels.get(record.step ?? '')
-    const outcome = outcomes.get(record.outcome ?? '')
-    if (!label || !outcome) return []
-    const method = record.step === 'upscale' ? finishingMethodLabel(record.method) : null
-    return [{ label: method ?? label, outcome }]
-  })
-  return { steps: records, omittedSteps: omitted + Math.max(0, steps.length - 32) }
+  let remaining = 64
+  function parse(value: unknown, depth = 0): FinishingHistoryView {
+    if (!value || typeof value !== 'object' || remaining <= 0) return empty()
+    const history = value as NonNullable<OutputMetadata['postprocessing']>
+    const steps = history.steps
+    const omitted = history.omitted_steps ?? 0
+    if (![1, 2].includes(history.version ?? 0) || !Array.isArray(steps)
+        || !Number.isSafeInteger(omitted) || omitted < 0 || omitted > 1_000_000
+        || steps.length + omitted > 1_000_032) return empty()
+    remaining -= 1
+    const records = steps.slice(-32).flatMap(record => {
+      if (!record || typeof record !== 'object') return []
+      const label = labels.get(record.step ?? '')
+      const outcome = outcomes.get(record.outcome ?? '')
+      if (!label || !outcome) return []
+      const method = record.step === 'upscale' ? finishingMethodLabel(record.method) : null
+      return [{ label: method ?? label, outcome }]
+    })
+    const result: FinishingHistoryView = { steps: records, omittedSteps: omitted + Math.max(0, steps.length - 32), branches: [], omittedBranches: 0 }
+    if (history.version === 2) {
+      const branches = history.branches
+      const dropped = history.omitted_branches ?? 0
+      if (!Array.isArray(branches) || !Number.isSafeInteger(dropped) || dropped < 0 || dropped > 1_000_000) return empty()
+      result.omittedBranches = dropped
+      for (const branch of branches) {
+        if (!branch || typeof branch !== 'object' || typeof branch.name !== 'string'
+            || !branch.name || branch.name.length > 255 || (/[/\\]/.test(branch.name) || branch.name.includes(String.fromCharCode(0))) || ['.', '..'].includes(branch.name)
+            || typeof branch.revision !== 'string' || !/^sha256:[0-9a-f]{64}$/.test(branch.revision)
+            || typeof branch.source_in !== 'number' || !Number.isFinite(branch.source_in) || branch.source_in < 0 || branch.source_in > 1_000_000_000
+            || typeof branch.duration !== 'number' || !Number.isFinite(branch.duration) || branch.duration < 0 || branch.duration > 1_000_000_000) continue
+        if (depth >= 3 || result.branches.length >= 8 || remaining <= 0 || (branch.history && typeof branch.history === 'object' && remaining < 2)) { result.omittedBranches += 1; continue }
+        remaining -= 1
+        result.branches.push({ name: branch.name, sourceIn: branch.source_in, duration: branch.duration, history: parse(branch.history, depth + 1) })
+      }
+    }
+    return result
+  }
+  return parse(metadata.postprocessing)
+}
+
+function finishingBranchDetails(history: FinishingHistoryView, prefix = 'Clip') {
+  return <>
+    {history.omittedBranches > 0 && <p className="mt-2 text-[11px] text-text-muted">Source histories omitted: {history.omittedBranches}</p>}
+    {history.branches.length > 0 && <ol aria-label="Source clip finishing histories" className="mt-2 space-y-2 text-[11px]">
+      {history.branches.map((branch, index) => <li key={index} className="border-l border-border pl-2">
+        <p className="break-all font-medium">{prefix} {index + 1}: {branch.name}</p>
+        <p className="text-text-muted">Source trim: {branch.sourceIn.toFixed(2)}–{(branch.sourceIn + branch.duration).toFixed(2)} seconds</p>
+        {branch.history.omittedSteps > 0 && <p>Earlier records omitted: {branch.history.omittedSteps}</p>}
+        {branch.history.steps.length > 0 ? <ol aria-label="Recorded work on source clip" className="mt-1 space-y-1">
+          {branch.history.steps.map((step, stepIndex) => <li key={stepIndex} className="flex justify-between gap-3"><span>{step.label}</span><span className="text-text-muted">{step.outcome}</span></li>)}
+        </ol> : branch.history.branches.length === 0 && branch.history.omittedBranches === 0 && branch.history.omittedSteps === 0 && <p className="text-text-muted">No recorded finishing work</p>}
+        {finishingBranchDetails(branch.history, `${prefix} ${index + 1} / source`)}
+      </li>)}
+    </ol>}
+  </>
 }
 
 /** Image component that retries loading if the file isn't fully written yet.
@@ -1430,7 +1479,7 @@ export function MediaFeedItem({ file, index, isActive, playbackSuspended, onSele
           )}
         </div>
       </div>
-      {!privateBlurred && (finishing || generationFinishing.length > 0 || finishingHistory.omittedSteps > 0) && (
+      {!privateBlurred && (finishing || generationFinishing.length > 0 || finishingHistory.omittedSteps > 0 || finishingHistory.branches.length > 0 || finishingHistory.omittedBranches > 0) && (
         <details className="border-t border-border bg-bg-secondary px-3 py-2 text-xs text-text-secondary" onClick={event => event.stopPropagation()}>
           <summary className="cursor-pointer select-none font-medium text-text-primary">Finishing details</summary>
           {finishing && <dl className="mt-2 grid grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-1 text-[11px]">
@@ -1443,12 +1492,13 @@ export function MediaFeedItem({ file, index, isActive, playbackSuspended, onSele
             {finishing.jobTime && <><dt className="text-text-muted">Recorded job time</dt><dd>{finishing.jobTime}</dd></>}
           </dl>}
           {finishingHistory.omittedSteps > 0 && <p className="mt-2 text-[11px] text-text-muted">Earlier records omitted: {finishingHistory.omittedSteps}</p>}
-          {generationFinishing.length > 0 && <p className="mt-2 text-[11px] font-medium">Recorded finishing work</p>}
+          {generationFinishing.length > 0 && <p className="mt-2 text-[11px] font-medium">{finishingHistory.branches.length > 0 ? 'Recorded finishing work on this output' : 'Recorded finishing work'}</p>}
           {generationFinishing.length > 0 && <ol aria-label="Recorded finishing work" className="mt-2 space-y-1 text-[11px]">
             {generationFinishing.map((step, index) => <li key={`${step.label}-${index}`} className="flex justify-between gap-3">
               <span>{step.label}</span><span className="text-text-muted">{step.outcome}</span>
             </li>)}
           </ol>}
+          {finishingBranchDetails(finishingHistory)}
         </details>
       )}
       {file.type === 'image' && showInputDestinations && (

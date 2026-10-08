@@ -567,6 +567,43 @@ class ToolInputExecutionTests(unittest.TestCase):
             self.assertNotIn(str(self.root), json.dumps(metadata['postprocessing']))
         self.assertEqual((first_source.read_bytes(), source_meta.read_bytes()), original)
 
+    def test_editor_branch_history_survives_tools_with_whole_output_steps_separate(self):
+        child = {'version': 1, 'steps': [{'step': 'film_grain', 'outcome': 'unconfirmed'}]}
+        history = {'version': 2, 'steps': [], 'branches': [
+            {'name': 'first.mp4', 'revision': 'sha256:' + 'a' * 64, 'source_in': 1, 'duration': 2, 'history': child},
+            {'name': 'legacy.mp4', 'revision': 'sha256:' + 'b' * 64, 'source_in': 0, 'duration': 1},
+        ]}
+        self.video.with_suffix('.meta.json').write_text(json.dumps({'workspace':'project-a','private':True,'postprocessing':history}))
+        for tool in ('upscale', 'hflip', 'revoice', 'browser_copy'):
+            job = self.job('tool_' + tool)
+            staged = self.root / 'processed.mp4'; staged.write_bytes(b'processed-' + tool.encode())
+            with patch.dict(sys.modules, {'services.media_info': types.SimpleNamespace(probe_video_facts=lambda *a, **kw: None)}):
+                self.assertTrue(self.ns['_publish_processed_tool_output'](job, str(staged), source=str(self.video), tool=tool,
+                    params={'method':'lanczos2','postprocessing':{'version':1,'steps':[{'step':'delivery_fit','outcome':'applied'}]}}, elapsed=1))
+            self.video = self.project / job['output_files'][0]
+            metadata = json.loads(self.video.with_suffix('.meta.json').read_text())
+            if tool in {'upscale', 'revoice'}:
+                history['steps'].append({'step':'upscale' if tool == 'upscale' else 'voice_clone', 'outcome':'applied',
+                    **({'method':'lanczos2'} if tool == 'upscale' else {})})
+            self.assertEqual(metadata['postprocessing'], history)
+
+    def test_nested_source_histories_bound_all_source_rows_and_report_omissions(self):
+        from services.recorded_finishing import sanitize_history
+        history = {'version':2,'steps':[], 'branches': [
+            {'name':f'clip-{i}.mp4','revision':'sha256:'+'a'*64,'source_in':0,'duration':1} for i in range(8)]}
+        for _ in range(5):
+            history = {'version':2,'steps':[], 'branches': [
+                {'name':f'export-{i}.mp4','revision':'sha256:'+'b'*64,'source_in':0,'duration':1,'history':history} for i in range(8)]}
+        result = sanitize_history(history)
+        def counts(node):
+            rows = node.get('branches', [])
+            nested = [counts(row['history']) for row in rows if 'history' in row]
+            return len(rows) + sum(c[0] for c in nested), node.get('omitted_branches',0) + sum(c[1] for c in nested)
+        count, omitted = counts(result)
+        self.assertLessEqual(count, 64)
+        self.assertGreater(omitted, 0)
+        self.assertEqual(sanitize_history(result), result)
+
     def test_history_bound_retains_newest_repeats_and_counts_earlier_records(self):
         source_meta = self.video.with_suffix('.meta.json')
         source_meta.write_text(json.dumps({'workspace': 'project-a', 'private': True,
