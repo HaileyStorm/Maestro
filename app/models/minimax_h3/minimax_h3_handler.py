@@ -626,6 +626,10 @@ class family_handler:
         custom_for_timeline = (
             custom_settings if isinstance(custom_settings, dict) else {}
         )
+        if (any(isinstance(key, str) and key.startswith("_h3_face_refine") for key in inputs)
+                or any(isinstance(key, str) and key.startswith("_h3_face_refine")
+                       for key in custom_for_timeline)):
+            return "MiniMax H3 FaceRefine is a private worker handoff, not a saved input."
         if (any(isinstance(key, str) and key.startswith("_h3_control")
                 and (key != "_h3_control_dispatch" or value is not None)
                 for key, value in inputs.items())

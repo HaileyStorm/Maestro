@@ -3,16 +3,18 @@
 This CPU tool prepares a clip of reviewed face crops and puts an explicitly
 supplied replacement crop clip back into the original video. It is the first
 implemented stage of the selected [H3 FaceRefine adaptation](https://github.com/Carasibana/ComfyUI-H3-FaceRefine).
-Automatic face detection, identity tracking, H3 crop regeneration, feathered
-masking and Gallery/Queue integration remain unfinished. It does not run a
-model, install packages, download assets or promise better faces.
+Automatic face detection, identity tracking, native-weight crop regeneration
+acceptance, feathered masking and Gallery/Queue integration remain unfinished.
+The CPU CLI does not run a model, install packages, download assets or promise
+better faces. A separate private native sampler path is described below.
 
 The current stage takes zero-start, constant-rate 24-fps videos, with at most
 345 frames, 4096 pixels per side and 64 MiB per encoded input. Composition
 caps combined decoded source and replacement RGB at 512 MiB. Crops have a
 32-pixel-aligned canvas, 64–1536 pixels per side. Clips on another clock are
 refused rather than resampled. The complete source frame count is retained;
-a future H3 executor must resolve its temporal lattice explicitly.
+the private native sampler accepts only exact Base-H3 lattice lengths, without
+silently extending or trimming a crop clip.
 
 Each frame has a reviewed rectangle in source pixels, `[x0, y0, x1, y1]`, or
 `null` when the subject is unresolved. Coordinates must stay inside the source.
@@ -90,3 +92,53 @@ The real CPU checks cover inverse geometry, original pixels outside repairs,
 unresolved frames, full-canvas round trips, multiple audio streams and audio
 packet/timestamp preservation. They do not establish native H3 generation,
 automatic subject tracking, human face quality or other-host acceptance.
+
+## Private native sampler
+
+`MiniMaxH3Model.generate(..., _h3_face_refine=payload)` now supports crop-video
+initialization behind `MAESTRO_H3_FACE_REFINE_EXPERIMENTAL=1`. This is an internal
+tensor handoff, not a saved setting, public API or Gallery operation. Its caller
+must own source/plan validation, exact decoding, existing model residency and
+a fresh GPU-coordinator grant. The CPU CLI has no native-generation command.
+
+`models.minimax_h3.face_refine.H3FaceRefinePayload` contains:
+
+- `video`: exact CPU float32 RGB `[1,3,frames,height,width]`, in `[0,1]`, bounded
+  to 512 MiB. The native VAE deterministically encodes its posterior mode using
+  the loaded VAE statistics; it never resizes, pads or trims the supplied crop.
+- `strength`: positive denoise strength, at most one. The video scheduler builds
+  `int(steps/strength)` full intervals, then keeps the last requested number of
+  evaluations. The full grid is capped at 4096 intervals.
+- `frame_multipliers`: a tuple of one explicit `[0,1]` multiplier per decoded
+  frame. They map linearly to latent frames with aligned endpoints, following
+  upstream FaceRefine. Zero holds the source; one fully advances the prediction.
+
+The admitted first path is one independent Base output at exactly 24 fps,
+124–345 frames with `frames % 17 == 5`, and a 32-pixel-aligned canvas at most
+1536 pixels per side. Use 2–100 evaluations and exactly
+`custom_settings={"h3_attention_engine": "sdpa"}`. References, keyframes,
+guides, Control, continuation, source-audio experiments, LoRAs, cache, Turbo,
+Lightx2V, Spectrum and PDD are rejected before encoding. In particular, a
+22-frame CPU preparation fixture is not a supported native sampling window.
+
+Only generated video rows are initialized from source crops. At every Euler
+step, held rows are mixed with the source re-noised to the next sigma; the
+multiplier stays in the sampler and does not change model token timesteps.
+Both modality updates publish together and cancellation resets both clocks.
+Ordinary requests retain their existing sampler arithmetic and random draws.
+
+Audio retains its independently generated ordinary clock in this first path.
+It does not condition face motion on source audio; discard generated audio and
+use the CPU compositor to preserve every original encoded audio stream.
+Source-audio conditioning remains an unfinished quality requirement.
+
+The long-grid tail and temporal hold mapping follow
+[upstream nodes.py at the pinned revision](https://github.com/Carasibana/ComfyUI-H3-FaceRefine/blob/d8521d14fe0d721d80cd9417fff5a559cbc21aba/nodes.py).
+CPU checks exercise the native VAE and transformer with miniature random
+weights, exact held rows, ordinary seeded parity, and cancellation followed by
+ordinary generation. They prove numerical wiring, not full-weight CUDA
+execution, lip sync or improved faces:
+
+```sh
+app/env/bin/python -m unittest discover -s tests -p test_h3_face_refine_native.py
+```

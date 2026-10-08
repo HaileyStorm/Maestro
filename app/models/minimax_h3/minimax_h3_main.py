@@ -140,6 +140,7 @@ def _advance_paired_h3_latents(
     locked_target_audio_rows: torch.Tensor | None = None,
     advance_video: bool = True,
     advance_audio: bool = True,
+    video_source_hold=None,
 ) -> None:
     """Atomically publish the requested members of one H3 prediction pair."""
     video_velocity, audio_velocity = prediction
@@ -152,6 +153,8 @@ def _advance_paired_h3_latents(
             video_rows[num_condition_video_rows:],
             return_dict=False,
         )[0]
+        if video_source_hold is not None:
+            next_video_rows = video_source_hold(next_video_rows)
     if advance_audio:
         next_audio_rows = audio_scheduler.step(
             audio_velocity[0, num_condition_audio_rows:].float(),
@@ -1307,6 +1310,27 @@ class MiniMaxH3Model:
             interrupted=lambda: self._interrupt,
         )
 
+    @torch.inference_mode()
+    def _encode_face_refine_video(self, payload):
+        from .face_refine import encode_face_refine_rows
+
+        if self.vae is None or tuple(self.patch_size) != (1, 2, 2):
+            raise ValueError("H3 FaceRefine requires the owned native video VAE and patch geometry")
+        device = torch.device(self.device)
+
+        def encode_mode(pixels):
+            # Existing MMGP VAE encoder hooks retain residency ownership.
+            with torch.autocast(device_type=device.type, dtype=torch.float16,
+                                enabled=device.type == "cuda"):
+                return self.vae.encode(pixels).latent_dist.mode()
+
+        return encode_face_refine_rows(
+            payload, device=device, encode_mode=encode_mode,
+            latents_mean=self.vae.config.latents_mean,
+            latents_std=self.vae.config.latents_std,
+            interrupted=lambda: self._interrupt,
+        )
+
     def _encode_keyframes(
         self,
         images: list[Image.Image],
@@ -1564,6 +1588,30 @@ class MiniMaxH3Model:
         custom_settings = _kwargs.get("custom_settings")
         if not isinstance(custom_settings, dict):
             custom_settings = {}
+        if any(isinstance(key, str) and key.startswith("_h3_face_refine") for key in custom_settings):
+            raise ValueError("H3 FaceRefine requires the private decoded-media handoff")
+        face_refine = _kwargs.get("_h3_face_refine")
+        if face_refine is not None:
+            from .face_refine import validate_face_refine_request
+
+            face_refine = validate_face_refine_request(
+                face_refine, frame_num=frame_num, height=height, width=width,
+                fps=fps, sampling_steps=sampling_steps,
+                reference_mode=self.reference_mode, model_type=self.selected_model_type,
+                custom_settings=custom_settings,
+                conditioning=(
+                    image_start, image_end, input_frames, input_frames2, input_frames3,
+                    input_ref_images, input_waveform, audio_guide, audio_guide2, audio_guide3,
+                    *(_kwargs.get(key) for key in (
+                        "input_video", "audio_source", "input_ref_masks", "_h3_control",
+                        "_h3_timeline_guides", "_h3_native_boundary",
+                        "_h3_timeline_third_still", "_h3_timeline_additional_stills",
+                        "audio_guide4", "audio_guide5", "audio_guide6",
+                    )),
+                ),
+                kwargs={**_kwargs, "video_prompt_type": video_prompt_type,
+                        "audio_prompt_type": audio_prompt_type},
+            )
         if any(isinstance(key, str) and key.startswith("_h3_control") for key in custom_settings):
             raise ValueError("H3 Control requires the private decoded-media handoff")
         control = _kwargs.get("_h3_control")
@@ -2481,6 +2529,13 @@ class MiniMaxH3Model:
             if control_rows is None or self._interrupt:
                 return None
 
+        face_refine_clean_rows = None
+        if face_refine is not None:
+            report_phase("Encoding H3 FaceRefine crops")
+            face_refine_clean_rows = self._encode_face_refine_video(face_refine)
+            if face_refine_clean_rows is None or self._interrupt:
+                return None
+
         prompt_presentation = list(reference_presentation)
         prompt_keyframes = keyframes or None
         if source_audio_roles.experimental:
@@ -2619,6 +2674,19 @@ class MiniMaxH3Model:
         if cumulative_audio_rows is not None:
             audio_rows = torch.cat([cumulative_audio_rows, audio_rows])
 
+        face_refine_noise_rows = None
+        face_refine_multipliers = None
+        if face_refine is not None:
+            from .face_refine import face_refine_row_multipliers
+
+            if (layout.num_condition_video_rows or layout.num_condition_audio_rows
+                    or face_refine_clean_rows.shape != video_rows.shape):
+                raise ValueError("H3 FaceRefine source rows must match an unconditioned target")
+            # Preserve the ordinary video/audio noise draw order, independently
+            # of deterministic crop encoding. Never replace condition rows.
+            face_refine_noise_rows = video_rows.clone()
+            face_refine_multipliers = face_refine_row_multipliers(face_refine, device=self.device)
+
         turbo_schedule = None
         if lightx2v_enabled:
             video_scheduler_points = lightx2v_scheduler_grid_points(sampling_steps)
@@ -2645,6 +2713,17 @@ class MiniMaxH3Model:
         else:
             self.scheduler.set_timesteps(video_scheduler_points, device=self.device)
             self.audio_scheduler.set_timesteps(audio_scheduler_points, device=self.device)
+        face_refine_sigmas = None
+        if face_refine is not None:
+            from .face_refine import configure_face_refine_schedule
+
+            face_refine_sigmas = configure_face_refine_schedule(
+                self.scheduler, steps=sampling_steps, strength=face_refine.strength,
+                device=self.device,
+            )
+            video_rows[:] = self.scheduler.scale_noise(
+                face_refine_clean_rows, self.scheduler.timesteps[0], face_refine_noise_rows,
+            )
         if source_audio_roles.mode == "remix_source":
             # Preserve the paired call count while beginning only the audio
             # clock at the requested source-denoise strength.  The two row
@@ -2764,6 +2843,16 @@ class MiniMaxH3Model:
                 num_condition_audio_rows=layout.num_condition_audio_rows,
                 locked_target_audio_rows=locked_target_audio_rows,
                 advance_video=advance_video,
+                video_source_hold=(hold_face_source if face_refine is not None else None),
+            )
+
+        def hold_face_source(proposed):
+            from .face_refine import hold_face_refine_rows
+
+            return hold_face_refine_rows(
+                proposed, clean=face_refine_clean_rows, noise=face_refine_noise_rows,
+                multipliers=face_refine_multipliers,
+                next_sigma=self.scheduler.sigmas[self.scheduler.step_index],
             )
 
         def reset_denoising_schedulers():
@@ -2774,6 +2863,8 @@ class MiniMaxH3Model:
                 self.device,
                 audio_scheduler_points,
             )
+            if face_refine_sigmas is not None:
+                self.scheduler.set_timesteps(sigmas=face_refine_sigmas, device=self.device)
 
         def run_native_denoising(*, progress_label="MiniMax H3 denoising"):
             report_phase("Running first H3 denoising step (runtime warmup)")
