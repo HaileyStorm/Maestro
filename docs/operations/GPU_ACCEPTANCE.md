@@ -2795,3 +2795,41 @@ This closes the observed whole-service recovery boundary for an ordinary
 unsealed CPU Editor export. It does not establish every publication crash
 window, LAN workflow parity, Windows/macOS behavior or human acceptance. No
 GPU/model workload, production source change or full-suite replay was needed.
+
+## 2026-10-08 private Face repair chain and CPU browser review
+
+At source revision `361c6611`, a single private Face repair attempt completed
+with the installed H3 Base weights and the native video/audio VAEs. Observed
+execution included one video encode, one audio encode and four model
+predictions. The private crop result passed sealed composition: original pixels
+outside repaired regions, unresolved frames and all original audio packets were
+preserved. The owned worker and descendants drained, and the exact GPU lease
+withdrawal was confirmed. Earlier failed attempts remain immutable evidence;
+the accepted attempt was not replayed.
+
+The source was a synthetic geometry clip. This proves the installed technical
+chain, not visual improvement of a real face. Native cancellation, live Gallery
+Queue admission/recovery, LAN workflow parity and human acceptance remain open.
+The later preview mount at `d847de4f` was deployed through Restart Maestro;
+local and stable health/readiness passed and the exact restart notice cleared.
+Both Face feature flags remained disabled, the catalog did not advertise Face
+repair, and live preview reads returned the installation's disabled response.
+
+Separate CPU browser qualification used a new 345-frame synthetic clip with
+two audio tracks and the actual FFmpeg/FastAPI source and PNG read routes.
+Firefox and narrow Chromium displayed pixels matching a full source decode at
+three distinct frame indices. Private previews made no frame request before
+reveal. The test exposed Firefox reusing an already decoded image on reopening;
+distinct read URLs now require current authorization when reopening, revisiting,
+revealing or retrying a frame within the loaded page. Revoking fixture access
+after metadata retrieval caused a fresh denied read with no displayed pixels.
+Restoring access required an explicit retry. Full-page reload freshness was not
+qualified.
+
+Measured long clips now choose a crop size within the existing memory limits,
+including audio-guidance capacity. The 345-frame case uses 352 pixels rather
+than the previously invalid 384-pixel default. Six request tests, fourteen
+existing/extended browser cases, the production UI build, scoped lint and E2E
+type checking passed. Synthetic submission intents were rejected by the private
+CPU fixture; it contained no Queue or model worker. Its authorizer was a fixture,
+so this is CPU browser integration evidence, not live account or Queue acceptance.

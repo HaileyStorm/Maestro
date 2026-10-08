@@ -55,6 +55,30 @@ async function setup(page: Page, options: { private?: boolean; ambiguous?: boole
 }
 async function review(page:Page){await expect(page.getByRole('img',{name:'Source frame 1',exact:true})).toBeVisible();await page.getByRole('button',{name:'Review this region',exact:true}).click();await page.getByLabel('Describe the face repair').fill('Restore the face detail; preserve expression.')}
 
+test('reopened, revisited and revealed frames receive fresh reads before becoming ready',async({page})=>{
+  const run=await setup(page,{private:true})
+  await expect(page.getByRole('button',{name:'Reveal source preview',exact:true})).toBeVisible()
+  expect(run.frames).toEqual([])
+  await page.getByRole('button',{name:'Reveal source preview',exact:true}).click()
+  const first=page.getByRole('img',{name:'Source frame 1',exact:true})
+  await expect(first).toBeVisible()
+  const urls=[await first.getAttribute('src')]
+  await page.getByLabel('Frame',{exact:true}).fill('2')
+  await expect(page.getByRole('img',{name:'Source frame 2',exact:true})).toBeVisible()
+  await page.getByLabel('Frame',{exact:true}).fill('1')
+  await expect(first).toBeVisible();urls.push(await first.getAttribute('src'))
+  await page.getByRole('button',{name:'Close face repair'}).click()
+  await page.getByRole('button',{name:'Repair face',exact:true}).click()
+  await expect(first).toBeVisible();urls.push(await first.getAttribute('src'))
+  await page.evaluate(()=>(window as unknown as {__faceFixture:{hide:()=>void}}).__faceFixture.hide())
+  await expect(first).toHaveCount(0)
+  await page.getByRole('button',{name:'Reveal source preview',exact:true}).click()
+  await expect(first).toBeVisible();urls.push(await first.getAttribute('src'))
+  expect(run.frames).toEqual([0,1,0,0,0])
+  expect(new Set(urls).size).toBe(4)
+  expect(run.requests).toEqual([]);expect(run.unexpected).toEqual([])
+})
+
 test('manual review, shot boundaries and exact source/audio contract',async({page},info)=>{
   const run=await setup(page)
   await review(page)

@@ -96,6 +96,20 @@ export function reviewFaceRange(
   return boxes.map((old, index) => index >= start && index <= end ? box?.slice() as FaceBox ?? null : old)
 }
 
+function faceRepairMemoryFits(facts: FaceRepairSource, canvas: number, audio: number | null): boolean {
+  return facts.frame_count * canvas * canvas * 12 + (audio === null ? 0 : 48_000 * 8 * facts.frame_count / 24) <= 512 * 1024 ** 2
+    && (facts.width * facts.height + canvas * canvas) * facts.frame_count * 3 <= 512 * 1024 ** 2
+}
+
+/** Keep the usual crop size when possible, including room for source audio guidance. */
+export function defaultFaceRepairCanvas(facts: FaceRepairSource): number {
+  const audio = facts.audio_streams.length > 0 ? 0 : null
+  for (let canvas = 384; canvas >= 64; canvas -= 32) {
+    if (faceRepairMemoryFits(facts, canvas, audio)) return canvas
+  }
+  throw new Error('This clip is too large for face repair on this installation.')
+}
+
 export function buildFaceRepairRequest(
   source: OutputFile, facts: FaceRepairSource, boxes: readonly (FaceBox | null)[], shots: readonly number[],
   prompt: string, strength: number, canvas: number, audio: number | null, steps: number, seed: number,
@@ -109,8 +123,7 @@ export function buildFaceRepairRequest(
     || !Number.isSafeInteger(seed) || seed < 0 || !Number.isFinite(strength) || strength < steps / 4096 || strength > 1
     || !Number.isInteger(canvas) || canvas < 64 || canvas > 1536 || canvas % 32 !== 0
     || (audio !== null && !facts.audio_streams.some(stream => stream.ordinal === audio))
-    || facts.frame_count * canvas * canvas * 12 + (audio === null ? 0 : 48_000 * 8 * facts.frame_count / 24) > 512 * 1024 ** 2
-    || (facts.width * facts.height + canvas * canvas) * facts.frame_count * 3 > 512 * 1024 ** 2) {
+    || !faceRepairMemoryFits(facts, canvas, audio)) {
     throw new Error('Review at least one region and check the repair settings and crop size.')
   }
   return {

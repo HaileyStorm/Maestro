@@ -2,12 +2,16 @@ import { useEffect, useId, useRef, useState, type PointerEvent } from 'react'
 import { createPortal } from 'react-dom'
 import type { OutputFile } from '../../types'
 import * as api from '../../api/client'
-import { beginFaceRepairAdmission, buildFaceRepairRequest, faceRepairAdmissionKey, readFaceRepairAdmission, setFaceRepairAdmission, subscribeFaceRepairAdmission, reviewFaceRange, validFaceBox, validateFaceRepairSource, type FaceBox, type FaceRepairSource } from '../../lib/faceRepairReview'
+import { beginFaceRepairAdmission, buildFaceRepairRequest, defaultFaceRepairCanvas, faceRepairAdmissionKey, readFaceRepairAdmission, setFaceRepairAdmission, subscribeFaceRepairAdmission, reviewFaceRange, validFaceBox, validateFaceRepairSource, type FaceBox, type FaceRepairSource } from '../../lib/faceRepairReview'
 import { installModalFocus } from '../../lib/modalFocus'
 import { privatePreviewIdentity, privatePreviewWasRevealed, revealPrivatePreview, subscribePrivatePreviewReveal } from '../../lib/privatePreview'
 
 const button = 'min-h-11 rounded-md border border-border px-3 py-2 text-sm hover:bg-bg-hover focus-visible:outline-2 focus-visible:outline-accent-blue disabled:opacity-50'
 const input = 'min-h-11 w-full rounded-md border border-border bg-bg-primary px-2 py-2 text-sm text-text-primary focus-visible:outline-2 focus-visible:outline-accent-blue'
+
+let framePreviewSerial = 0
+// Never recycle a decoded-image URL. The server rejects serials beyond its bounded range.
+const nextFramePreviewSerial = () => ++framePreviewSerial
 
 export function FaceRepairPanel({ source, accountScope, isCurrentSelection, onQueued }: {
   source: OutputFile
@@ -48,9 +52,12 @@ function FaceRepairEditor({ source, accountScope, isCurrentSelection, onQueued, 
   const [attempt, setAttempt] = useState(0)
   const [error, setError] = useState('')
   const [frame, setFrame] = useState(0)
-  const [loadedFrame, setLoadedFrame] = useState<number | null>(null)
+  const [loadedFrame, setLoadedFrame] = useState<{ index: number; attempt: number } | null>(null)
   const [failedFrame, setFailedFrame] = useState<number | null>(null)
-  const [frameAttempt, setFrameAttempt] = useState(0)
+  const [frameAttempt, setFrameAttempt] = useState(nextFramePreviewSerial)
+  const activeFrameRead = useRef({ index: frame, attempt: frameAttempt })
+  activeFrameRead.current = { index: frame, attempt: frameAttempt }
+  const isCurrentFrameRead = () => isCurrent() && activeFrameRead.current.index === frame && activeFrameRead.current.attempt === frameAttempt
   const [boxes, setBoxes] = useState<(FaceBox | null)[]>([])
   const [box, setBox] = useState<FaceBox>([0, 0, 1, 1])
   const [shots, setShots] = useState([0])
@@ -65,7 +72,7 @@ function FaceRepairEditor({ source, accountScope, isCurrentSelection, onQueued, 
   const pending = admission === 'pending', accepted = admission === 'accepted', uncertain = admission === 'uncertain'
   const [queuePending, setQueuePending] = useState(false)
   const drag = useRef<{ x: number; y: number; frame: number } | null>(null)
-  const ready = Boolean(facts && revealed && loadedFrame === frame && failedFrame !== frame)
+  const ready = Boolean(facts && revealed && loadedFrame?.index === frame && loadedFrame.attempt === frameAttempt && failedFrame !== frame)
   const disabled = !ready || pending || accepted || uncertain
   const reviewed = boxes.filter(Boolean).length
 
@@ -75,7 +82,10 @@ function FaceRepairEditor({ source, accountScope, isCurrentSelection, onQueued, 
       appRoot: document.getElementById('root'), onClose: () => closeCurrent.current() })
     return () => { alive.current = false; cleanup() }
   }, [restoreFocus])
-  useEffect(() => subscribePrivatePreviewReveal(identity, value => setRevealed(!source.private || value)), [identity, source.private])
+  useEffect(() => subscribePrivatePreviewReveal(identity, value => {
+    setRevealed(!source.private || value)
+    setLoadedFrame(null); setFailedFrame(null); setFrameAttempt(nextFramePreviewSerial())
+  }), [identity, source.private])
   useEffect(() => subscribeFaceRepairAdmission(admissionKey, setAdmission), [admissionKey])
   useEffect(() => {
     const abort = new AbortController()
@@ -85,6 +95,8 @@ function FaceRepairEditor({ source, accountScope, isCurrentSelection, onQueued, 
       .then(value => {
         if (!live || !isCurrent()) return
         const next = validateFaceRepairSource(value, source)
+        const initialCanvas = defaultFaceRepairCanvas(next)
+        setCanvas(initialCanvas)
         setFacts(next); setBoxes(Array.from({ length: next.frame_count }, () => null))
         const side = Math.max(1, Math.floor(Math.min(next.width, next.height) / 2))
         const left = Math.floor((next.width-side)/2), top = Math.floor((next.height-side)/2)
@@ -100,7 +112,7 @@ function FaceRepairEditor({ source, accountScope, isCurrentSelection, onQueued, 
 
   function chooseFrame(next: number) {
     if (!facts || pending || accepted || uncertain || !isCurrent()) return
-    setFrame(next); setLoadedFrame(null); drag.current = null
+    setFrame(next); setLoadedFrame(null); setFrameAttempt(nextFramePreviewSerial()); drag.current = null
     if (boxes[next]) setBox([...boxes[next]!])
   }
   function applyRange(region: FaceBox | null, from: number, to: number) {
@@ -172,12 +184,12 @@ function FaceRepairEditor({ source, accountScope, isCurrentSelection, onQueued, 
               onPointerCancel={() => { drag.current = null }}>
               <img key={`${frame}:${frameAttempt}`} src={`${api.faceRepairFrameUrl({ workspace: source.workspace, name: source.name, revision: source.revision }, frame)}&preview_attempt=${frameAttempt}`}
                 alt={`Source frame ${frame + 1}`} draggable={false} className={`absolute inset-0 h-full w-full ${ready ? '' : 'invisible'}`}
-                onLoad={event => { if (!isCurrent()) return; if (event.currentTarget.naturalWidth !== facts.width || event.currentTarget.naturalHeight !== facts.height) setFailedFrame(frame); else { setLoadedFrame(frame); setFailedFrame(null) } }}
-                onError={() => { if (isCurrent()) setFailedFrame(frame) }} />
+                onLoad={event => { if (!isCurrentFrameRead()) return; if (event.currentTarget.naturalWidth !== facts.width || event.currentTarget.naturalHeight !== facts.height) setFailedFrame(frame); else { setLoadedFrame({ index: frame, attempt: frameAttempt }); setFailedFrame(null) } }}
+                onError={() => { if (isCurrentFrameRead()) setFailedFrame(frame) }} />
               {ready && validFaceBox(box, facts) && <div aria-hidden="true" className="pointer-events-none absolute border-2 border-cyan-300 bg-cyan-300/10"
                 style={{ left: `${box[0]/facts.width*100}%`, top: `${box[1]/facts.height*100}%`, width: `${(box[2]-box[0])/facts.width*100}%`, height: `${(box[3]-box[1])/facts.height*100}%` }} />}
               {!ready && <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 p-3" role="status">
-                {failedFrame === frame ? <><p>Could not read this frame.</p><button className={button} onClick={() => { setFailedFrame(null); setLoadedFrame(null); setFrameAttempt(value => value + 1) }}>Read frame again</button></> : 'Loading source frame…'}
+                {failedFrame === frame ? <><p>Could not read this frame.</p><button className={button} onClick={() => { setFailedFrame(null); setLoadedFrame(null); setFrameAttempt(nextFramePreviewSerial()) }}>Read frame again</button></> : 'Loading source frame…'}
               </div>}
             </div>}
             <p className="text-xs text-text-secondary">Draw a square region, or enter its coordinates below. Preview shows the original frame.</p>

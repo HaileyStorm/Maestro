@@ -4,7 +4,7 @@ import { build } from 'esbuild'
 import { fileURLToPath } from 'node:url'
 
 const built = await build({ entryPoints: [fileURLToPath(new URL('../src/lib/faceRepairReview.ts', import.meta.url))], bundle: true, write: false, format: 'esm', platform: 'node' })
-const { validateFaceRepairSource, resolveFaceRepairSelection, reviewFaceRange, buildFaceRepairRequest, faceRepairAdmissionKey, readFaceRepairAdmission, beginFaceRepairAdmission, setFaceRepairAdmission } = await import('data:text/javascript;base64,' + Buffer.from(built.outputFiles[0].text).toString('base64'))
+const { validateFaceRepairSource, resolveFaceRepairSelection, reviewFaceRange, buildFaceRepairRequest, defaultFaceRepairCanvas, faceRepairAdmissionKey, readFaceRepairAdmission, beginFaceRepairAdmission, setFaceRepairAdmission } = await import('data:text/javascript;base64,' + Buffer.from(built.outputFiles[0].text).toString('base64'))
 const source = { workspace: 'project', name: 'clip.mkv', revision: 'r1', type: 'video', artifact_class: 'final', private: true, explicit: true }
 const facts = { workspace: 'project', name: 'clip.mkv', revision: 'r1', width: 192, height: 128, frame_count: 124, fps: '24/1', audio_streams: [{ ordinal: 0, label: 'Track 1' }, { ordinal: 1, label: 'Track 2' }] }
 const model = { model_type: 'minimax_h3', h3_face_refine: true, execution_allowed: true }
@@ -39,6 +39,21 @@ test('public repair recipe preserves opaque creative text, unresolved frames and
   assert.equal(result.audio_stream,1); assert.equal(result.private_output,true); assert.equal(result.explicit_output,true)
   assert.equal(result.settings.seed,42)
   for (const [strength,canvas,audio,steps,seed] of [[0,128,null,20,42],[.5,65,null,20,42],[.5,128,2,20,42],[.5,128,null,1,42],[.5,128,null,20,Number.MAX_SAFE_INTEGER+1],[.5,1536,null,20,42]]) assert.throws(()=>buildFaceRepairRequest(source,facts,boxes,[0],prompt,strength,canvas,audio,steps,seed))
+})
+test('measured long sources get a usable default without relaxing crop or audio budgets', () => {
+  for (const [frame_count, expected] of [[124,384],[294,384],[311,352],[328,352],[345,352]]) {
+    const measured={...facts,frame_count}, boxes=Array(frame_count).fill(null)
+    boxes[0]=[32,16,96,80]
+    const canvas=defaultFaceRepairCanvas(validateFaceRepairSource(measured,source))
+    assert.equal(canvas,expected)
+    for (const audio of [null,1]) {
+      const request=buildFaceRepairRequest(source,measured,boxes,[0],'Preserve expression.',.5,canvas,audio,20,42)
+      assert.deepEqual(request.observations.canvas,[canvas,canvas])
+    }
+    if(frame_count>=311) assert.throws(()=>buildFaceRepairRequest(source,measured,boxes,[0],'Preserve expression.',.5,384,null,20,42))
+  }
+  const exhausted=validateFaceRepairSource({...facts,width:1280,height:405,frame_count:345},source)
+  assert.throws(()=>defaultFaceRepairCanvas(exhausted),/too large/)
 })
 test('submission receipts are account/source scoped, durable before POST, and fail closed without storage', () => {
   const values=new Map(), previousStorage=globalThis.sessionStorage, previousWindow=globalThis.window
