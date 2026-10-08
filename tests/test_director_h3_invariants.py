@@ -170,6 +170,28 @@ non_diegetic_music: N/A"""
         # Physical children remain discoverable until each scene is assembled.
         self.assertEqual(outputs.clip_output_files, {0: "a.mp4", 1: "b.mp4", 2: "c.mp4"})
 
+    def test_assembled_scene_slots_preserve_raw_children_and_survive_save(self):
+        params, clips, planned = self._output_group_fixture()
+        outputs = pipeline._director_job_outputs({"output_files": ["joined.mp4"],
+            "clip_output_files": {"0": "a.mp4", "1": "b.mp4", "2": "c.mp4"},
+            "h3_scene_output_files": {"0": "scene-a.mp4", "1": "scene-b.mp4"}})
+        artifacts = pipeline._director_clip_video_artifacts(outputs, params, 2)
+        self.assertEqual(artifacts["_clip_video_files"], ["scene-a.mp4", "scene-b.mp4"])
+        self.assertEqual([[member["filename"] for member in group]
+            for group in artifacts["_h3_clip_video_groups"]], [["a.mp4", "b.mp4"], ["c.mp4"]])
+        pid = "assembled-scene-save"
+        pipeline._pipelines[pid] = {"id": pid, "status": "completed", "params": params,
+            "clip_plans": clips, "_planned_clips": planned, "out_dir": self.temp_dir.name,
+            "created_at": 1, "output_files": list(outputs), **artifacts}
+        self.assertTrue(pipeline._save_pipeline_state(pid))
+        state = pipeline.load_pipeline_state(self.temp_dir.name, pid)
+        self.assertEqual([clip["video_filename"] for clip in state["clips"]], ["scene-a.mp4", "scene-b.mp4"])
+        for mapping in ({0: "scene-a.mp4", "0": "scene-b.mp4"}, {"01": "scene-b.mp4"},
+                        {True: "scene-b.mp4"}, {0: "../scene-a.mp4"}, {0: "absent.mp4"}):
+            with self.subTest(mapping=mapping), self.assertRaises(ValueError):
+                pipeline._director_clip_video_artifacts(pipeline._DirectorOutputs(
+                    list(outputs), outputs.clip_output_files, mapping), params, 2)
+
     def test_sparse_h3_completion_retains_missing_members_and_exact_owner(self):
         params, _, _ = self._output_group_fixture()
         outputs = pipeline._DirectorOutputs(["b.mp4", "c.mp4"], {1: "b.mp4", 2: "c.mp4"})

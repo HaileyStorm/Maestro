@@ -2810,6 +2810,8 @@ def snapshot_job(job: MutableMapping[str, Any]) -> dict[str, Any]:
             snapshot["artifact_files"] = list(snapshot["artifact_files"])
         if isinstance(snapshot.get("clip_output_files"), dict):
             snapshot["clip_output_files"] = dict(snapshot["clip_output_files"])
+        if isinstance(snapshot.get("h3_scene_output_files"), dict):
+            snapshot["h3_scene_output_files"] = dict(snapshot["h3_scene_output_files"])
         if isinstance(snapshot.get("events"), list):
             snapshot["events"] = [dict(event) for event in snapshot["events"]]
         if isinstance(snapshot.get("credit_queue"), dict):
@@ -2921,6 +2923,7 @@ def record_job_outputs(
     output_files: list[str],
     *,
     clip_output_files: Mapping[int | str, str] | None = None,
+    h3_scene_output_files: Mapping[int | str, str] | None = None,
     join_output_file: str | None = None,
     final_output_files: list[str] | None = None,
     expected_execution_attempt: int | None = None,
@@ -2963,16 +2966,18 @@ def record_job_outputs(
         candidate["output_files"] = _merge_unique_filenames(
             candidate.get("output_files"), final_files,
         )
-        if clip_output_files:
-            clip_outputs = dict(candidate.get("clip_output_files") or {})
-            for index, filename in clip_output_files.items():
+        for field, mapping in (("clip_output_files", clip_output_files), ("h3_scene_output_files", h3_scene_output_files)):
+            if not mapping:
+                continue
+            clip_outputs = dict(candidate.get(field) or {})
+            for index, filename in mapping.items():
                 try:
                     key = str(int(index))
                 except (TypeError, ValueError):
                     continue
                 if filename:
                     clip_outputs[key] = filename
-            candidate["clip_output_files"] = clip_outputs
+            candidate[field] = clip_outputs
         if join_output_file:
             candidate["join_output_file"] = join_output_file
         if (

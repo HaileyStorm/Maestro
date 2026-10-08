@@ -2075,5 +2075,241 @@ class DirectorRecoveryTests(unittest.TestCase):
         commit.assert_called_once_with(pid, "image-keyframe-2-3")
 
 
+
+class DirectorSceneAssemblyTests(unittest.TestCase):
+    def setUp(self):
+        from services.queue_recovery_runtime import artifact_descriptor, recovery_unit_id, validate_artifact_descriptor
+        from services.queue_recovery_runtime import ensure_recovery_staging_directory, promote_recovery_staged_artifact, QueueRecoveryRuntimeError, sha256_file
+        from services.queue_recovery import QueueRecoveryJournal
+        from services.queue_recovery_adapter import QueueRecoveryCoordinator, owner_principal_digest, project_instance_digest
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.plan = {"clip_count": 3, "segment_source_indices": [0, 0, 1],
+            "clip_frames": [27, 27, 27], "clip_published_frames": [24, 24, 24],
+            "clip_trim_tail_frames": [3, 3, 3],
+            "segment_models": [{"discard_frames": 0}, {"discard_frames": 17}, {"discard_frames": 0}]}
+        self.job = {"id": "a" * 32, "status": "running", "params": {
+            "_director_pipeline_id": "pipeline", "_h3_longform": self.plan,
+            "multi_clip_audio_start_sec": 2.013}, "recovery_cursor": {"completed_units": []}}
+        self.journal = QueueRecoveryJournal(self.root / "queue.jsonl")
+        self.coordinator = QueueRecoveryCoordinator(self.journal)
+        self.coordinator.register_job(self.job, owner_digest=owner_principal_digest(b"scene-test-secret-long", "owner"),
+            project_digest=project_instance_digest(b"scene-test-secret-long", "b" * 32),
+            request_manifest={"kind": "scene-test"})
+        def checkpoint(job, **updates):
+            candidate = {**job, **updates}
+            self.coordinator.prospective_transition(types.SimpleNamespace(jobs=(candidate,), tombstones=(), global_state=None))
+            job.update(updates)
+            return True
+        self.calls = []
+        def concat(paths, output, audio, **kwargs):
+            self.calls.append((list(paths), audio, dict(kwargs)))
+            Path(output).write_bytes(b"assembled")
+            return True
+        self.namespace = _launch_functions({"_assemble_director_h3_scenes", "_h3_true_peak_policy_identity",
+            "_queue_recovery_checkpoint_unit", "_queue_recovery_unit_matches", "_h3_dependency_closed_recovery_units",
+            "_director_recovery_scene_map", "_director_recovery_verified_child", "_director_recovery_validate_child",
+            "_queue_recovery_completed_h3_graph", "_queue_recovery_reconcile_cursor"}, {
+            "os": os, "uuid": uuid, "copy": copy, "json": json, "hmac": hmac,
+            "_queue_recovery_reconcile_orphan_delivery": lambda *_args: None,
+            "QueueRecoveryRuntimeError": QueueRecoveryRuntimeError,
+            "recovery_unit_id": recovery_unit_id, "_recovery_artifact_descriptor": artifact_descriptor,
+            "validate_artifact_descriptor": validate_artifact_descriptor,
+            "ensure_recovery_staging_directory": ensure_recovery_staging_directory,
+            "promote_recovery_staged_artifact": promote_recovery_staged_artifact,
+            "_queue_recovery_units": lambda job: job["recovery_cursor"]["completed_units"],
+            "_queue_recovery_checkpoint": checkpoint, "_recovery_sha256_file": sha256_file,
+            "wgp": types.SimpleNamespace(concatenate_multi_clip_videos=concat),
+            "is_cancel_requested": lambda job: job.get("cancel_requested", False),
+        })
+        self.policy = self.namespace["_h3_true_peak_policy_identity"]()
+        self.namespace["_enforce_deferred_h3_final_audio"] = lambda *args, **kwargs: {**self.policy, "verified": True}
+        self.cancel_after_sidecar = False
+        self.published = []
+        for index in range(3):
+            name = f"child-{index}.mp4"
+            (self.root / name).write_bytes(f"child-{index}".encode())
+            settings = {"generated_frames": 27, "published_frames": 24,
+                "trim_tail_frames": 3, "discard_prefix_frames": self.plan["segment_models"][index]["discard_frames"]}
+            unit_id = recovery_unit_id(self.job["id"], "h3_segment", variant=0, index=index, settings=settings)
+            self.sidecars([name], recovery_units={name: {"unit_id": unit_id, "kind": "h3_segment", "variant": 0, "index": index, "settings": settings, "dependencies": []}})
+            self.namespace["_queue_recovery_checkpoint_unit"](self.job, kind="h3_segment", variant=0, index=index,
+                project_dir=str(self.root), artifact_names=[name], settings=settings)
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def sidecars(self, names, *, recovery_units, media_paths=None, **kwargs):
+        for name in names:
+            producer = recovery_units[name]
+            data = Path((media_paths or {}).get(name) or self.root / name).read_bytes()
+            metadata = {"job_id": self.job["id"], "workspace": self.job.get("workspace"),
+                "producer_unit_id": producer["unit_id"], "producer_unit_kind": producer["kind"],
+                "producer_unit_index": producer["index"], "producer_unit_variant": producer["variant"],
+                "producer_unit_settings": producer.get("settings", {}),
+                "producer_unit_dependencies": producer.get("dependencies", []),
+                "producer_unit_artifact_names": names, "producer_media_size": len(data),
+                "producer_media_sha256": hashlib.sha256(data).hexdigest(),
+                "artifact_class": "final" if producer["kind"] == "h3_concat" else "component",
+                "producer_artifact_class": "final" if producer["kind"] == "h3_concat" else "component",
+                "params": {"multi_clip_info": {"output_index": 0, "output_total": 1}}, "output_filename": name}
+            if producer.get("attestation"):
+                metadata["producer_unit_attestation"] = producer["attestation"]
+            (self.root / (Path(name).stem + ".meta.json")).write_text(json.dumps(metadata), encoding="utf-8")
+            if media_paths:
+                self.assertFalse((self.root / name).exists())
+                self.assertTrue(Path(media_paths[name]).exists())
+        if self.cancel_after_sidecar:
+            self.job["cancel_requested"] = True
+
+    def cancel(self):
+        if self.job.get("cancel_requested"):
+            raise InterruptedError("cancelled")
+
+    def run_assembly(self):
+        return self.namespace["_assemble_director_h3_scenes"](self.job, self.plan, str(self.root), variant=0,
+            write_sidecars=self.sidecars, cancel_check=self.cancel,
+            publish_scene=lambda index, name: self.published.append((index, name)))
+
+    def synthetic_probe(self, path, *, expected_frames, **kwargs):
+        data = Path(path).read_bytes()
+        return {"validation": "valid", "fps": 24, "frame_count": expected_frames,
+                "artifact_size_bytes": len(data), "artifact_sha256": "sha256:" + hashlib.sha256(data).hexdigest()}
+
+    def test_recover_sealed_scenes_without_concat_and_reject_swapped_ownership(self):
+        with patch("services.h3_output_integrity.probe_h3_output", side_effect=self.synthetic_probe):
+            self.run_assembly()
+            first = list(self.published)
+            self.published.clear()
+            self.run_assembly()
+        self.assertEqual(self.published, first)
+        self.assertEqual(len(self.calls), 2)
+        self.assertEqual(self.calls[0][2]["clip_start_frames"], [0, 17])
+        self.assertEqual(self.calls[1][2]["audio_start_sec"], 4.013)
+        self.job.update(status="completed", clip_output_files={str(i): f"child-{i}.mp4" for i in range(3)},
+            h3_scene_output_files={str(index): name for index, name in first})
+        evidence = self.namespace["_director_recovery_verified_child"](self.job, str(self.root))
+        self.assertIsNotNone(evidence)
+        self.assertIsNotNone(self.namespace["_director_recovery_validate_child"](str(self.root), evidence))
+        restored = self.journal.recover().jobs[self.job["id"]]
+        self.assertEqual(len([u for u in restored["recovery_cursor"]["completed_units"] if u["kind"] == "h3_scene"]), 2)
+        for mapping in ({"0": first[1][1], "1": first[0][1]}, {"0": "child-0.mp4"},
+                        {"01": first[1][1]}, {0: first[0][1], "0": first[0][1]}):
+            altered = {**evidence, "h3_scene_output_files": mapping}
+            with self.subTest(mapping=mapping):
+                self.assertIsNone(self.namespace["_director_recovery_validate_child"](str(self.root), altered))
+        (self.root / "child-0.mp4").write_bytes(b"changed")
+        self.assertIsNone(self.namespace["_director_recovery_validate_child"](str(self.root), evidence))
+
+    def test_cancel_after_sidecar_never_promotes_or_checkpoints_scene(self):
+        self.cancel_after_sidecar = True
+        with patch("services.h3_output_integrity.probe_h3_output", side_effect=self.synthetic_probe), self.assertRaises(InterruptedError):
+            self.run_assembly()
+        self.assertFalse(list(self.root.glob("director_scene_*.mp4")))
+        self.assertFalse(self.published)
+        self.assertEqual(len(self.job["recovery_cursor"]["completed_units"]), 3)
+
+    def test_scene_receipt_recovers_after_promotion_before_journal(self):
+        with patch("services.h3_output_integrity.probe_h3_output", side_effect=self.synthetic_probe):
+            self.run_assembly()
+        expected = {str(index): name for index, name in self.published}
+        self.job["recovery_cursor"]["completed_units"] = [u for u in self.job["recovery_cursor"]["completed_units"]
+                                                        if u["kind"] == "h3_segment"]
+        self.namespace["_queue_recovery_reconcile_cursor"](self.job, str(self.root))
+        self.assertEqual(self.job["h3_scene_output_files"], expected)
+        self.assertEqual(len([u for u in self.job["recovery_cursor"]["completed_units"] if u["kind"] == "h3_scene"]), 2)
+        self.assertEqual(self.job["output_files"], [])
+
+    def test_completed_film_graph_preserves_sibling_scene_units_without_extra_finals(self):
+        with patch("services.h3_output_integrity.probe_h3_output", side_effect=self.synthetic_probe):
+            self.run_assembly()
+        parents = self.job["recovery_cursor"]["completed_units"][:3]
+        settings = {"component_hashes": [u["artifacts"][0]["sha256"] for u in parents],
+                    "clip_start_frames": [0, 17, 0], "clip_tail_frames": [3, 3, 3], "source_prefix": None,
+                    "h3_audio_true_peak_policy": self.policy}
+        dependencies = [unit["unit_id"] for unit in parents]
+        unit_id = self.namespace["recovery_unit_id"](self.job["id"], "h3_concat", variant=0, index=0,
+                                                   dependencies=dependencies, settings=settings)
+        (self.root / "film.mp4").write_bytes(b"film")
+        self.sidecars(["film.mp4"], recovery_units={"film.mp4": {"unit_id": unit_id, "kind": "h3_concat",
+            "index": 0, "variant": 0, "settings": settings, "dependencies": dependencies}})
+        self.namespace["_queue_recovery_checkpoint_unit"](self.job, kind="h3_concat", variant=0, index=0,
+            project_dir=str(self.root), artifact_names=["film.mp4"], dependencies=dependencies, settings=settings,
+            attestation={"h3_audio_true_peak": {**self.policy, "verified": True}})
+        self.job.update(status="completed", h3_scene_output_files={str(index): name for index, name in self.published})
+        graph = self.namespace["_queue_recovery_completed_h3_graph"](self.job, str(self.root))
+        self.assertIsNotNone(graph)
+        self.assertEqual(graph["output_files"], ["film.mp4"])
+        self.assertEqual(len(graph["completed_units"]), 6)
+        self.job["recovery_cursor"]["completed_units"] = graph["completed_units"]
+        self.assertIsNotNone(self.namespace["_director_recovery_verified_child"](self.job, str(self.root)))
+
+    def test_geometry_clock_and_receipt_are_bound_and_future_replan_is_stable(self):
+        from services.director_h3_scene_assembly import director_h3_scene_specs, scene_dependency_settings_match, scene_receipt_matches
+        units = {unit["index"]: unit for unit in self.job["recovery_cursor"]["completed_units"]}
+        specs = director_h3_scene_specs(self.plan, units, audio_start_sec=2.013)
+        self.assertEqual([s["settings"]["published_frames"] for s in specs], [48, 24])
+        changed = copy.deepcopy(self.plan); changed["clip_frames"][2] = 28; changed["clip_trim_tail_frames"][2] = 4
+        changed_units = copy.deepcopy(units); changed_units[2]["settings"].update(generated_frames=28, trim_tail_frames=4)
+        later = director_h3_scene_specs(changed, changed_units, audio_start_sec=2.013)
+        self.assertEqual(specs[0], later[0])
+        for field, value in (("published_start_frame", True), ("assembly_version", True),
+                             ("audio_start_sec", float("nan")), ("component_hashes", ["x"])):
+            settings = {**specs[0]["settings"], field: value}
+            self.assertFalse(scene_dependency_settings_match(settings, [units[0], units[1]]))
+        with patch("services.h3_output_integrity.probe_h3_output", side_effect=self.synthetic_probe):
+            self.run_assembly()
+        scene = self.job["recovery_cursor"]["completed_units"][-1]
+        self.assertTrue(scene_receipt_matches(scene))
+        for field, value in (("frame_count", 25), ("fps", 30), ("artifact_sha256", "sha256:" + "0" * 64)):
+            bad = copy.deepcopy(scene); bad["attestation"]["media"][field] = value
+            self.assertFalse(scene_receipt_matches(bad))
+        (self.root / "child-2.mp4").write_bytes(b"future child changed")
+        self.assertIsNotNone(self.namespace["_queue_recovery_unit_matches"](self.job, kind="h3_scene",
+            variant=0, index=0, project_dir=str(self.root), quarantine_invalid=False))
+        (self.root / "child-2.mp4").write_bytes(b"child-2")
+        bad = copy.deepcopy(scene); bad["settings"]["audio_start_sec"] += 1
+        self.job["recovery_cursor"]["completed_units"][-1] = bad
+        self.assertIsNone(self.namespace["_queue_recovery_unit_matches"](self.job, kind="h3_scene",
+            variant=0, index=1, project_dir=str(self.root), quarantine_invalid=False))
+
+    @unittest.skipUnless(__import__("shutil").which("ffmpeg") and __import__("shutil").which("ffprobe"), "ffmpeg required")
+    def test_cpu_media_has_exact_new_frames_and_original_song_window(self):
+        import subprocess
+        import wave
+        import math
+        import struct
+        from tests.test_h3_native_boundary_conditioning import _load_functions
+        from services.h3_audio_safety import enforce_true_peak_safety
+        from services.h3_output_integrity import probe_h3_output
+        native = _load_functions(APP / "wgp.py", {"PostDecodeStageError", "concatenate_multi_clip_videos"}, {"os": os})
+        self.namespace["wgp"].concatenate_multi_clip_videos = native["concatenate_multi_clip_videos"]
+        self.namespace["_enforce_deferred_h3_final_audio"] = lambda job, path, **kwargs: enforce_true_peak_safety(path)
+        for index, frames in enumerate((24, 41, 24)):
+            subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", f"color=blue:s=64x64:r=24:d={frames / 24}",
+                "-f", "lavfi", "-i", f"sine=frequency=220:sample_rate=32000:duration={frames / 24}",
+                "-frames:v", str(frames), "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-ar", "32000", "-ac", "2",
+                str(self.root / f"child-{index}.mp4")], check=True, capture_output=True, timeout=60)
+            unit = self.job["recovery_cursor"]["completed_units"][index]
+            unit["artifacts"] = [self.namespace["_recovery_artifact_descriptor"](self.root, basename=f"child-{index}.mp4",
+                sidecar_basename=f"child-{index}.meta.json", producer_unit_id=unit["unit_id"])]
+        source = self.root / "song.wav"
+        with wave.open(str(source), "wb") as handle:
+            handle.setparams((1, 2, 32000, 0, "NONE", "not compressed"))
+            handle.writeframes(b"".join(struct.pack("<h", int(6000 * math.sin(2 * math.pi * (440 if i < 128000 else 880) * i / 32000)))
+                for i in range(32000 * 8)))
+        self.job["params"]["audio_source"] = str(source)
+        self.namespace["_load_h3_mapping_manifest_inputs"] = lambda job: (str(self.root), [{"field": "audio_source:0",
+            "sha256": hashlib.sha256(source.read_bytes()).hexdigest()}])
+        self.run_assembly()
+        for (index, filename), frames, frequency in zip(self.published, (48, 24), (440, 880)):
+            output = self.root / filename
+            self.assertEqual(probe_h3_output(output, expected_fps=24, expected_frames=frames, require_audio=True)["validation"], "valid")
+            audio = subprocess.run(["ffmpeg", "-v", "error", "-i", str(output), "-ss", "0.1", "-t", "0.2", "-f", "s16le", "-ac", "1", "-ar", "32000", "-"],
+                check=True, capture_output=True, timeout=60).stdout
+            samples = struct.unpack("<" + "h" * (len(audio) // 2), audio)
+            crossings = sum(a <= 0 < b for a, b in zip(samples, samples[1:]))
+            self.assertAlmostEqual(crossings / (len(samples) / 32000), frequency, delta=10)
+
 if __name__ == "__main__":
     unittest.main()

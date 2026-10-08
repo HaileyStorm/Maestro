@@ -1088,3 +1088,32 @@ helper and launcher checks pass with one existing skip; source review and
 publication checks pass. This is local subprocess evidence with mocked Pinokio
 status, not native failed-start or Windows acceptance. No launcher, model,
 provider, creative-content or GPU behavior changed.
+
+### 2026-10-08 — H3 Director authored-scene assembly
+
+Director now assembles each authored scene from its verified physical H3
+children. The scene has its own producer, ordered dependencies, exact published
+frame count and floating soundtrack origin. Native history is discarded once;
+already-trimmed physical tails are not removed again. Scene outputs remain
+components of the Director film, so they do not inflate Queue's completed-film
+count. Raw children remain available in each saved scene's segment group.
+
+Media stays in private recovery staging until its ownership sidecar, current
+true-peak receipt and exact-frame probe are sealed. Completed queue recovery
+retains scene producers alongside the film producer. Sidecar reconciliation
+recovers a promoted scene after a crash before its journal checkpoint. Recovered
+scene slots must match their sealed producer's scene index and dependencies;
+changed later scenes do not duplicate an unchanged earlier scene.
+
+Evidence: all 614 affected checks pass. Actual CPU FFmpeg assembly publishes a
+48-frame two-child scene and a 24-frame following scene at 24 fps, removes the
+17-frame history once, and selects the original song windows at 2.013 and 4.013
+seconds. Recovery reuses completed scenes without concat, rejects swapped
+ownership and changed dependencies, and preserves one film Final through queue
+replay. Cancellation before promotion leaves no public scene media. Independent
+source review found no remaining consequential issue in this slice.
+
+This is assembly and recovery evidence. Exact H3 single-scene rerun geometry,
+edited-prompt compilation, original predecessor conditioning and the combined
+runtime rollout remain in progress. Native generation quality, LAN workflow
+and human listening acceptance are not established by these CPU checks.

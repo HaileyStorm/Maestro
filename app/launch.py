@@ -2100,6 +2100,7 @@ def _startup_recovery_gate_response(request: Request) -> JSONResponse | None:
     return response
 _RECOVERY_UNIT_FIXED_ARTIFACT_ROLES = {
     "h3_segment": "component",
+    "h3_scene": "component",
     "h3_concat": "final",
     "h3_delivery": "final",
     "h3_source_audio_premux": "temporary",
@@ -6490,6 +6491,158 @@ def _director_recovery_submit_child(
     return _jobs[job_id]
 
 
+def _assemble_director_h3_scenes(
+    job: dict, plan: dict, project_dir: str, *, variant: int,
+    write_sidecars, cancel_check, publish_scene,
+) -> None:
+    """Publish complete scene cards from sealed children, without denoising."""
+    from services.director_h3_scene_assembly import director_h3_scene_specs
+    from services.h3_output_integrity import probe_h3_output
+    from shared.utils.media_encoder import run_encoder
+    import tempfile
+    import subprocess
+
+    params = job.get("params") or {}
+    if not params.get("_director_pipeline_id") or not isinstance(plan.get("segment_source_indices"), list):
+        return
+    units = {}
+    for index in range(plan["clip_count"]):
+        unit = _queue_recovery_unit_matches(job, kind="h3_segment", variant=variant,
+                                            index=index, project_dir=project_dir)
+        if unit is not None:
+            units[index] = unit
+    audio_source = params.get("audio_source")
+    source_audio_sha = None
+    if audio_source:
+        manifest_dir, inputs = _load_h3_mapping_manifest_inputs(job)
+        if os.path.realpath(manifest_dir) != os.path.realpath(project_dir):
+            raise QueueRecoveryRuntimeError("H3 scene source project changed.")
+        source = next((item for item in inputs if item.get("field") == "audio_source:0"), None)
+        if not isinstance(source, dict) or not source.get("sha256"):
+            raise QueueRecoveryRuntimeError("H3 scene soundtrack has no sealed input.")
+        source_audio_sha = source["sha256"]
+    specs = director_h3_scene_specs(plan, units,
+        audio_start_sec=params.get("multi_clip_audio_start_sec", 0.0))
+
+    def run_probe(command, *, timeout, **kwargs):
+        with tempfile.TemporaryFile() as captured:
+            code = run_encoder(command, timeout=timeout, stdout=captured, abort_check=cancel_check)
+            captured.seek(0)
+            payload = captured.read().decode("utf-8")
+        if code:
+            raise subprocess.CalledProcessError(code, command)
+        return subprocess.CompletedProcess(command, code, stdout=payload)
+
+    for spec in specs:
+        cancel_check()
+        settings = dict(spec["settings"])
+        settings.update(source_audio_sha256=source_audio_sha,
+                        h3_audio_true_peak_policy=_h3_true_peak_policy_identity())
+        scene_index = spec["index"]
+        unit_id = recovery_unit_id(str(job["id"]), "h3_scene", variant=variant,
+                                  index=scene_index, dependencies=spec["dependencies"], settings=settings)
+        existing = _queue_recovery_unit_matches(job, kind="h3_scene", variant=variant,
+            index=scene_index, project_dir=project_dir)
+        if existing is not None and existing.get("unit_id") == unit_id:
+            names = [item["basename"] for item in existing.get("artifacts") or []]
+            if len(names) != 1:
+                raise QueueRecoveryRuntimeError("H3 scene recovery artifact is ambiguous.")
+            publish_scene(scene_index, names[0])
+            continue
+        output_name = f"director_scene_{job['id']}_v{variant}_c{scene_index}_{unit_id.rsplit(':', 1)[-1][:16]}.mp4"
+        attestation = {}
+
+        def concatenate(paths, staged_path):
+            cancel_check()
+            if wgp.concatenate_multi_clip_videos(paths, staged_path, audio_source,
+                    audio_start_sec=settings["audio_start_sec"], clip_start_frames=settings["clip_start_frames"],
+                    abort_callback=lambda: is_cancel_requested(job)) is not True:
+                return False
+            safety = _enforce_deferred_h3_final_audio(job, staged_path,
+                update_job_fn=lambda target, **updates: not is_cancel_requested(target))
+            if not isinstance(safety, dict) or safety.get("verified") is not True:
+                raise QueueRecoveryRuntimeError("H3 scene audio safety was not verified.")
+            media = probe_h3_output(staged_path, expected_fps=24,
+                expected_frames=settings["published_frames"], require_audio=True, run=run_probe)
+            if media.get("validation") != "valid":
+                raise QueueRecoveryRuntimeError("H3 scene frame geometry was not verified.")
+            attestation.update(h3_audio_true_peak=safety, media=media)
+            cancel_check()
+            return True
+
+        staging_dir = ensure_recovery_staging_directory(project_dir)
+        staged_path = os.path.join(staging_dir, f"unit-{job['id']}-{uuid.uuid4().hex}.scene.mp4")
+        component_paths = [os.path.join(project_dir, name) for name in spec["component_names"]]
+        if concatenate(component_paths, staged_path) is not True:
+            raise QueueRecoveryRuntimeError("H3 scene concat failed.")
+        cancel_check()
+        write_sidecars([output_name], recovery_units={output_name: {
+            "unit_id": unit_id, "kind": "h3_scene", "variant": variant, "index": scene_index,
+            "settings": settings, "dependencies": spec["dependencies"],
+            "attestation": dict(attestation),
+        }}, media_paths={output_name: staged_path},
+            task_params={**params, "h3_audio_true_peak": attestation["h3_audio_true_peak"]})
+        cancel_check()
+        promote_recovery_staged_artifact(project_dir, staged_path=staged_path, output_basename=output_name)
+        unit = _queue_recovery_checkpoint_unit(job, kind="h3_scene", variant=variant, index=scene_index,
+            project_dir=project_dir, artifact_names=[output_name], dependencies=spec["dependencies"],
+            settings=settings, attestation=attestation)
+        if not unit:
+            raise InterruptedError("H3 scene checkpoint rejected")
+        publish_scene(scene_index, output_name)
+
+
+def _director_recovery_scene_map(project_dir: str, mapping, units: list[dict]) -> dict | None:
+    """Admit scene slots only from their dependency-closed sealed producers."""
+    if not isinstance(mapping, dict):
+        return None
+    if not mapping:
+        return {}
+    result = {}
+    closed = _h3_dependency_closed_recovery_units(units)
+    for raw_index, filename in mapping.items():
+        try:
+            index = int(raw_index)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if (isinstance(raw_index, bool) or str(index) != str(raw_index) or index < 0
+                or str(index) in result or not isinstance(filename, str)
+                or os.path.basename(filename) != filename or filename.startswith(".")
+                or os.path.splitext(filename)[1].lower() not in {".mp4", ".webm", ".mkv", ".mov"}):
+            return None
+        producers = [unit for unit in closed if unit.get("kind") == "h3_scene"
+                     and unit.get("index") == index
+                     and any(artifact.get("basename") == filename for artifact in unit.get("artifacts") or [])]
+        if len(producers) != 1:
+            return None
+        producer = producers[0]
+        by_id = {unit.get("unit_id"): unit for unit in closed}
+        pending = [producer]
+        checked = set()
+        while pending:
+            unit = pending.pop()
+            if unit["unit_id"] in checked:
+                continue
+            checked.add(unit["unit_id"])
+            if not all(validate_artifact_descriptor(project_dir, artifact, producer_unit_id=unit["unit_id"])
+                       for artifact in unit.get("artifacts") or []):
+                return None
+            pending.extend(by_id[key] for key in unit.get("dependencies") or [])
+        sidecar = next(artifact["sidecar_basename"] for artifact in producer["artifacts"]
+                       if artifact["basename"] == filename)
+        try:
+            with open(os.path.join(project_dir, sidecar), encoding="utf-8") as handle:
+                metadata = json.load(handle)
+            if (metadata.get("producer_unit_kind") != "h3_scene"
+                    or metadata.get("producer_unit_index") != index
+                    or metadata.get("producer_unit_variant") != producer.get("variant")):
+                return None
+        except (OSError, ValueError, TypeError):
+            return None
+        result[str(index)] = filename
+    return result
+
+
 def _director_recovery_verified_child(job: dict, project_dir: str) -> dict | None:
     """Return only terminal outputs backed by completed queue safe units."""
     if str(job.get("status") or "") != "completed":
@@ -6505,6 +6658,20 @@ def _director_recovery_verified_child(job: dict, project_dir: str) -> dict | Non
             clip_outputs.items(), key=lambda item: int(item[0]),
         ) if filename
     ]
+    units = _queue_recovery_units(job)
+    scene_outputs = _director_recovery_scene_map(project_dir, job.get("h3_scene_output_files") or {}, units)
+    if scene_outputs is None:
+        return None
+    for index in scene_outputs:
+        producer = next(unit for unit in units if unit.get("kind") == "h3_scene"
+                        and any(artifact.get("basename") == scene_outputs[index]
+                                for artifact in unit.get("artifacts") or []))
+        if _queue_recovery_unit_matches(job, kind="h3_scene", variant=producer["variant"], index=int(index),
+                                        project_dir=project_dir, quarantine_invalid=False) is None:
+            return None
+    for filename in scene_outputs.values():
+        if filename and filename not in ordered:
+            ordered.append(filename)
     join_output = str(job.get("join_output_file") or "")
     if join_output and join_output not in ordered:
         ordered.append(join_output)
@@ -6513,7 +6680,6 @@ def _director_recovery_verified_child(job: dict, project_dir: str) -> dict | Non
             str(filename) for filename in (job.get("output_files") or [])
             if isinstance(filename, str) and filename
         ]
-    units = _queue_recovery_units(job)
     evidence = []
     for filename in ordered:
         matched = None
@@ -6539,6 +6705,8 @@ def _director_recovery_verified_child(job: dict, project_dir: str) -> dict | Non
     return {
         "outputs": ordered,
         "clip_output_files": clip_outputs,
+        "h3_scene_output_files": scene_outputs,
+        "scene_recovery_units": copy.deepcopy(units) if scene_outputs else [],
         "artifacts": evidence,
     }
 
@@ -6566,9 +6734,15 @@ def _director_recovery_validate_child(
             or not validate_artifact_descriptor(project_dir, descriptor)
         ):
             return None
+    scenes = _director_recovery_scene_map(project_dir, evidence.get("h3_scene_output_files") or {},
+                                         evidence.get("scene_recovery_units") or [])
+    if scenes is None or any(filename not in outputs for filename in scenes.values()):
+        return None
     return {
         "outputs": list(outputs),
         "clip_output_files": dict(evidence.get("clip_output_files") or {}),
+        "h3_scene_output_files": scenes,
+        "scene_recovery_units": copy.deepcopy(evidence.get("scene_recovery_units") or []) if scenes else [],
         "artifacts": [dict(item) for item in artifacts],
     }
 
@@ -7571,6 +7745,8 @@ def _queue_recovery_materialize_job(
             completed_graph = graph_verifier(runtime, current[0])
         if completed_graph is not None:
             adopted_outputs = completed_graph["output_files"]
+            if completed_graph.get("h3_scene_output_files"):
+                runtime["h3_scene_output_files"] = dict(completed_graph["h3_scene_output_files"])
             runtime["recovery_cursor"] = dict(
                 runtime.get("recovery_cursor") or {},
                 completed_units=completed_graph["completed_units"],
@@ -9628,6 +9804,27 @@ def _queue_recovery_unit_matches(
                 # Preserve verified segments and replay only concat through
                 # the current final-container audio policy.
                 continue
+        if kind == "h3_scene":
+            from services.director_h3_scene_assembly import director_h3_scene_specs, scene_receipt_matches
+            try:
+                parents = [candidate for candidate in _queue_recovery_units(job)
+                           if candidate.get("kind") == "h3_segment" and candidate.get("variant") == variant]
+                parents = _h3_dependency_closed_recovery_units(parents)
+                expected = next(spec for spec in director_h3_scene_specs(
+                    (job.get("params") or {})["_h3_longform"],
+                    {parent["index"]: parent for parent in parents},
+                    audio_start_sec=(job.get("params") or {}).get("multi_clip_audio_start_sec", 0.0))
+                    if spec["index"] == index)
+                actual = dict(unit.get("settings") or {})
+                actual.pop("source_audio_sha256", None)
+                actual.pop("h3_audio_true_peak_policy", None)
+                if (not scene_receipt_matches(unit) or actual != expected["settings"]
+                        or unit.get("dependencies") != expected["dependencies"]
+                        or _director_recovery_scene_map(project_dir,
+                            {str(index): unit["artifacts"][0]["basename"]}, parents + [unit]) is None):
+                    continue
+            except (KeyError, TypeError, ValueError, StopIteration):
+                continue
         unit_id = str(unit.get("unit_id") or "")
         artifacts = unit.get("artifacts")
         if not isinstance(artifacts, list) or not artifacts:
@@ -10464,7 +10661,7 @@ def _queue_recovery_repair_unit_roles(
         )
         meta["producer_artifact_class"] = expected_role
         meta["artifact_class"] = expected_role
-        if kind in {"h3_segment", "h3_concat"}:
+        if kind in {"h3_segment", "h3_concat", "h3_scene"}:
             lineage = f"h3:{job.get('id', '')}:variant:{variant}"
             changed = changed or (
                 meta.get("artifact_lineage") != lineage
@@ -10536,6 +10733,13 @@ def _h3_dependency_closed_recovery_units(verified: list[dict]) -> list[dict]:
                     if isinstance(predecessor_continuation, dict) else ""
                 )
                 if str(settings.get("predecessor_continuation_sha256") or "") != expected_continuation_hash:
+                    continue
+            elif kind == "h3_scene":
+                from services.director_h3_scene_assembly import scene_dependency_settings_match, scene_receipt_matches
+                if (not scene_dependency_settings_match(settings, [accepted_by_id[key] for key in dependencies])
+                        or settings.get("scene_index") != unit.get("index")
+                        or any(accepted_by_id[key].get("variant") != unit.get("variant") for key in dependencies)
+                        or not scene_receipt_matches(unit)):
                     continue
             elif kind == "h3_concat":
                 actual_hashes = []
@@ -10674,6 +10878,17 @@ def _queue_recovery_completed_h3_graph(job: dict, project_dir: str) -> dict | No
         positions = []
         outputs = []
         final_ids = set(pending)
+        scene_outputs = dict(job.get("h3_scene_output_files") or {})
+        for unit in sealed.values():
+            if unit.get("kind") == "h3_scene" and len(unit.get("artifacts") or []) == 1:
+                scene_outputs.setdefault(str(unit["index"]), unit["artifacts"][0]["basename"])
+        if scene_outputs:
+            if _director_recovery_scene_map(project_dir, scene_outputs, list(sealed.values())) is None:
+                return None
+            pending.extend(unit["unit_id"] for unit in sealed.values()
+                           if unit.get("kind") == "h3_scene"
+                           and any(artifact.get("basename") in scene_outputs.values()
+                                   for artifact in unit.get("artifacts") or []))
         while pending:
             unit_id = pending.pop()
             if unit_id in units:
@@ -10689,7 +10904,7 @@ def _queue_recovery_completed_h3_graph(job: dict, project_dir: str) -> dict | No
             dependencies, settings = meta.get("producer_unit_dependencies"), meta.get("producer_unit_settings")
             names = meta.get("producer_unit_artifact_names")
             if (
-                kind not in {"h3_segment", "h3_concat", "h3_delivery", "ordinary_repeat"}
+                kind not in {"h3_segment", "h3_concat", "h3_scene", "h3_delivery", "ordinary_repeat"}
                 or type(variant) is not int or variant < 0
                 or type(index) is not int or index < 0
                 or not isinstance(dependencies, list)
@@ -10706,9 +10921,11 @@ def _queue_recovery_completed_h3_graph(job: dict, project_dir: str) -> dict | No
                     "state": "completed", "artifacts": []}
             if "producer_unit_continuation" in meta:
                 unit["continuation"] = meta["producer_unit_continuation"]
+            if kind == "h3_scene":
+                unit["attestation"] = meta.get("producer_unit_attestation")
             identity_keys = ("producer_unit_kind", "producer_unit_variant", "producer_unit_index",
                              "producer_unit_dependencies", "producer_unit_settings",
-                             "producer_unit_artifact_names", "producer_unit_continuation")
+                             "producer_unit_artifact_names", "producer_unit_continuation", "producer_unit_attestation")
             for name, item in entries:
                 if (item.get("workspace") != job.get("workspace")
                     or any(item.get(key) != meta.get(key) for key in identity_keys)
@@ -10767,7 +10984,8 @@ def _queue_recovery_completed_h3_graph(job: dict, project_dir: str) -> dict | No
         for unit in units.values():
             check = dict(job, recovery_cursor={"completed_units": (
                 list(units.values())
-                if isinstance(job.get("params"), dict) and job["params"].get("_h3_cumulative_append") is True
+                if unit["kind"] == "h3_scene" or (isinstance(job.get("params"), dict)
+                    and job["params"].get("_h3_cumulative_append") is True)
                 else [unit]
             )})
             if _queue_recovery_unit_matches(
@@ -10780,7 +10998,7 @@ def _queue_recovery_completed_h3_graph(job: dict, project_dir: str) -> dict | No
         closed = _h3_dependency_closed_recovery_units(verified)
         if {unit["unit_id"] for unit in closed} != set(units):
             return None
-        return {"completed_units": closed, "output_files": sorted(outputs)}
+        return {"completed_units": closed, "output_files": sorted(outputs), "h3_scene_output_files": scene_outputs}
     except (OSError, KeyError, TypeError, ValueError, QueueRecoveryRuntimeError):
         return None
 
@@ -11130,6 +11348,12 @@ def _queue_recovery_reconcile_cursor(job: dict, project_dir: str, *, adopt_stage
             continue
         if settings:
             recovered["settings"] = dict(settings)
+        if kind == "h3_scene":
+            attestation = meta.get("producer_unit_attestation")
+            if not isinstance(attestation, dict):
+                invalid_recovered_units.add(unit_id)
+            else:
+                recovered["attestation"] = copy.deepcopy(attestation)
         if kind == "h3_concat" and isinstance(job.get("params"), dict) and job["params"].get("_h3_cumulative_append") is True:
             meta_params = meta.get("params")
             stats = meta_params.get("h3_audio_true_peak") if isinstance(meta_params, dict) else None
@@ -11185,7 +11409,8 @@ def _queue_recovery_reconcile_cursor(job: dict, project_dir: str, *, adopt_stage
                     continue
             check_job = dict(job, recovery_cursor={"completed_units": (
                 [unit] + verified + [candidate for key, candidate in recovered_by_unit.items() if key != unit_id]
-                if isinstance(job.get("params"), dict) and job["params"].get("_h3_cumulative_append") is True
+                if unit["kind"] == "h3_scene" or (isinstance(job.get("params"), dict)
+                    and job["params"].get("_h3_cumulative_append") is True)
                 else [unit]
             )})
             if _queue_recovery_unit_matches(
@@ -11205,6 +11430,12 @@ def _queue_recovery_reconcile_cursor(job: dict, project_dir: str, *, adopt_stage
     # An independently valid downstream file must not survive after a
     # predecessor artifact or continuation is quarantined.
     verified = _h3_dependency_closed_recovery_units(verified)
+    scene_outputs = {}
+    for unit in sorted(verified, key=lambda item: (item.get("variant", 0), item.get("index", 0))):
+        if unit.get("kind") == "h3_scene":
+            scene_outputs[str(unit["index"])] = unit["artifacts"][0]["basename"]
+    if scene_outputs or job.get("h3_scene_output_files"):
+        job["h3_scene_output_files"] = scene_outputs
     # A sanctioned sidecar update can precede its journal replacement. Give
     # verified same-media orphan evidence a chance before quarantining stale
     # descriptors, and never remove a file adopted by the reconciled view.
@@ -70586,6 +70817,7 @@ def _run_generation(
         output_files: list[str],
         *,
         clip_output_files=None,
+        h3_scene_output_files=None,
         join_output_file=None,
         final_output_files=None,
         expected_execution_attempt: int | None = None,
@@ -70598,6 +70830,7 @@ def _run_generation(
                 target,
                 output_files,
                 clip_output_files=clip_output_files,
+                h3_scene_output_files=h3_scene_output_files,
                 join_output_file=join_output_file,
                 final_output_files=final_output_files,
                 expected_execution_attempt=attempt,
@@ -70611,6 +70844,7 @@ def _run_generation(
                 target,
                 output_files,
                 clip_output_files=clip_output_files,
+                h3_scene_output_files=h3_scene_output_files,
                 join_output_file=join_output_file,
                 final_output_files=final_output_files,
                 expected_execution_attempt=attempt,
@@ -72347,7 +72581,7 @@ def _run_generation(
                             ordinary_units_to_reseal[ordinary_unit["unit_id"]] = ordinary_unit
                             return False
                         if (
-                            kind not in {"h3_segment", "h3_concat"}
+                            kind not in {"h3_segment", "h3_concat", "h3_scene"}
                             or type(variant) is not int
                             or type(index) is not int
                         ):
@@ -72604,7 +72838,7 @@ def _run_generation(
                         unit_variant = max(
                             0, int(recovery_unit.get("variant", 0) or 0),
                         )
-                        if unit_kind in {"h3_segment", "h3_concat"}:
+                        if unit_kind in {"h3_segment", "h3_concat", "h3_scene"}:
                             variant_lineage = (
                                 f"h3:{job_id}:variant:{unit_variant}"
                             )
@@ -72638,6 +72872,8 @@ def _run_generation(
                         settings = recovery_unit.get("settings")
                         if isinstance(settings, dict):
                             file_sidecar["producer_unit_settings"] = dict(settings)
+                        if unit_kind == "h3_scene":
+                            file_sidecar["producer_unit_attestation"] = copy.deepcopy(recovery_unit["attestation"])
                         continuation = recovery_unit.get("continuation")
                         if isinstance(continuation, dict):
                             file_sidecar["producer_unit_continuation"] = dict(
@@ -72858,6 +73094,33 @@ def _run_generation(
                         expected_artifacts=expected_ordinary_artifacts[unit["unit_id"]],
                     ):
                         raise QueueRecoveryRuntimeError("Completed output recovery update failed.")
+
+            def _assemble_director_scene_outputs(variant):
+                if not h3_longform or not job["params"].get("_director_pipeline_id"):
+                    return
+
+                def cancel_check():
+                    if is_cancel_requested(job) or not sample_safe_unit_current(abort_state):
+                        raise InterruptedError("H3 scene assembly cancelled")
+
+                def write_scene_sidecars(names, **kwargs):
+                    cancel_check()
+                    for name in names:
+                        producer_artifact_roles[name] = "component"
+                    _write_output_sidecars(names, **kwargs)
+
+                def publish_scene(index, name):
+                    with _sample_campaign_transition_lock:
+                        cancel_check()
+                        if not sample_safe_unit_current(abort_state):
+                            raise InterruptedError("H3 scene publication preempted")
+                        record_job_outputs(job, [name], h3_scene_output_files={index: name}, final_output_files=[],
+                                           expected_execution_attempt=job.get("execution_attempt"))
+                        if (job.get("h3_scene_output_files") or {}).get(str(index)) != name:
+                            raise InterruptedError("H3 scene publication rejected")
+
+                _assemble_director_h3_scenes(job, h3_longform, out_dir, variant=variant,
+                    write_sidecars=write_scene_sidecars, cancel_check=cancel_check, publish_scene=publish_scene)
 
             def _replay_h3_concat_from_verified_segments(
                 *, variant: int, total_segments: int, clip_info: dict,
@@ -73434,6 +73697,7 @@ def _run_generation(
                                 producer_artifact_roles[artifact["basename"]] = "final"
                                 if join_output_file is None:
                                     join_output_file = artifact["basename"]
+                        _assemble_director_scene_outputs(recovery_variant)
                         completed += 1
                         print(f"\n  Task {task_no} recovered from verified output")
                         continue
@@ -73916,6 +74180,7 @@ def _run_generation(
                         ):
                             raise InterruptedError("H3 segment checkpoint rejected")
                         clip_output_files[segment_index] = name
+                        _assemble_director_scene_outputs(variant)
                         return os.path.join(out_dir, name)
 
                 if not is_multiclip and not defer_output_publication:
@@ -75030,6 +75295,7 @@ def _run_generation(
                                     continuation=continuation_descriptor,
                                 ):
                                     return False
+                        _assemble_director_scene_outputs(h3_variant)
                         if concat_names and not task_error:
                             concat_dependencies = []
                             clip_start_frames = []

@@ -48,6 +48,20 @@ def _serialize(job):
 
 
 class LogicalReferenceRecoveryTests(unittest.TestCase):
+    def test_scene_map_round_trips_with_queue_checkpoint(self):
+        with tempfile.TemporaryDirectory() as directory:
+            journal = QueueRecoveryJournal(Path(directory) / "queue.jsonl")
+            coordinator = QueueRecoveryCoordinator(journal)
+            request_id, job_id = str(uuid.uuid4()), uuid.uuid4().hex
+            coordinator.reserve_studio_submission(request_id, job_id=job_id, **self._studio_scope())
+            job = self._accept_studio(coordinator, request_id, job_id)
+            job.update(h3_scene_output_files={"0": "scene-a.mp4", "1": "../private.mp4"},
+                       clip_output_files={"0": "child-a.mp4"})
+            coordinator.prospective_transition(types.SimpleNamespace(jobs=(job,), tombstones=(), global_state=None))
+            recovered = journal.recover().jobs[job["id"]]
+            self.assertEqual(recovered["h3_scene_output_files"], {"0": "scene-a.mp4"})
+            self.assertEqual(recovered["clip_output_files"], {"0": "child-a.mp4"})
+
     def _studio_scope(self):
         return {"scope_digest": "a" * 64, "owner_digest": OWNER,
                 "project_digest": PROJECT, "workspace": "project-a", "request_digest": "b" * 64}

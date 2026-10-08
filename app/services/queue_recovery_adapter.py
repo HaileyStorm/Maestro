@@ -71,7 +71,7 @@ _JOB_FIELDS = frozenset({
     "current_segment_model", "current_segment_reason",
     "current_segment_boundary", "h3_estimate", "window_index",
     "window_count", "segment_index", "segment_count", "repeat_index",
-    "repeat_count", "output_files", "artifact_files", "clip_output_files",
+    "repeat_count", "output_files", "artifact_files", "clip_output_files", "h3_scene_output_files",
     "join_output_file", "queue_reorder_reason",
     "plan_review_required", "plan_review_deadline",
     "plan_review_terms_required",
@@ -1167,7 +1167,7 @@ def serialize_job(
                 safe for safe in (_safe_filename(item) for item in (value or []))
                 if safe is not None
             ]
-        elif key == "clip_output_files":
+        elif key in {"clip_output_files", "h3_scene_output_files"}:
             result[key] = {
                 str(index): safe
                 for index, item in dict(value or {}).items()

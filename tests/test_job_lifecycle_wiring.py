@@ -1988,6 +1988,7 @@ class TestJobLifecycleWiring(unittest.TestCase):
               "_queue_recovery_checkpoint_unit": lambda *_args, **_kwargs: events.append("checkpoint") or {"unit_id": "unit"},
               "h3_delivery_request": False, "h3_copy_on_write_delivery": False,
               "h3_delivery_native_source": False, "task_sidecar_params": {},
+              "_assemble_director_scene_outputs": lambda _variant: events.append("assemble"),
               "gen": {}, "clip_output_files": {}}
         exec(compile(ast.fix_missing_locations(ast.Module(body=[callback], type_ignores=[])), "launch.py", "exec"), ns)
         for wrong in (dict(expected, index=1), dict(expected, index=-1), dict(expected, index=True),
@@ -1996,7 +1997,7 @@ class TestJobLifecycleWiring(unittest.TestCase):
                 ns[callback.name]("staging/native.mp4", wrong)
         self.assertEqual(events, [])
         self.assertEqual(ns[callback.name]("staging/native.mp4", expected), os.path.join("project", "native.mp4"))
-        self.assertEqual(events, ["sidecar", "promote", "checkpoint"])
+        self.assertEqual(events, ["sidecar", "promote", "checkpoint", "assemble"])
         self.assertEqual(ns["clip_output_files"], {0: "native.mp4"})
 
     def test_segment_without_producer_evidence_fails_before_checkpoint(self):

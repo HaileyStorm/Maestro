@@ -1244,6 +1244,20 @@ def _director_clip_video_artifacts(output_files: list[str], params: dict, clip_c
         # also needs removal before its raw child can become that scene's file.
         if len(members) == 1 and members[0]["boundary_discard_frames"] == 0:
             slots[owner] = members[0]["filename"]
+    scene_owners = set()
+    for index, filename in getattr(output_files, "h3_scene_output_files", {}).items():
+        try:
+            owner = int(index)
+        except (TypeError, ValueError, OverflowError) as error:
+            raise ValueError("H3 assembled scene index is invalid") from error
+        if (isinstance(index, bool) or str(owner) != str(index) or not 0 <= owner < clip_count
+                or owner in scene_owners or filename not in output_files
+                or not isinstance(filename, str) or not filename or os.path.basename(filename) != filename
+                or os.path.splitext(filename)[1].lower() not in {".mp4", ".webm", ".mkv", ".mov"}
+                or not all(member["filename"] for member in groups[owner])):
+            raise ValueError("H3 assembled scene ownership is incomplete")
+        slots[owner] = filename
+        scene_owners.add(owner)
     return {"_clip_video_files": slots, "_h3_clip_video_groups": groups}
 
 
@@ -3563,9 +3577,10 @@ def init(
 class _DirectorOutputs(list):
     """List-compatible outputs that retain exact Director clip ownership."""
 
-    def __init__(self, values, clip_output_files=None):
+    def __init__(self, values, clip_output_files=None, h3_scene_output_files=None):
         super().__init__(values)
         self.clip_output_files = dict(clip_output_files or {})
+        self.h3_scene_output_files = dict(h3_scene_output_files or {})
 
 
 class _GenerationTimeoutError(RuntimeError):
@@ -3587,8 +3602,9 @@ def _director_job_outputs(job: dict) -> _DirectorOutputs:
     snapshot = snapshot_job(job)
     output_files = list(snapshot.get("output_files") or [])
     clip_outputs = snapshot.get("clip_output_files") or {}
+    scenes = snapshot.get("h3_scene_output_files") or {}
     if not isinstance(clip_outputs, dict) or not clip_outputs:
-        return _DirectorOutputs(output_files)
+        return _DirectorOutputs(output_files, h3_scene_output_files=scenes)
 
     indexed = []
     for index, filename in clip_outputs.items():
@@ -3598,12 +3614,16 @@ def _director_job_outputs(job: dict) -> _DirectorOutputs:
             continue
     indexed.sort(key=lambda item: item[0])
     collapsed = [filename for _, filename in indexed if filename]
+    for filename in scenes.values():
+        if filename and filename not in collapsed:
+            collapsed.append(filename)
     join_output = snapshot.get("join_output_file")
     if join_output and join_output not in collapsed:
         collapsed.append(join_output)
     return _DirectorOutputs(
         collapsed or output_files,
         {index: filename for index, filename in indexed if filename},
+        scenes,
     )
 
 
@@ -3662,6 +3682,7 @@ def _recovered_child_outputs(
     return _DirectorOutputs(
         outputs,
         verified.get("clip_output_files") or {},
+        verified.get("h3_scene_output_files") or {},
     )
 
 
@@ -4086,6 +4107,7 @@ def _submit_and_wait(
                 return _DirectorOutputs(
                     completed_outputs,
                     verified.get("clip_output_files") or {},
+                    verified.get("h3_scene_output_files") or {},
                 )
             return outputs
         if j["status"] == "cancelled":

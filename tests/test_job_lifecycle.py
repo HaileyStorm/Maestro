@@ -1381,6 +1381,28 @@ class TestJobLifecycle(unittest.TestCase):
         )
         self.assertEqual(job["clip_output_files"], {"0": "clip-2.mp4"})
 
+    def test_scene_output_publication_is_durable_and_does_not_count_as_a_final(self):
+        job = {**_job(), "execution_attempt": 1, "output_files": [], "artifact_files": [], "params": {"_h3_longform": {"clip_count": 2}}}
+        self.assertTrue(try_start(job))
+        def offline(*args, **kwargs):
+            raise OSError("journal offline")
+        configure_durability_hook(offline)
+        with self.assertRaisesRegex(OSError, "offline"):
+            record_job_outputs(job, ["scene.mp4"], h3_scene_output_files={0: "scene.mp4"}, final_output_files=[])
+        self.assertNotIn("h3_scene_output_files", job)
+        self.assertEqual(job["artifact_files"], [])
+        configure_durability_hook(None)
+        self.assertEqual(record_job_outputs(job, ["scene.mp4"],
+            h3_scene_output_files={0: "scene.mp4"}, final_output_files=[]), [])
+        snapshot = snapshot_job(job)
+        self.assertEqual(snapshot["h3_scene_output_files"], {"0": "scene.mp4"})
+        snapshot["h3_scene_output_files"]["0"] = "changed.mp4"
+        self.assertEqual(job["h3_scene_output_files"], {"0": "scene.mp4"})
+        self.assertEqual(job["artifact_files"], ["scene.mp4"])
+        request_cancel(job)
+        record_job_outputs(job, ["late.mp4"], h3_scene_output_files={1: "late.mp4"}, final_output_files=[], expected_execution_attempt=1)
+        self.assertEqual(job["h3_scene_output_files"], {"0": "scene.mp4"})
+
     def test_segmented_h3_counts_only_joined_variants_and_keeps_lineage(self):
         job = {
             **_job(),
