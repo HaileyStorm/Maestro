@@ -181,9 +181,19 @@ def _stream(command, limit, consume, cancel_check):
             if count > limit:
                 raise H3GalleryAVGuideError("Guide decoded media exceeds its limit")
             consume(chunk)
+        # EOF can precede decoder exit. Keep Stop effective during teardown.
+        while True:
+            _check(cancel_check)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise H3GalleryAVGuideError("Guide decoder timed out")
+            try:
+                returncode = process.wait(timeout=min(0.05, remaining))
+                break
+            except subprocess.TimeoutExpired:
+                continue
         _check(cancel_check)
-        remaining = max(0.001, deadline - time.monotonic())
-        if process.wait(timeout=remaining) != 0:
+        if returncode != 0:
             raise H3GalleryAVGuideError("Guide media cannot be decoded")
         return count
     except (OSError, subprocess.TimeoutExpired):

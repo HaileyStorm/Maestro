@@ -242,6 +242,34 @@ class GalleryAVGuideTests(unittest.TestCase):
         with patch.object(av, "MAX_SAMPLES", 100), self.assertRaisesRegex(av.H3GalleryAVGuideError, "exceeds its limit"):
             av.probe_gallery_av(str(self.audio), "audio")
 
+    def test_cancellation_after_pipe_eof_reaps_decoder_instead_of_succeeding(self):
+        real_popen = subprocess.Popen
+        cancelled = threading.Event()
+        children = []
+
+        def spawn(command, **kwargs):
+            child = real_popen(command, **kwargs)
+            children.append(child)
+            real_wait = child.wait
+
+            def cancel_during_exit_wait(*args, **wait_kwargs):
+                cancelled.set()
+                return real_wait(*args, **wait_kwargs)
+
+            child.wait = cancel_during_exit_wait
+            return child
+
+        with patch.object(av.subprocess, "Popen", side_effect=spawn):
+            with self.assertRaises(av.H3GalleryAVGuideCancelled):
+                av._stream(
+                    [sys.executable, "-B", "-c", "import os,time; os.close(1); time.sleep(0.7)"],
+                    64, lambda chunk: None, cancelled.is_set,
+                )
+        self.assertTrue(cancelled.is_set())
+        self.assertEqual(len(children), 1)
+        self.assertIsNotNone(children[0].returncode)
+        self.assertFalse(any(thread.name == "h3-av-pipe" for thread in threading.enumerate()))
+
     def test_links_fifo_and_wrong_encoded_type_fail_closed_without_source_changes(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
