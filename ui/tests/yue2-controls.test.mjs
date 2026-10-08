@@ -85,14 +85,15 @@ const componentBundle = await build({
           import { useState, useLayoutEffect } from 'react';
           const listeners = new Set();
           const subscribe = listener => { listeners.add(listener); return () => listeners.delete(listener); };
-          export const account = { epoch: 0, advance() { this.epoch++; for (const listener of listeners) listener(); } };
+          export const account = { epoch: 0, context: undefined, advance() { this.epoch++; for (const listener of listeners) listener(); }, setContext(context) { this.context = context; for (const listener of listeners) listener(); } };
           export const currentAccountIdentityEpoch = () => account.epoch;
           export const useStore = selector => {
-            const [value, setValue] = useState(() => selector({}));
-            useLayoutEffect(() => subscribe(() => setValue(selector({}))), [selector]);
+            const [value, setValue] = useState(() => selector(useStore.getState()));
+            useLayoutEffect(() => subscribe(() => setValue(selector(useStore.getState()))), [selector]);
             return value;
           };
           useStore.subscribe = subscribe;
+          useStore.getState = () => ({ accountContext: account.context === undefined ? { enabled: true, authenticated: true, account: { id: 'owner-' + account.epoch } } : account.context });
         `,
         api: `
           import { account } from '../../stores/useStore';
@@ -127,7 +128,7 @@ const componentBundle = await build({
           export function cancelYue2Training(id, workspace) {
             const pending = { ...deferred(), id, workspace }; control.trainingCancels.push(pending); return pending.promise;
           }
-          export async function fetchYue2Plan(id) { return { reviewable: true, abc: 'X:1\\n% ' + id + '\\nK:C\\nC4|' }; }
+          export async function fetchYue2Plan(id) { if (control.nextPlan) { const p = control.nextPlan; control.nextPlan = null; return p.promise; } return { reviewable: true, abc: 'X:1\\n% ' + id + '\\nK:C\\nC4|' }; }
           export function submitYue2(input) {
             const pending = { ...deferred(), input }; control.submits.push(pending); return pending.promise;
           }
@@ -172,10 +173,16 @@ function deferred() {
   const promise = new Promise((done, fail) => { resolve = done; reject = fail })
   return { promise, resolve, reject }
 }
-async function componentFixture({ review = false } = {}) {
+async function componentFixture({ review = false, reload = false, accountContext } = {}) {
+  if (!reload) {
+    const entries = new Map()
+    globalThis.sessionStorage = { getItem: key => entries.get(key) ?? null,
+      setItem: (key, value) => entries.set(key, value), removeItem: key => entries.delete(key) }
+  }
   const { Yue2Controls, createHarness, control, account } = await import(
     `data:text/javascript;base64,${Buffer.from(componentBundle.outputFiles[0].text).toString('base64')}#yue2-${++componentRealm}`,
   )
+  if (accountContext !== undefined) account.setContext(accountContext)
   const props = { workspace: 'A', description: 'A local song', style: 'pop', lyrics: 'Rain falls',
     instrumental: false, onStyle() {}, onLyrics() {} }
   if (review) control.libraries.A = [{ id: 'old-take', project: 'A', title: 'Old take', status: 'needs-review' }]
@@ -455,6 +462,107 @@ const refreshButton = h => {
   return node
 }
 
+test('YuE2 reload restores an uncertain identity and adopts only its exact canonical take without POST', async () => {
+  const original = await componentFixture()
+  button(original.h, 'Generate with YuE2').props.onClick(); original.h.flush()
+  const request = original.control.submits[0]
+  request.reject(new Error('Acknowledgement lost after acceptance')); await settle(original.h)
+  original.h.unmount()
+  const reloaded = await componentFixture({ reload: true })
+  assert.equal(button(reloaded.h, 'Generate with YuE2').props.disabled, true)
+  assert.match(textContent(reloaded.h.tree), /not yet confirmed/)
+  assert.equal(reloaded.control.submits.length, 0)
+  reloaded.control.libraries.A = [submittedTrack(request, { status: 'completed' })]
+  refreshButton(reloaded.h).props.onClick(); await settle(reloaded.h)
+  assert.doesNotMatch(textContent(reloaded.h.tree), /not yet confirmed/)
+  assert.equal(reloaded.control.submits.length, 0)
+  assert.match(textContent(reloaded.h.tree), /Accepted take/)
+})
+
+test('YuE2 reload before an acknowledgement allows only an explicit original-input retry', async () => {
+  const original = await componentFixture()
+  button(original.h, 'Generate with YuE2').props.onClick(); original.h.flush()
+  const request = original.control.submits[0], frozen = JSON.stringify(request.input)
+  original.h.unmount()
+  const reloaded = await componentFixture({ reload: true })
+  assert.equal(reloaded.control.submits.length, 0)
+  reloaded.h.render({ ...reloaded.h.props, lyrics: 'New draft', style: 'rock' }); reloaded.h.flush()
+  button(reloaded.h, 'Generate with YuE2').props.onClick()
+  assert.equal(reloaded.control.submits.length, 0)
+  button(reloaded.h, 'Retry this submission').props.onClick()
+  assert.equal(JSON.stringify(reloaded.control.submits[0].input), frozen)
+  reloaded.control.submits[0].reject(new Error('Retry also lost')); await settle(reloaded.h)
+  assert.equal(button(reloaded.h, 'Generate with YuE2').props.disabled, true)
+})
+
+test('YuE2 scope changes clear an existing library and retire a delayed score review without a POST', async () => {
+  const { h, control, account } = await componentFixture({ review: true })
+  const plan = deferred(); control.nextPlan = plan
+  control.libraries.A = [{ id: 'new-review', project: 'A', title: 'Private take', status: 'needs-review' }]
+  refreshButton(h).props.onClick(); await settle(h)
+  assert.match(textContent(h.tree), /Private take/)
+  const nextLibrary = deferred(); control.nextLibrary = nextLibrary
+  account.setContext(null); await settle(h)
+  assert.doesNotMatch(textContent(h.tree), /Private take/)
+  assert.equal(control.submits.length, 0)
+  h.mutations.length = 0
+  plan.resolve({ reviewable: true, abc: 'X:77\nK:C\nC4|' }); await settle(h)
+  assert.deepEqual(h.mutations, [])
+  assert.ok(!findNode(h.tree, node => node.type === 'textarea' && node.props.value === 'X:77\nK:C\nC4|'))
+})
+
+test('YuE2 persisted receipts use stable account identity across fresh page epochs', async () => {
+  const original = await componentFixture()
+  button(original.h, 'Generate with YuE2').props.onClick(); original.h.flush()
+  original.control.submits[0].reject(new Error('Lost acknowledgement')); await settle(original.h)
+  original.h.unmount()
+  const other = await componentFixture({ reload: true, accountContext: { enabled: true, authenticated: true, account: { id: 'different-owner' } } })
+  assert.equal(other.account.epoch, 0)
+  assert.equal(button(other.h, 'Generate with YuE2').props.disabled, false)
+  assert.doesNotMatch(textContent(other.h.tree), /not yet confirmed/)
+  other.h.unmount()
+  const returned = await componentFixture({ reload: true })
+  assert.equal(returned.account.epoch, 0)
+  assert.equal(button(returned.h, 'Generate with YuE2').props.disabled, true)
+  assert.match(textContent(returned.h.tree), /not yet confirmed/)
+  assert.equal(returned.control.submits.length, 0)
+})
+
+test('YuE2 unresolved account projection retires pending submit and library callbacks without discarding recovery', async () => {
+  const { h, control, account } = await componentFixture()
+  button(h, 'Generate with YuE2').props.onClick(); h.flush()
+  const pending = control.submits[0]
+  const library = deferred(); control.nextLibrary = library
+  refreshButton(h).props.onClick()
+  account.setContext(null); await settle(h)
+  assert.match(textContent(h.tree), /recovery could not be read/)
+  h.mutations.length = 0
+  pending.resolve(acknowledgement(pending)); library.resolve({ tracks: [submittedTrack(pending)] })
+  await settle(h)
+  assert.deepEqual(h.mutations, [])
+  button(h, 'Generate with YuE2').props.onClick()
+  assert.equal(control.submits.length, 1)
+  account.setContext(undefined); await settle(h)
+  assert.equal(button(h, 'Generate with YuE2').props.disabled, true)
+  assert.match(textContent(h.tree), /not yet confirmed/)
+})
+
+test('YuE2 storage failures and malformed receipts refuse submission before POST', async () => {
+  let nested = {}
+  for (let i = 0; i < 30; i++) nested = { nested }
+  for (const storage of [
+    { getItem: () => null, setItem: () => { throw new Error('Quota') } },
+    { getItem: () => '{bad', setItem() {} },
+    { getItem: () => JSON.stringify({ A: { payload: { workspace: 'A', requestId: 'maestro-uncertain', nested } } }), setItem() {} },
+    { getItem: () => { throw new Error('Denied') }, setItem() {} },
+  ]) {
+    const { h, control } = await componentFixture()
+    globalThis.sessionStorage = storage
+    button(h, 'Generate with YuE2').props.onClick(); await settle(h)
+    assert.equal(control.submits.length, 0)
+  }
+})
+
 test('YuE2 coalesces rapid clicks before render and freezes the entire retry payload', async () => {
   const { h, control } = await componentFixture()
   const click = button(h, 'Generate with YuE2').props.onClick
@@ -640,7 +748,7 @@ test('YuE2 account changes exclude old intents and fence late submit and library
   assert.equal(control.submits[2].input.requestId, current.input.requestId)
 })
 
-test('YuE2 account changes while unmounted discard the old submission before remount', async () => {
+test('YuE2 account changes while unmounted exclude the old submission before remount', async () => {
   const { h, control, account, remount } = await componentFixture()
   button(h, 'Generate with YuE2').props.onClick(); h.flush()
   const old = control.submits[0]
@@ -663,6 +771,11 @@ test('YuE2 bounded intent store fails new projects closed and never evicts unres
     control.submits[i].reject(new Error('Unconfirmed'))
     await settle(h)
   }
+  const reloaded = await componentFixture({ reload: true })
+  await reloaded.transition('overflow')
+  button(reloaded.h, 'Generate with YuE2').props.onClick(); await settle(reloaded.h)
+  assert.equal(reloaded.control.submits.length, 0)
+  assert.match(textContent(reloaded.h.tree), /Confirm an unresolved YuE2 submission/)
   await transition('overflow')
   button(h, 'Generate with YuE2').props.onClick(); await settle(h)
   assert.equal(control.submits.length, 16)
