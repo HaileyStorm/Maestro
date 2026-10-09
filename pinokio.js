@@ -112,19 +112,41 @@ module.exports = {
             ? local.$share.cloudflare[local.url]
             : undefined
           const quick = local.quick_share_url || capturedQuick || (local.share_kind === "quick" ? local.share_url : undefined)
+          const healthStarted = typeof local.share_health_checked_at === 'number'
+          const healthCurrent = healthStarted &&
+            Date.now() - local.share_health_checked_at >= 0 &&
+            Date.now() - local.share_health_checked_at <= 360000 &&
+            local.share_health_quick_url === quick && capturedQuick === quick
+          const quickHealth = healthCurrent ? local.share_health_quick : 'unknown'
+          const stableHealth = healthCurrent && local.share_health_stable_url === stable
+            ? local.share_health_stable : 'unknown'
+          const usable = (health) => !healthStarted || health === 'healthy' || health === 'checking'
           const remoteMenu = []
-          if (stable) {
+          if (stable && usable(stableHealth)) {
             remoteMenu.push({
               icon: "fa-brands fa-cloudflare",
               text: `<div><strong>Open / copy Cloudflare stable URL</strong><div>${stable}</div></div>`,
               href: stable,
             })
           }
-          if (quick && quick !== stable) {
+          if (quick && quick !== stable && usable(quickHealth)) {
             remoteMenu.push({
               icon: "fa-brands fa-cloudflare",
               text: `<div><strong>Open / copy direct Quick Tunnel URL</strong><div>${quick}</div><div>Bypasses the Worker proxy hop; use if the Worker quota or stable route is unavailable.</div></div>`,
               href: quick,
+            })
+          }
+          if (healthStarted && (!usable(quickHealth) || (stable && !usable(stableHealth)))) {
+            remoteMenu.push({
+              icon: 'fa-solid fa-triangle-exclamation',
+              text: quickHealth === 'healthy'
+                ? 'Cloudflare stable URL is unavailable · Use the direct Quick Tunnel above'
+                : stableHealth === 'healthy'
+                  ? 'Direct Quick Tunnel is unavailable · Use the Cloudflare stable URL above'
+                : quickHealth === 'unavailable' && backendAlive
+                  ? 'Cloudflare connection is unavailable · Local Web UI still works · Open terminal'
+                  : 'Cloudflare connection could not be verified · Open terminal',
+              href: 'start.js',
             })
           }
           if (!backendAlive) {

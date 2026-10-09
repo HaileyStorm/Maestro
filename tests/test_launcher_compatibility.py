@@ -7,6 +7,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -208,6 +209,54 @@ Promise.resolve(launcher.menu({}, info))
         self.assertIn("stable route is unavailable", quick_item["text"])
         self.assertNotIn("100 MB", quick_item["text"])
         self.assertNotIn("upload", quick_item["text"].lower())
+
+    def test_public_health_warning_preserves_local_access_and_direct_fallback(self):
+        local_url = "http://127.0.0.1:7860"
+        quick = "https://current-session.trycloudflare.com"
+        stable = "https://maestro.example.workers.dev"
+        state = {
+            "url": local_url, "share_url": stable, "share_kind": "stable",
+            "quick_share_url": quick, "$share": {"cloudflare": {local_url: quick}},
+            "share_health_quick_url": quick, "share_health_stable_url": stable,
+            "share_health_checked_at": int(time.time() * 1000),
+            "share_health_quick": "healthy", "share_health_stable": "unavailable",
+        }
+        menu = self._render_launcher_menu(running={"start.js": True},
+                                         locals_by_script={"start.js": state})
+        hrefs = [item.get("href") for item in menu]
+        self.assertIn(local_url, hrefs)
+        self.assertIn(quick, hrefs)
+        self.assertNotIn(stable, hrefs)
+        self.assertTrue(any("stable URL is unavailable" in item.get("text", "") for item in menu))
+        state.update(share_health_quick="unavailable", share_health_stable="healthy")
+        menu = self._render_launcher_menu(running={"start.js": True},
+                                         locals_by_script={"start.js": state})
+        self.assertIn(stable, [item.get("href") for item in menu])
+        self.assertTrue(any("Use the Cloudflare stable URL" in item.get("text", "") for item in menu))
+        state["share_health_stable"] = "unavailable"
+        for quick_health, timestamp, binding in (
+            ("unavailable", state["share_health_checked_at"], quick),
+            ("healthy", int((time.time() - 400) * 1000), quick),
+            ("healthy", state["share_health_checked_at"], "https://old.trycloudflare.com"),
+        ):
+            with self.subTest(quick_health=quick_health, timestamp=timestamp, binding=binding):
+                state.update(share_health_quick=quick_health,
+                             share_health_checked_at=timestamp, share_health_quick_url=binding)
+                menu = self._render_launcher_menu(running={"start.js": True},
+                                                 locals_by_script={"start.js": state})
+                hrefs = [item.get("href") for item in menu]
+                self.assertIn(local_url, hrefs)
+                self.assertNotIn(quick, hrefs)
+                self.assertNotIn(stable, hrefs)
+        state.update(share_health_quick="healthy", share_health_stable="healthy",
+                     share_health_checked_at=int(time.time() * 1000), share_health_quick_url=quick)
+        for captured in ({}, {local_url: "https://rotated.trycloudflare.com"}):
+            state["$share"] = {"cloudflare": captured}
+            menu = self._render_launcher_menu(running={"start.js": True},
+                                             locals_by_script={"start.js": state})
+            hrefs = [item.get("href") for item in menu]
+            self.assertNotIn(quick, hrefs)
+            self.assertNotIn(stable, hrefs)
 
     def test_quick_tunnel_is_shown_independently_without_stable_share(self):
         local_url = "http://127.0.0.1:7860"
@@ -922,6 +971,27 @@ Promise.resolve(build({port: async () => 7860, envs}))
                 self.assertEqual(backend["path"], "app")
                 self.assertEqual(backend["env"]["MAESTRO_ACCOUNTS_ENABLED"], "")
                 self.assertEqual(backend["env"]["MAESTRO_ACCOUNT_BOOTSTRAP_ENABLED"], "")
+
+    def test_public_health_monitor_preserves_worker_periodic_request_budget(self):
+        definition = self._load_start_with_environment(
+            "PINOKIO_SHARE_CLOUDFLARE=true\nPINOKIO_STABLE_SHARE_URL=https://maestro.example.workers.dev\n",
+            {},
+        )
+        scheduled = next(
+            step["params"]["share_health_next_check"]
+            for step in definition["run"]
+            if "share_health_checked_at" in step.get("params", {})
+        )
+        expression = scheduled.removeprefix("{{").removesuffix("}}")
+        delay = int(subprocess.run(
+            ["node", "-e", "const Date={now:()=>0}; process.stdout.write(String(eval(process.argv[1])))", expression],
+            capture_output=True, text=True, check=True, timeout=10,
+        ).stdout)
+        self.assertGreater(delay, 0)
+        # The accepted one-running/ten-queued browser bound is 59,040/day.
+        # Each periodic stable check adds /direct, /health and /ready.
+        checks_per_day = (86_400_000 + delay - 1) // delay
+        self.assertLessEqual(59_040 + 3 * checks_per_day, 60_000)
 
     def test_app_cloudflare_true_overrides_global_false_for_delayed_registration(self):
         definition = self._load_start_with_environment(

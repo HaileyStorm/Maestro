@@ -2055,5 +2055,100 @@ class StableShareSourceContracts(unittest.TestCase):
         self.assertNotIn("PINOKIO_STABLE_SHARE_UPDATE_SECRET=s", environment)
 
 
+class TestPublicShareConnectivity(unittest.TestCase):
+    def setUp(self):
+        _load_script_module("share_health_watch_dependency", WATCH_HELPER_PATH)
+        self.helper = _load_script_module(
+            "maestro_share_health_test", ROOT / "app/scripts/check_share_health.py",
+        )
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.state = Path(self.directory.name) / "health.json"
+        self.clock = 1000.0
+        self.local = "http://127.0.0.1:7860"
+        self.quick = "https://live-process-stale-url.trycloudflare.com"
+        self.stable = "https://maestro.example.workers.dev"
+
+    def check(self, *, quick_ready=False, stable_ready=False, local_ready=True,
+              quick=None, stable=None):
+        return self.helper.check_share_health(
+            self.local, quick or self.quick, stable if stable is not None else self.stable,
+            state_file=self.state, now=lambda: self.clock,
+            probe=lambda origin: local_ready if origin == self.local else quick_ready,
+            stable_probe=lambda *_args, **_kwargs: stable_ready,
+        )
+
+    def test_alive_tunnel_with_unchanged_url_is_reported_after_bounded_failures(self):
+        # URL publication/process survival do not substitute for public probes.
+        self.assertEqual(self.check(), ("checking", "checking"))
+        self.clock += 301
+        self.assertEqual(self.check(), ("checking", "checking"))
+        self.clock += 301
+        self.assertEqual(self.check(), ("unavailable", "unavailable"))
+        self.clock += 301
+        self.assertEqual(self.check(quick_ready=True, stable_ready=True), ("healthy", "healthy"))
+        self.clock += 301
+        self.assertEqual(self.check(), ("checking", "checking"))
+
+    def test_short_reconnect_and_rapid_failures_do_not_report_disconnection(self):
+        for _ in range(5):
+            self.assertEqual(self.check(), ("checking", "checking"))
+            self.clock += 1
+        self.assertEqual(self.check(quick_ready=True, stable_ready=True), ("healthy", "healthy"))
+
+    def test_stable_failure_preserves_healthy_direct_tunnel(self):
+        for _ in range(2):
+            self.check(quick_ready=True)
+            self.clock += 301
+        self.assertEqual(self.check(quick_ready=True), ("healthy", "unavailable"))
+
+    def test_rotation_and_stale_observation_reset_failure_history(self):
+        for _ in range(2):
+            self.check()
+            self.clock += 301
+        self.assertEqual(self.check(), ("unavailable", "unavailable"))
+        self.clock += 301
+        rotated = "https://replacement.trycloudflare.com"
+        self.assertEqual(self.check(quick=rotated), ("checking", "checking"))
+        self.clock += 361
+        self.assertEqual(self.check(quick=rotated), ("checking", "checking"))
+
+    def test_local_recovery_is_unknown_and_does_not_accumulate_tunnel_failures(self):
+        for _ in range(4):
+            self.assertEqual(self.check(local_ready=False), ("unknown", "unknown"))
+            self.clock += 301
+        self.assertEqual(self.check(), ("checking", "checking"))
+
+    def test_malformed_owned_receipt_and_absent_stable_are_bounded(self):
+        self.state.write_text('{"quick":null}', encoding="utf-8")
+        self.state.chmod(0o600)
+        self.assertEqual(self.check(stable=""), ("checking", "absent"))
+        self.assertEqual(self.state.stat().st_mode & 0o777, 0o600)
+
+    def test_arbitrary_public_origin_is_rejected_before_any_request(self):
+        with self.assertRaises(ValueError):
+            self.check(quick="https://unrelated.example")
+
+    def test_html_login_page_and_unready_app_are_not_healthy(self):
+        class Response:
+            status = 200
+            def __init__(self, body): self.body = body
+            def __enter__(self): return self
+            def __exit__(self, *_args): pass
+            def read(self, size): return self.body[:size]
+        calls = []
+        def html_page(request, timeout):
+            calls.append(request.full_url)
+            self.assertEqual(timeout, 3)
+            return Response(b"<html>Sign in</html>")
+        self.assertFalse(self.helper.probe_app(self.quick, open_request=html_page))
+        self.assertEqual(calls, [self.quick + "/health"])
+        def unready(request, timeout):
+            response = Response(b'{"status":"ok"}')
+            if request.full_url.endswith("/ready"): response.status = 503
+            return response
+        self.assertFalse(self.helper.probe_app(self.quick, open_request=unready))
+
+
 if __name__ == "__main__":
     unittest.main()

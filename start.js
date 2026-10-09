@@ -436,9 +436,43 @@ module.exports = async (kernel) => {
         method: "local.set",
         params: {
           observed_quick_share_url: "{{local.$share && local.$share.cloudflare && local.$share.cloudflare[local.url] ? local.$share.cloudflare[local.url] : ''}}",
+          share_health_probe_pending: "{{!!(local.quick_share_url && local.$share && local.$share.cloudflare && local.$share.cloudflare[local.url] === local.quick_share_url && (!local.share_health_next_check || Date.now() >= local.share_health_next_check))}}",
           share_rotation_published: false,
           share_rotation_pending: "{{!!(local.$share && local.$share.cloudflare && local.$share.cloudflare[local.url] && local.$share.cloudflare[local.url] !== local.quick_share_url)}}",
           share_tunnel_missing: "{{!!(local.quick_share_url && !(local.$share && local.$share.cloudflare && local.$share.cloudflare[local.url]))}}"
+        }
+      },
+      {
+        when: cloudflareEnabled ? "{{local.share_health_probe_pending}}" : false,
+        method: "shell.run",
+        params: {
+          env: runtimeSecretEnv,
+          venv: selectedEnv,
+          venv_python: selectedPython,
+          path: "app",
+          message: [
+            "python scripts/check_share_health.py --origin {{local.url}} --quick-url {{local.quick_share_url}} {{local.share_kind === 'stable' && local.share_url ? '--stable-url ' + local.share_url : ''}}"
+          ],
+          on: [{
+            "event": "/MAESTRO_SHARE_HEALTH (https:\/\/[^ ]+) ([^ ]+) (healthy|checking|unavailable|unknown) (healthy|checking|unavailable|unknown|absent)/",
+            "kill": true
+          }, {
+            "event": "/MAESTRO_SHARE_HEALTH_FAILED ([a-z_]+)/",
+            "kill": true
+          }]
+        }
+      },
+      {
+        when: cloudflareEnabled ? "{{local.share_health_probe_pending}}" : false,
+        method: "local.set",
+        params: {
+          share_health_quick_url: "{{local.quick_share_url}}",
+          share_health_stable_url: "{{local.share_kind === 'stable' ? local.share_url : ''}}",
+          share_health_quick: "{{input.event && input.event[1] === local.quick_share_url ? input.event[3] : 'unknown'}}",
+          share_health_stable: "{{input.event && input.event[1] === local.quick_share_url && input.event[2] === local.share_url ? input.event[4] : 'unknown'}}",
+          share_health_checked_at: "{{Date.now()}}",
+          share_health_next_check: "{{Date.now() + 300000}}",
+          share_health_probe_pending: false
         }
       },
       {
@@ -472,6 +506,7 @@ module.exports = async (kernel) => {
           quick_share_url: "",
           share_url: "",
           share_kind: "",
+          share_health_next_check: 0,
           share_tunnel_missing: false,
           sharing: "Cloudflare tunnel is reconnecting…"
         }
@@ -569,6 +604,7 @@ module.exports = async (kernel) => {
         method: "local.set",
         params: {
           quick_share_url: "{{local.observed_quick_share_url}}",
+          share_health_next_check: 0,
           share_url: "{{input.event[1]}}",
           share_kind: "{{input.event[2]}}",
           share_rotation_published: false,
