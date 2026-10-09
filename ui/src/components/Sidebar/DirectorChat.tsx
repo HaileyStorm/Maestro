@@ -757,13 +757,6 @@ export function DirectorChat() {
         <DirectorQueueAdmissionNotice queueAdmission={queueAdmission}
           checkQueueAdmission={checkQueueAdmission} retryQueueAdmission={retryQueueAdmission} />
 
-        {/* Welcome message */}
-        <SystemBubble>
-          <p className="text-xs text-text-secondary">
-            Welcome to Maestro Director. Choose a Skill below to get started.
-          </p>
-        </SystemBubble>
-
         {preparationStatus && (
           preparationStatus.actions.length > 0
           || (preparationStatus.status === 'completed' && preparationStatus.phase === 'structure_completed')
@@ -1525,10 +1518,10 @@ function SkillSelector({ onSelect }: { onSelect: (skill: DirectorSkill) => void 
   ]
 
   return (
-    <fieldset aria-label="Director Skills" className="rounded-xl border border-border bg-bg-tertiary/20 p-2">
+    <fieldset aria-label="Director Skills" aria-describedby="director-skills-guidance" className="rounded-xl border border-border bg-bg-tertiary/20 p-2">
       <legend className="px-1 text-[11px] font-medium uppercase tracking-wider text-text-secondary">Skills</legend>
-      <p id="director-skills-guidance" className="mb-2 text-[9px] text-text-muted">Choose the production workflow Director should guide.</p>
-      <div role="group" aria-labelledby="director-skills-guidance" className="grid grid-cols-2 gap-2">
+      <p id="director-skills-guidance" className="mb-2 text-[10px] text-text-secondary">Choose a Skill to get started.</p>
+      <div className="grid grid-cols-2 gap-2">
       {skills.map((s) => (
         <button
           type="button"

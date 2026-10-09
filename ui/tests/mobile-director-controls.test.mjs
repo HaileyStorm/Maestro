@@ -1,8 +1,51 @@
 import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
+import { createRequire } from 'node:module'
 import test from 'node:test'
+import ts from 'typescript'
+import { renderToStaticMarkup } from 'react-dom/server'
+import { Music, Film, Mic, Sparkles } from 'lucide-react'
 
 const directorUrl = new URL('../src/components/Sidebar/DirectorChat.tsx', import.meta.url)
+
+test('Director Skills guidance describes the rendered chooser beside its choices', async () => {
+  const source = await readFile(directorUrl, 'utf8')
+  const ast = ts.createSourceFile('DirectorChat.tsx', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX)
+  const selector = ast.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === 'SkillSelector')
+  assert.ok(selector)
+  const { outputText } = ts.transpileModule(selector.getText(ast) + '\nexports.Selector = SkillSelector', {
+    compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX },
+  })
+  const exports = {}
+  new Function('exports', 'require', 'Music', 'Film', 'Mic', 'Sparkles', outputText)(
+    exports, createRequire(import.meta.url), Music, Film, Mic, Sparkles,
+  )
+  const tree = exports.Selector({ onSelect() {} })
+  const html = renderToStaticMarkup(tree)
+  const elements = []
+  function visit(node) {
+    if (!node || typeof node !== 'object') return
+    if (Array.isArray(node)) return node.forEach(visit)
+    elements.push(node)
+    visit(node.props?.children)
+  }
+  visit(tree)
+  const fieldset = html.match(/<fieldset\b[^>]*>([\s\S]*?)<\/fieldset>/)
+  assert.ok(fieldset, 'the choices form one visible accessible group')
+  assert.match(fieldset[0], /aria-label="Director Skills"/)
+  const descriptionId = fieldset[0].match(/aria-describedby="([^"]+)"/)?.[1]
+  assert.ok(descriptionId, 'the chooser announces its guidance')
+  assert.match(fieldset[1], /<legend\b[^>]*>Skills<\/legend>/)
+  const description = elements.find(node => node.props?.id === descriptionId)
+  assert.ok(description, 'the description belongs to the chooser')
+  assert.match(renderToStaticMarkup(description), /Choose a Skill to get started\./)
+  const buttons = elements.filter(node => node.type === 'button')
+  for (const [label, disabled] of [['Music Video', false], ['Short Film', false], ['Video Podcast', true], ['Viral Video', true]]) {
+    const button = buttons.find(node => renderToStaticMarkup(node).includes(`>${label}<`))
+    assert.ok(button, `${label} is visible`)
+    assert.equal(button.props.disabled, disabled, `${label} availability is accurate`)
+  }
+})
 
 function openingTagContaining(source, tagName, marker) {
   const markerIndex = source.indexOf(marker)
