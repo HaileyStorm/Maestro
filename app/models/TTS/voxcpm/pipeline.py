@@ -10,6 +10,7 @@ import numpy as np
 import torch
 
 from shared.utils import files_locator as fl
+from ..voxcpm_handler import _get_voxcpm2_checkpoint_root
 
 from services.tts_script_breakdown import (
     format_voxcpm_turn_text,
@@ -39,7 +40,10 @@ def _output_sample_rate(ckpt_root: str, model: Any = None) -> int:
 
 class VoxCpmPipeline:
     def __init__(self, ckpt_root: Optional[str] = None, device: Optional[str] = None) -> None:
-        self.ckpt_root = ckpt_root or os.path.join(fl.get_download_location(), "voxcpm2")
+        self.ckpt_root = (
+            ckpt_root or _get_voxcpm2_checkpoint_root()
+            or fl.get_download_location("voxcpm2")
+        )
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.model = None
 

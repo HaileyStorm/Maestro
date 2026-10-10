@@ -10,6 +10,28 @@ from .prompt_enhancers import VOXCPM_SCRIPT_PROMPT
 VOXCPM2_MODEL_TYPE = "voxcpm2"
 VOXCPM2_REPO = "openbmb/VoxCPM2"
 VOXCPM2_FOLDER = "voxcpm2"
+VOXCPM2_FILES = (
+    "model.safetensors",
+    "audiovae.pth",
+    "config.json",
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+    "tokenization_voxcpm2.py",
+)
+
+
+def _get_voxcpm2_checkpoint_root():
+    from shared.utils import files_locator as fl
+
+    folder = fl.locate_folder(
+        VOXCPM2_FOLDER, error_if_none=False, required_files=VOXCPM2_FILES,
+    )
+    # The shared locator returns a partial folder as a best-effort fallback.
+    # VoxCPM needs its weights, codec and tokenizer together in one folder.
+    if folder and all(os.path.isfile(os.path.join(folder, name)) for name in VOXCPM2_FILES):
+        return folder
+    return None
 
 
 def _get_voxcpm2_model_def() -> dict:
@@ -59,15 +81,7 @@ def _get_voxcpm2_download_def() -> dict:
         "repoId": VOXCPM2_REPO,
         "sourceFolderList": [""],
         "targetFolderList": [VOXCPM2_FOLDER],
-        "fileList": [[
-            "model.safetensors",
-            "audiovae.pth",
-            "config.json",
-            "tokenizer.json",
-            "tokenizer_config.json",
-            "special_tokens_map.json",
-            "tokenization_voxcpm2.py",
-        ]],
+        "fileList": [list(VOXCPM2_FILES)],
     }
 
 
@@ -116,12 +130,7 @@ class family_handler:
 
     @staticmethod
     def validate_generative_settings(base_model_type, model_def, inputs):
-        from shared.utils import files_locator as fl
-
-        config_path = fl.locate_file(
-            os.path.join(VOXCPM2_FOLDER, "config.json"), error_if_none=False,
-        )
-        if not config_path:
+        if not _get_voxcpm2_checkpoint_root():
             return (
                 "VoxCPM 2 is listed, but its weights are not installed on this "
                 "Maestro yet. Download VoxCPM 2 from the model list, then try again."
@@ -145,10 +154,11 @@ class family_handler:
         profile=0,
         **kwargs,
     ):
+        ckpt_root = _get_voxcpm2_checkpoint_root()
+        if ckpt_root is None:
+            raise RuntimeError("VoxCPM 2 weights are not installed on this Maestro yet.")
         from .voxcpm.pipeline import VoxCpmPipeline
-        from shared.utils import files_locator as fl
 
-        ckpt_root = os.path.join(fl.get_download_location(), VOXCPM2_FOLDER)
         pipeline = VoxCpmPipeline(ckpt_root=ckpt_root).load()
         return pipeline, {"voxcpm": pipeline.model}
 

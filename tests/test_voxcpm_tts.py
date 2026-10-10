@@ -2,8 +2,14 @@
 from __future__ import annotations
 
 import json
+import ast
+import os
+import sys
+import tempfile
+import types
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 _ROOT = Path(__file__).resolve().parents[1]
@@ -12,6 +18,109 @@ _HANDLER = _APP / "models" / "TTS" / "voxcpm_handler.py"
 _DEFAULTS = _APP / "defaults" / "voxcpm2.json"
 _WGP = _APP / "wgp.py"
 _ENHANCERS = _APP / "models" / "TTS" / "prompt_enhancers.py"
+
+
+class VoxCpmModelFolderTests(unittest.TestCase):
+    def setUp(self):
+        if str(_APP) not in sys.path:
+            sys.path.insert(0, str(_APP))
+        from models.TTS import voxcpm_handler
+        from shared.utils import files_locator
+
+        self.handler = voxcpm_handler
+        self.locator = files_locator
+        self.old_roots = list(files_locator.get_checkpoints_paths())
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.addCleanup(files_locator.set_checkpoints_paths, self.old_roots)
+        self.primary = Path(self.temp.name) / "downloads"
+        self.fallback = Path(self.temp.name) / "installed"
+        files_locator.set_checkpoints_paths([str(self.primary), str(self.fallback)])
+
+    def install(self, root, files=None):
+        folder = root / "voxcpm2"
+        folder.mkdir(parents=True, exist_ok=True)
+        if files is None:
+            files = self.handler._get_voxcpm2_download_def()["fileList"][0]
+        for name in files:
+            (folder / name).write_text("disposable model fixture", encoding="utf-8")
+        return folder
+
+    def load_handler(self):
+        # Exercise the actual handler without importing torch or constructing a model.
+        pipeline_module = types.ModuleType("models.TTS.voxcpm.pipeline")
+        package = types.ModuleType("models.TTS.voxcpm")
+        package.__path__ = []
+
+        class Pipeline:
+            def __init__(self, ckpt_root):
+                self.ckpt_root = ckpt_root
+                self.model = object()
+
+            def load(self):
+                return self
+
+        pipeline_module.VoxCpmPipeline = Pipeline
+        with patch.dict(sys.modules, {
+            package.__name__: package, pipeline_module.__name__: pipeline_module,
+        }):
+            return self.handler.family_handler.load_model(
+                None, "voxcpm2", "voxcpm2", {},
+            )
+
+    def pipeline_constructor(self):
+        # Execute the unchanged native constructor body with explicit CPU and a
+        # forbidden CUDA probe; the rest of the model module is never imported.
+        path = _APP / "models" / "TTS" / "voxcpm" / "pipeline.py"
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        cls = next(n for n in tree.body if isinstance(n, ast.ClassDef)
+                   and n.name == "VoxCpmPipeline")
+        ctor = next(n for n in cls.body if isinstance(n, ast.FunctionDef)
+                    and n.name == "__init__")
+        module = ast.Module(body=[ast.ImportFrom(
+            module="__future__", names=[ast.alias(name="annotations")], level=0,
+        ), ctor], type_ignores=[])
+        namespace = dict(vars(self.handler))
+        namespace.update(os=os, fl=self.locator, torch=types.SimpleNamespace(
+            cuda=types.SimpleNamespace(is_available=lambda: self.fail("CUDA probe")),
+        ))
+        exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
+        return type("ConstructorFixture", (), {"__init__": namespace["__init__"]})
+
+    def test_loader_finds_complete_fallback_with_empty_or_partial_primary(self):
+        complete = self.install(self.fallback)
+        for partial in (False, True):
+            with self.subTest(partial_primary=partial):
+                if partial:
+                    self.install(self.primary, ["config.json"])
+                self.assertIsNone(self.handler.family_handler.validate_generative_settings(
+                    "voxcpm2", {}, {},
+                ))
+                pipeline, components = self.load_handler()
+                self.assertEqual(Path(pipeline.ckpt_root), complete)
+                self.assertIs(components["voxcpm"], pipeline.model)
+
+    def test_complete_primary_keeps_priority(self):
+        complete = self.install(self.primary)
+        self.install(self.fallback)
+        pipeline, _ = self.load_handler()
+        self.assertEqual(Path(pipeline.ckpt_root), complete)
+
+    def test_split_incomplete_install_is_rejected_before_pipeline(self):
+        self.install(self.primary, ["config.json", "model.safetensors"])
+        self.install(self.fallback, ["audiovae.pth", "tokenizer.json"])
+        self.assertIsNotNone(self.handler.family_handler.validate_generative_settings(
+            "voxcpm2", {}, {},
+        ))
+        with self.assertRaisesRegex(RuntimeError, "weights are not installed"):
+            self.load_handler()
+
+    def test_default_constructor_uses_fallback_and_preserves_explicit_root(self):
+        complete = self.install(self.fallback)
+        constructor = self.pipeline_constructor()
+        self.assertEqual(Path(constructor(device="cpu").ckpt_root), complete)
+        explicit = str(Path(self.temp.name) / "explicit")
+        self.assertEqual(constructor(ckpt_root=explicit, device="cpu").ckpt_root, explicit)
 
 
 class VoxCpmCatalogTests(unittest.TestCase):
