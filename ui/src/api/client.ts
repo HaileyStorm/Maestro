@@ -25,6 +25,7 @@ import type {
   LoraParameterSchema,
   LoraParameterDefinition,
   LoraParameterValue,
+  LoraParameterSelection,
   ModelManualInstallation,
   ProjectReferenceManagedLayoutAssistMode,
   ProjectReferencePackPlan,
@@ -4310,6 +4311,51 @@ export function validateLoraParameterValues(
         errors.push(`${parameter.label} must follow the published step of ${parameter.step}.`)
       }
     }
+  }
+  return errors
+}
+
+/** Studio uses only the parameters published for generic generation. */
+export function studioLoraParameterSchema(lora: LoraInfo): LoraParameterSchema | undefined {
+  if (!lora.parameter_schema || lora.parameter_execution?.studio_image_generation !== true) return undefined
+  return {
+    ...lora.parameter_schema,
+    parameters: lora.parameter_schema.parameters.filter(parameter => (
+      parameter.scopes.includes('generation') && parameter.roles.length === 0
+    )),
+  }
+}
+
+export function createStudioLoraParameterSelection(lora: LoraInfo): LoraParameterSelection | undefined {
+  const schema = studioLoraParameterSchema(lora)
+  return schema ? {
+    parameter_schema_digest: schema.schema_digest,
+    parameter_values: getLoraParameterDefaults(schema),
+  } : undefined
+}
+
+/** Validate the current exact catalog, never silently migrate saved choices. */
+export function validateStudioLoraParameters(
+  activated: readonly string[],
+  selections: Record<string, LoraParameterSelection> | undefined,
+  catalog: readonly LoraInfo[],
+): string[] {
+  const errors: string[] = []
+  if (selections != null && (typeof selections !== 'object' || Array.isArray(selections))) {
+    return ['Saved LoRA settings are invalid. Remove and add the LoRAs again.']
+  }
+  for (const [filename, selection] of Object.entries(selections ?? {})) {
+    const lora = catalog.find(item => item.filename === filename)
+    const schema = lora && studioLoraParameterSchema(lora)
+    if (!activated.includes(filename)) errors.push(`${filename}: remove settings for this unselected LoRA.`)
+    else if (!schema) errors.push(`${filename}: parameter controls are unavailable for this model and generation path.`)
+    else if (!selection || selection.parameter_schema_digest !== schema.schema_digest) {
+      errors.push(`${filename}: settings changed. Remove and add this LoRA again before generating.`)
+    } else if (typeof selection !== 'object' || Array.isArray(selection)
+      || Object.keys(selection).some(key => !['parameter_schema_digest', 'parameter_values'].includes(key))
+      || !selection.parameter_values || typeof selection.parameter_values !== 'object' || Array.isArray(selection.parameter_values)) {
+      errors.push(`${filename}: saved parameter choices are invalid. Remove and add this LoRA again.`)
+    } else errors.push(...validateLoraParameterValues(schema, selection.parameter_values).map(error => `${filename}: ${error}`))
   }
   return errors
 }

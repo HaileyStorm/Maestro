@@ -99,15 +99,18 @@ test('mobile target utilities compile to 44px and compact only from 768px', asyn
 })
 
 test('Director LoRA actions and fields share the mobile target and keyboard focus contract', async () => {
-  const [source, sharedSource, styles] = await Promise.all([
+  const [source, sharedSource, parameterSource, styles] = await Promise.all([
     readFile(directorSelectorUrl, 'utf8'),
     readFile(selectorUrl, 'utf8'),
+    readFile(new URL('../src/components/SettingsDrawer/LoraParameterField.tsx', import.meta.url), 'utf8'),
     readFile(stylesUrl, 'utf8'),
   ])
   const buttons = openingTags(source, 'button')
   const fields = [
     ...openingTags(source, 'input').filter(tag => !/type="range"/.test(tag)),
     ...openingTags(source, 'select'),
+    ...openingTags(parameterSource, 'input'),
+    ...openingTags(parameterSource, 'select'),
   ]
 
   assert.ok(buttons.length >= 10, 'covers every Director LoRA action family')

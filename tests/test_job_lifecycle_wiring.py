@@ -1903,7 +1903,8 @@ class TestJobLifecycleWiring(unittest.TestCase):
         )]
         verify = Mock()
         ns = {"QueueRecoveryRuntimeError": QueueRecoveryRuntimeError,
-              "_queue_recovery_unit_matches": verify, "job": {}, "out_dir": "synthetic"}
+              "_queue_recovery_unit_matches": verify, "job": {}, "out_dir": "synthetic",
+              "h3_scene_repair": None}
         exec(compile(ast.fix_missing_locations(ast.Module(body=nodes, type_ignores=[])), "launch.py", "exec"), ns)
         evidence = ns["_h3_verified_segment_dependency_evidence"]
         self.assertEqual(evidence(0, 0), ([], {}))

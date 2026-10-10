@@ -1944,20 +1944,32 @@ test('Reference queue navigation uses one payload-free event with exact cleanup'
 
   const { OPEN_QUEUE_VIEW_EVENT, requestQueueView, subscribeQueueView } = await loadMainViewNavigation()
   const seen = []
-  const listener = event => seen.push(event)
+  const events = []
+  const observeEvent = event => events.push(event)
+  testWindow.addEventListener(OPEN_QUEUE_VIEW_EVENT, observeEvent)
+  t.after(() => testWindow.removeEventListener(OPEN_QUEUE_VIEW_EVENT, observeEvent))
+  const listener = (...args) => seen.push(args)
   const cleanupFirst = subscribeQueueView(listener)
   const cleanupDuplicate = subscribeQueueView(listener)
 
   requestQueueView()
   requestQueueView()
-  assert.equal(seen.length, 2, 'the browser de-duplicates the identical listener registration')
-  assert.ok(seen.every(event => event.type === OPEN_QUEUE_VIEW_EVENT))
-  assert.ok(seen.every(event => !('detail' in event)), 'the navigation event carries no job or content payload')
+  assert.equal(events.length, 2, 'each request dispatches one navigation event')
+  assert.equal(seen.length, 4, 'each independently owned subscription receives both requests')
+  assert.ok(seen.every(args => args.length === 0), 'subscription callbacks receive no event or content payload')
+  assert.ok(events.every(event => event.type === OPEN_QUEUE_VIEW_EVENT))
+  assert.ok(events.every(event => !('detail' in event)), 'the navigation event carries no job or content payload')
 
   cleanupFirst()
   requestQueueView()
-  assert.equal(seen.length, 2, 'cleanup removes the exact registered listener')
+  assert.equal(seen.length, 5, 'cleanup removes only its owned subscription')
   cleanupDuplicate()
+  requestQueueView()
+  assert.equal(seen.length, 5, 'both removed subscriptions stay inactive')
+  let replayed = 0
+  const cleanupLate = subscribeQueueView(() => { replayed += 1 })
+  assert.equal(replayed, 1, 'a request made before mounting is delivered to the next subscription')
+  cleanupLate()
 
   const mainSource = await readFile(mainUrl, 'utf8')
   assert.match(mainSource, /const openQueue = \(\) => changeMainView\('queue'\)/)

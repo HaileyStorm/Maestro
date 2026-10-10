@@ -618,6 +618,8 @@ def _normalize_v2_params(value: Any, *, mode: str) -> dict[str, Any]:
         key: (
             _normalize_v2_custom_settings(item)
             if key == "custom_settings"
+            else normalize_generation_lora_parameters(item)
+            if key == "lora_parameters"
             else _profile_field_value(item, descriptors[key], f"params.{key}")
         )
         for key, item in value.items()
@@ -720,6 +722,35 @@ def _normalize_director_parameter_values(
             raise GenerationPresetError(
                 f"{name} must contain only scalar parameter values",
             )
+    return normalized
+
+
+def normalize_generation_lora_parameters(value: Any) -> dict[str, Any]:
+    """Validate the restorable wire without substituting runtime schemas."""
+    if type(value) is not dict or len(value) > 64:
+        raise GenerationPresetError("lora_parameters must be a bounded plain object")
+    normalized = {}
+    for filename, selection in value.items():
+        if (
+            type(filename) is not str or not filename
+            or len(filename.encode("utf-8")) > 512
+            or filename in {".", ".."}
+            or any(character in filename for character in ("/", "\\", "\x00"))
+            or type(selection) is not dict
+            or set(selection) != {"parameter_schema_digest", "parameter_values"}
+        ):
+            raise GenerationPresetError("LoRA parameter selection is invalid")
+        digest = selection["parameter_schema_digest"]
+        if type(digest) is not str or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            raise GenerationPresetError("LoRA parameter schema digest is invalid")
+        normalized[filename] = {
+            "parameter_schema_digest": digest,
+            "parameter_values": _normalize_director_parameter_values(
+                selection["parameter_values"], "LoRA parameter values",
+            ),
+        }
+    if len(_canonical(normalized)) > 65_536:
+        raise GenerationPresetLimitError("LoRA parameter selections exceed their budget")
     return normalized
 
 
@@ -1132,6 +1163,15 @@ def _normalize_preset(value: Any) -> dict[str, Any]:
             else _normalize_params(value["params"])
         ),
     }
+    parameter_selections = normalized["params"].get("lora_parameters") or {}
+    if parameter_selections and (
+        mode != "image"
+        or normalized["params"].get("image_mode") != 1
+        or not set(parameter_selections).issubset(activated_loras)
+    ):
+        raise GenerationPresetError(
+            "LoRA parameters require active LoRAs in generic image generation",
+        )
     if (
         profile_version in {2, 3}
         and mode != "audio"

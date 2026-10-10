@@ -159,14 +159,21 @@ class TestDirectorLlmStreamUi(unittest.TestCase):
 
         start = source_slice(STORE, "startDirectorPipeline: async", "continuePipeline: async")
         begin_at = start.index("_beginDirectorPipelineLifecycle(requestWorkspace)")
-        defaults_at = start.index("await Promise.all")
+        defaults_at = start.index("const [videoModelDefaults, videoModelOptions] = await Promise.all([")
         post_at = start.index("await api.startPipeline(pipelineParams)")
         guards = [match.start() for match in re.finditer(
             r"if \(!lifecycle\.ownsWorkspace\(\)\) return",
             start,
         )]
+        preparation_guards = [match.start() for match in re.finditer(
+            r"(?m)^\s*assertCurrent\(\)", start,
+        )]
+        current_guard = source_slice(start, "const assertCurrent = () => {", "let queueProjectInstance")
+        self.assertIn("if (!lifecycle.ownsWorkspace())", current_guard)
+        self.assertIn("throw new DOMException('The browser stopped waiting', 'AbortError')", current_guard)
+        self.assertIn("_directorPipelineSnapshotCurrent(expectedState, get())", current_guard)
         self.assertLess(begin_at, defaults_at)
-        self.assertTrue(any(defaults_at < guard < post_at for guard in guards))
+        self.assertTrue(any(defaults_at < guard < post_at for guard in preparation_guards))
         self.assertTrue(any(guard > post_at for guard in guards))
         self.assertIn("workspace: requestWorkspace", start)
         self.assertRegex(

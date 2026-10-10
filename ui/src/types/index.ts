@@ -165,6 +165,11 @@ export interface ProjectReferenceTypeFieldItem {
 export type ProjectReferenceLoraScope = 'auto' | 'generation' | 'editing'
 
 export type LoraParameterValue = string | number | boolean
+
+export interface LoraParameterSelection {
+  parameter_schema_digest: string
+  parameter_values: Record<string, LoraParameterValue>
+}
 export type LoraParameterType = 'enum' | 'number' | 'integer' | 'boolean' | 'text'
 
 export interface LoraParameterOption {
@@ -571,6 +576,8 @@ export interface GenerateParams extends H3AdaptiveSelection {
   repeat_generation: number
   activated_loras: string[]
   loras_multipliers: string
+  /** Exact filename and published schema binding; strength remains separate. */
+  lora_parameters?: Record<string, LoraParameterSelection>
   image_start?: string | string[] | null
   image_end?: string | string[] | null
   multi_prompts_gen_type?: number
@@ -1954,6 +1961,8 @@ export interface LoraInfo {
   h3_kind?: string
   /** Optional public input contract. Private trigger/template expansion stays server-side. */
   parameter_schema?: LoraParameterSchema
+  /** Server-declared paths that consume and seal parameter choices. */
+  parameter_execution?: { studio_image_generation: boolean }
   /** Update status from the cached CivitAI manifest. Populated by
    *  /api/v1/loras/check-updates and surfaced through this endpoint
    *  without an extra round-trip. The UI uses this to render badges. */

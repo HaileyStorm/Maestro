@@ -3817,6 +3817,7 @@ interface AppState {
   refreshLoraIdMap: () => Promise<void>
   loadLoras: (modelType: string) => Promise<void>
   toggleLora: (filename: string) => void
+  setLoraParameters: (modelType: string, filename: string, selection: import('../types').LoraParameterSelection) => void
   toggleH3ArchitectureLora: (architecture: 'fl2va' | 'ref2va', filename: string) => void
   setH3ArchitectureLoraWeight: (architecture: 'fl2va' | 'ref2va', filename: string, phaseIndex: number, value: number) => void
   /** Ensure the LTX-2.3 transition LoRA is downloaded and activated for
@@ -7702,6 +7703,7 @@ export const useStore = create<AppState>((set, get) => ({
         prompt: recipe.prompt_example || '',
         activated_loras: activated,
         loras_multipliers: multipliers,
+        lora_parameters: undefined,
         seed: -1,
         repeat_generation: 1,
         // Recipes are look presets — land in the base Studio sub-mode
@@ -9290,6 +9292,22 @@ export const useStore = create<AppState>((set, get) => ({
     if (state.modelOptionsLoading) {
       window.alert('Model settings are still loading. Please wait a moment before generating.')
       return
+    }
+    if (Object.keys(state.params.lora_parameters ?? {}).length > 0) {
+      if (state.generationMode !== 'image' || state.params.image_mode !== 1 || state.studioPromptEnhance
+        || state.params.progressive_pipeline || state.params.single_stage_pipeline || state.params.reference_pipeline) {
+        window.alert('LoRA parameter choices currently work with plain Image generation. Turn off prompt enhancement and specialized image pipelines, or remove these LoRAs before using another path.')
+        return
+      }
+      const parameterSnapshot = state.params
+      const catalog = await api.fetchLoraDetails(parameterSnapshot.model_type)
+      if (!ownsSubmission()) return
+      if (get().params !== parameterSnapshot || get().generationMode !== state.generationMode) {
+        window.alert('Image settings changed while checking LoRA controls. Review them and generate again.')
+        return
+      }
+      const errors = api.validateStudioLoraParameters(parameterSnapshot.activated_loras, parameterSnapshot.lora_parameters, catalog.loras)
+      if (errors.length > 0) { window.alert(errors.join('\n')); return }
     }
     if (state.h3StyleWorkflow
       && !state.h3StyleWorkflowCatalog
@@ -11507,6 +11525,7 @@ export const useStore = create<AppState>((set, get) => ({
       return
     }
     const newWeights = { ...loraWeights }
+    const loraParameters = { ...(params.lora_parameters ?? {}) }
     // SCAIL-2 Recast is intentionally a single-phase pipeline even though
     // the shared Wan model family advertises support for up to three phases.
     const recastSinglePhase = generationMode === 'avatar' && editSubMode === 'recast'
@@ -11515,6 +11534,7 @@ export const useStore = create<AppState>((set, get) => ({
     if (idx >= 0) {
       current.splice(idx, 1)
       delete newWeights[filename]
+      delete loraParameters[filename]
     } else {
       current.push(filename)
       newWeights[filename] = Array(phases).fill(1.0)
@@ -11537,6 +11557,7 @@ export const useStore = create<AppState>((set, get) => ({
         ...s.params,
         activated_loras: current,
         loras_multipliers: multipliers,
+        lora_parameters: loraParameters,
       },
     }))
     // Persist LoRA state
@@ -11548,6 +11569,19 @@ export const useStore = create<AppState>((set, get) => ({
     }
     set({ savedLoraPerMode: updatedLoraPerMode })
     _saveSettings({ generationMode: mode, selectedModelPerMode: s.selectedModelPerMode, savedParamsPerMode: s.savedParamsPerMode, savedLoraPerMode: updatedLoraPerMode, savedPromptPerMode: s.savedPromptPerMode }, s.loraIdByFilename)
+  },
+
+  setLoraParameters: (modelType, filename, selection) => {
+    const live = get()
+    if (live.params.model_type !== modelType || !live.params.activated_loras.includes(filename)) return
+    ++_modelDefaultsSeq
+    const params = {
+      ...live.params,
+      lora_parameters: { ...(live.params.lora_parameters ?? {}), [filename]: structuredClone(selection) },
+    }
+    set({ params, savedParamsPerMode: {
+      ...live.savedParamsPerMode, [live.generationMode]: _snapshotModeParams(params, live),
+    } })
   },
 
   toggleH3ArchitectureLora: (architecture, filename) => {
@@ -11978,6 +12012,7 @@ export const useStore = create<AppState>((set, get) => ({
         model_type: preset.model_type,
         activated_loras: [...preset.activated_loras],
         loras_multipliers: preset.loras_multipliers,
+        lora_parameters: preset.params.lora_parameters ? structuredClone(preset.params.lora_parameters) as GenerateParams['lora_parameters'] : undefined,
         spatial_upsampling: preset.spatial_upsampling,
       } as GenerateParams
       const uiSettings = restored.uiSettings as Partial<AppState>
@@ -16971,6 +17006,7 @@ export const useStore = create<AppState>((set, get) => ({
         model_type: modelType,
         activated_loras: [],
         loras_multipliers: '',
+        lora_parameters: undefined,
       },
       selectedModelPerMode: { ...s.selectedModelPerMode, [currentMode]: modelType },
       loraWeights: {},
@@ -18389,6 +18425,7 @@ export const useStore = create<AppState>((set, get) => ({
       repeat_generation: 1,
       activated_loras: (p.activated_loras as string[]) || [],
       loras_multipliers: (p.loras_multipliers as string) || '',
+      lora_parameters: p.lora_parameters ? structuredClone(p.lora_parameters) as GenerateParams['lora_parameters'] : undefined,
     } as Partial<GenerateParams>
     if (restoredBlend) newParams.image_mode = 4
     if (H3_STUDIO_MODELS.has(modelType)) {

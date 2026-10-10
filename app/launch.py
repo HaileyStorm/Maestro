@@ -5392,6 +5392,11 @@ def _queue_recovery_register_and_publish(
     # Internal/direct callers share this pre-publication gate with HTTP
     # submissions. It runs before registry, manifest, thread, or network work.
     _require_job_model_recipe_terms(job)
+    lora_params = job.get("params") or {}
+    if lora_params.get("lora_parameters") or "_studio_lora_parameter_snapshot" in lora_params:
+        if recovery_kind == "studio_generation_preparation":
+            raise HTTPException(status_code=400, detail="LoRA parameters cannot use prompt preparation yet")
+        _seal_studio_image_lora_parameters(lora_params)
     if (
         recovery_kind != "studio_generation_preparation"
         and job.get("status") == "queued"
@@ -14982,7 +14987,7 @@ def _redact_local_paths(value):
         return {
             key: _redact_local_paths(nested)
             for key, nested in value.items()
-            if key not in {"owner_session_id", "_maestro_session_id", "_maestro_access_policy"}
+            if key not in {"owner_session_id", "_maestro_session_id", "_maestro_access_policy", "_studio_lora_parameter_snapshot"}
         }
     if isinstance(value, list):
         return [_redact_local_paths(item) for item in value]
@@ -17249,6 +17254,158 @@ def _normalize_lora_parameter_values(
     )
 
 
+def _studio_image_lora_schema_applicable(schema):
+    return bool(
+        isinstance(schema, dict)
+        and (schema.get("parameters") or schema.get("trigger_fragments"))
+        and all(
+            "generation" in definition["scopes"] and not definition["roles"]
+            for definition in (*schema["parameters"], *schema["trigger_fragments"])
+        )
+    )
+
+
+def _resolve_studio_image_lora_parameters(params, *, freeze=False, contexts=None):
+    from services.generation_presets import (
+        GenerationPresetError, normalize_generation_lora_parameters,
+    )
+    try:
+        wire = normalize_generation_lora_parameters(params.get("lora_parameters", {}))
+    except GenerationPresetError as error:
+        raise HTTPException(status_code=400, detail="Invalid LoRA parameter selections") from error
+    if not wire:
+        return []
+    model_type = params.get("model_type")
+    model_def = wgp.get_model_def(model_type)
+    if (
+        params.get("generation_mode") != "image"
+        or type(params.get("image_mode")) is not int or params["image_mode"] != 1
+        or not isinstance(model_def, dict) or not model_def.get("image_outputs")
+        or any(params.get(key) for key in (
+            "edit_sub_mode", "sfx_mode", "progressive_pipeline",
+            "single_stage_pipeline", "reference_pipeline", "enhance_before_generate",
+            "_director_image_role", "_director_image_role_loras",
+            "_h3_longform", "_h3_cumulative_plan", "_shot_prompts", "per_clip_frames",
+        ))
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="LoRA parameters currently require generic image generation without prompt enhancement",
+        )
+    prompt_mode = params.get("multi_prompts_gen_type", 0)
+    if (
+        not isinstance(params.get("prompt"), str)
+        or (prompt_mode is not None and (type(prompt_mode) is not int or prompt_mode not in range(5)))
+    ):
+        raise HTTPException(status_code=400, detail="Image prompt or prompt split mode is invalid")
+    active = params.get("activated_loras")
+    if (
+        not isinstance(active, list) or len(active) > 64
+        or any(not isinstance(name, str) for name in active)
+        or len(set(active)) != len(active) or not set(wire).issubset(active)
+    ):
+        raise HTTPException(status_code=400, detail="LoRA parameters must name active catalog files")
+    selections = []
+    for filename in active:
+        if filename not in wire:
+            continue
+        try:
+            path = wgp.resolve_lora_path(model_type, filename)
+            schema = _project_reference_lora_parameter_schema(model_type, path)
+        except (OSError, ValueError, TypeError) as error:
+            raise HTTPException(status_code=409, detail="LoRA parameter schema is unavailable") from error
+        if not _studio_image_lora_schema_applicable(schema):
+            raise HTTPException(
+                status_code=409,
+                detail="This LoRA parameter contract requires a Reference or Director role",
+            )
+        selections.append({"id": filename, "multiplier": 1.0, "scope": "generation", **wire[filename]})
+    return _project_reference_resolve_additional_loras(
+        selections, generation_model=model_type, editor_model=None,
+        operation_roles={"generation": (), "editing": ()},
+        freeze=freeze, commitment_contexts=contexts,
+    )
+
+
+def _studio_image_lora_parameter_binding(params, *, contexts=None):
+    selections = _resolve_studio_image_lora_parameters(params, freeze=True, contexts=contexts)
+    sources = []
+    for selection in selections:
+        path = wgp.resolve_lora_path(params["model_type"], selection["id"])
+        if not isinstance(path, str) or os.path.islink(path) or not os.path.isfile(path):
+            raise HTTPException(status_code=409, detail="Selected LoRA source changed")
+        sources.append({"id": selection["id"], "path": os.path.realpath(path)})
+    # JSON normalization makes the private seal identical after manifest replay.
+    return json.loads(json.dumps({
+        "version": 1, "model_type": params["model_type"],
+        "generation_mode": params["generation_mode"], "image_mode": params["image_mode"],
+        "authored_prompt": params.get("prompt", ""),
+        "multi_prompts_gen_type": params.get("multi_prompts_gen_type", 0),
+        "activated_loras": params.get("activated_loras"),
+        "loras_multipliers": params.get("loras_multipliers", ""),
+        "lora_parameters": params["lora_parameters"],
+        "selections": selections, "sources": sources,
+    }, allow_nan=False))
+
+
+def _seal_studio_image_lora_parameters(params):
+    if "_studio_lora_parameter_snapshot" in params:
+        _validate_studio_image_lora_parameters(params)
+        return
+    binding = _studio_image_lora_parameter_binding(params)
+    params["_studio_lora_parameter_snapshot"] = {
+        "binding": binding,
+        "digest": _project_reference_private_commitment(binding),
+    }
+
+
+def _validate_studio_image_lora_parameters(params):
+    snapshot = params.get("_studio_lora_parameter_snapshot")
+    if not isinstance(snapshot, dict) or set(snapshot) != {"binding", "digest"}:
+        raise ValueError("LoRA parameter admission snapshot is missing")
+    binding = snapshot["binding"]
+    if (
+        not isinstance(binding, dict) or not isinstance(snapshot["digest"], str)
+        or not hmac.compare_digest(snapshot["digest"], _project_reference_private_commitment(binding))
+    ):
+        raise ValueError("LoRA parameter admission snapshot changed")
+    contexts = {
+        selection["id"]: selection["parameter_commitment_context"]
+        for selection in binding["selections"]
+    }
+    current = _studio_image_lora_parameter_binding(params, contexts=contexts)
+    if current != binding:
+        raise ValueError("Selected LoRA parameters or source changed; refresh and submit again")
+    return binding
+
+
+def _apply_studio_image_lora_parameters(params, binding):
+    """Expand each native prompt once while preserving its split mode."""
+    result = params.copy()
+    result.pop("lora_parameters", None)
+    result.pop("_studio_lora_parameter_snapshot", None)
+    fragments = [
+        expansion["text"]
+        for selection in binding["selections"]
+        for expansion in selection["parameter_expansions"]
+        if "generation" in expansion["scopes"] and not expansion["roles"]
+        and expansion["text"]
+    ]
+    authored = binding["authored_prompt"]
+    if not isinstance(authored, str) or result.get("prompt", "") != authored:
+        raise ValueError("Authored image prompt changed after LoRA admission")
+    if fragments:
+        suffix = " ".join(fragments)
+        if binding["multi_prompts_gen_type"] == 2:
+            result["prompt"] = f"{authored} {suffix}"
+        else:
+            result["prompt"] = "\n".join(
+                f"{line} {suffix}" if line.strip() else line
+                for line in authored.split("\n")
+            )
+    return result
+
+
 # ── System-managed LoRA detection ────────────────────────────────────
 # Some LoRAs in the user's loras folder are auto-downloaded by the
 # launcher itself (model-loading code, blend mode, edit anything, etc.)
@@ -17566,6 +17723,7 @@ def _prepare_generation_sidecar_params(source_params: dict):
                 for item in value
             ]
     sidecar_params = source_params.copy()
+    sidecar_params.pop("_studio_lora_parameter_snapshot", None)
     sidecar_params.pop("_project_asset_ref_provenance", None)
     sidecar_params.pop("_project_asset_ref_paths", None)
     sidecar_params.pop("_h3_rerun_predecessor_path", None)
@@ -21108,6 +21266,16 @@ def list_loras_details(model_type: str):
                     parameter_schema,
                 )
                 info["parameter_schema_status"] = "ready"
+                info["parameter_execution"] = {
+                    "studio_image_generation": bool(
+                        md.get("image_outputs")
+                        and (parameter_schema["parameters"] or parameter_schema["trigger_fragments"])
+                        and all(
+                            "generation" in definition["scopes"] and not definition["roles"]
+                            for definition in (*parameter_schema["parameters"], *parameter_schema["trigger_fragments"])
+                        )
+                    ),
+                }
         # Downloaded-date fallback for HF/hand-installed files without a
         # CivitAI sidecar: the weight file's mtime.
         if not info.get("downloaded_at"):
@@ -33913,6 +34081,8 @@ async def generate_project_asset_references(project: str, request: Request):
     visual_style_default = build_visual_style_default_block()
     project_id, workspace_id = _asset_scope(request, project)
     body = await request.json()
+    if isinstance(body, dict) and (body.get("lora_parameters") or "_studio_lora_parameter_snapshot" in body):
+        raise HTTPException(status_code=400, detail="LoRA parameters are available only for Studio image generation")
     if isinstance(body, dict):
         fresh_profile = body.get("character_profile")
         if (
@@ -40884,6 +41054,8 @@ def _build_music_gen_params(model_type: str, lyrics: str, style: str, duration_s
 async def director_preparation_start(request: Request):
     """Issue the durable request id before a long music/analysis chain."""
     body = await request.json()
+    if isinstance(body, dict) and (body.get("lora_parameters") or "_studio_lora_parameter_snapshot" in body):
+        raise HTTPException(status_code=400, detail="LoRA parameters are available only for Studio image generation")
     workspace = body.get("workspace") or _get_active_workspace()
     image_paths = body.get("image_paths") or []
     if not image_paths and body.get("reference_image_path"):
@@ -40933,6 +41105,8 @@ async def director_generate_music(request: Request):
     from services.llm_operations import run_blocking_shielded
 
     body = await request.json()
+    if isinstance(body, dict) and (body.get("lora_parameters") or "_studio_lora_parameter_snapshot" in body):
+        raise HTTPException(status_code=400, detail="LoRA parameters are available only for Studio image generation")
     _promote_external_llm_request(request)
     description = (body.get("description") or "").strip()
     style = (body.get("style") or "").strip()
@@ -51681,6 +51855,8 @@ async def generate(request: Request):
     body = await request.json()
     if not isinstance(body, dict):
         raise HTTPException(status_code=422, detail="Generation settings must be an object")
+    if "_studio_lora_parameter_snapshot" in body:
+        raise HTTPException(status_code=400, detail="LoRA parameter admission state is server-owned")
     if "generation_request_id" in body:
         try:
             validate_generation_request_id(body["generation_request_id"])
@@ -51758,6 +51934,10 @@ async def generate(request: Request):
                 raise HTTPException(status_code=400, detail="enhance_before_generate must be a boolean")
             if queue_mode not in {"now", "held"}:
                 raise HTTPException(status_code=400, detail="_queue_mode must be either 'now' or 'held'")
+        if "lora_parameters" in body:
+            _resolve_studio_image_lora_parameters({
+                **body, "enhance_before_generate": enhance_before_generate,
+            })
         project_asset_ref_descriptors = (
             _normalize_project_asset_ref_descriptors(raw_project_asset_refs)
             if submitted_project_asset_refs else []
@@ -52346,6 +52526,8 @@ async def retake_video_endpoint(request: Request):
     }
     """
     body = await request.json()
+    if isinstance(body, dict) and (body.get("lora_parameters") or "_studio_lora_parameter_snapshot" in body):
+        raise HTTPException(status_code=400, detail="LoRA parameters are available only for Studio image generation")
     from contextlib import nullcontext
     if not isinstance(body, dict):
         raise HTTPException(status_code=400, detail="Retake request must be an object")
@@ -52971,6 +53153,8 @@ async def edit_anything_endpoint(request: Request):
     }
     """
     body = await request.json()
+    if isinstance(body, dict) and (body.get("lora_parameters") or "_studio_lora_parameter_snapshot" in body):
+        raise HTTPException(status_code=400, detail="LoRA parameters are available only for Studio image generation")
 
     video_path = body.get("video_path")
     if not video_path:
@@ -58366,6 +58550,8 @@ def _build_repaint_shot_manifest(
 async def repaint_preview_endpoint(request: Request):
     """Preview optional source/edited-frame semantic correspondences."""
     body = await request.json()
+    if isinstance(body, dict) and (body.get("lora_parameters") or "_studio_lora_parameter_snapshot" in body):
+        raise HTTPException(status_code=400, detail="LoRA parameters are available only for Studio image generation")
     workspace = body.get("workspace")
     video_path = _resolve_recast_media(request, body.get("video_path"), workspace)
     target_path = _resolve_recast_media(
@@ -58516,6 +58702,8 @@ async def repaint_endpoint(request: Request):
     underlying motion-conditioning recipe.
     """
     body = await request.json()
+    if isinstance(body, dict) and (body.get("lora_parameters") or "_studio_lora_parameter_snapshot" in body):
+        raise HTTPException(status_code=400, detail="LoRA parameters are available only for Studio image generation")
     workspace = body.get("workspace") or _get_active_workspace()
     job_out_dir = _require_project_access(
         request, workspace, permission="project.generate",
@@ -59100,6 +59288,8 @@ async def recast_preview_endpoint(request: Request):
             time?: float, end_time?: float, workspace?: str }
     """
     body = await request.json()
+    if isinstance(body, dict) and (body.get("lora_parameters") or "_studio_lora_parameter_snapshot" in body):
+        raise HTTPException(status_code=400, detail="LoRA parameters are available only for Studio image generation")
     workspace = body.get("workspace")
     video_path = _resolve_recast_media(request, body.get("video_path"), workspace)
     if not video_path:
@@ -59463,6 +59653,8 @@ async def recast_endpoint(request: Request):
     }
     """
     body = await request.json()
+    if isinstance(body, dict) and (body.get("lora_parameters") or "_studio_lora_parameter_snapshot" in body):
+        raise HTTPException(status_code=400, detail="LoRA parameters are available only for Studio image generation")
     workspace = body.get("workspace") or _get_active_workspace()
     job_out_dir = _require_project_access(
         request, workspace, permission="project.generate",
@@ -61407,6 +61599,8 @@ async def outpaint_endpoint(request: Request):
     }
     """
     body = await request.json()
+    if isinstance(body, dict) and (body.get("lora_parameters") or "_studio_lora_parameter_snapshot" in body):
+        raise HTTPException(status_code=400, detail="LoRA parameters are available only for Studio image generation")
 
     video_path = body.get("video_path")
     if not video_path:
@@ -61935,6 +62129,8 @@ async def h3_bridge_endpoint(request: Request):
     from services.h3_bridge_plan import H3BridgePlanError, plan_h3_bridge
 
     body = await request.json()
+    if isinstance(body, dict) and (body.get("lora_parameters") or "_studio_lora_parameter_snapshot" in body):
+        raise HTTPException(status_code=400, detail="LoRA parameters are available only for Studio image generation")
     if not isinstance(body, dict):
         raise HTTPException(status_code=400, detail="Bridge request must be an object")
     workspace = _request_project_workspace(request, body.get("workspace"))
@@ -62145,6 +62341,11 @@ async def blend_endpoint(request: Request):
     }
     """
     body = await request.json()
+    if isinstance(body, dict) and (body.get("lora_parameters") or "_studio_lora_parameter_snapshot" in body):
+        raise HTTPException(status_code=400, detail="LoRA parameters are available only for Studio image generation")
+    base_params = body.get("base_params") if isinstance(body, dict) else None
+    if isinstance(base_params, dict) and (base_params.get("lora_parameters") or "_studio_lora_parameter_snapshot" in base_params):
+        raise HTTPException(status_code=400, detail="LoRA parameters are available only for Studio image generation")
 
     clip_a_path = body.get("clip_a_path")
     clip_b_path = body.get("clip_b_path")
@@ -63497,6 +63698,8 @@ async def segment_preview_endpoint(request: Request):
     }
     """
     body = await request.json()
+    if isinstance(body, dict) and (body.get("lora_parameters") or "_studio_lora_parameter_snapshot" in body):
+        raise HTTPException(status_code=400, detail="LoRA parameters are available only for Studio image generation")
     video_path = body.get("video_path")
     if not video_path:
         raise HTTPException(status_code=400, detail="video_path is required")
@@ -63594,6 +63797,8 @@ async def inpaint_endpoint(request: Request):
     }
     """
     body = await request.json()
+    if isinstance(body, dict) and (body.get("lora_parameters") or "_studio_lora_parameter_snapshot" in body):
+        raise HTTPException(status_code=400, detail="LoRA parameters are available only for Studio image generation")
     video_path = body.get("video_path")
     if not video_path:
         raise HTTPException(status_code=400, detail="video_path is required")
@@ -71124,6 +71329,8 @@ async def tools_upscale(request: Request):
             seed?: int, workspace?: str (required remotely) }
     """
     body = await request.json()
+    if isinstance(body, dict) and (body.get("lora_parameters") or "_studio_lora_parameter_snapshot" in body):
+        raise HTTPException(status_code=400, detail="LoRA parameters are available only for Studio image generation")
     if not isinstance(body, dict):
         raise HTTPException(status_code=400, detail="Tool request must be an object")
     video_path = body.get("video_path")
@@ -71198,6 +71405,8 @@ async def tools_revoice(request: Request):
             workspace?: str (required remotely) }
     """
     body = await request.json()
+    if isinstance(body, dict) and (body.get("lora_parameters") or "_studio_lora_parameter_snapshot" in body):
+        raise HTTPException(status_code=400, detail="LoRA parameters are available only for Studio image generation")
     if not isinstance(body, dict):
         raise HTTPException(status_code=400, detail="Tool request must be an object")
     video_path = body.get("video_path")
@@ -71609,6 +71818,19 @@ def _run_generation(
     abort_state = None
     h3_reference_file_tokens = []
 
+    studio_lora_binding = None
+    studio_params = job.get("params") or {}
+    if studio_params.get("lora_parameters") or "_studio_lora_parameter_snapshot" in studio_params:
+        try:
+            studio_lora_binding = _validate_studio_image_lora_parameters(studio_params)
+        except Exception:
+            finish_job(
+                job, "failed",
+                error="Selected LoRA parameters or source changed; refresh and submit again.",
+                message="LoRA parameter validation failed",
+            )
+            return False
+
     guide_params = job.get("params") if isinstance(job, dict) else None
     guide_custom = (
         guide_params.get("custom_settings")
@@ -71802,6 +72024,11 @@ def _run_generation(
 
             # Build task manifest from user params
             raw_params = job["params"].copy()
+            if studio_lora_binding is not None:
+                raw_params = _apply_studio_image_lora_parameters(raw_params, studio_lora_binding)
+            else:
+                raw_params.pop("lora_parameters", None)
+                raw_params.pop("_studio_lora_parameter_snapshot", None)
             raw_params.pop("_h3_offload_plan", None)
             if job.get("kind") == "studio_h3_bridge":
                 for bridge_key in (
@@ -73004,6 +73231,8 @@ def _run_generation(
                         message="Selected Gallery guide changed",
                     )
                     return False
+            if studio_lora_binding is not None:
+                _validate_studio_image_lora_parameters(job["params"])
             queue, error = wgp._parse_task_manifest(manifest, state, os.getcwd())
 
             if error:
@@ -73321,6 +73550,11 @@ def _run_generation(
                 upload_filenames, sidecar_params = (
                     _prepare_generation_sidecar_params(source_params)
                 )
+                studio_snapshot = job["params"].get("_studio_lora_parameter_snapshot")
+                if isinstance(studio_snapshot, dict):
+                    studio_binding = studio_snapshot["binding"]
+                    sidecar_params["prompt"] = studio_binding["authored_prompt"]
+                    sidecar_params["lora_parameters"] = studio_binding["lora_parameters"]
                 if isinstance(guide_source, dict):
                     for key in (
                         "_h3_timeline_still_guide_source",
@@ -75004,15 +75238,21 @@ def _run_generation(
                                     key: filtered_params.get(key)
                                     for key in ("model_type", "resolution", "video_length", "num_inference_steps", "repeat_generation", "batch_size")
                                 }
-                                _run_generation_task_with_llm_exclusion(
-                                    call_model,
-                                    send_cmd,
-                                    lambda: wgp.generate_video(
+                                def invoke_native_generation():
+                                    admitted_params = job.get("params") or {}
+                                    if admitted_params.get("lora_parameters") or "_studio_lora_parameter_snapshot" in admitted_params:
+                                        _validate_studio_image_lora_parameters(admitted_params)
+                                    return wgp.generate_video(
                                         task,
                                         send_cmd,
                                         plugin_data=plugin_data,
                                         **filtered_params,
-                                    ),
+                                    )
+
+                                _run_generation_task_with_llm_exclusion(
+                                    call_model,
+                                    send_cmd,
+                                    invoke_native_generation,
                                 )
                         except Exception as e:
                             print(f"\n  [ERROR] {e}")

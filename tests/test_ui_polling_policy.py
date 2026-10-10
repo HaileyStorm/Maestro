@@ -145,7 +145,9 @@ class UiPollingStateTests(unittest.TestCase):
         self.assertIn("aria-live=\"polite\"", MAIN)
         self.assertIn("Showing the last successful update", MAIN)
         self.assertIn("retrying automatically", MAIN)
-        self.assertIn("machineControls && queue &&", MAIN)
+        self.assertIn("queue={ordinaryQueueState}", MAIN)
+        self.assertIn("queueError={queueTabError}", MAIN)
+        self.assertIn("queueLastSuccessAt={queueTabSnapshot.lastSuccessAt}", MAIN)
         self.assertIn("const queueDisplayJobs = queueTabDisplayJobs(queueTabSnapshot, jobs)", MAIN)
         self.assertIn("The queue is unavailable. Maestro is retrying automatically.", MAIN)
         self.assertLess(

@@ -6,6 +6,9 @@ import { generateLoraGuide, fetchLoraGuide, fetchLoraDetails, checkLoraUpdates }
 import { formatAge } from '../../lib/format'
 import type { LoraRecommendedWeights, LoraUpdateStatus } from '../../types'
 import { sortLoraNames } from './loraSort'
+import { LoraParameterField } from './LoraParameterField'
+import { createStudioLoraParameterSelection, studioLoraParameterSchema, validateStudioLoraParameters } from '../../api/client'
+import type { LoraInfo } from '../../types'
 import { HOST_TERM_NOTICES } from '../../lib/hostTerms'
 import type { LoraDates, LoraPickerSort } from './loraSort'
 import {
@@ -186,6 +189,13 @@ export function LoraSelector() {
     model => model.model_type === s.params.model_type,
   )?.lora_compatibility_note)
   const activatedLoras = useStore(s => s.params.activated_loras)
+  const loraParameters = useStore(s => s.params.lora_parameters)
+  const setLoraParameters = useStore(s => s.setLoraParameters)
+  const imageMode = useStore(s => s.params.image_mode)
+  const promptEnhance = useStore(s => s.studioPromptEnhance)
+  const specialisedImagePath = useStore(s => Boolean(
+    s.params.progressive_pipeline || s.params.single_stage_pipeline || s.params.reference_pipeline,
+  ))
   const availableLoras = useStore(s => s.availableLoras)
   const lorasLoading = useStore(s => s.lorasLoading)
   const loraWeights = useStore(s => s.loraWeights)
@@ -259,6 +269,9 @@ export function LoraSelector() {
   const [guideTexts, setGuideTexts] = useState<Record<string, string>>({})
   const [loraWeightRecs, setLoraWeightRecs] = useState<Record<string, LoraRecommendedWeights>>({})
   const [loraDetailsError, setLoraDetailsError] = useState('')
+  const [parameterCatalog, setParameterCatalog] = useState<{ modelType: string; loras: LoraInfo[] } | null>(null)
+  const currentCatalog = parameterCatalog?.modelType === modelType ? parameterCatalog.loras : []
+  const parameterPathAvailable = generationMode === 'image' && imageMode === 1 && !promptEnhance && !specialisedImagePath
   const loraDetailsRequest = useRef(0)
   // Per-filename update_status from the cached LoRA-update manifest. The
   // backend embeds this on every /details response so we don't need to
@@ -441,6 +454,19 @@ export function LoraSelector() {
         }
       }
       setLoraWeightRecs(recs)
+      if (!h3Adaptive) {
+        const loras = responses[0].loras
+        setParameterCatalog({ modelType, loras })
+        if (parameterPathAvailable) {
+          const live = useStore.getState()
+          for (const lora of loras) {
+            if (live.params.model_type !== modelType || !live.params.activated_loras.includes(lora.filename)
+              || Object.prototype.hasOwnProperty.call(live.params.lora_parameters ?? {}, lora.filename)) continue
+            const selection = createStudioLoraParameterSelection(lora)
+            if (selection) setLoraParameters(modelType, lora.filename, selection)
+          }
+        }
+      }
       setGuideTexts(prev => ({ ...prev, ...guides }))
       setGuideStatus(prev => ({ ...prev, ...statuses }))
       setUpdateStatuses(updates)
@@ -493,6 +519,7 @@ export function LoraSelector() {
     h3Adaptive,
     h3SelectionError,
     modelType,
+    parameterPathAvailable,
     ref2vaState.loras,
   ])
 
@@ -748,6 +775,36 @@ export function LoraSelector() {
                       </div>
                     )
                   })}
+                  {!architecture && (() => {
+                    const lora = currentCatalog.find(item => item.filename === filename)
+                    const schema = lora && studioLoraParameterSchema(lora)
+                    const selection = loraParameters?.[filename]
+                    const errors = selection ? validateStudioLoraParameters([filename], { [filename]: selection }, currentCatalog) : []
+                    if (!lora?.parameter_schema && !selection) return null
+                    if (!parameterPathAvailable || !schema) return (
+                      <p role="status" className="mt-2 text-[10px] text-text-muted">{selection
+                        ? 'Saved parameter choices cannot run on this generation path. Remove this LoRA, or return to plain Image generation.'
+                        : 'Parameter controls are unavailable for this model or generation path. Strength still applies.'}</p>
+                    )
+                    if (!selection || selection.parameter_schema_digest !== schema.schema_digest) return (
+                      <p role="status" className="mt-2 text-[10px] text-red-300">{errors[0] || 'Loading parameter controls…'}</p>
+                    )
+                    return (
+                      <fieldset className="mt-2 grid grid-cols-1 gap-2 sm:grid-cols-2">
+                        <legend className="mb-1 text-[10px] text-text-muted">LoRA settings</legend>
+                        {errors.length > 0 && <p role="status" className="text-[10px] text-red-300 sm:col-span-2">{errors.join(' ')}</p>}
+                        {schema.parameters.map(parameter => (
+                          <LoraParameterField key={parameter.id} namespace="studio" loraId={filename} parameter={parameter} values={selection.parameter_values} onChange={value => {
+                            setLoraParameters(modelType, filename, { ...selection, parameter_values: { ...selection.parameter_values, [parameter.id]: value } })
+                          }} onClear={() => {
+                            const values = { ...selection.parameter_values }
+                            delete values[parameter.id]
+                            setLoraParameters(modelType, filename, { ...selection, parameter_values: values })
+                          }} />
+                        ))}
+                      </fieldset>
+                    )
+                  })()}
                 </div>
               )
             })}
@@ -811,7 +868,7 @@ export function LoraSelector() {
     )
   }
 
-  if (availableLoras.length === 0 && !h3Adaptive) {
+  if (availableLoras.length === 0 && activatedLoras.length === 0 && Object.keys(loraParameters ?? {}).length === 0 && !h3Adaptive) {
     return (
       <div>
         {loraHeader}
@@ -833,6 +890,14 @@ export function LoraSelector() {
         <p role="status" className="mb-2 rounded border border-amber-500/30 bg-amber-500/10 px-2.5 py-2 text-[10px] text-amber-100">
           {loraDetailsError}
         </p>
+      )}
+      {Object.keys(loraParameters ?? {}).some(filename => !activatedLoras.includes(filename)) && (
+        <div role="status" className="mb-2 rounded border border-amber-500/30 px-2.5 py-2 text-[10px] text-amber-100">
+          Some saved parameter choices belong to LoRAs that are no longer selected.
+          <button type="button" className="mobile-control-target ml-2 underline" onClick={() => setParams({
+            lora_parameters: Object.fromEntries(Object.entries(loraParameters ?? {}).filter(([filename]) => activatedLoras.includes(filename))),
+          })}>Remove unused choices</button>
+        </div>
       )}
 
       {/* Search + Updatable toggle */}

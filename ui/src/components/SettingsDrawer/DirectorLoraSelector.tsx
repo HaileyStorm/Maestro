@@ -1,3 +1,4 @@
+import { LoraParameterField } from './LoraParameterField'
 import { GenerationProfileRefreshStatus } from '../GenerationProfileRefreshStatus'
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { Search, X, Loader2, FolderOpen, Globe, Sparkles, BookOpen } from 'lucide-react'
@@ -11,7 +12,6 @@ import type {
   DirectorImageRole,
   DirectorImageRoleLoraSelection,
   LoraInfo,
-  LoraParameterDefinition,
   LoraParameterValue,
   LoraRecommendedWeights,
 } from '../../types'
@@ -37,69 +37,6 @@ function updateDirectorRoleSelection(
     : selection)
 }
 
-function DirectorRoleLoraParameterField({
-  loraId, parameter, values, onChange, onClear,
-}: {
-  loraId: string
-  parameter: LoraParameterDefinition
-  values: Record<string, LoraParameterValue>
-  onChange: (value: LoraParameterValue) => void
-  onClear: () => void
-}) {
-  const value = api.getLoraParameterValue(parameter, values)
-  const id = `director-${loraId}-${parameter.id}`.replace(/[^a-z0-9_-]/gi, '-')
-  const label = `${parameter.label}${parameter.required ? ' (required)' : ''}`
-  if (parameter.type === 'boolean') {
-    return (
-      <label htmlFor={id} className="block text-[9px] text-text-secondary">
-        {label}
-        <select id={id} value={value === true ? 'true' : value === false ? 'false' : ''} onChange={event => {
-          if (event.target.value === '') onClear()
-          else onChange(event.target.value === 'true')
-        }} className="mobile-control-target mt-0.5 w-full rounded border border-border bg-bg-primary px-1.5 py-1 text-[9px] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue">
-          <option value="">Choose…</option>
-          <option value="false">No</option>
-          <option value="true">Yes</option>
-        </select>
-      </label>
-    )
-  }
-  if (parameter.type === 'enum') {
-    const token = value === undefined ? '' : api.getLoraParameterOptionToken(value)
-    return (
-      <label htmlFor={id} className="block text-[9px] text-text-secondary">
-        {label}
-        <select id={id} value={token} onChange={event => {
-          const option = parameter.options?.find(candidate => (
-            api.getLoraParameterOptionToken(candidate.value) === event.target.value
-          ))
-          if (option) onChange(option.value)
-        }} className="mobile-control-target mt-0.5 w-full rounded border border-border bg-bg-primary px-1.5 py-1 text-[9px] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue">
-          {value === undefined && <option value="">Choose…</option>}
-          {(parameter.options ?? []).map(option => (
-            <option key={api.getLoraParameterOptionToken(option.value)} value={api.getLoraParameterOptionToken(option.value)}>{option.label}</option>
-          ))}
-        </select>
-      </label>
-    )
-  }
-  if (parameter.type === 'number' || parameter.type === 'integer') {
-    return (
-      <label htmlFor={id} className="block text-[9px] text-text-secondary">
-        {label}
-        <input id={id} type="number" value={typeof value === 'number' ? value : ''} min={parameter.minimum} max={parameter.maximum} step={parameter.step ?? (parameter.type === 'integer' ? 1 : 'any')} onChange={event => {
-          if (Number.isFinite(event.target.valueAsNumber)) onChange(event.target.valueAsNumber)
-        }} className="mobile-control-target mt-0.5 w-full rounded border border-border bg-bg-primary px-1.5 py-1 text-[9px] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue" />
-      </label>
-    )
-  }
-  return (
-    <label htmlFor={id} className="block text-[9px] text-text-secondary">
-      {label}
-      <input id={id} type="text" value={typeof value === 'string' ? value : ''} minLength={parameter.min_length} maxLength={parameter.max_length} onChange={event => onChange(event.target.value)} className="mobile-control-target mt-0.5 w-full rounded border border-border bg-bg-primary px-1.5 py-1 text-[9px] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue" />
-    </label>
-  )
-}
 
 /** Role-scoped Director LoRAs use the exact model details catalog and wire. */
 export function DirectorImageRoleLoraSelector({
@@ -204,7 +141,7 @@ export function DirectorImageRoleLoraSelector({
             {schema && selection.parameter_schema_digest === schema.schema_digest && (
               <div className="mt-2 grid grid-cols-1 gap-1.5 sm:grid-cols-2">
                 {schema.parameters.map(parameter => (
-                  <DirectorRoleLoraParameterField key={parameter.id} loraId={selection.id} parameter={parameter} values={selection.parameter_values ?? {}} onChange={value => setParameter(selection, parameter.id, value)} onClear={() => clearParameter(selection, parameter.id)} />
+                  <LoraParameterField key={parameter.id} loraId={selection.id} parameter={parameter} values={selection.parameter_values ?? {}} onChange={value => setParameter(selection, parameter.id, value)} onClear={() => clearParameter(selection, parameter.id)} />
                 ))}
               </div>
             )}

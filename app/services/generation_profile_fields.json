@@ -7,6 +7,7 @@
     "guidance_scale": {"type":"number","minimum":0,"maximum":100},
     "seed": {"type":"integer","minimum":-1,"maximum":9223372036854775807},
     "image_mode": {"type":"integer","minimum":0,"maximum":4},
+    "lora_parameters": {"type":"object"},
     "repeat_generation": {"type":"integer","minimum":1,"maximum":1000},
     "multi_prompts_gen_type": {"type":"integer","nullable":true,"minimum":0,"maximum":4},
     "sliding_window_size": {"type":"integer","nullable":true,"minimum":1,"maximum":16777216},

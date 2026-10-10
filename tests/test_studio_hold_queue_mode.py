@@ -89,11 +89,17 @@ class StudioHoldQueueModeTests(unittest.TestCase):
             "const { pipeline_id } = await api.startPipeline(pipelineParams)",
         )
         self.assertIn("if (mode === 'queue')", pipeline)
-        self.assertIn("await api.enqueueDirectorPipeline(pipelineParams)", pipeline)
+        reserve_at = pipeline.index("_directorAdmissionLedger.reserve(queueScope, requestWorkspace")
+        send_at = pipeline.index("await _sendDirectorAdmission(intent, queueScope, queueKey)")
+        self.assertLess(reserve_at, send_at)
+        self.assertIn("params: pipelineParams", pipeline[reserve_at:send_at])
+        self.assertIn("await _sendDirectorAdmission(intent, queueScope, queueKey)\n        return", pipeline)
+        admission = _slice(STORE, "async function _sendDirectorAdmission(", "async function _mutateDirectorQueue(")
+        self.assertIn("await api.enqueueDirectorPipeline(intent.params, intent.requestId, intent.workspace, intent.projectInstance)", admission)
         enqueue = _slice(
             CLIENT,
             "export async function enqueueDirectorPipeline(",
-            "export async function startDirectorQueue()",
+            "export async function startDirectorQueue(",
         )
         self.assertIn("${BASE}/api/v1/director/queue", enqueue)
         self.assertIn("method: 'POST'", enqueue)

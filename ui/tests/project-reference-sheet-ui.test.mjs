@@ -2823,7 +2823,8 @@ test('Reference and Director expose style, skill, flow, and truthful Blender cho
   assert.match(reference, /select Custom to describe your own style/)
   assert.match(reference, /section\.values\.length >= 8/)
 
-  assert.match(director, /Welcome to Maestro Director\. Choose a Skill below/)
+  assert.match(director, /id="director-skills-guidance"[^>]*>Choose a Skill to get started\.<\/p>/)
+  assert.match(director, /aria-describedby="director-skills-guidance"/)
   assert.match(director, /<fieldset aria-label="Director Skills"/)
   assert.match(director, /<legend[^>]*>Skills<\/legend>/)
   assert.match(director, /aria-label="Director visual style"/)

@@ -9,6 +9,7 @@ import contextvars
 import copy
 import hashlib
 import hmac
+import io
 import json
 import os
 from pathlib import Path
@@ -704,6 +705,271 @@ class QueueRecoveryRuntimeTests(unittest.TestCase):
 
 
 class QueueLaunchWiringTests(unittest.TestCase):
+    @contextlib.contextmanager
+    def _image_lora_parameters(self):
+        from test_project_reference_sheet_route import ProjectReferenceRouteTests
+        fixture = ProjectReferenceRouteTests()
+        fixture.setUp()
+        try:
+            ns = _isolated_functions(_tree("app/launch.py"), (
+                "_studio_image_lora_schema_applicable", "_resolve_studio_image_lora_parameters",
+                "_studio_image_lora_parameter_binding", "_seal_studio_image_lora_parameters",
+                "_validate_studio_image_lora_parameters", "_apply_studio_image_lora_parameters",
+                "_prepare_generation_sidecar_params", "_redact_local_paths",
+            ), fixture.ns)
+            ns["PureWindowsPath"] = __import__("pathlib").PureWindowsPath
+            lora = fixture.root / "detail.safetensors"
+            lora.write_bytes(b"synthetic LoRA bytes for CPU admission only")
+            ns["wgp"].lora_dir = str(fixture.root)
+            schema = {
+                "schema_version": 1,
+                "parameters": [{
+                    "id": "shape", "label": "Shape", "type": "enum", "required": True,
+                    "scopes": ["generation"], "options": [{
+                        "value": "wide", "label": "Wide", "prompt_fragment": "wide shape",
+                    }],
+                }],
+                "trigger_fragments": [{"text": "creator trigger", "scopes": ["generation"]}],
+            }
+            sidecar = lora.with_suffix(".maestro.json")
+            sidecar.write_text(json.dumps({"maestro_lora_parameter_schema": schema}))
+            with mock.patch.object(ns["wgp"], "resolve_lora_path", return_value=str(lora)):
+                resolved_schema = ns["_project_reference_lora_parameter_schema"]("flux2_klein_9b", str(lora))
+                params = {
+                    "model_type": "flux2_klein_9b", "generation_mode": "image", "image_mode": 1,
+                    "prompt": "first prompt\n\nsecond prompt", "multi_prompts_gen_type": 0,
+                    "activated_loras": [lora.name], "loras_multipliers": "0.8;0.6",
+                    "lora_parameters": {lora.name: {
+                        "parameter_schema_digest": resolved_schema["schema_digest"],
+                        "parameter_values": {"shape": "wide"},
+                    }},
+                }
+                yield ns, params, lora, sidecar, schema
+        finally:
+            fixture.tearDown()
+
+    def test_image_lora_durable_snapshot_freezes_source_schema_values_and_expands_each_prompt(self):
+        with self._image_lora_parameters() as (ns, params, lora, _sidecar, _schema):
+            ns["_seal_studio_image_lora_parameters"](params)
+            binding = ns["_validate_studio_image_lora_parameters"](json.loads(json.dumps(params)))
+            self.assertTrue(ns["list_loras_details"]("flux2_klein_9b")["loras"][0]["parameter_execution"]["studio_image_generation"])
+            self.assertEqual(binding["selections"][0]["parameter_values"], [["shape", "wide"]])
+            self.assertNotEqual(binding["selections"][0]["source_sha256"], "pending")
+            native = ns["_apply_studio_image_lora_parameters"](params, binding)
+            self.assertEqual(native["prompt"], "first prompt creator trigger wide shape\n\nsecond prompt creator trigger wide shape")
+            self.assertEqual(native["loras_multipliers"], "0.8;0.6")
+            self.assertNotIn("lora_parameters", native)
+            self.assertNotIn("_studio_lora_parameter_snapshot", native)
+            self.assertEqual(params["prompt"], "first prompt\n\nsecond prompt")
+            public = ns["_redact_local_paths"](params)
+            self.assertNotIn("_studio_lora_parameter_snapshot", public)
+            self.assertEqual(public["lora_parameters"], params["lora_parameters"])
+            _, sidecar_params = ns["_prepare_generation_sidecar_params"](params)
+            self.assertNotIn("_studio_lora_parameter_snapshot", sidecar_params)
+            self.assertEqual(sidecar_params["lora_parameters"], params["lora_parameters"])
+            lora.write_bytes(b"changed bytes")
+            with self.assertRaises(ValueError):
+                ns["_validate_studio_image_lora_parameters"](params)
+
+    def test_image_lora_rejects_schema_value_prompt_strength_and_private_snapshot_drift(self):
+        with self._image_lora_parameters() as (ns, params, _lora, sidecar, schema):
+            ns["_seal_studio_image_lora_parameters"](params)
+            for key, changed in (
+                ("prompt", "replacement prompt"), ("loras_multipliers", "0.3"),
+                ("multi_prompts_gen_type", 2), ("lora_parameters", {}),
+                ("activated_loras", []),
+            ):
+                amended = copy.deepcopy(params)
+                amended[key] = changed
+                with self.subTest(key=key), self.assertRaises((ValueError, ns["HTTPException"])):
+                    ns["_validate_studio_image_lora_parameters"](amended)
+            amended = copy.deepcopy(params)
+            amended["_studio_lora_parameter_snapshot"]["binding"]["authored_prompt"] = "tampered"
+            with self.assertRaises(ValueError):
+                ns["_validate_studio_image_lora_parameters"](amended)
+            schema["parameters"][0]["options"][0]["prompt_fragment"] = "changed expansion"
+            sidecar.write_text(json.dumps({"maestro_lora_parameter_schema": schema}))
+            with self.assertRaises(ns["HTTPException"]):
+                ns["_validate_studio_image_lora_parameters"](params)
+
+    def test_image_lora_scopes_and_single_multiline_prompt_are_truthful(self):
+        with self._image_lora_parameters() as (ns, params, _lora, sidecar, schema):
+            params["multi_prompts_gen_type"] = 2
+            ns["_seal_studio_image_lora_parameters"](params)
+            binding = ns["_validate_studio_image_lora_parameters"](params)
+            native = ns["_apply_studio_image_lora_parameters"](params, binding)
+            self.assertEqual(native["prompt"], "first prompt\n\nsecond prompt creator trigger wide shape")
+            for amendment in (
+                {"generation_mode": "video"}, {"image_mode": 2},
+                {"progressive_pipeline": True}, {"enhance_before_generate": True},
+                {"edit_sub_mode": "inpaint"}, {"model_type": "video_only"},
+                {"activated_loras": []},
+            ):
+                with self.subTest(amendment=amendment), self.assertRaises(ns["HTTPException"]):
+                    ns["_resolve_studio_image_lora_parameters"]({**params, **amendment})
+            schema["parameters"][0]["roles"] = ["canonical_identity"]
+            sidecar.write_text(json.dumps({"maestro_lora_parameter_schema": schema}))
+            with self.assertRaises(ns["HTTPException"]):
+                ns["_resolve_studio_image_lora_parameters"](params)
+            self.assertFalse(ns["_studio_image_lora_schema_applicable"](
+                ns["_project_reference_lora_parameter_schema"]("flux2_klein_9b", str(_lora))))
+            self.assertFalse(ns["list_loras_details"]("flux2_klein_9b")["loras"][0]["parameter_execution"]["studio_image_generation"])
+
+    def test_image_lora_registration_retains_private_manifest_and_rejects_unsupported_before_publication(self):
+        with self._image_lora_parameters() as (lora_ns, params, lora, _sidecar, _schema):
+            with tempfile.TemporaryDirectory() as directory:
+                ns, Request, coordinator, registry, observed, project = self._studio_submission_test_namespace(directory)
+                for name in (
+                    "_resolve_studio_image_lora_parameters", "_seal_studio_image_lora_parameters",
+                    "_validate_studio_image_lora_parameters",
+                ):
+                    ns[name] = lora_ns[name]
+                ns["wgp"].get_model_def = lora_ns["wgp"].get_model_def
+                wire = {**params, "generation_request_id": str(uuid.uuid4()), "workspace": "project-a", "_queue_mode": "held"}
+                accepted = asyncio.run(ns["generate"](Request(wire)))
+                pointer = registry[accepted["job_id"]]["_recovery_manifest_pointer"]
+                restored = load_request_manifest(project, pointer, expected_job_id=accepted["job_id"])["params"]
+                self.assertEqual(restored["lora_parameters"], params["lora_parameters"])
+                self.assertEqual(restored["prompt"], params["prompt"])
+                lora_ns["_validate_studio_image_lora_parameters"](restored)
+                journal_text = (Path(directory) / "queue.jsonl").read_text()
+                self.assertNotIn(str(lora), journal_text)
+                self.assertNotIn("wide shape", journal_text)
+                self.assertNotIn("_studio_lora_parameter_snapshot", journal_text)
+                # An immutable request replay recovers the original receipt even
+                # when later source drift prevents executing the retained job.
+                lora.write_bytes(b"later source revision")
+                replay = asyncio.run(ns["generate"](Request(wire)))
+                self.assertEqual(replay["job_id"], accepted["job_id"])
+                self.assertEqual(len(observed["threads"]), 1)
+                for amendment in (
+                    {"generation_mode": "video"}, {"enhance_before_generate": True},
+                    {"_studio_lora_parameter_snapshot": restored["_studio_lora_parameter_snapshot"]},
+                ):
+                    unsupported = {**wire, **amendment, "generation_request_id": str(uuid.uuid4())}
+                    with self.subTest(amendment=amendment), self.assertRaises(ns["HTTPException"]):
+                        asyncio.run(ns["generate"](Request(unsupported)))
+                self.assertEqual(len(coordinator.journal.recover().jobs), 1)
+                self.assertEqual(len(registry), 1)
+
+    def test_specialized_endpoints_reject_image_lora_choices_before_media_work(self):
+        names = (
+            "retake_video_endpoint", "edit_anything_endpoint", "repaint_preview_endpoint",
+            "repaint_endpoint", "recast_preview_endpoint", "recast_endpoint",
+            "outpaint_endpoint", "h3_bridge_endpoint", "blend_endpoint",
+            "segment_preview_endpoint", "inpaint_endpoint", "tools_upscale", "tools_revoice",
+            "director_preparation_start", "director_generate_music", "generate_project_asset_references",
+        )
+        from fastapi import HTTPException
+
+        class Request:
+            def __init__(self, body):
+                self.body = body
+
+            async def json(self):
+                return self.body
+
+        namespace = _isolated_functions(self.launch, names, {
+            "HTTPException": HTTPException, "Request": Request,
+            "api": types.SimpleNamespace(post=lambda *_args, **_kwargs: lambda function: function),
+            "_asset_scope": lambda *_args: ("project-a", "main"),
+        })
+        choices = {"detail.safetensors": {
+            "parameter_schema_digest": "a" * 64, "parameter_values": {"shape": "wide"},
+        }}
+        for name in names:
+            for payload in ({"lora_parameters": choices}, {"_studio_lora_parameter_snapshot": {}}):
+                with self.subTest(endpoint=name, payload=payload):
+                    arguments = ("project-a", Request(payload)) if name == "generate_project_asset_references" else (Request(payload),)
+                    with self.assertRaises(HTTPException) as raised:
+                        asyncio.run(namespace[name](*arguments))
+                    self.assertEqual(raised.exception.status_code, 400)
+                    self.assertIn("Studio image", raised.exception.detail)
+        for base in ({"lora_parameters": choices}, {"_studio_lora_parameter_snapshot": {}}):
+            with self.assertRaises(HTTPException):
+                asyncio.run(namespace["blend_endpoint"](Request({"base_params": base})))
+        # Empty selections retain the legacy endpoint's own input validation.
+        with self.assertRaises(HTTPException) as raised:
+            asyncio.run(namespace["edit_anything_endpoint"](Request({"lora_parameters": {}})))
+        self.assertEqual(raised.exception.detail, "video_path is required")
+
+    def test_image_lora_source_drift_terminalizes_before_native_gpu_slot(self):
+        from typing import Callable
+        with self._image_lora_parameters() as (ns, params, lora, _sidecar, _schema):
+            ns["_seal_studio_image_lora_parameters"](params)
+            job = {"id": "image-job", "kind": "studio_generation", "status": "queued", "params": params}
+            native = mock.Mock(side_effect=AssertionError("native GPU slot must not run"))
+            def finish(target, status, **updates):
+                target.update(status=status, **updates)
+                return True
+            ns.update({
+                "Callable": Callable, "_jobs": {job["id"]: job},
+                "_queue_recovery_delivery_pending": lambda _job: None,
+                "_require_h3_legal_execution": lambda _models: None,
+                "_h3_job_model_types": lambda _job: [],
+                "_H3_LONG_STUDIO_MODELS": frozenset(),
+                "_SAMPLE_CAMPAIGN_JOB_KIND": "sample_campaign_generation",
+                "_lifecycle_finish_job": finish,
+                "generation_slot": native, "_WgpNativeGpuExecutionSlot": native,
+            })
+            _isolated_functions(_tree("app/launch.py"), ("_run_generation",), ns)
+            lora.write_bytes(b"changed before native admission")
+            self.assertFalse(ns["_run_generation"](job["id"]))
+            self.assertEqual(job["status"], "failed")
+            self.assertIn("refresh and submit again", job["error"])
+            native.assert_not_called()
+
+    def test_image_lora_native_callback_rechecks_source_after_parse_and_between_prompts(self):
+        from services import native_acceptance_reservation
+        acceptance = types.SimpleNamespace(target=None, worker=lambda _admission: contextlib.nullcontext())
+        for scenario in ("unchanged", "after_parse", "second_prompt", "legacy"):
+            with self.subTest(scenario=scenario), self._image_lora_parameters() as (ns, params, lora, _sidecar, _schema):
+                ns["_seal_studio_image_lora_parameters"](params)
+                binding = ns["_validate_studio_image_lora_parameters"](params)
+                native_params = ns["_apply_studio_image_lora_parameters"](params, binding)
+                prompts = [prompt for prompt in native_params["prompt"].splitlines() if prompt]
+                calls, events = [], []
+
+                def generate_video(task, send_cmd, *, plugin_data, model_type, prompt):
+                    calls.append(prompt)
+
+                def excluded_operation(_model, _send_cmd, operation):
+                    if scenario == "after_parse":
+                        lora.write_bytes(b"drift during dispatch wait after parsing")
+                    operation()
+
+                validate = ns["_validate_studio_image_lora_parameters"]
+                if scenario == "legacy":
+                    params = {key: value for key, value in params.items()
+                              if key not in {"lora_parameters", "_studio_lora_parameter_snapshot"}}
+                    validate = mock.Mock(side_effect=AssertionError("legacy strength-only must not validate a snapshot"))
+                callback_ns = {
+                    "job": {"params": params}, "wgp": types.SimpleNamespace(generate_video=generate_video),
+                    "_validate_studio_image_lora_parameters": validate,
+                    "_run_generation_task_with_llm_exclusion": excluded_operation,
+                    "worker_start_lock": threading.Lock(), "worker_started": threading.Event(),
+                    "worker_start_state": {"cancelled": False}, "task_h3_turbo_validation_authorized": False,
+                    "_H3_LONG_STUDIO_MODELS": frozenset(), "task_resource_failure": {},
+                    "_safe_failure_updates": lambda error, _job: {"failure_details": str(error)},
+                    "inspect": __import__("inspect"), "time": time, "traceback": __import__("traceback"),
+                }
+                module = ast.Module(body=[_function(self.launch, "make_error_handler")], type_ignores=[])
+                exec(compile(ast.fix_missing_locations(module), "isolated-image-lora-native-callback", "exec"), callback_ns)
+                with mock.patch.object(native_acceptance_reservation, "reservation", acceptance), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    for index, prompt in enumerate(prompts):
+                        if scenario == "second_prompt" and index == 1:
+                            lora.write_bytes(b"drift after first actual image prompt")
+                        handler = callback_ns["make_error_handler"](
+                            {}, {**native_params, "prompt": prompt}, lambda *event: events.append(event), {},
+                        )
+                        handler()
+                expected_calls = [] if scenario == "after_parse" else prompts[:1] if scenario == "second_prompt" else prompts
+                self.assertEqual(calls, expected_calls)
+                self.assertEqual(sum(event[0] == "error" for event in events), len(prompts) - len(expected_calls))
+                self.assertEqual(sum(event[0] == "exit" for event in events), len(prompts))
+                if scenario == "legacy":
+                    validate.assert_not_called()
+
     def _studio_submission_test_namespace(self, directory):
         from fastapi import HTTPException
         from fastapi.responses import JSONResponse, Response
@@ -11928,6 +12194,19 @@ class QueueLaunchWiringTests(unittest.TestCase):
                 ],
             })
             self.assertNotIn("/private/source", sidecar_path.read_text())
+
+            with self._image_lora_parameters() as (lora_ns, params, _lora, _sidecar, _schema):
+                lora_ns["_seal_studio_image_lora_parameters"](params)
+                binding = lora_ns["_validate_studio_image_lora_parameters"](params)
+                native = lora_ns["_apply_studio_image_lora_parameters"](params, binding)
+                namespace["job"]["params"] = params
+                namespace["_prepare_generation_sidecar_params"] = lora_ns["_prepare_generation_sidecar_params"]
+                write_sidecar(["fresh.mp4"], media_paths=media_paths, task_params=native)
+                restored = json.loads(sidecar_path.read_text())["params"]
+                self.assertEqual(restored["prompt"], params["prompt"])
+                self.assertEqual(restored["lora_parameters"], params["lora_parameters"])
+                self.assertNotIn("_studio_lora_parameter_snapshot", sidecar_path.read_text())
+                self.assertNotIn("wide shape", sidecar_path.read_text())
 
     def test_generic_finishing_runs_once_for_ordinary_outputs_and_skips_transaction_outputs(self):
         runner = _function(self.launch, "_run_generation")

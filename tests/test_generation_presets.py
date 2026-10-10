@@ -242,6 +242,39 @@ def _concurrent_update(
 
 
 class GenerationPresetStoreTests(unittest.TestCase):
+    def test_image_lora_parameter_profile_roundtrip_and_invalid_bindings(self):
+        payload = v2_preset_payload()
+        payload["mode"] = "image"
+        payload["params"]["image_mode"] = 1
+        choices = {
+            payload["activated_loras"][0]: {
+                "parameter_schema_digest": "a" * 64,
+                "parameter_values": {"shape": "wide", "enabled": False, "amount": 0.25},
+            },
+        }
+        payload["params"]["lora_parameters"] = choices
+        created = self.create(payload=payload)
+        self.assertEqual(created["params"]["lora_parameters"], choices)
+        self.assertEqual(self.listing()[0]["params"]["lora_parameters"], choices)
+        invalid = [
+            {"mode": "video"},
+            {"params": {"image_mode": 2}},
+            {"params": {"lora_parameters": {"other.safetensors": next(iter(choices.values()))}}},
+            {"params": {"lora_parameters": {"../bad.safetensors": next(iter(choices.values()))}}},
+            {"params": {"lora_parameters": {payload["activated_loras"][0]: {
+                "parameter_schema_digest": "A" * 64, "parameter_values": {},
+            }}}},
+            {"params": {"lora_parameters": {payload["activated_loras"][0]: {
+                "parameter_schema_digest": "a" * 64, "parameter_values": {"shape": []},
+            }}}},
+        ]
+        for amendment in invalid:
+            candidate = json.loads(json.dumps(payload))
+            candidate.update({key: value for key, value in amendment.items() if key != "params"})
+            candidate["params"].update(amendment.get("params", {}))
+            with self.subTest(amendment=amendment), self.assertRaises(presets.GenerationPresetError):
+                self.create(payload=candidate, preset_id=None)
+
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)

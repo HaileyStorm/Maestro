@@ -182,9 +182,16 @@ class CaptureTests(unittest.TestCase):
         launch = (ROOT / "app/launch.py").read_text()
         start = launch.index('filtered_params.pop("_h3_decode_observer", None)')
         factory = launch.index('decode_observation = capture_for_job(', start)
-        generate = launch.index('lambda: wgp.generate_video(', factory)
+        callback = launch.index('def invoke_native_generation():', factory)
+        generate = launch.index('return wgp.generate_video(', callback)
+        exclusion = launch.index('_run_generation_task_with_llm_exclusion(', generate)
         self.assertLess(start, factory)
-        self.assertLess(factory, generate)
+        self.assertLess(factory, callback)
+        self.assertLess(callback, generate)
+        self.assertLess(generate, exclusion)
+        self.assertIn('**filtered_params', launch[generate:exclusion])
+        self.assertRegex(launch[exclusion:exclusion + 300],
+                         r'_run_generation_task_with_llm_exclusion\(\s*call_model,\s*send_cmd,\s*invoke_native_generation,\s*\)')
 
 
 if __name__ == "__main__":
