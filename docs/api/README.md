@@ -88,11 +88,31 @@ console.log(await maestro.request('GET', '/api/v1/workspaces'))
 JS
 ```
 
-Node's built-in `fetch` does not persist session cookies. For signed-in Node
-usage, supply a `fetch` adapter backed by your operator-managed cookie jar;
-an empty project list from this example does not prove private projects are
-absent. Python and curl can directly use the private jar created by the login
-helper below. In a same-origin browser application, import the TypeScript SDK
+For signed-in Node 22+ usage, use the Node-only adapter with the private
+Netscape cookie jar created by the human login helper below:
+
+```bash
+node --input-type=module <<'JS'
+import { createNodeClient } from './sdk/typescript/dist/node.js'
+const maestro = await createNodeClient(process.env.MAESTRO_URL, {
+  cookieFile: process.env.MAESTRO_COOKIE_FILE,
+})
+const account = await maestro.request('GET', '/api/v1/account/context')
+if (!account.authenticated) throw new Error('Human sign-in is required')
+console.log(await maestro.request('GET', '/api/v1/workspaces'))
+console.log(await maestro.request('GET', '/api/v1/projects/mythwright-media/editor/projects'))
+JS
+```
+
+The adapter reads only the explicitly selected jar, imports Maestro cookies
+for the configured host, confines requests to that exact origin, refuses
+redirects and keeps response cookie updates in memory. It never exports or
+rewrites the file and never logs in automatically. POSIX files must be regular,
+owned by the current user and inaccessible to group/others; on Windows, the
+operator must protect the file with their account's ACL. Browser bundles should
+import `index.js`, which has no Node filesystem dependency. An empty project
+list from anonymous discovery does not prove private projects are absent.
+In a same-origin browser application, import the TypeScript SDK
 through that application's bundler; the browser keeps its existing session:
 
 ```typescript
@@ -133,6 +153,16 @@ filename for a later login and retire sessions through the existing account UI.
 For Python, pass `cookie_file=os.environ["MAESTRO_COOKIE_FILE"]` to `MaestroClient`.
 curl uses `-b "$MAESTRO_COOKIE_FILE"`; MCP reads the same operator-selected path.
 This login helper does not provide recent owner reauthentication or model consent.
+
+For sustained service access, keep the jar in the operator's private store and
+provide only its path to the authorized server worker. Account sessions normally
+expire after 30 days and can be revoked earlier. They retain that account's
+permissions, so a client must explicitly bind every operation to its intended
+project; the jar is not a project-restricted API key. Read account/access context
+on reconnection. Expiry or revocation requires a new human login and a new jar
+path, followed by reloading the client. Before retrying work, reconcile saved
+submission/job/pipeline identities. A new login does not authorize replaying an
+uncertain mutation or continuing a browser-session-owned Director pipeline.
 
 To use your own operator credential mechanism, obtain `POST /api/v1/account/nonce` with
 `{"purpose":"login"}`, then `POST /api/v1/account/login` with `username`,

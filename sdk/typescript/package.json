@@ -1,11 +1,17 @@
 {
   "name": "@maestro/continuum",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "private": true,
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "exports": {
+    ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" },
+    "./node": { "types": "./dist/node.d.ts", "node": "./dist/node.js" }
+  },
   "files": ["dist", "src", "tsconfig.json"],
   "scripts": { "build": "tsc -p tsconfig.json" },
-  "devDependencies": { "typescript": "^5.9.3" }
+  "engines": { "node": ">=18" },
+  "dependencies": { "tough-cookie": "^6.0.2" },
+  "devDependencies": { "typescript": "^5.9.3", "@types/node": "^22.0.0" }
 }
