@@ -6582,7 +6582,9 @@ def restore_registered_pipeline(
         "progress": {
             "current": 0, "total": 0,
             "message": (
-                blocked_reason
+                f"Director pipeline {saved_status}"
+                if terminal
+                else blocked_reason
                 if blocked_manual
                 else "Owner reauthentication is required to resume"
                 if blocked_remote else "Recovered after restart"
