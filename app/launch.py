@@ -10754,7 +10754,12 @@ def _director_recovery_restore_parent(
             else "restored"
         ),
         phase=str(state.get("phase") or state.get("status") or "restored"),
-        message="Director recovery state restored",
+        message=(
+            "Director pipeline complete" if state.get("status") == "completed"
+            else "Director pipeline cancelled" if state.get("status") == "cancelled"
+            else "Director pipeline failed" if state.get("status") == "failed"
+            else "Director recovery state restored"
+        ),
         recovery_unit=dict(parent["recovery_unit"]),
         recovery_cursor=dict(parent["recovery_cursor"]),
     )
@@ -48330,6 +48335,10 @@ def _public_director_recovery_metadata(pipeline: dict) -> dict:
     if state not in _DIRECTOR_RECOVERY_STATES:
         state = ""
     status = str(pipeline.get("status") or "")
+    if status in {"completed", "failed", "cancelled"}:
+        state = "terminal"
+    elif status == "running" and state in {"paused", "interrupted"}:
+        state = "retrying"
     blocked = status == "blocked" and state.startswith("blocked_")
     reason, reason_text = _DIRECTOR_RECOVERY_REASONS.get(
         state, (None, None),
@@ -49135,6 +49144,7 @@ def director_pipeline_status(request: Request, pid: str):
     for internal in (
         "_recovery", "_recovery_parent", "_recovery_owner_digest",
         "_recovery_project_digest", "_recovery_block_reason",
+        "_recovery_saved_phase", "_recovered_without_worker",
         "_llm_log", "_llm_passes",
         "_planning_custody_required",
     ):

@@ -6195,6 +6195,11 @@ def continue_pipeline(pid: str, updates: Optional[dict] = None, *, planning_admi
             "hold_video": p["params"].get("hold_video"),
             "planning_custody_present": _DIRECTOR_PLANNING_CUSTODY_KEY in p,
             "planning_custody": p.get(_DIRECTOR_PLANNING_CUSTODY_KEY),
+            "recovery_projection": {
+                key: p[key] for key in (
+                    "recovery_state", "recovery_actions", "_recovery_saved_phase",
+                ) if key in p
+            },
         }
         if updates:
             if "clip_plans" in updates:
@@ -6210,6 +6215,10 @@ def continue_pipeline(pid: str, updates: Optional[dict] = None, *, planning_admi
         p["status"] = "running"
         p["_resume_after_pause"] = p.get("pause_reason")
         p["pause_reason"] = None
+        if p.get("recovery_state"):
+            p["recovery_state"] = "retrying"
+            p["recovery_actions"] = []
+        p.pop("_recovery_saved_phase", None)
         start_recovered = bool(p.pop("_recovered_without_worker", False)) or before_planning
     try:
         _require_pipeline_checkpoint(pid, "review-continue")
@@ -6244,6 +6253,13 @@ def continue_pipeline(pid: str, updates: Optional[dict] = None, *, planning_admi
                         current[_DIRECTOR_PLANNING_CUSTODY_KEY] = rollback["planning_custody"]
                     else:
                         current.pop(_DIRECTOR_PLANNING_CUSTODY_KEY, None)
+                    for key in (
+                        "recovery_state", "recovery_actions", "_recovery_saved_phase",
+                    ):
+                        if key in rollback["recovery_projection"]:
+                            current[key] = rollback["recovery_projection"][key]
+                        else:
+                            current.pop(key, None)
         raise
     with _pipeline_lock:
         current = _pipelines.get(pid)

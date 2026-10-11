@@ -1646,7 +1646,7 @@ def _validated_recovered_state(
             and clean.get("status") == "running"
             and clean.get("resource_state") == "preemption_requested"
         )
-        if clean.get("status") not in _TERMINAL:
+        if clean.get("status") not in _TERMINAL and not _terminal_director_parent(clean):
             # Process-local leases never survive restart. Pre-contract and
             # explicit CPU snapshots both reacquire from the standard queued
             # lane; the attempt counter remains the stale-result fence.
@@ -1690,6 +1690,7 @@ def _validated_recovered_state(
         for job_id, snapshot in jobs.items()
         if snapshot.get("status") == "queued"
         and not snapshot.get("cancel_requested", False)
+        and not _terminal_director_parent(snapshot)
     }
     preferred: list[str] = []
     for job_id in global_state.get("queue_order", []):
@@ -1704,6 +1705,14 @@ def _validated_recovered_state(
         ),
     )
     return jobs, global_state
+
+
+def _terminal_director_parent(snapshot: Mapping[str, Any]) -> bool:
+    # Semantic parents stay registered for repair and explicit deletion. Their
+    # journal status is deliberately queued to survive generic compaction;
+    # this does not make a finished parent schedulable generation work.
+    return (snapshot.get("kind") == "director_pipeline"
+            and snapshot.get("recovery_state") == "terminal")
 
 
 def _durable_order_key(
@@ -1790,6 +1799,7 @@ class QueueRecoveryCoordinator:
             for job_id, snapshot in prospective.items()
             if snapshot.get("status") == "queued"
             and not snapshot.get("cancel_requested", False)
+            and not _terminal_director_parent(snapshot)
         }
         current_order = [
             job_id for job_id in self._global_state.get("queue_order", [])
