@@ -1,5 +1,5 @@
 // Generated from the authoritative exported OpenAPI contract.
-export type OperationId = "research_status_api_v1_research_status_get" | "run_research_now_api_v1_research_run_post" | "issue_research_implementation_nonce_api_v1_research_implementation_nonce_post" | "run_research_implementation_api_v1_research_implementation_run_post" | "list_models_api_v1_models_get" | "get_model_visibility_api_v1_model_visibility_get" | "update_model_visibility_api_v1_model_visibility_put" | "debug_model_api_v1_models__model_type__debug_get" | "delete_model_api_v1_models__model_type__delete" | "verify_manual_checkpoint_api_v1_models__model_type__verify_manual_checkpoint_post" | "download_model_api_v1_models__model_type__download_post" | "model_downloads_status_api_v1_models_downloads_status_get" | "list_resolutions_api_v1_resolutions_get" | "get_defaults_api_v1_defaults__model_type__get" | "get_primary_settings_api_v1_primary_settings_get" | "scan_status_api_v1_loras_scan_status__scan_id__get" | "list_lora_directories_api_v1_loras_directories_get" | "serve_lora_preview_api_v1_loras_preview__filename__get" | "list_all_installed_loras_api_v1_loras_installed_get" | "delete_lora_file_api_v1_loras_file_delete" | "list_loras_api_v1_loras__model_type__get" | "list_loras_details_api_v1_loras__model_type__details_get" | "check_lora_updates_api_v1_loras_check_updates_post" | "get_lora_update_manifest_api_v1_loras_update_manifest_get" | "civitai_base_models_api_v1_civitai_base_models_get" | "civitai_checkpoint_architectures_api_v1_civitai_checkpoint_architectures_get" | "reload_model_definitions_api_v1_models_reload_post" | "checkpoints_installed_api_v1_checkpoints_installed_get" | "checkpoints_check_updates_api_v1_checkpoints_check_updates_post" | "civitai_search_api_v1_civitai_search_get" | "civitai_model_detail_api_v1_civitai_model__model_id__get" | "civitai_download_api_v1_civitai_download_post" | "civitai_downloads_status_api_v1_civitai_downloads_get" | "hf_import_lora_api_v1_huggingface_import_lora_post" | "generate_lora_guide_api_v1_loras_generate_guide_post" | "get_lora_guide_api_v1_loras__model_type___filename__guide_get" | "generate_checkpoint_guide_api_v1_checkpoints__model_type__generate_guide_post" | "scan_and_generate_guides_api_v1_loras_scan_and_generate_guides_post" | "get_model_options_api_v1_model_options__model_type__get" | "list_presets_api_v1_presets_get" | "create_preset_api_v1_presets_post" | "update_preset_api_v1_presets__preset_id__put" | "delete_preset_api_v1_presets__preset_id__delete" | "get_system_config_api_v1_system_config_get" | "update_system_config_api_v1_system_config_put" | "scan_model_folders_api_v1_model_folders_scan_get" | "get_active_downloads_api_v1_downloads_active_get" | "get_system_detect_api_v1_system_detect_get" | "apply_system_detect_api_v1_system_detect_apply_post" | "get_system_stats_live_api_v1_system_stats_get" | "system_release_model_api_v1_system_release_model_post" | "owner_resource_release_preview_api_v1_system_resource_release_get" | "owner_resource_release_api_v1_system_resource_release_post" | "list_recipes_route_api_v1_recipes_get" | "get_recipe_route_api_v1_recipes__rid__get" | "delete_recipe_route_api_v1_recipes__rid__delete" | "get_recipe_thumbnail_route_api_v1_recipes__rid__thumbnail_get" | "save_recipe_from_output_route_api_v1_recipes_save_from_output_post" | "import_recipe_route_api_v1_recipes_import_post" | "system_preflight_api_v1_system_preflight_get" | "get_services_config_api_v1_services_config_get" | "update_services_config_api_v1_services_config_put" | "get_host_terms_api_v1_host_terms_get" | "accept_host_terms_api_v1_host_terms_accept_post" | "get_account_context_api_v1_account_context_get" | "get_h3_legal_access_api_v1_h3_legal_access_get" | "update_h3_legal_access_api_v1_h3_legal_access_put" | "get_krea_owner_policy_api_v1_krea_owner_policy_get" | "update_krea_owner_policy_api_v1_krea_owner_policy_put" | "get_account_project_migration_api_v1_account_projects_migration_get" | "migrate_account_projects_api_v1_account_projects_migration_post" | "list_project_members_api_v1_workspaces__workspace__members_get" | "add_project_member_api_v1_workspaces__workspace__members_post" | "set_project_member_api_v1_workspaces__workspace__members__account_id__put" | "remove_project_member_api_v1_workspaces__workspace__members__account_id__delete" | "issue_account_nonce_api_v1_account_nonce_post" | "bootstrap_account_owner_api_v1_account_bootstrap_post" | "login_account_api_v1_account_login_post" | "register_public_account_api_v1_account_register_post" | "logout_account_api_v1_account_logout_post" | "reauthenticate_account_api_v1_account_reauth_post" | "recover_account_api_v1_account_recover_post" | "change_account_password_api_v1_account_password_put" | "rotate_account_recovery_codes_api_v1_account_recovery_codes_post" | "list_account_sessions_api_v1_account_sessions_get" | "revoke_account_session_api_v1_account_sessions__session_handle__delete" | "revoke_all_account_sessions_api_v1_account_sessions_revoke_all_post" | "list_server_accounts_api_v1_account_users_get" | "create_server_account_api_v1_account_users_post" | "update_server_account_api_v1_account_users__account_id__put" | "get_support_catalog_api_v1_support_catalog_get" | "get_account_support_api_v1_support_self_get" | "receive_buy_me_a_coffee_webhook_api_v1_support_webhooks_buy_me_a_coffee_post" | "get_account_responsible_use_api_v1_support_responsible_use_get" | "accept_account_responsible_use_api_v1_support_responsible_use_accept_post" | "get_admin_account_support_api_v1_support_admin_accounts__account_id__get" | "transition_admin_account_fulfillment_api_v1_support_admin_accounts__account_id__fulfillment_post" | "record_admin_account_contribution_api_v1_support_admin_accounts__account_id__contributions_post" | "get_access_context_api_v1_access_context_get" | "register_runtime_share_url_api_v1_access_context_share_url_put" | "list_workspaces_endpoint_api_v1_workspaces_get" | "create_workspace_api_v1_workspaces_post" | "set_active_workspace_api_v1_workspaces_active_put" | "set_workspace_password_api_v1_workspaces__name__password_put" | "unlock_workspace_api_v1_workspaces__name__unlock_post" | "lock_workspace_api_v1_workspaces__name__lock_post" | "lock_all_workspaces_api_v1_workspaces_lock_all_post" | "delete_workspace_api_v1_workspaces__name__delete" | "get_project_reference_authoring_api_v1_projects__project__assets__asset_id__variants__variant_id__reference_authoring_get" | "get_output_editor_projects_api_v1_projects__project__editor_projects_get" | "open_output_editor_project_api_v1_projects__project__editor_projects_post" | "get_output_editor_project_api_v1_projects__project__editor_projects__editor_id__get" | "save_output_editor_project_api_v1_projects__project__editor_projects__editor_id__put" | "append_output_editor_clip_api_v1_projects__project__editor_projects__editor_id__clips_post" | "add_output_editor_take_api_v1_projects__project__editor_projects__editor_id__clips__clip_id__takes_post" | "list_editor_retakes_api_v1_projects__project__editor_projects__editor_id__retakes_get" | "return_editor_retake_api_v1_projects__project__editor_projects__editor_id__retakes__job_id__take_post" | "dismiss_editor_retake_api_v1_projects__project__editor_projects__editor_id__retakes__job_id__dismiss_post" | "switch_output_editor_take_api_v1_projects__project__editor_projects__editor_id__clips__clip_id__take_post" | "add_output_editor_audio_api_v1_projects__project__editor_projects__editor_id__audio_post" | "add_output_editor_image_api_v1_projects__project__editor_projects__editor_id__image_post" | "export_output_editor_project_api_v1_projects__project__editor_projects__editor_id__exports_post" | "resolve_current_selection_api_v1_projects__project__visual_styles_references_resolve_post" | "list_styles_api_v1_projects__project__visual_styles_get" | "create_style_api_v1_projects__project__visual_styles_post" | "get_style_api_v1_projects__project__visual_styles__asset_id__get" | "update_style_api_v1_projects__project__visual_styles__asset_id__patch" | "delete_style_api_v1_projects__project__visual_styles__asset_id__delete" | "list_project_assets_api_v1_projects__project__assets_get" | "create_project_asset_api_v1_projects__project__assets_post" | "update_project_asset_api_v1_projects__project__assets__asset_id__patch" | "delete_project_asset_api_v1_projects__project__assets__asset_id__delete" | "add_project_asset_variant_api_v1_projects__project__assets__asset_id__variants_post" | "set_project_asset_variant_status_api_v1_projects__project__assets__asset_id__variants__variant_id__patch" | "delete_project_asset_variant_api_v1_projects__project__assets__asset_id__variants__variant_id__delete" | "serve_project_asset_media_api_v1_projects__project__assets_media__relative_path__get" | "get_project_reference_capabilities_api_v1_projects__project__assets_reference_capabilities_get" | "generate_character_sheet_quad_api_v1_projects__project__assets__asset_id__character_sheet_quad_post" | "generate_project_asset_references_api_v1_projects__project__assets_generate_post" | "blender_mcp_status_api_v1_blender_status_get" | "blender_scene_create_api_v1_blender_scene_post" | "blender_director_plan_api_v1_blender_director_plan_post" | "blender_animate_keyframes_api_v1_blender_animate_post" | "blender_inspect_scene_api_v1_blender_inspect_post" | "blender_render_preview_api_v1_blender_render_post" | "blender_director_finalize_api_v1_blender_director_finalize_post" | "storage_duplicates_api_v1_storage_duplicates_get" | "storage_reclaim_api_v1_storage_duplicates_reclaim_post" | "storage_remove_linked_api_v1_storage_duplicates_remove_linked_post" | "storage_usage_api_v1_storage_usage_get" | "llm_status_api_v1_llm_status_get" | "llm_load_api_v1_llm_load_post" | "llm_unload_api_v1_llm_unload_post" | "llm_chat_upload_api_v1_llm_chat_upload_post" | "delete_llm_chat_upload_api_v1_llm_chat_upload__filename__delete" | "reconcile_llm_chat_upload_request_api_v1_llm_chat_upload_request__request_id__delete" | "add_llm_refusal_literal_api_v1_llm_refusal_literals_post" | "list_llm_models_api_v1_llm_models_get" | "llm_route_operation_status_api_v1_llm_operations__operation_kind___request_id__get" | "cancel_llm_route_operation_api_v1_llm_operations__operation_kind___request_id__delete" | "llm_route_operation_result_api_v1_llm_operations__operation_kind___request_id__result_get" | "llm_prepare_api_v1_llm_prepare_post" | "llm_prepare_status_api_v1_llm_prepare__operation_id__get" | "llm_chat_api_v1_llm_chat_post" | "llm_chat_status_api_v1_llm_chat__request_id__get" | "llm_stream_status_api_v1_llm_stream_status_get" | "llm_generate_api_v1_llm_generate_post" | "llm_write_song_api_v1_llm_write_song_post" | "yue2_status_api_v1_yue2_status_get" | "yue2_library_api_v1_yue2_library_get" | "yue2_submit_api_v1_yue2_generations_post" | "yue2_plan_api_v1_yue2_takes__take_id__plan_get" | "yue2_continue_api_v1_yue2_takes__take_id__continue_post" | "yue2_cancel_api_v1_yue2_takes__take_id__cancel_post" | "yue2_training_jobs_api_v1_yue2_training_get" | "yue2_training_submit_api_v1_yue2_training_post" | "yue2_training_cancel_api_v1_yue2_training__job_id__cancel_post" | "yue2_audio_api_v1_yue2_takes__take_id__audio__fmt__get" | "yue2_compose_api_v1_yue2_compose_post" | "director_preparation_start_api_v1_director_preparation_post" | "director_generate_music_api_v1_director_generate_music_post" | "llm_h3_prompt_rewriter_apply_api_v1_llm_operations_enhance__request_id__h3_apply_post" | "llm_enhance_prompt_api_v1_llm_enhance_prompt_post" | "llm_describe_image_api_v1_llm_describe_image_post" | "upload_audio_api_v1_upload_audio_post" | "serve_audio_upload_api_v1_uploads_audio__filename__get" | "mix_audio_api_v1_audio_mix_post" | "analyze_audio_api_v1_audio_analyze_post" | "audio_analyze_status_api_v1_audio_analyze_status_get" | "suggest_audio_clips_api_v1_audio_suggest_clips_post" | "director_plan_prompts_api_v1_director_plan_prompts_post" | "director_plan_angle_prompts_api_v1_director_plan_angle_prompts_post" | "plan_audio_structure_api_v1_audio_plan_structure_post" | "director_classify_sections_api_v1_director_classify_sections_post" | "director_plan_prompts_and_images_api_v1_director_plan_prompts_and_images_post" | "director_plan_dialogue_scenes_api_v1_director_plan_dialogue_scenes_post" | "director_plan_short_film_prompts_api_v1_director_plan_short_film_prompts_post" | "director_plan_short_film_script_api_v1_director_plan_short_film_script_post" | "director_preparation_status_api_v1_director_preparation__request_id__get" | "director_capabilities_api_v1_director_capabilities_get" | "director_preflight_api_v1_director_preflight_post" | "director_queue_list_api_v1_director_queue_get" | "director_queue_add_api_v1_director_queue_post" | "director_queue_start_api_v1_director_queue_start_post" | "director_queue_pause_api_v1_director_queue_pause_post" | "director_queue_reorder_api_v1_director_queue_reorder_post" | "director_queue_get_api_v1_director_queue__entry_id__get" | "director_queue_update_api_v1_director_queue__entry_id__put" | "director_queue_delete_api_v1_director_queue__entry_id__delete" | "director_pipeline_start_api_v1_director_pipeline_start_post" | "director_pipeline_status_api_v1_director_pipeline__pid__get" | "director_pipeline_continue_api_v1_director_pipeline__pid__continue_post" | "director_pipeline_stop_api_v1_director_pipeline__pid__stop_post" | "director_pipeline_resume_api_v1_director_pipeline__pid__resume_post" | "list_saved_pipelines_api_v1_director_pipelines_get" | "get_saved_pipeline_api_v1_director_pipelines__pid__get" | "delete_pipeline_endpoint_api_v1_director_pipelines__pid__delete" | "tag_pipeline_clip_api_v1_director_pipelines__pid__clips__clip_index__tag_put" | "repair_saved_pipeline_api_v1_director_pipelines__pid__repair_post" | "cancel_saved_pipeline_repair_api_v1_director_pipelines__pid__repair_cancel_post" | "rerun_pipeline_clip_image_api_v1_director_pipelines__pid__clips__clip_index__rerun_image_post" | "rerun_pipeline_clip_video_api_v1_director_pipelines__pid__clips__clip_index__rerun_video_post" | "rejoin_pipeline_clips_api_v1_director_pipelines__pid__rejoin_post" | "director_v2_plan_api_v1_director_v2_plan_post" | "preview_generation_plan_api_v1_generate_plan_post" | "h3_evaluation_catalog_api_v1_h3_evaluation_catalog_get" | "h3_style_workflow_catalog_api_v1_h3_style_workflows_get" | "h3_acceleration_status_api_v1_h3_acceleration_get" | "h3_estimate_api_v1_h3_estimate_post" | "h3_benchmark_report_api_v1_h3_benchmark_get" | "h3_evaluation_preflight_api_v1_h3_evaluation_preflight_post" | "get_sample_campaign_queue_api_v1_sample_campaign_queue_get" | "submit_sample_campaign_pair_api_v1_sample_campaign_pairs_post" | "release_sample_campaign_arm_api_v1_sample_campaign_release_post" | "h3_gallery_control_endpoint_api_v1_h3_gallery_control_post" | "h3_gallery_av_guide_endpoint_api_v1_h3_gallery_av_guide_post" | "h3_gallery_still_guide_endpoint_api_v1_h3_gallery_still_guide_post" | "get_generation_submission_api_v1_generate_submissions__generation_request_id__get" | "generate_api_v1_generate_post" | "retake_video_endpoint_api_v1_retake_post" | "extract_frames_endpoint_api_v1_extract_frames_post" | "edit_anything_endpoint_api_v1_edit_anything_post" | "repaint_preview_endpoint_api_v1_repaint_preview_post" | "repaint_endpoint_api_v1_repaint_post" | "recast_preview_endpoint_api_v1_recast_preview_post" | "recast_endpoint_api_v1_recast_post" | "outpaint_endpoint_api_v1_outpaint_post" | "h3_bridge_endpoint_api_v1_h3_bridge_post" | "blend_endpoint_api_v1_blend_post" | "sam_status_endpoint_api_v1_sam_status_get" | "segment_preview_endpoint_api_v1_segment_preview_post" | "inpaint_endpoint_api_v1_inpaint_post" | "face_preview_source_api_v1_tools_h3_face_refine_source_get" | "face_preview_frame_api_v1_tools_h3_face_refine_frame_get" | "tools_h3_face_refine_api_v1_tools_h3_face_refine_post" | "tools_hflip_api_v1_tools_hflip_post" | "tools_browser_copy_api_v1_tools_browser_copy_post" | "recover_blender_editor_composition_api_v1_queue__job_id__composition_recovery_post" | "get_blender_editor_composition_recovery_api_v1_queue__job_id__composition_recovery__recovery_request_id__get" | "submit_blender_editor_composition_api_v1_projects__project__compositions_post" | "tools_upscale_api_v1_tools_upscale_post" | "tools_revoice_api_v1_tools_revoice_post" | "get_status_api_v1_status__job_id__get" | "cancel_job_api_v1_cancel__job_id__post" | "list_jobs_api_v1_jobs_get" | "approve_generation_plan_api_v1_generate__job_id__plan_approve_post" | "get_h3_delivery_recovery_api_v1_jobs__job_id__delivery_recovery_get" | "accept_h3_delivery_native_api_v1_jobs__job_id__delivery_recovery_accept_native_post" | "retry_h3_delivery_postprocess_api_v1_jobs__job_id__delivery_recovery_retry_post" | "get_queue_state_api_v1_queue_get" | "set_job_queue_priority_api_v1_queue__job_id__priority_post" | "hold_queued_job_api_v1_queue__job_id__hold_post" | "start_studio_queue_api_v1_jobs_queue_start_post" | "resume_held_job_api_v1_queue__job_id__resume_post" | "reattach_blend_recovery_inputs_api_v1_queue__job_id__blend_reattach_post" | "get_local_h3_recovery_discovery_api_v1_local_recovery_h3_discovery_get" | "get_local_h3_recovery_status_api_v1_local_recovery_h3__job_id__get" | "prepare_local_h3_recovery_control_api_v1_local_recovery_h3__job_id__prepare_post" | "start_local_h3_recovery_control_api_v1_local_recovery_h3__job_id__start_post" | "resume_recovered_job_api_v1_queue__job_id__recovery_resume_post" | "retry_recovered_job_api_v1_queue__job_id__recovery_retry_post" | "start_queued_job_next_api_v1_queue__job_id__start_next_post" | "set_job_output_count_api_v1_queue__job_id__output_count_post" | "get_job_log_api_v1_jobs__job_id__log_get" | "pause_queue_after_output_api_v1_queue_pause_after_output_post" | "resume_generation_queue_api_v1_queue_resume_post" | "list_favorites_api_v1_favorites_get" | "toggle_favorite_api_v1_favorites__name__post" | "list_outputs_api_v1_outputs_get" | "serve_file_api_v1_file__filename__get" | "get_output_metadata_api_v1_outputs__name__metadata_get" | "create_output_share_api_v1_output_shares_post" | "revoke_output_share_api_v1_output_shares_delete" | "serve_output_share_media_api_v1_output_shares__token__media_get" | "rejoin_clips_api_v1_outputs_rejoin_post" | "get_group_clips_api_v1_outputs_group__group_id__get" | "bulk_output_privacy_api_v1_outputs_bulk_privacy_post" | "bulk_move_outputs_api_v1_outputs_bulk_move_post" | "bulk_delete_outputs_api_v1_outputs_bulk_delete_post" | "move_output_api_v1_outputs__name__move_post" | "delete_output_components_api_v1_outputs__name__components_delete" | "delete_output_api_v1_outputs__name__delete" | "upload_image_api_v1_upload_post" | "delete_upload_api_v1_uploads__filename__delete" | "serve_upload_api_v1_uploads__filename__get" | "continuum_api_documentation_api_v1_api_documentation__document__get" | "continuum_api_discovery_api_v1_api_discovery_get";
+export type OperationId = "research_status_api_v1_research_status_get" | "run_research_now_api_v1_research_run_post" | "issue_research_implementation_nonce_api_v1_research_implementation_nonce_post" | "run_research_implementation_api_v1_research_implementation_run_post" | "list_models_api_v1_models_get" | "get_model_visibility_api_v1_model_visibility_get" | "update_model_visibility_api_v1_model_visibility_put" | "debug_model_api_v1_models__model_type__debug_get" | "delete_model_api_v1_models__model_type__delete" | "verify_manual_checkpoint_api_v1_models__model_type__verify_manual_checkpoint_post" | "download_model_api_v1_models__model_type__download_post" | "model_downloads_status_api_v1_models_downloads_status_get" | "list_resolutions_api_v1_resolutions_get" | "get_defaults_api_v1_defaults__model_type__get" | "get_primary_settings_api_v1_primary_settings_get" | "scan_status_api_v1_loras_scan_status__scan_id__get" | "list_lora_directories_api_v1_loras_directories_get" | "serve_lora_preview_api_v1_loras_preview__filename__get" | "list_all_installed_loras_api_v1_loras_installed_get" | "delete_lora_file_api_v1_loras_file_delete" | "list_loras_api_v1_loras__model_type__get" | "list_loras_details_api_v1_loras__model_type__details_get" | "check_lora_updates_api_v1_loras_check_updates_post" | "get_lora_update_manifest_api_v1_loras_update_manifest_get" | "civitai_base_models_api_v1_civitai_base_models_get" | "civitai_checkpoint_architectures_api_v1_civitai_checkpoint_architectures_get" | "reload_model_definitions_api_v1_models_reload_post" | "checkpoints_installed_api_v1_checkpoints_installed_get" | "checkpoints_check_updates_api_v1_checkpoints_check_updates_post" | "civitai_search_api_v1_civitai_search_get" | "civitai_model_detail_api_v1_civitai_model__model_id__get" | "civitai_download_api_v1_civitai_download_post" | "civitai_downloads_status_api_v1_civitai_downloads_get" | "hf_import_lora_api_v1_huggingface_import_lora_post" | "generate_lora_guide_api_v1_loras_generate_guide_post" | "get_lora_guide_api_v1_loras__model_type___filename__guide_get" | "generate_checkpoint_guide_api_v1_checkpoints__model_type__generate_guide_post" | "scan_and_generate_guides_api_v1_loras_scan_and_generate_guides_post" | "get_model_options_api_v1_model_options__model_type__get" | "list_presets_api_v1_presets_get" | "create_preset_api_v1_presets_post" | "update_preset_api_v1_presets__preset_id__put" | "delete_preset_api_v1_presets__preset_id__delete" | "get_system_config_api_v1_system_config_get" | "update_system_config_api_v1_system_config_put" | "scan_model_folders_api_v1_model_folders_scan_get" | "get_active_downloads_api_v1_downloads_active_get" | "get_system_detect_api_v1_system_detect_get" | "apply_system_detect_api_v1_system_detect_apply_post" | "get_system_stats_live_api_v1_system_stats_get" | "system_release_model_api_v1_system_release_model_post" | "owner_resource_release_preview_api_v1_system_resource_release_get" | "owner_resource_release_api_v1_system_resource_release_post" | "list_recipes_route_api_v1_recipes_get" | "get_recipe_route_api_v1_recipes__rid__get" | "delete_recipe_route_api_v1_recipes__rid__delete" | "get_recipe_thumbnail_route_api_v1_recipes__rid__thumbnail_get" | "save_recipe_from_output_route_api_v1_recipes_save_from_output_post" | "import_recipe_route_api_v1_recipes_import_post" | "system_preflight_api_v1_system_preflight_get" | "get_services_config_api_v1_services_config_get" | "update_services_config_api_v1_services_config_put" | "get_host_terms_api_v1_host_terms_get" | "accept_host_terms_api_v1_host_terms_accept_post" | "get_account_context_api_v1_account_context_get" | "get_h3_legal_access_api_v1_h3_legal_access_get" | "update_h3_legal_access_api_v1_h3_legal_access_put" | "get_krea_owner_policy_api_v1_krea_owner_policy_get" | "update_krea_owner_policy_api_v1_krea_owner_policy_put" | "get_account_project_migration_api_v1_account_projects_migration_get" | "migrate_account_projects_api_v1_account_projects_migration_post" | "list_project_members_api_v1_workspaces__workspace__members_get" | "add_project_member_api_v1_workspaces__workspace__members_post" | "set_project_member_api_v1_workspaces__workspace__members__account_id__put" | "remove_project_member_api_v1_workspaces__workspace__members__account_id__delete" | "issue_account_nonce_api_v1_account_nonce_post" | "bootstrap_account_owner_api_v1_account_bootstrap_post" | "login_account_api_v1_account_login_post" | "register_public_account_api_v1_account_register_post" | "logout_account_api_v1_account_logout_post" | "reauthenticate_account_api_v1_account_reauth_post" | "recover_account_api_v1_account_recover_post" | "change_account_password_api_v1_account_password_put" | "rotate_account_recovery_codes_api_v1_account_recovery_codes_post" | "list_account_sessions_api_v1_account_sessions_get" | "revoke_account_session_api_v1_account_sessions__session_handle__delete" | "revoke_all_account_sessions_api_v1_account_sessions_revoke_all_post" | "list_server_accounts_api_v1_account_users_get" | "create_server_account_api_v1_account_users_post" | "update_server_account_api_v1_account_users__account_id__put" | "get_support_catalog_api_v1_support_catalog_get" | "get_account_support_api_v1_support_self_get" | "receive_buy_me_a_coffee_webhook_api_v1_support_webhooks_buy_me_a_coffee_post" | "get_account_responsible_use_api_v1_support_responsible_use_get" | "accept_account_responsible_use_api_v1_support_responsible_use_accept_post" | "get_admin_account_support_api_v1_support_admin_accounts__account_id__get" | "transition_admin_account_fulfillment_api_v1_support_admin_accounts__account_id__fulfillment_post" | "record_admin_account_contribution_api_v1_support_admin_accounts__account_id__contributions_post" | "get_access_context_api_v1_access_context_get" | "register_runtime_share_url_api_v1_access_context_share_url_put" | "list_workspaces_endpoint_api_v1_workspaces_get" | "create_workspace_api_v1_workspaces_post" | "set_active_workspace_api_v1_workspaces_active_put" | "set_workspace_password_api_v1_workspaces__name__password_put" | "unlock_workspace_api_v1_workspaces__name__unlock_post" | "lock_workspace_api_v1_workspaces__name__lock_post" | "lock_all_workspaces_api_v1_workspaces_lock_all_post" | "delete_workspace_api_v1_workspaces__name__delete" | "get_project_reference_authoring_api_v1_projects__project__assets__asset_id__variants__variant_id__reference_authoring_get" | "get_output_editor_projects_api_v1_projects__project__editor_projects_get" | "open_output_editor_project_api_v1_projects__project__editor_projects_post" | "get_output_editor_project_api_v1_projects__project__editor_projects__editor_id__get" | "save_output_editor_project_api_v1_projects__project__editor_projects__editor_id__put" | "append_output_editor_clip_api_v1_projects__project__editor_projects__editor_id__clips_post" | "add_output_editor_take_api_v1_projects__project__editor_projects__editor_id__clips__clip_id__takes_post" | "list_editor_retakes_api_v1_projects__project__editor_projects__editor_id__retakes_get" | "return_editor_retake_api_v1_projects__project__editor_projects__editor_id__retakes__job_id__take_post" | "dismiss_editor_retake_api_v1_projects__project__editor_projects__editor_id__retakes__job_id__dismiss_post" | "switch_output_editor_take_api_v1_projects__project__editor_projects__editor_id__clips__clip_id__take_post" | "add_output_editor_audio_api_v1_projects__project__editor_projects__editor_id__audio_post" | "add_output_editor_image_api_v1_projects__project__editor_projects__editor_id__image_post" | "export_output_editor_project_api_v1_projects__project__editor_projects__editor_id__exports_post" | "resolve_current_selection_api_v1_projects__project__visual_styles_references_resolve_post" | "list_styles_api_v1_projects__project__visual_styles_get" | "create_style_api_v1_projects__project__visual_styles_post" | "get_style_api_v1_projects__project__visual_styles__asset_id__get" | "update_style_api_v1_projects__project__visual_styles__asset_id__patch" | "delete_style_api_v1_projects__project__visual_styles__asset_id__delete" | "list_project_assets_api_v1_projects__project__assets_get" | "create_project_asset_api_v1_projects__project__assets_post" | "update_project_asset_api_v1_projects__project__assets__asset_id__patch" | "delete_project_asset_api_v1_projects__project__assets__asset_id__delete" | "add_project_asset_variant_api_v1_projects__project__assets__asset_id__variants_post" | "set_project_asset_variant_status_api_v1_projects__project__assets__asset_id__variants__variant_id__patch" | "delete_project_asset_variant_api_v1_projects__project__assets__asset_id__variants__variant_id__delete" | "serve_project_asset_media_api_v1_projects__project__assets_media__relative_path__get" | "get_project_reference_capabilities_api_v1_projects__project__assets_reference_capabilities_get" | "generate_character_sheet_quad_api_v1_projects__project__assets__asset_id__character_sheet_quad_post" | "generate_project_asset_references_api_v1_projects__project__assets_generate_post" | "blender_mcp_status_api_v1_blender_status_get" | "blender_scene_create_api_v1_blender_scene_post" | "blender_director_plan_api_v1_blender_director_plan_post" | "blender_animate_keyframes_api_v1_blender_animate_post" | "blender_inspect_scene_api_v1_blender_inspect_post" | "blender_render_preview_api_v1_blender_render_post" | "blender_director_finalize_api_v1_blender_director_finalize_post" | "storage_duplicates_api_v1_storage_duplicates_get" | "storage_reclaim_api_v1_storage_duplicates_reclaim_post" | "storage_remove_linked_api_v1_storage_duplicates_remove_linked_post" | "storage_usage_api_v1_storage_usage_get" | "llm_status_api_v1_llm_status_get" | "llm_load_api_v1_llm_load_post" | "llm_unload_api_v1_llm_unload_post" | "llm_chat_upload_api_v1_llm_chat_upload_post" | "delete_llm_chat_upload_api_v1_llm_chat_upload__filename__delete" | "reconcile_llm_chat_upload_request_api_v1_llm_chat_upload_request__request_id__delete" | "add_llm_refusal_literal_api_v1_llm_refusal_literals_post" | "list_llm_models_api_v1_llm_models_get" | "llm_route_operation_status_api_v1_llm_operations__operation_kind___request_id__get" | "cancel_llm_route_operation_api_v1_llm_operations__operation_kind___request_id__delete" | "llm_route_operation_result_api_v1_llm_operations__operation_kind___request_id__result_get" | "llm_prepare_api_v1_llm_prepare_post" | "llm_prepare_status_api_v1_llm_prepare__operation_id__get" | "llm_chat_api_v1_llm_chat_post" | "llm_chat_status_api_v1_llm_chat__request_id__get" | "llm_stream_status_api_v1_llm_stream_status_get" | "llm_generate_api_v1_llm_generate_post" | "llm_write_song_api_v1_llm_write_song_post" | "yue2_status_api_v1_yue2_status_get" | "yue2_library_api_v1_yue2_library_get" | "yue2_submit_api_v1_yue2_generations_post" | "yue2_plan_api_v1_yue2_takes__take_id__plan_get" | "yue2_continue_api_v1_yue2_takes__take_id__continue_post" | "yue2_cancel_api_v1_yue2_takes__take_id__cancel_post" | "yue2_training_jobs_api_v1_yue2_training_get" | "yue2_training_submit_api_v1_yue2_training_post" | "yue2_training_cancel_api_v1_yue2_training__job_id__cancel_post" | "yue2_audio_api_v1_yue2_takes__take_id__audio__fmt__get" | "yue2_compose_api_v1_yue2_compose_post" | "director_preparation_start_api_v1_director_preparation_post" | "director_generate_music_api_v1_director_generate_music_post" | "llm_h3_prompt_rewriter_apply_api_v1_llm_operations_enhance__request_id__h3_apply_post" | "llm_enhance_prompt_api_v1_llm_enhance_prompt_post" | "llm_describe_image_api_v1_llm_describe_image_post" | "upload_audio_api_v1_upload_audio_post" | "serve_audio_upload_api_v1_uploads_audio__filename__get" | "mix_audio_api_v1_audio_mix_post" | "analyze_audio_api_v1_audio_analyze_post" | "audio_analyze_status_api_v1_audio_analyze_status_get" | "suggest_audio_clips_api_v1_audio_suggest_clips_post" | "director_plan_prompts_api_v1_director_plan_prompts_post" | "director_plan_angle_prompts_api_v1_director_plan_angle_prompts_post" | "plan_audio_structure_api_v1_audio_plan_structure_post" | "director_classify_sections_api_v1_director_classify_sections_post" | "director_plan_prompts_and_images_api_v1_director_plan_prompts_and_images_post" | "director_plan_dialogue_scenes_api_v1_director_plan_dialogue_scenes_post" | "director_plan_short_film_prompts_api_v1_director_plan_short_film_prompts_post" | "director_plan_short_film_script_api_v1_director_plan_short_film_script_post" | "director_preparation_status_api_v1_director_preparation__request_id__get" | "director_capabilities_api_v1_director_capabilities_get" | "director_preflight_api_v1_director_preflight_post" | "director_queue_list_api_v1_director_queue_get" | "director_queue_add_api_v1_director_queue_post" | "director_queue_start_api_v1_director_queue_start_post" | "director_queue_pause_api_v1_director_queue_pause_post" | "director_queue_reorder_api_v1_director_queue_reorder_post" | "director_queue_get_api_v1_director_queue__entry_id__get" | "director_queue_update_api_v1_director_queue__entry_id__put" | "director_queue_delete_api_v1_director_queue__entry_id__delete" | "director_pipeline_start_api_v1_director_pipeline_start_post" | "director_pipeline_status_api_v1_director_pipeline__pid__get" | "director_pipeline_continue_api_v1_director_pipeline__pid__continue_post" | "director_pipeline_stop_api_v1_director_pipeline__pid__stop_post" | "director_pipeline_resume_api_v1_director_pipeline__pid__resume_post" | "list_saved_pipelines_api_v1_director_pipelines_get" | "get_saved_pipeline_api_v1_director_pipelines__pid__get" | "delete_pipeline_endpoint_api_v1_director_pipelines__pid__delete" | "tag_pipeline_clip_api_v1_director_pipelines__pid__clips__clip_index__tag_put" | "repair_saved_pipeline_api_v1_director_pipelines__pid__repair_post" | "cancel_saved_pipeline_repair_api_v1_director_pipelines__pid__repair_cancel_post" | "rerun_pipeline_clip_image_api_v1_director_pipelines__pid__clips__clip_index__rerun_image_post" | "rerun_pipeline_clip_video_api_v1_director_pipelines__pid__clips__clip_index__rerun_video_post" | "rejoin_pipeline_clips_api_v1_director_pipelines__pid__rejoin_post" | "director_v2_plan_api_v1_director_v2_plan_post" | "preview_generation_plan_api_v1_generate_plan_post" | "h3_evaluation_catalog_api_v1_h3_evaluation_catalog_get" | "h3_style_workflow_catalog_api_v1_h3_style_workflows_get" | "h3_acceleration_status_api_v1_h3_acceleration_get" | "h3_estimate_api_v1_h3_estimate_post" | "h3_benchmark_report_api_v1_h3_benchmark_get" | "h3_evaluation_preflight_api_v1_h3_evaluation_preflight_post" | "get_sample_campaign_queue_api_v1_sample_campaign_queue_get" | "submit_sample_campaign_pair_api_v1_sample_campaign_pairs_post" | "release_sample_campaign_arm_api_v1_sample_campaign_release_post" | "h3_gallery_control_endpoint_api_v1_h3_gallery_control_post" | "h3_gallery_av_guide_endpoint_api_v1_h3_gallery_av_guide_post" | "h3_gallery_still_guide_endpoint_api_v1_h3_gallery_still_guide_post" | "get_generation_submission_api_v1_generate_submissions__generation_request_id__get" | "generate_api_v1_generate_post" | "retake_video_endpoint_api_v1_retake_post" | "extract_frames_endpoint_api_v1_extract_frames_post" | "edit_anything_endpoint_api_v1_edit_anything_post" | "repaint_preview_endpoint_api_v1_repaint_preview_post" | "repaint_endpoint_api_v1_repaint_post" | "recast_preview_endpoint_api_v1_recast_preview_post" | "recast_endpoint_api_v1_recast_post" | "outpaint_endpoint_api_v1_outpaint_post" | "h3_bridge_endpoint_api_v1_h3_bridge_post" | "blend_endpoint_api_v1_blend_post" | "sam_status_endpoint_api_v1_sam_status_get" | "segment_preview_endpoint_api_v1_segment_preview_post" | "inpaint_endpoint_api_v1_inpaint_post" | "face_preview_source_api_v1_tools_h3_face_refine_source_get" | "face_preview_frame_api_v1_tools_h3_face_refine_frame_get" | "tools_h3_face_refine_api_v1_tools_h3_face_refine_post" | "tools_hflip_api_v1_tools_hflip_post" | "tools_browser_copy_api_v1_tools_browser_copy_post" | "recover_blender_editor_composition_api_v1_queue__job_id__composition_recovery_post" | "get_blender_editor_composition_recovery_api_v1_queue__job_id__composition_recovery__recovery_request_id__get" | "submit_blender_editor_composition_api_v1_projects__project__compositions_post" | "tools_upscale_api_v1_tools_upscale_post" | "tools_revoice_api_v1_tools_revoice_post" | "get_status_api_v1_status__job_id__get" | "cancel_job_api_v1_cancel__job_id__post" | "list_jobs_api_v1_jobs_get" | "approve_generation_plan_api_v1_generate__job_id__plan_approve_post" | "get_h3_delivery_recovery_api_v1_jobs__job_id__delivery_recovery_get" | "accept_h3_delivery_native_api_v1_jobs__job_id__delivery_recovery_accept_native_post" | "retry_h3_delivery_postprocess_api_v1_jobs__job_id__delivery_recovery_retry_post" | "get_queue_state_api_v1_queue_get" | "set_job_queue_priority_api_v1_queue__job_id__priority_post" | "hold_queued_job_api_v1_queue__job_id__hold_post" | "start_studio_queue_api_v1_jobs_queue_start_post" | "resume_held_job_api_v1_queue__job_id__resume_post" | "reattach_blend_recovery_inputs_api_v1_queue__job_id__blend_reattach_post" | "get_local_h3_recovery_discovery_api_v1_local_recovery_h3_discovery_get" | "get_local_h3_recovery_status_api_v1_local_recovery_h3__job_id__get" | "prepare_local_h3_recovery_control_api_v1_local_recovery_h3__job_id__prepare_post" | "start_local_h3_recovery_control_api_v1_local_recovery_h3__job_id__start_post" | "resume_recovered_job_api_v1_queue__job_id__recovery_resume_post" | "retry_recovered_job_api_v1_queue__job_id__recovery_retry_post" | "set_generation_completion_policy_api_v1_jobs__job_id__completion_policy_put" | "start_queued_job_next_api_v1_queue__job_id__start_next_post" | "set_job_output_count_api_v1_queue__job_id__output_count_post" | "get_job_log_api_v1_jobs__job_id__log_get" | "pause_queue_after_output_api_v1_queue_pause_after_output_post" | "resume_generation_queue_api_v1_queue_resume_post" | "list_favorites_api_v1_favorites_get" | "toggle_favorite_api_v1_favorites__name__post" | "list_outputs_api_v1_outputs_get" | "serve_file_api_v1_file__filename__get" | "get_output_metadata_api_v1_outputs__name__metadata_get" | "create_output_share_api_v1_output_shares_post" | "revoke_output_share_api_v1_output_shares_delete" | "serve_output_share_media_api_v1_output_shares__token__media_get" | "rejoin_clips_api_v1_outputs_rejoin_post" | "get_group_clips_api_v1_outputs_group__group_id__get" | "bulk_output_privacy_api_v1_outputs_bulk_privacy_post" | "bulk_move_outputs_api_v1_outputs_bulk_move_post" | "bulk_delete_outputs_api_v1_outputs_bulk_delete_post" | "move_output_api_v1_outputs__name__move_post" | "delete_output_components_api_v1_outputs__name__components_delete" | "delete_output_api_v1_outputs__name__delete" | "upload_image_api_v1_upload_post" | "delete_upload_api_v1_uploads__filename__delete" | "serve_upload_api_v1_uploads__filename__get" | "continuum_api_documentation_api_v1_api_documentation__document__get" | "continuum_api_discovery_api_v1_api_discovery_get";
 export type OperationReference = { operation_id: OperationId; method: string; path: string; summary: string; parameters: unknown[]; request_body: unknown; responses: Record<string, unknown>; metadata: Record<string, unknown> };
 export const operationReference: readonly OperationReference[] = [
   {
@@ -75812,6 +75812,45 @@ export const operationReference: readonly OperationReference[] = [
                     "paused",
                     "pause_after_current"
                   ]
+                },
+                "completion_policy": {
+                  "type": "object",
+                  "properties": {
+                    "release_generation_model": {
+                      "type": "boolean",
+                      "default": false
+                    }
+                  },
+                  "required": [
+                    "release_generation_model"
+                  ],
+                  "additionalProperties": false
+                },
+                "completion_cleanup": {
+                  "type": "object",
+                  "properties": {
+                    "status": {
+                      "type": "string",
+                      "enum": [
+                        "not_requested",
+                        "pending",
+                        "released",
+                        "not_loaded",
+                        "not_used",
+                        "unconfirmed"
+                      ],
+                      "description": "Wait for released/not_loaded after a genuine model invocation. not_used means no renderer entry; unconfirmed requires owner reconciliation. Terminal generation status alone is not a cleanup proof."
+                    },
+                    "execution_attempt": {
+                      "type": "integer",
+                      "minimum": 1
+                    }
+                  },
+                  "required": [
+                    "status",
+                    "execution_attempt"
+                  ],
+                  "additionalProperties": false
                 }
               },
               "additionalProperties": true,
@@ -75882,7 +75921,9 @@ export const operationReference: readonly OperationReference[] = [
                 "h3_estimate",
                 "estimate_after_resume",
                 "events",
-                "queue"
+                "queue",
+                "completion_policy",
+                "completion_cleanup"
               ]
             }
           }
@@ -81646,6 +81687,302 @@ export const operationReference: readonly OperationReference[] = [
       "mcp": true,
       "contract_status": "authored",
       "evidence": "Source review of app/launch.py and named service projections; no runtime, native, GPU, provider or human acceptance exercised."
+    }
+  },
+  {
+    "operation_id": "set_generation_completion_policy_api_v1_jobs__job_id__completion_policy_put",
+    "method": "PUT",
+    "path": "/api/v1/jobs/{job_id}/completion-policy",
+    "summary": "Set held image job completion cleanup",
+    "parameters": [
+      {
+        "name": "job_id",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string"
+        }
+      },
+      {
+        "name": "Origin",
+        "in": "header",
+        "required": false,
+        "description": "Exact configured app origin. Required while sharing is enabled; account mutations always require exact origin. Not a permission grant.",
+        "schema": {
+          "type": "string",
+          "format": "uri"
+        }
+      }
+    ],
+    "request_body": {
+      "required": true,
+      "content": {
+        "application/json": {
+          "schema": {
+            "type": "object",
+            "properties": {
+              "workspace": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Exact owning project name; this operation does not create or switch projects."
+              },
+              "release_generation_model": {
+                "type": "boolean",
+                "description": "true opts this job into generation-model cleanup; false retains normal caching. Change only while this ordinary image job is held and unstarted."
+              }
+            },
+            "required": [
+              "workspace",
+              "release_generation_model"
+            ],
+            "additionalProperties": false
+          },
+          "example": {
+            "workspace": "my-project",
+            "release_generation_model": true
+          }
+        }
+      }
+    },
+    "responses": {
+      "200": {
+        "description": "Durable policy acknowledged; no model work or queue release occurred.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "job_id": {
+                  "type": "string"
+                },
+                "workspace": {
+                  "type": "string"
+                },
+                "completion_policy": {
+                  "type": "object",
+                  "properties": {
+                    "release_generation_model": {
+                      "type": "boolean",
+                      "default": false
+                    }
+                  },
+                  "required": [
+                    "release_generation_model"
+                  ],
+                  "additionalProperties": false
+                },
+                "completion_cleanup": {
+                  "type": "object",
+                  "properties": {
+                    "status": {
+                      "type": "string",
+                      "enum": [
+                        "not_requested",
+                        "pending",
+                        "released",
+                        "not_loaded",
+                        "not_used",
+                        "unconfirmed"
+                      ],
+                      "description": "Wait for released/not_loaded after a genuine model invocation. not_used means no renderer entry; unconfirmed requires owner reconciliation. Terminal generation status alone is not a cleanup proof."
+                    },
+                    "execution_attempt": {
+                      "type": "integer",
+                      "minimum": 1
+                    }
+                  },
+                  "required": [
+                    "status",
+                    "execution_attempt"
+                  ],
+                  "additionalProperties": false
+                },
+                "held": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "job_id",
+                "workspace",
+                "completion_policy",
+                "completion_cleanup",
+                "held"
+              ],
+              "additionalProperties": false
+            },
+            "example": {
+              "job_id": "returned-job-id",
+              "workspace": "my-project",
+              "completion_policy": {
+                "release_generation_model": true
+              },
+              "completion_cleanup": {
+                "status": "pending",
+                "execution_attempt": 1
+              },
+              "held": true
+            }
+          }
+        }
+      },
+      "422": {
+        "description": "Validation Error",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/HTTPValidationError"
+            }
+          }
+        }
+      },
+      "400": {
+        "description": "Provide only workspace and a JSON boolean release_generation_model.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "detail": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "detail"
+              ],
+              "additionalProperties": false
+            }
+          }
+        }
+      },
+      "409": {
+        "description": "Only an unstarted held ordinary Studio image job can change policy. Inspect the same job; do not create a replacement submission.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "detail": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "detail"
+              ],
+              "additionalProperties": false
+            }
+          }
+        }
+      },
+      "401": {
+        "description": "Authentication required. Ask the owner to sign in through the existing account flow.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "detail": {
+                  "description": "Actionable handler-specific error; may be text, object or validation list."
+                }
+              },
+              "required": [
+                "detail"
+              ],
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "403": {
+        "description": "Access, origin, locality or recent confirmation is missing. Read access-context and project access.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "detail": {
+                  "description": "Actionable handler-specific error; may be text, object or validation list."
+                }
+              },
+              "required": [
+                "detail"
+              ],
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "404": {
+        "description": "Not found or not authorized in this session/project. Verify the returned identity and scope.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "detail": {
+                  "description": "Actionable handler-specific error; may be text, object or validation list."
+                }
+              },
+              "required": [
+                "detail"
+              ],
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "423": {
+        "description": "Resource is locked. Preserve the operation and wait for its owner.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "detail": {
+                  "description": "Actionable handler-specific error; may be text, object or validation list."
+                }
+              },
+              "required": [
+                "detail"
+              ],
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "503": {
+        "description": "Temporarily unavailable. Observe an existing operation; never blindly resubmit a mutation.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "detail": {
+                  "description": "Actionable handler-specific error; may be text, object or validation list."
+                }
+              },
+              "required": [
+                "detail"
+              ],
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    "metadata": {
+      "feature": "queue.completion_cleanup",
+      "permissions": [
+        "project.generate"
+      ],
+      "boundary": "Exact existing account/session-owned job and project identity; project.generate required. This invocation-scoped policy cannot trigger machine-wide resource unload, change another job or bypass owner reauthentication on Free Resources. Existing origin, terms and model admission remain controlling.",
+      "idempotency": "Setting the same boolean on the same job is idempotent, including after start. A differing value requires an unstarted held job. After a timeout read the same job status completion_policy/completion_cleanup; never resubmit generation.",
+      "operation_kind": "generation_completion_policy",
+      "mcp": true,
+      "read_only": false,
+      "destructive": false,
+      "idempotent": true,
+      "evidence": "Implemented production handler/lifecycle/native-slot cleanup. Fresh actual cleanup evidence pending; native/full parity not claimed.",
+      "contract_status": "authored"
     }
   },
   {

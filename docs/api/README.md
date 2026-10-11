@@ -275,6 +275,33 @@ satisfied. `/jobs/queue/start` releases all authorized held jobs: do not use it
 to release an unrelated backlog. `POST /api/v1/cancel/{job_id}` requests
 cancellation; observe terminal status and resource release separately.
 
+For an ordinary **held, unstarted Studio image job**, opt into releasing its
+generation model when its invocation exits. This leaves the immutable generation
+request and its submission ID intact:
+
+```python
+policy = maestro.request("PUT", f"/api/v1/jobs/{job_id}/completion-policy",
+                         body={"workspace": workspace,
+                               "release_generation_model": True})
+```
+
+The same operation is discoverable through the TypeScript client and MCP under
+`queue.completion_cleanup`. Setting the same value on the same job is idempotent;
+after an uncertain policy response, read that job's `completion_policy` through
+`GET /api/v1/status/{job_id}`. The policy does not release the queue or execute a
+model. Start the existing job separately after its execution prerequisites are
+satisfied. Wait for `completion_cleanup.status` as well as terminal generation
+status: `released` confirms the generation-model owners were released while the
+invocation still held its native slot; `not_loaded` means no generation model
+remained. `not_used` means no renderer entry, and `pending` or `unconfirmed`
+requires reconciliation before claiming resource cleanup. A timeout or process
+crash does not prove cleanup and must not cause a new generation submission.
+
+This policy currently supports ordinary Studio image jobs. It does not unload
+the language model, other tools' models, or a peer's yielded execution slot.
+General Free Resources still uses the existing owner confirmation and recent
+reauthentication flow. Other job types retain their documented resource controls.
+
 H3 plan preview and approval use `/generate/plan` and
 `/generate/{job_id}/plan/approve`. Guides and Bridge use their dedicated authored
 operations with current Gallery revisions. Continue/Extend can be composed from

@@ -75286,6 +75286,8 @@ def _run_generation(
     h3_integrity_passed = False
     cumulative_dispatch = None
     director_finishing_result = None
+    completion_model_type = None
+    completion_execution_attempt = int(job.get("execution_attempt", 1))
 
     def _defer_h3_final_publication(target: Mapping[str, Any]) -> bool:
         params = target.get("params")
@@ -79322,6 +79324,8 @@ def _run_generation(
                                                 while not reap_owned_after_failure(error):
                                                     time.sleep(1)
                                             raise
+                                    nonlocal completion_model_type
+                                    completion_model_type = call_model
                                     return wgp.generate_video(
                                         task,
                                         send_cmd,
@@ -81675,6 +81679,37 @@ def _run_generation(
             finish_job(job, "failed", **failure_updates)
             return False
         finally:
+            if job.get("release_generation_model_on_completion") is True:
+                from services.job_lifecycle import record_generation_completion_cleanup
+                cleanup_status = "unconfirmed"
+                # Never reacquire a yielded slot: that could unload a peer's
+                # model. This is this invocation's still-owned model lane.
+                with native_slot._guard:
+                    if (native_slot._acquired and _jobs.get(job_id) is job
+                            and job.get("execution_attempt", 1) == completion_execution_attempt):
+                        if completion_model_type is None:
+                            cleanup_status = "not_used"
+                        elif (getattr(wgp, "wan_model", None) is None
+                                and getattr(wgp, "offloadobj", None) is None):
+                            cleanup_status = "not_loaded"
+                        elif getattr(wgp, "transformer_type", None) == completion_model_type:
+                            try:
+                                _release_wgp_model_with_native_gpu_exclusion()
+                                if (wgp.wan_model is None and wgp.offloadobj is None):
+                                    cleanup_status = "released"
+                            except Exception:
+                                logging.getLogger(__name__).warning("Generation model cleanup could not be confirmed")
+                try:
+                    cleanup_recorded = record_generation_completion_cleanup(
+                        job, execution_attempt=completion_execution_attempt,
+                        status=cleanup_status,
+                    )
+                    if not cleanup_recorded:
+                        logging.getLogger(__name__).warning("Generation cleanup receipt remains pending")
+                except Exception:
+                    # Preserve the authoritative generation outcome and all
+                    # following cleanup. Pending is not proof of release.
+                    logging.getLogger(__name__).warning("Generation cleanup receipt could not be persisted")
             if h3_reference_file_tokens:
                 from services.h3_reference_binding import cleanup_h3_reference_files
                 for reference_token in h3_reference_file_tokens:
@@ -83286,6 +83321,8 @@ def get_status(job_id: str, request: Request, response: Response):
         "queue_priority": j.get("queue_priority", 0),
         "queue_held": bool(j.get("queue_held", False)),
         "hold_after_output": bool(j.get("hold_after_output", False)),
+        "completion_policy": {"release_generation_model": bool(j.get("release_generation_model_on_completion", False))},
+        "completion_cleanup": j.get("completion_cleanup", {"status": "not_requested", "execution_attempt": int(j.get("execution_attempt", 1))}),
         "queue_position": (
             None if recovery_blocked else queue_position(job)
         ),
@@ -86492,6 +86529,29 @@ def retry_recovered_job(
 ):
     _set_recovery_no_store(response)
     return _resume_recovered_job(job_id, request, requested_action="retry")
+
+
+@api.put("/api/v1/jobs/{job_id}/completion-policy")
+async def set_generation_completion_policy(job_id: str, request: Request, response: Response):
+    """Configure one held Studio image invocation's generation-model cleanup."""
+    _set_recovery_no_store(response)
+    try:
+        body = await request.json()
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail="A JSON completion policy is required") from error
+    if (type(body) is not dict or set(body) != {"workspace", "release_generation_model"}
+            or type(body["workspace"]) is not str
+            or type(body["release_generation_model"]) is not bool):
+        raise HTTPException(status_code=400, detail="Provide workspace and boolean release_generation_model")
+    job = _require_owned_job_project(job_id, request, body["workspace"])
+    _require_project_access(request, body["workspace"], permission="project.generate")
+    from services.job_lifecycle import configure_generation_completion
+    if not configure_generation_completion(job, body["release_generation_model"]):
+        raise HTTPException(status_code=409, detail="Change completion policy only on an unstarted, held Studio image job")
+    return {"job_id": job_id, "workspace": body["workspace"],
+            "completion_policy": {"release_generation_model": body["release_generation_model"]},
+            "completion_cleanup": job.get("completion_cleanup", {"status": "not_requested", "execution_attempt": int(job.get("execution_attempt", 1))}),
+            "held": bool(job.get("queue_held", False))}
 
 
 @api.post("/api/v1/queue/{job_id}/start-next")

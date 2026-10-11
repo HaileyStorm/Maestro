@@ -286,6 +286,7 @@ See [API setup and workflows](README.md). Current server discovery controls avai
 | `start_local_h3_recovery_control_api_v1_local_recovery_h3__job_id__start_post` | `POST /api/v1/local-recovery/h3/{job_id}/start` | authored | False |
 | `resume_recovered_job_api_v1_queue__job_id__recovery_resume_post` | `POST /api/v1/queue/{job_id}/recovery-resume` | authored | True |
 | `retry_recovered_job_api_v1_queue__job_id__recovery_retry_post` | `POST /api/v1/queue/{job_id}/recovery-retry` | authored | True |
+| `set_generation_completion_policy_api_v1_jobs__job_id__completion_policy_put` | `PUT /api/v1/jobs/{job_id}/completion-policy` | authored | True |
 | `start_queued_job_next_api_v1_queue__job_id__start_next_post` | `POST /api/v1/queue/{job_id}/start-next` | authored | False |
 | `set_job_output_count_api_v1_queue__job_id__output_count_post` | `POST /api/v1/queue/{job_id}/output-count` | authored | True |
 | `get_job_log_api_v1_jobs__job_id__log_get` | `GET /api/v1/jobs/{job_id}/log` | authored | True |

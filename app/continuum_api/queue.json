@@ -3,7 +3,7 @@
     "method": "GET",
     "path": "/api/v1/status/{job_id}",
     "summary": "Read generation job status",
-    "description": "Session-owned physical job projection with lifecycle, progress, output filenames, resource, queue and recovery fields. H3 prompt text is blanked in polling. Recovery-blocked jobs have null queue position/ETA and expose estimate_after_resume. Resources may still be releasing after terminal cancellation. Private no-store response.",
+    "description": "Session-owned physical job projection with lifecycle, progress, output filenames, resource, queue and recovery fields. H3 prompt text is blanked in polling. Recovery-blocked jobs have null queue position/ETA and expose estimate_after_resume. Resources may still be releasing after terminal cancellation. Private no-store response. completion_policy and completion_cleanup report invocation-scoped generation-model cleanup; terminal generation status alone does not prove release. Configure before admission through PUT /api/v1/jobs/{job_id}/completion-policy.",
     "responses": {
       "200": {
         "description": "Authorized result. No execution or acceptance claim beyond the returned state.",
@@ -689,6 +689,45 @@
                     "paused",
                     "pause_after_current"
                   ]
+                },
+                "completion_policy": {
+                  "type": "object",
+                  "properties": {
+                    "release_generation_model": {
+                      "type": "boolean",
+                      "default": false
+                    }
+                  },
+                  "required": [
+                    "release_generation_model"
+                  ],
+                  "additionalProperties": false
+                },
+                "completion_cleanup": {
+                  "type": "object",
+                  "properties": {
+                    "status": {
+                      "type": "string",
+                      "enum": [
+                        "not_requested",
+                        "pending",
+                        "released",
+                        "not_loaded",
+                        "not_used",
+                        "unconfirmed"
+                      ],
+                      "description": "Wait for released/not_loaded after a genuine model invocation. not_used means no renderer entry; unconfirmed requires owner reconciliation. Terminal generation status alone is not a cleanup proof."
+                    },
+                    "execution_attempt": {
+                      "type": "integer",
+                      "minimum": 1
+                    }
+                  },
+                  "required": [
+                    "status",
+                    "execution_attempt"
+                  ],
+                  "additionalProperties": false
                 }
               },
               "additionalProperties": true,
@@ -759,7 +798,9 @@
                 "h3_estimate",
                 "estimate_after_resume",
                 "events",
-                "queue"
+                "queue",
+                "completion_policy",
+                "completion_cleanup"
               ]
             }
           }

@@ -75809,6 +75809,45 @@
                     "paused",
                     "pause_after_current"
                   ]
+                },
+                "completion_policy": {
+                  "type": "object",
+                  "properties": {
+                    "release_generation_model": {
+                      "type": "boolean",
+                      "default": false
+                    }
+                  },
+                  "required": [
+                    "release_generation_model"
+                  ],
+                  "additionalProperties": false
+                },
+                "completion_cleanup": {
+                  "type": "object",
+                  "properties": {
+                    "status": {
+                      "type": "string",
+                      "enum": [
+                        "not_requested",
+                        "pending",
+                        "released",
+                        "not_loaded",
+                        "not_used",
+                        "unconfirmed"
+                      ],
+                      "description": "Wait for released/not_loaded after a genuine model invocation. not_used means no renderer entry; unconfirmed requires owner reconciliation. Terminal generation status alone is not a cleanup proof."
+                    },
+                    "execution_attempt": {
+                      "type": "integer",
+                      "minimum": 1
+                    }
+                  },
+                  "required": [
+                    "status",
+                    "execution_attempt"
+                  ],
+                  "additionalProperties": false
                 }
               },
               "additionalProperties": true,
@@ -75879,7 +75918,9 @@
                 "h3_estimate",
                 "estimate_after_resume",
                 "events",
-                "queue"
+                "queue",
+                "completion_policy",
+                "completion_cleanup"
               ]
             }
           }
@@ -81643,6 +81684,302 @@
       "mcp": true,
       "contract_status": "authored",
       "evidence": "Source review of app/launch.py and named service projections; no runtime, native, GPU, provider or human acceptance exercised."
+    }
+  },
+  {
+    "operation_id": "set_generation_completion_policy_api_v1_jobs__job_id__completion_policy_put",
+    "method": "PUT",
+    "path": "/api/v1/jobs/{job_id}/completion-policy",
+    "summary": "Set held image job completion cleanup",
+    "parameters": [
+      {
+        "name": "job_id",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string"
+        }
+      },
+      {
+        "name": "Origin",
+        "in": "header",
+        "required": false,
+        "description": "Exact configured app origin. Required while sharing is enabled; account mutations always require exact origin. Not a permission grant.",
+        "schema": {
+          "type": "string",
+          "format": "uri"
+        }
+      }
+    ],
+    "request_body": {
+      "required": true,
+      "content": {
+        "application/json": {
+          "schema": {
+            "type": "object",
+            "properties": {
+              "workspace": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Exact owning project name; this operation does not create or switch projects."
+              },
+              "release_generation_model": {
+                "type": "boolean",
+                "description": "true opts this job into generation-model cleanup; false retains normal caching. Change only while this ordinary image job is held and unstarted."
+              }
+            },
+            "required": [
+              "workspace",
+              "release_generation_model"
+            ],
+            "additionalProperties": false
+          },
+          "example": {
+            "workspace": "my-project",
+            "release_generation_model": true
+          }
+        }
+      }
+    },
+    "responses": {
+      "200": {
+        "description": "Durable policy acknowledged; no model work or queue release occurred.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "job_id": {
+                  "type": "string"
+                },
+                "workspace": {
+                  "type": "string"
+                },
+                "completion_policy": {
+                  "type": "object",
+                  "properties": {
+                    "release_generation_model": {
+                      "type": "boolean",
+                      "default": false
+                    }
+                  },
+                  "required": [
+                    "release_generation_model"
+                  ],
+                  "additionalProperties": false
+                },
+                "completion_cleanup": {
+                  "type": "object",
+                  "properties": {
+                    "status": {
+                      "type": "string",
+                      "enum": [
+                        "not_requested",
+                        "pending",
+                        "released",
+                        "not_loaded",
+                        "not_used",
+                        "unconfirmed"
+                      ],
+                      "description": "Wait for released/not_loaded after a genuine model invocation. not_used means no renderer entry; unconfirmed requires owner reconciliation. Terminal generation status alone is not a cleanup proof."
+                    },
+                    "execution_attempt": {
+                      "type": "integer",
+                      "minimum": 1
+                    }
+                  },
+                  "required": [
+                    "status",
+                    "execution_attempt"
+                  ],
+                  "additionalProperties": false
+                },
+                "held": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "job_id",
+                "workspace",
+                "completion_policy",
+                "completion_cleanup",
+                "held"
+              ],
+              "additionalProperties": false
+            },
+            "example": {
+              "job_id": "returned-job-id",
+              "workspace": "my-project",
+              "completion_policy": {
+                "release_generation_model": true
+              },
+              "completion_cleanup": {
+                "status": "pending",
+                "execution_attempt": 1
+              },
+              "held": true
+            }
+          }
+        }
+      },
+      "422": {
+        "description": "Validation Error",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/HTTPValidationError"
+            }
+          }
+        }
+      },
+      "400": {
+        "description": "Provide only workspace and a JSON boolean release_generation_model.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "detail": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "detail"
+              ],
+              "additionalProperties": false
+            }
+          }
+        }
+      },
+      "409": {
+        "description": "Only an unstarted held ordinary Studio image job can change policy. Inspect the same job; do not create a replacement submission.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "detail": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "detail"
+              ],
+              "additionalProperties": false
+            }
+          }
+        }
+      },
+      "401": {
+        "description": "Authentication required. Ask the owner to sign in through the existing account flow.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "detail": {
+                  "description": "Actionable handler-specific error; may be text, object or validation list."
+                }
+              },
+              "required": [
+                "detail"
+              ],
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "403": {
+        "description": "Access, origin, locality or recent confirmation is missing. Read access-context and project access.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "detail": {
+                  "description": "Actionable handler-specific error; may be text, object or validation list."
+                }
+              },
+              "required": [
+                "detail"
+              ],
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "404": {
+        "description": "Not found or not authorized in this session/project. Verify the returned identity and scope.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "detail": {
+                  "description": "Actionable handler-specific error; may be text, object or validation list."
+                }
+              },
+              "required": [
+                "detail"
+              ],
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "423": {
+        "description": "Resource is locked. Preserve the operation and wait for its owner.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "detail": {
+                  "description": "Actionable handler-specific error; may be text, object or validation list."
+                }
+              },
+              "required": [
+                "detail"
+              ],
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "503": {
+        "description": "Temporarily unavailable. Observe an existing operation; never blindly resubmit a mutation.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "detail": {
+                  "description": "Actionable handler-specific error; may be text, object or validation list."
+                }
+              },
+              "required": [
+                "detail"
+              ],
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    "metadata": {
+      "feature": "queue.completion_cleanup",
+      "permissions": [
+        "project.generate"
+      ],
+      "boundary": "Exact existing account/session-owned job and project identity; project.generate required. This invocation-scoped policy cannot trigger machine-wide resource unload, change another job or bypass owner reauthentication on Free Resources. Existing origin, terms and model admission remain controlling.",
+      "idempotency": "Setting the same boolean on the same job is idempotent, including after start. A differing value requires an unstarted held job. After a timeout read the same job status completion_policy/completion_cleanup; never resubmit generation.",
+      "operation_kind": "generation_completion_policy",
+      "mcp": true,
+      "read_only": false,
+      "destructive": false,
+      "idempotent": true,
+      "evidence": "Implemented production handler/lifecycle/native-slot cleanup. Fresh actual cleanup evidence pending; native/full parity not claimed.",
+      "contract_status": "authored"
     }
   },
   {

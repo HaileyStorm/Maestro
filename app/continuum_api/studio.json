@@ -2542,7 +2542,7 @@
                 "properties": {
                   "resolution": {
                     "type": "string",
-                    "description": "WIDTHxHEIGHT; each size 32–4096 and divisible by 32."
+                    "description": "WIDTHxHEIGHT; each size 32\u20134096 and divisible by 32."
                   },
                   "num_inference_steps": {
                     "type": "integer",
@@ -4915,7 +4915,7 @@
     "method": "POST",
     "path": "/api/v1/tools/h3-face-refine",
     "summary": "Repair reviewed face regions in one Gallery clip",
-    "description": "Host-gated local crop generation and source composite. Requires an exact Base H3 source frame count 124–345 on the 17n+5 grid and reviewed observations; geometry, memory and source revision limits are enforced.",
+    "description": "Host-gated local crop generation and source composite. Requires an exact Base H3 source frame count 124\u2013345 on the 17n+5 grid and reviewed observations; geometry, memory and source revision limits are enforced.",
     "responses": {
       "200": {
         "description": "Successful result. A queued acknowledgement is not completion of native execution.",
@@ -12013,5 +12013,186 @@
         }
       }
     ]
+  },
+  {
+    "method": "PUT",
+    "path": "/api/v1/jobs/{job_id}/completion-policy",
+    "summary": "Set held image job completion cleanup",
+    "description": "Configure an unstarted, held ordinary Studio image job to release its generation model before yielding its own native execution slot. This does not start/retry/cancel generation or change its frozen request. Only the invocation\u2019s generation model is released; language models and other resource owners are untouched. Defaults to retaining generation residency. Other job kinds are not currently supported. After starting the same job separately, inspect completion_cleanup in GET /api/v1/status/{job_id}; generation completion can precede cleanup. A process crash can leave pending: reconcile with the owner, do not infer release or replay generation.",
+    "parameters": [
+      {
+        "name": "job_id",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string"
+        }
+      }
+    ],
+    "requestBody": {
+      "required": true,
+      "content": {
+        "application/json": {
+          "schema": {
+            "type": "object",
+            "properties": {
+              "workspace": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Exact owning project name; this operation does not create or switch projects."
+              },
+              "release_generation_model": {
+                "type": "boolean",
+                "description": "true opts this job into generation-model cleanup; false retains normal caching. Change only while this ordinary image job is held and unstarted."
+              }
+            },
+            "required": [
+              "workspace",
+              "release_generation_model"
+            ],
+            "additionalProperties": false
+          },
+          "example": {
+            "workspace": "my-project",
+            "release_generation_model": true
+          }
+        }
+      }
+    },
+    "responses": {
+      "200": {
+        "description": "Durable policy acknowledged; no model work or queue release occurred.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "job_id": {
+                  "type": "string"
+                },
+                "workspace": {
+                  "type": "string"
+                },
+                "completion_policy": {
+                  "type": "object",
+                  "properties": {
+                    "release_generation_model": {
+                      "type": "boolean",
+                      "default": false
+                    }
+                  },
+                  "required": [
+                    "release_generation_model"
+                  ],
+                  "additionalProperties": false
+                },
+                "completion_cleanup": {
+                  "type": "object",
+                  "properties": {
+                    "status": {
+                      "type": "string",
+                      "enum": [
+                        "not_requested",
+                        "pending",
+                        "released",
+                        "not_loaded",
+                        "not_used",
+                        "unconfirmed"
+                      ],
+                      "description": "Wait for released/not_loaded after a genuine model invocation. not_used means no renderer entry; unconfirmed requires owner reconciliation. Terminal generation status alone is not a cleanup proof."
+                    },
+                    "execution_attempt": {
+                      "type": "integer",
+                      "minimum": 1
+                    }
+                  },
+                  "required": [
+                    "status",
+                    "execution_attempt"
+                  ],
+                  "additionalProperties": false
+                },
+                "held": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "job_id",
+                "workspace",
+                "completion_policy",
+                "completion_cleanup",
+                "held"
+              ],
+              "additionalProperties": false
+            },
+            "example": {
+              "job_id": "returned-job-id",
+              "workspace": "my-project",
+              "completion_policy": {
+                "release_generation_model": true
+              },
+              "completion_cleanup": {
+                "status": "pending",
+                "execution_attempt": 1
+              },
+              "held": true
+            }
+          }
+        }
+      },
+      "400": {
+        "description": "Provide only workspace and a JSON boolean release_generation_model.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "detail": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "detail"
+              ],
+              "additionalProperties": false
+            }
+          }
+        }
+      },
+      "409": {
+        "description": "Only an unstarted held ordinary Studio image job can change policy. Inspect the same job; do not create a replacement submission.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "detail": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "detail"
+              ],
+              "additionalProperties": false
+            }
+          }
+        }
+      }
+    },
+    "x-maestro": {
+      "feature": "queue.completion_cleanup",
+      "permissions": [
+        "project.generate"
+      ],
+      "boundary": "Exact existing account/session-owned job and project identity; project.generate required. This invocation-scoped policy cannot trigger machine-wide resource unload, change another job or bypass owner reauthentication on Free Resources. Existing origin, terms and model admission remain controlling.",
+      "idempotency": "Setting the same boolean on the same job is idempotent, including after start. A differing value requires an unstarted held job. After a timeout read the same job status completion_policy/completion_cleanup; never resubmit generation.",
+      "operation_kind": "generation_completion_policy",
+      "mcp": true,
+      "read_only": false,
+      "destructive": false,
+      "idempotent": true,
+      "evidence": "Implemented production handler/lifecycle/native-slot cleanup. Fresh actual cleanup evidence pending; native/full parity not claimed.",
+      "contract_status": "authored"
+    }
   }
 ]

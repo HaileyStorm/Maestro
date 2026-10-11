@@ -64,6 +64,7 @@ _JOB_FIELDS = frozenset({
     "explicit", "explicit_output", "source_remote", "created_at",
     "started_at", "finished_at", "queue_class", "queue_priority", "queue_held",
     "hold_after_output", "pause_queue_after", "requested_outputs",
+    "release_generation_model_on_completion", "completion_cleanup",
     "cancel_requested", "message", "phase", "progress", "step",
     "total_steps", "window_current", "window_total", "window_step",
     "window_total_steps", "window_progress", "overall_progress",
@@ -1208,6 +1209,17 @@ def serialize_job(
             if type(value) is not bool:
                 raise QueueRecoveryAdapterError("Pending worker receipt is invalid.")
             result[key] = value
+        elif key == "release_generation_model_on_completion":
+            if type(value) is not bool:
+                raise QueueRecoveryAdapterError("Generation completion policy is invalid.")
+            result[key] = value
+        elif key == "completion_cleanup":
+            if (type(value) is not dict or set(value) != {"status", "execution_attempt"}
+                    or value["status"] not in {"not_requested", "pending", "released", "not_loaded", "not_used", "unconfirmed"}
+                    or type(value["execution_attempt"]) is not int
+                    or not 1 <= value["execution_attempt"] <= _MAX_EXECUTION_ATTEMPT):
+                raise QueueRecoveryAdapterError("Generation completion receipt is invalid.")
+            result[key] = dict(value)
         elif key == "editor_retake_origin":
             try:
                 result[key] = validate_editor_retake_origin(value)

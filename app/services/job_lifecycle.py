@@ -768,6 +768,52 @@ def job_events(job: MutableMapping[str, Any], limit: int = 100) -> list[dict[str
         return [dict(event) for event in list(job.get("events") or [])[-safe_limit:]]
 
 
+def configure_generation_completion(
+    job: MutableMapping[str, Any], release_generation_model: bool,
+) -> bool:
+    """Set one held image job's cleanup policy without changing its request."""
+    if type(release_generation_model) is not bool:
+        raise ValueError("release_generation_model must be a boolean")
+    with _lifecycle_lock:
+        if (job.get("kind") != "studio_generation"
+                or job.get("generation_mode") != "image"):
+            return False
+        if job.get("release_generation_model_on_completion", False) is release_generation_model:
+            return True  # Same-value reconciliation never starts or repeats work.
+        if (job.get("status") != "queued" or job.get("queue_held") is not True
+                or job.get("started_at") or job.get("_generation_slot_owned")
+                or is_cancel_requested(job)):
+            return False
+        candidate = _copy_job_for_transition(job)
+        candidate["release_generation_model_on_completion"] = release_generation_model
+        candidate["completion_cleanup"] = {
+            "status": "pending" if release_generation_model else "not_requested",
+            "execution_attempt": int(job.get("execution_attempt", 1)),
+        }
+        _persist_prospective_unlocked("generation_completion_policy", jobs=(candidate,))
+        _publish_job_unlocked(job, candidate)
+        return True
+
+
+def record_generation_completion_cleanup(
+    job: MutableMapping[str, Any], *, execution_attempt: int, status: str,
+) -> bool:
+    """Persist cleanup independently of the generation's terminal winner."""
+    if status not in {"released", "not_loaded", "not_used", "unconfirmed"}:
+        raise ValueError("Invalid generation cleanup outcome")
+    with _lifecycle_lock:
+        if (job.get("release_generation_model_on_completion") is not True
+                or job.get("execution_attempt", 1) != execution_attempt):
+            return False
+        candidate = _copy_job_for_transition(job)
+        candidate["completion_cleanup"] = {
+            "status": status, "execution_attempt": execution_attempt,
+        }
+        _persist_prospective_unlocked("generation_completion_cleanup", jobs=(candidate,))
+        _publish_job_unlocked(job, candidate)
+        return True
+
+
 def update_requested_outputs(
     job: MutableMapping[str, Any],
     count: int,
