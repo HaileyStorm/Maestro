@@ -6849,7 +6849,7 @@ def _run_pipeline(pid: str, resume: bool = False):
             try:
                 clip_plans, planned_clips = _run_planning(pid, params, pipeline_type)
             except _DirectorLlmCancelled:
-                return
+                raise
             except Exception:
                 print("[Pipeline] Planning failed")
                 raise
