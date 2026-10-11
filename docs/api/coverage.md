@@ -50,7 +50,7 @@ constraints. API availability is separate from native or human acceptance.
 | LoRA lists/directories/multipliers/previews/parameters and custom acquisition | `/loras`, per-model lists/options/preview and local model/import routes | Relative names and public parameter settings supported. Arbitrary HF/Civitai acquisition, local folder scans, checkpoint verification/deletion and host mutations retain local-owner/provider consent boundaries. |
 | Performance profiles, resolution/settings options and auto tune | `/resolutions`, `/system-detect`, `/system-detect/apply`, `/system-config`, `/system-stats`, `/system/preflight` plus model options/defaults | Current supported settings only. Host configuration/auto-tune mutations remain owner/local where enforced. A statistical resource estimate is not an execution grant. |
 | Resource unloading / Free Resources | `/system/release-model`, `/system/resource-release` preview/confirmation; LLM unload | Preserve active-work token, exact confirmation fields and recent owner reauthentication. General MCP does not bypass confirmation or stop other work. |
-| Release an image job's generation model after execution | `PUT /jobs/{job_id}/completion-policy`; observe `/status/{job_id}` | Ordinary held, unstarted Studio image jobs only. Exact session/project job ownership and generate permission; policy is separate from frozen request. Cleanup uses the invocation's still-owned native slot; no language-model or machine-wide release. Native cleanup evidence remains pending. |
+| Release an image job's generation model after execution | `PUT /jobs/{job_id}/completion-policy`; observe `/status/{job_id}` | Ordinary held, unstarted Studio image jobs only. Exact session/project job ownership and generate permission; policy is separate from frozen request. Cleanup uses the invocation's still-owned native slot; no language-model or machine-wide release. A real Flux2 Klein image job completed and returned a released cleanup receipt; this is generation-model release, not proof that all machine VRAM is free. |
 | Storage duplicate scan/reclaim/remove-linked and usage | `/storage/duplicates`, `/reclaim`, `/remove-linked`, `/storage/usage` | Local owner maintenance. Preserve referenced/active/frozen assets; destructive operations are not automatic cleanup authority. |
 | Service/provider configuration, runtime share registration, host terms, legal/owner policies and support/research | Corresponding settings/account/support/research operations in the contract | Human/owner administration or server-to-server webhook as specified; no provider keys, paid dispatch, remote code, content moderation or account activation through general MCP. |
 | Theme, panel sizes, expanded controls, preview playback, drag/drop, clipboard, notifications | Browser/OS presentation and existing local preferences | No meaningful durable backend operation. Clients implement their own presentation; browser privileges are not HTTP permissions. |
@@ -128,115 +128,48 @@ identified, preserve that unresolved attempt for owner resolution. Clients and
 MCP never automatically resubmit it. Browser-only presentation and human
 credential/terms/confirmation actions are documented above.
 
-The October 11 deployment exercised the running app through the Python client,
-the built TypeScript client, curl and the official MCP stdio protocol. Discovery,
-access-filtered workspace reads and the served documentation worked. The
-TypeScript declarations build, and the existing publication-boundary check
-passed. The coordinated restart preserved all 16 retained queue payloads;
-local and stable-share health/readiness answered successfully. No routine unit
-or integration suites, model execution or accepted-sample replay were performed.
+Actual local acceptance used the running app through Python, the built Node
+client, curl, same-origin Swagger and official MCP stdio. Discovery, authorized
+project/Editor reads, served documentation and typed response schemas passed.
+TypeScript builds, offline Python/Node packages and the existing publication
+boundary passed. No routine unit or integration suites or accepted-sample
+replays were run.
 
-Account enforcement is active on the observed host. Fresh clients correctly
-see no private projects until the human establishes an authorized client session.
-The signed-in same-origin Swagger browser exercised the scoped Editor collection
-and saved timeline reads. One fresh private generation was admitted as held,
-reconciled by its original request ID, read through job status, cancelled, and
-separately observed terminal with no outputs or model execution. No cookies were
-extracted. After a coordinated restart, the same submission ID returned its
-retained accepted admission and cancelled job. The terminal job left active
-recovery while all 16 pre-existing queue payloads remained unchanged; it was
-never resubmitted. That actual Editor response also established numeric Unix timestamps;
-the corrected collection and saved-timeline schemas validate those retained
-HTTP bodies. The filterable explorer exposes operation IDs and collapsed groups.
-The human-only login helper established a separate private session. Python and
-Node clients authenticated and read the authorized project and Editor collection;
-the official MCP stdio client read that same collection. One authenticated
-`maestro_gallery_to_upload` call then read an exact authorized Gallery image
-revision and created a private session upload (350,168 bytes), returning its
-filename without a path or generation submission. Its exclusive transfer intent
-and receipt were retained; it was not repeated. These observations establish the
-local client/session and bounded upload handoff, without browser credential
-extraction. The Gallery response contract now names the production listing fields
-and explains the difference between listing revisions, content revisions and
-unpinned convenience URLs. Authenticated LAN/Cloudflare feature acceptance,
-native model execution, subjective quality
-and Git publication are not established by these discovery observations.
+The human created a separate owner-private API session through the login helper.
+Authenticated Python, Node and MCP project reads passed, and the same session
+remained usable after coordinated restart. No browser credentials were extracted.
+One revision-bound MCP Gallery handoff transferred 350,168 bytes to a private
+session upload without generation. Its original intent and receipt were retained;
+no transfer was repeated. Listing revisions, content revisions and convenience
+URLs now have explicit contracts.
+
+A held generation was reconciled by its original submission ID, cancelled and
+read independently after restart, with no model execution. A separate genuine
+Mythwright Flux2 Klein image submission stayed held across restart. Its owner
+configured invocation cleanup through the new API, then released that same job
+once under fresh development GPU authority. It completed with one PNG and
+`completion_cleanup.status: "released"`. Mythwright adopted that output into a
+private map copy, and its connected DM edited the copy. This establishes the
+ordinary image submission/status/output/cleanup handoff; it does not establish
+all-model execution, every downstream feature or subjective image quality.
+
+Director's real held story admission, recovered Continue, explicit Stop and
+terminal reconnection paths were exercised. Frozen inputs and unrelated retained
+queue payloads survived coordinated restarts. Later bounded attempts reached
+local model preparation and CPU inference but did not complete planning. Runtime
+and observation failures, explicit cancellation and interrupted admission remain
+distinct; a timeout never cancels or authorizes replay. Current recovery errors
+identify the required next action. Completed Director planning and output quality
+remain unverified. Historical attempt receipts remain retained separately rather
+than becoming routine regression scenarios.
+
+Local and stable-share health/readiness passed after the coordinated deployment,
+and public Cloudflare API discovery worked in the browser. That remote origin was
+unauthenticated: private LAN/Cloudflare workflow acceptance remains pending and
+requires the existing human session on that origin. Do not copy a localhost
+session to another origin. Git publication and human/model-specific acceptance
+remain separate from local deployment.
+
 Every mapped action has a production operation, documented composition or
-explicit boundary; complete deployed feature parity remains unclaimed while
-those acceptance limitations remain.
-
-A fresh private story also exercised Director's genuine `hold_planning` start
-and pipeline status through the signed-in owner browser. Its retained parent
-survived a coordinated restart, with the frozen request and source bindings
-unchanged, `pause_reason:"before_planning"`, no clips or outputs, and an explicit
-recovered `continue` action. The other 16 queue payloads remained unchanged.
-At that checkpoint, the story had not been released or resubmitted. This journey corrected the
-documented workflow to `short_film_story` and established the structured
-progress, numeric timestamp and nullable recovery/failure response fields.
-It proves held admission and reconnection, not native planning or cancellation
-of an executing model.
-
-A later exact-reservation attempt exercised the production Continue operation:
-the owner session submitted the retained story once and received HTTP 200 with
-`status:"resumed"`. The private supervisor subsequently rejected an incoherent
-journal/state observation and drained its owned runtime. Normal Maestro was
-restored; the exact pipeline was explicitly stopped through the public API,
-which persisted cancellation. A separate status read confirmed `cancelled`,
-with no clips or outputs; model status and queue counters were inactive. All
-16 unrelated retained queue payloads were preserved. This establishes accepted
-continuation, explicit cancellation and recovery observations; it does not
-establish completed planning, model execution or output quality. The observer
-coherence correction is retained for a future separately authorized attempt.
-The durable custody correction is now deployed: interrupted reserved planning
-stays blocked without fresh authority, and private custody markers are omitted
-from public responses. After that deployment, a fresh status read confirmed
-the same cancelled parent remained terminal with no outputs, and all 16
-unrelated queue payloads stayed unchanged. This terminal reconnection does not
-establish execution or interrupted-marker recovery acceptance.
-
-The successor attempt exercised a fresh held story, recovered Continue and
-explicit Stop through the same owner HTTP session. Its corrected supervisor
-maintained coherent state observations and fresh authority, but planning waited
-before model load because a legacy GPU wait counted retained held/blocked jobs.
-Only that owned attempt was cancelled; normal local and stable-share health
-returned, cancellation survived reconnection, and all 17 unrelated queue
-payloads remained unchanged. No clips, model result or quality acceptance were
-produced. The narrow CPU-planning correction resolves the frozen selection
-before applying that wait only to native GPU selections; native planning
-acceptance remains pending. Public queue summaries are access-filtered and do
-not establish global resource idleness.
-
-After deploying that CPU-wait correction, a fresh private story was continued
-once through the owner API under a separately validated lease and corrected
-supervisor. It reached model preparation, then failed before model load because
-llama-server runtime validation rejected both the installed binary and its staged
-replacement. The pipeline reports terminal `failed`, no clips or outputs, and
-survives reconnection. Original runtime configuration was restored; local and
-stable-share health/readiness answered 200 and all 18 unrelated retained queue
-payloads were unchanged. The exact lease was withdrawn after the owned runtime
-drained. This establishes the continuation/failure/reconnection path, not
-completed planning. The next safe action is to repair the owner-managed LLM
-runtime, recheck readiness, and use a fresh authorized attempt; do not Continue
-or resubmit this failed parent.
-
-A source correction now supplies sibling-library paths to CPU and CUDA runtime
-probes and launch, retains bounded private loader diagnostics, and fails closed
-before runtime repair/download during a reserved native attempt. Director
-exposes the typed `llm_runtime_unavailable` failure with an actionable public
-message. After deployment, a fresh separately authorized owner-API Continue
-returned 200 and reached CPU llama-server launch without replacing the frozen
-runtime assets. The private supervisor then timed out while observing model
-loading and drained its owned process. No model-ready response, generated text,
-clips or outputs were established. On normal restart, the production API
-returned `blocked_planning_admission` with an explicit requirement for fresh
-authority, demonstrating interrupted planning custody. Explicit Stop returned
-persisted cancellation; a separate status read confirmed `cancelled`. Original
-configuration, inactive model state, local/stable-share health/readiness and
-all 19 unrelated retained queue payloads were verified after withdrawal.
-Completed planning remains unverified; a timeout is never cancellation or
-permission to replay the attempt.
-
-The stable-share API viewer and discovery also answered successfully from the
-browser. That origin was unauthenticated, so this proves public discovery rather
-than authenticated Cloudflare feature acceptance. Establish the existing owner
-session on that origin before private workflows; do not copy a localhost session.
+explicit boundary. Complete deployed feature parity remains unclaimed while
+these acceptance limitations remain.
