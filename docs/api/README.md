@@ -276,6 +276,21 @@ attempt and obtain fresh authority through the existing recovery path;
 ordinary Continue cannot release it. Clients cannot supply private admission
 markers or reconstruct an expired grant.
 
+Unexpected runtime stops end the pipeline as `failed`; an explicit Stop remains
+`cancelled`. Read `failure_details.code` before taking recovery action. The
+planning guard retains these fixed reasons without exposing execution authority:
+
+| Code | Meaning and next action |
+|---|---|
+| `director_planning_parent_busy` | The parent could not be observed within the guard's lock budget. Check the retained pipeline status and local logs before an explicit recovery attempt. |
+| `director_planning_parent_inactive` | The parent disappeared or became terminal. Read its current status; do not start another attempt for a cancelled or completed parent. |
+| `director_planning_authority_rejected` | The current execution reservation observation was rejected. The owner must resolve that reservation and obtain fresh authority before recovery. |
+| `director_planning_observation_expired` | No sufficiently fresh observation was available. Inspect the retained attempt; a timeout is neither permission to resubmit nor cancellation of other work. |
+
+These codes identify a guard stop, not a model timeout or crash. Other failures
+retain the existing structured failure envelope. Cleanup does not replace the
+first recorded guard reason; historical attempts without it remain unknown.
+
 For example, save this body as `director-story.json`, using a project you can
 access and model IDs returned by discovery. `short_film_story` is the story
 workflow; `short_film` is not an accepted pipeline type.

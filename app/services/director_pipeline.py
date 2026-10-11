@@ -305,15 +305,34 @@ class DirectorGpuParentGuard:
         self.probe_started = 0.0
         self.last_validated = 0.0
         self.finished = False
+        self.failure_code = None
+        self._failure_lock = threading.Lock()
         with _pipeline_lock:
             self.admission = _pipeline_planning_admissions.get(pid)
 
+    def _abort(self, code):
+        # Preserve the first guard cause before signalling. Cleanup and Stop
+        # still use owner.abort directly and cannot replace this diagnosis.
+        with self._failure_lock:
+            if self.failure_code is None:
+                self.failure_code = code
+        self.owner.abort()
+
     def checkpoint(self):
-        self.owner.checkpoint()
-        _director_pipeline_cancel_checkpoint(self.pid)
-        if self.admission is not None and time.monotonic() - self.last_validated >= 3:
-            self.owner.abort()
+        try:
             self.owner.checkpoint()
+            _director_pipeline_cancel_checkpoint(self.pid)
+            if self.admission is not None and time.monotonic() - self.last_validated >= 3:
+                self._abort("director_planning_observation_expired")
+                self.owner.checkpoint()
+        except LlmRequestCancelled as exc:
+            raise self.cancelled_error() from exc
+
+    def cancelled_error(self):
+        cancelled = _DirectorLlmCancelled("Director LLM pass was cancelled")
+        if self.failure_code is not None:
+            cancelled.code = self.failure_code
+        return cancelled
 
     def _probe(self):
         from services.native_acceptance_reservation import reservation
@@ -327,7 +346,7 @@ class DirectorGpuParentGuard:
     def _watch(self):
         while not self.stop.wait(0.25):
             if not _pipeline_lock.acquire(timeout=0.05):
-                self.owner.abort()
+                self._abort("director_planning_parent_busy")
                 return
             try:
                 p = _pipelines.get(self.pid)
@@ -335,21 +354,21 @@ class DirectorGpuParentGuard:
             finally:
                 _pipeline_lock.release()
             if not active:
-                self.owner.abort()
+                self._abort("director_planning_parent_inactive")
                 return
             if self.admission is None:
                 continue
             now = time.monotonic()
             if self.probe_done.is_set():
                 if not self.probe_result:
-                    self.owner.abort()
+                    self._abort("director_planning_authority_rejected")
                     return
                 # Freshness begins at observation START, never its delayed end.
                 self.last_validated = self.probe_started
                 self.probe_done.clear()
                 self.probe_started = 0.0
             if now - self.last_validated >= 3:
-                self.owner.abort()
+                self._abort("director_planning_observation_expired")
                 return
             if not self.probe_started:
                 self.probe_started = now
@@ -412,6 +431,12 @@ class DirectorGpuParentGuard:
         self.finish_runtime(exc_type is not None)
         _director_native_gpu_slot_state.planning_admission = None
         _director_native_gpu_slot_state.parent_guard = None
+        # Cold loading and owner-scope exit can cancel before a pass wrapper
+        # exists. Preserve their cause after the same owned-runtime cleanup.
+        if (self.failure_code is not None
+                and isinstance(exc, LlmRequestCancelled)
+                and getattr(exc, "code", None) is None):
+            raise self.cancelled_error() from exc
         return False
 
     def release_drained_custody(self):
@@ -631,7 +656,7 @@ def _unload_director_resident_if_current(
 
 
 class _DirectorLlmCancelled(LlmRequestCancelled, RuntimeError):
-    """Internal content-free signal for Stop winning an LLM pass."""
+    """Content-free signal for cancellation or loss of runtime custody."""
 
 
 def _fresh_explicit_guidance_decision(params: dict) -> bool:
@@ -4962,7 +4987,12 @@ def _pipeline_llm_call_body(
         _unload_director_resident_if_current(
             selection, resident_identity,
         )
-        raise _DirectorLlmCancelled("Director LLM pass was cancelled") from exc
+        guard = getattr(_director_native_gpu_slot_state, "parent_guard", None)
+        cancelled = (
+            guard.cancelled_error() if guard is not None
+            else _DirectorLlmCancelled("Director LLM pass was cancelled")
+        )
+        raise cancelled from exc
     finally:
         _finish_pipeline_llm_pass(pid, token, failed=failed)
 
