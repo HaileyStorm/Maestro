@@ -214,5 +214,20 @@ A source correction now supplies sibling-library paths to CPU and CUDA runtime
 probes and launch, retains bounded private loader diagnostics, and fails closed
 before runtime repair/download during a reserved native attempt. Director
 exposes the typed `llm_runtime_unavailable` failure with an actionable public
-message. This correction has syntax/source evidence only; restored runtime
-readiness and completed native planning remain unverified.
+message. After deployment, a fresh separately authorized owner-API Continue
+returned 200 and reached CPU llama-server launch without replacing the frozen
+runtime assets. The private supervisor then timed out while observing model
+loading and drained its owned process. No model-ready response, generated text,
+clips or outputs were established. On normal restart, the production API
+returned `blocked_planning_admission` with an explicit requirement for fresh
+authority, demonstrating interrupted planning custody. Explicit Stop returned
+persisted cancellation; a separate status read confirmed `cancelled`. Original
+configuration, inactive model state, local/stable-share health/readiness and
+all 19 unrelated retained queue payloads were verified after withdrawal.
+Completed planning remains unverified; a timeout is never cancellation or
+permission to replay the attempt.
+
+The stable-share API viewer and discovery also answered successfully from the
+browser. That origin was unauthenticated, so this proves public discovery rather
+than authenticated Cloudflare feature acceptance. Establish the existing owner
+session on that origin before private workflows; do not copy a localhost session.
