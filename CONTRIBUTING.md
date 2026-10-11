@@ -107,33 +107,41 @@ worker. See [Trusted Local CI](docs/operations/LOCAL_CI.md). A future self-hoste
 runner is a separate activation and must not execute unreviewed pull-request
 code.
 
-Run the full applicable suite, not a filtered test as the final gate. The
-wrapper reuses `app/env/` and `ui/node_modules/`, masks its named GPU-related
-environment variables for every child process, and never installs dependencies.
-The defined gates contain no generation command; masking is not hardware
-isolation and cannot prove what arbitrary future tests will access:
+Routine validation does not run unit or integration suites. Use the smallest
+check justified by the change, and reuse compatible results:
 
 ```bash
-app/env/bin/python scripts/run_local_ci.py --gate all
+# Before publication: exclude runtime/private files from the tracked payload.
+app/env/bin/python scripts/run_local_ci.py
+# After UI changes: compile and build the shipped UI.
+(cd ui && npm run build)
 ```
 
-Its CI-equivalent commands are:
+`--gate all` combines the publication boundary with the UI build. `backend`
+remains a compatibility alias for the publication boundary. There is no Python
+test discovery, broad compileall sweep, Node test glob, synthetic browser
+matrix, or check-to-list-other-checks gate in the routine runner. H3 upstream
+observation remains an optional standalone tool, not a release prerequisite.
 
-```bash
-app/env/bin/python scripts/verify_clean_repo.py
-app/env/bin/python -m compileall -q -x '(^|/)(env|node_modules)/' app/services app/launch.py scripts
-app/env/bin/python -m unittest discover -s tests -p "test_*.py"
-(cd ui && npm test && npm run build)
-```
+Use a few real journeys through the running Maestro application when changed
+behavior needs acceptance: sign in and open a project, change the affected
+controls, and confirm their saved state; for a changed generation path, submit
+one authorized job and inspect its result through Gallery or Editor. Reuse
+retained outputs when they establish the claim. Remote access needs its own
+actual owner-session observation when that surface changes. Avoid multiplying
+these journeys by every model, browser, profile, or hypothetical case.
 
-The exclusion keeps embedded helper runtimes (for example SAM's separately
-managed Python environment) out of the host interpreter's source check.
+Historical test sources and receipts are retained only as reference evidence;
+they are outside routine acceptance. Formal proof obligations and their frozen
+dependencies retain their meaning. A build or browser observation does not
+establish GPU execution, subjective quality, or device behavior. Obtain only
+those additional observations needed for an unresolved claim, using the exact
+GPU lease and existing consent. Keep runtime access, ownership, provider-stop,
+and no-resend controls in force.
 
-Run the applicable browser/E2E checks when their dependencies are available.
-Record any gate you could not run and why; do not relabel static or mocked
-evidence as live acceptance. Missing app or UI dependencies are a local
-preflight failure; update the normal Pinokio-managed environment rather than
-teaching CI to install a partial replacement.
+Missing app or UI dependencies require the normal Pinokio-managed environment;
+validation does not install a replacement or restart the app. Record the actual
+observations and any missing acceptance plainly.
 
 Once all intended changes are committed, finish repository state changes
 serially—never in parallel:

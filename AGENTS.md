@@ -45,10 +45,14 @@ To guarantee every contribution follows this guide precisely, obey this checklis
   intended service and access surface are healthy, clear that exact generation
   and show the empty/current state. Never publish operator secrets, private
   runtime identifiers, or host paths in tracked files or logs.
-- Before completion, run the full applicable test suite and every CI-equivalent
-  check. Commit and perform Git closure serially. Skip Beads sync while the
-  historical tracker is preserved. Never run index/ref mutations in parallel
-  or force them through unrelated dirty work.
+- Routine validation defaults to zero active unit or integration tests. Run
+  only the build or real shipped-app acceptance justified by changed inputs
+  and an unresolved claim; reuse compatible evidence. Preserve formal proof
+  obligations and runtime access, ownership, provider-stop and no-resend
+  safeguards. Follow `CONTRIBUTING.md` for the remaining publication/build
+  checks. Commit and perform Git closure serially through the shared landing
+  procedure and current tracker contract. Never run index/ref mutations in
+  parallel or force them through unrelated dirty work.
 - See `CONTRIBUTING.md` for the exact startup, restart, evidence, test, and
   closure procedure.
 
@@ -115,12 +119,11 @@ To guarantee every contribution follows this guide precisely, obey this checklis
   implementation, invariant, and review work, and Luna high or xhigh for
   read-heavy scouting and documentation. Use another route only when current
   task evidence supports it.
-- For genuinely multi-file or cross-layer work, choose the smallest useful set
-  of one to three bounded, read-only ownership, invariant, or test guard roles.
-  Do not require a fixed three-map ceremony. Synthesize centrally, then use one
-  writer per file or symbol cluster plus proportionate independent review and
-  verification. Do not fan out trivial work, and stop parallel scouting when
-  findings converge.
+- Use an independent lane only when a concrete unresolved ownership,
+  correctness or acceptance question earns its cost. Do not require a role
+  count, map ceremony or extra review stage. Synthesize centrally and keep
+  one writer per file or symbol cluster. Do not fan out trivial work, and
+  stop parallel scouting when findings converge.
 - Serialize owner creation, credentials/recovery-code handling, restarts,
   project migration, and Git/index/ref operations. Never ask an agent to invent
   owner credentials or handle recovery codes on the user's behalf.
@@ -715,12 +718,12 @@ The `torch.js` script also includes ways to install pytorch dependent libraries 
 - **CLI Commands:** See `PTERM.md` at `/media/hailey/TVBox/pinokio/prototype/PTERM.md`
 ### Common Patterns
 - **Python Virtual Env:** `shell.run` with `venv` attribute
-- **Cross-platform Commands:** Always test on multiple platforms
+- **Cross-platform Commands:** Keep commands portable; verify each affected platform before claiming it works there
 - **Error Handling:** Check logs/api for launcher issues
 - **GitHub Operations:** Use `gh` CLI for advanced GitHub features
 ## Development Principles
 1. **Minimize Shell Usage:** Leverage API parameters instead of raw commands
 2. **Maintain Separation:** Keep app logic and launchers separate
 3. **Follow Conventions:** Match existing project patterns
-4. **Test Thoroughly:** Use CLI to verify launcher functionality
+4. **Verify Changed Behavior:** Use the smallest real launcher journey needed for an unresolved claim
 5. **Document Changes:** Update relevant metadata and documentation

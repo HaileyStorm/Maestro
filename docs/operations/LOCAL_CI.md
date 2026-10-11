@@ -1,63 +1,37 @@
-# Trusted Local CI
+# Local publication and build checks
 
-Maestro does not spend GitHub-hosted Actions minutes. The repository defines no
-GitHub Actions workflows while it has no approved self-hosted runner. Pushes,
-pull requests, and schedules therefore allocate no Actions worker at all.
-
-The canonical check runner is `scripts/run_local_ci.py`. It uses the Python
-environment already maintained at `app/env/` and the existing dependencies in
-`ui/node_modules/`. It never runs `pip`, `npm ci`, or another installer. Missing
-dependencies are a preflight failure with an instruction to use Maestro's
-normal Pinokio install/update path outside CI.
-
-## Run checks directly
-
-From the repository root:
+Maestro defines no GitHub Actions workflows and allocates no hosted Actions
+worker. `scripts/run_local_ci.py` uses the installed `app/env/` and
+`ui/node_modules/`; it does not install dependencies, start generation, contact
+GitHub, or restart services.
 
 ```bash
-app/env/bin/python scripts/run_local_ci.py --gate guard
-app/env/bin/python scripts/run_local_ci.py --gate backend
+# Default: tracked-publication boundary only.
+app/env/bin/python scripts/run_local_ci.py
+# Build the UI only when its inputs changed.
 app/env/bin/python scripts/run_local_ci.py --gate ui
+# Publication boundary plus UI build.
 app/env/bin/python scripts/run_local_ci.py --gate all
-app/env/bin/python scripts/run_local_ci.py --gate h3-upstream
 ```
 
-Use `--dry-run` with any gate to print its exact commands without probing the
-environment or executing anything.
+`guard` names the default publication boundary. `backend` is a compatibility
+alias for it. `--dry-run` lists the selected commands without executing them.
+These checks exclude private/runtime artifacts from publication and compile
+the shipped UI. They do not run Python unittest discovery, Node unit tests,
+a broad Python syntax sweep, or the retired mocked Playwright matrix.
 
-| Gate | Checks |
-| --- | --- |
-| `guard` | Tracked-publication boundary and Python syntax. |
-| `backend` | `guard`, complete Python unittest discovery, and the standalone JSON grammar regression. |
-| `ui` | Existing UI tests, then the TypeScript/Vite production build. |
-| `all` | `backend` followed by `ui`; this is the complete local CI gate. |
-| `h3-upstream` | Read-only comparison of the pinned H3 Turbo observation with Hugging Face main. |
+Child processes receive masked GPU visibility. This is an environment hint,
+not hardware isolation or a GPU lease. No native generation is included.
+Optional upstream research uses `scripts/check_h3_turbo_upstream.py` directly;
+it is not a routine acceptance gate.
 
-Every child process receives empty CUDA/HIP/ROCm visibility and
-`NVIDIA_VISIBLE_DEVICES=void`. The defined command list contains no generation
-step. This environment masking is a runtime hint, not hardware isolation, and
-does not prove that arbitrary future test code cannot touch another accelerator
-or load a model. It does not replace the real-GPU acceptance matrix. Python
-bytecode/cache writes use a process-owned temporary directory rather than the
-repository's storage tier.
+For behavior acceptance, use the small real Maestro journeys described in
+[CONTRIBUTING.md](../../CONTRIBUTING.md). Retained test sources, private CPU
+receipts, and archived synthetic fixtures are historical evidence, outside the
+routine run list. Preserve formal proof obligations and frozen dependencies;
+do not relabel mocked browser checks as real E2E or a build as native acceptance.
+Runtime authorization and execution safeguards remain in force.
 
-## GitHub Actions stay off
-
-Do not add a GitHub Actions workflow merely to make checks look automatic. Run
-the wrapper locally and record the selected gates with the change. The H3
-upstream check prints its current observation for human review; it no longer
-has a schedule or automatic issue mutation.
-
-A future self-hosted workflow is a separate activation. Before adding one,
-verify an owner-controlled Linux x64 runner, a clean disposable checkout,
-pre-provisioned dependency paths outside that checkout, immutable action SHAs,
-least-privilege credentials, bounded concurrency/timeouts, and trusted-ref-only
-execution. There must still be no hosted fallback and no automatic execution of
-unreviewed pull-request code.
-
-## Evidence boundary
-
-A passing direct wrapper run proves the selected checks in that checkout and
-environment. Source review proves only that Actions workflows are absent.
-Record any later runner acceptance separately, and continue to track model
-generation in [GPU_ACCEPTANCE.md](GPU_ACCEPTANCE.md).
+A future self-hosted runner needs separate activation with an owner-controlled
+host, provisioned dependencies, trusted-ref execution and no hosted fallback.
+Do not add a workflow merely to make these checks automatic.

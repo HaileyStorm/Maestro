@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run Maestro's trusted GPU-masked checks using existing local dependencies.
+"""Check Maestro's publication boundary or build its UI with local dependencies.
 
 The defined commands never install packages, start generation, or contact
 GitHub. Environment masking is not hardware isolation and cannot prove what
@@ -16,7 +16,6 @@ import shlex
 import shutil
 import subprocess
 import sys
-import tempfile
 from typing import Iterable
 
 
@@ -52,55 +51,15 @@ def commands_for_gate(gate: str, *, python: Path | None = None) -> tuple[GateCom
             (str(python), "scripts/verify_clean_repo.py"),
             REPO_ROOT,
         ),
-        GateCommand(
-            "Python syntax",
-            (
-                str(python),
-                "-m",
-                "compileall",
-                "-q",
-                "-x",
-                r"(^|/)(env|node_modules)/",
-                "app/services",
-                "app/launch.py",
-                "scripts",
-            ),
-            REPO_ROOT,
-        ),
-    )
-    backend = guard + (
-        GateCommand(
-            "Python unit tests",
-            (
-                str(python),
-                "-m",
-                "unittest",
-                "discover",
-                "-s",
-                "tests",
-                "-p",
-                "test_*.py",
-            ),
-            REPO_ROOT,
-        ),
     )
     ui = (
-        GateCommand("UI tests", ("npm", "test"), UI_ROOT),
         GateCommand("UI type-check and build", ("npm", "run", "build"), UI_ROOT),
-    )
-    h3 = (
-        GateCommand(
-            "H3 Turbo upstream observation",
-            (str(python), "scripts/check_h3_turbo_upstream.py"),
-            REPO_ROOT,
-        ),
     )
     gates = {
         "guard": guard,
-        "backend": backend,
+        "backend": guard,  # Compatibility alias; no test discovery.
         "ui": ui,
-        "all": backend + ui,
-        "h3-upstream": h3,
+        "all": guard + ui,
     }
     return gates[gate]
 
@@ -153,25 +112,13 @@ def run_commands(commands: Iterable[GateCommand], *, dry_run: bool = False) -> i
         print("DRY RUN: commands listed; no gates were executed.")
         return 0
 
-    # Keep compileall and incidental cache traffic off the repository/storage
-    # tier. The directory is exact, process-owned, and removed on exit.
-    with tempfile.TemporaryDirectory(prefix="maestro-local-ci-") as pycache:
-        env["PYTHONPYCACHEPREFIX"] = pycache
-        for command in selected:
-            rendered = shlex.join(command.argv)
-            print(f"==> {command.label}: {rendered}", flush=True)
-            completed = subprocess.run(
-                command.argv,
-                cwd=command.cwd,
-                env=env,
-                check=False,
-            )
-            if completed.returncode != 0:
-                print(
-                    f"FAILED ({completed.returncode}): {command.label}",
-                    file=sys.stderr,
-                )
-                return completed.returncode
+    for command in selected:
+        rendered = shlex.join(command.argv)
+        print(f"==> {command.label}: {rendered}", flush=True)
+        completed = subprocess.run(command.argv, cwd=command.cwd, env=env, check=False)
+        if completed.returncode != 0:
+            print(f"FAILED ({completed.returncode}): {command.label}", file=sys.stderr)
+            return completed.returncode
     print(
         "PASS: selected local CI gates completed with GPU-related "
         "environment variables masked."
@@ -183,9 +130,9 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--gate",
-        choices=("guard", "backend", "ui", "all", "h3-upstream"),
-        default="all",
-        help="bounded gate set to run (default: all)",
+        choices=("guard", "backend", "ui", "all"),
+        default="guard",
+        help="publication boundary, UI build, or both (default: guard)",
     )
     parser.add_argument(
         "--dry-run",

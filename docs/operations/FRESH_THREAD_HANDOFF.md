@@ -77,15 +77,17 @@ auto-link by email or rewrite project/account IDs. Authentik is a promising
 self-hosted candidate, including for brokering Google sign-in.
 It is not a hard dependency or final product choice. Preserve local password and recovery
 access as break-glass until the future link/unlink and provider-outage contract
-is implemented and proven. The full deferred contract and test matrix live in
+is implemented and proven. The deferred contract and acceptance requirements live in
 `docs/operations/CONTINUATION.md` under **Preserve a future SSO migration path**.
 
 ## Parallelization contract
 
-- For any multi-file or cross-layer change, use three bounded read-only scouts:
-  ownership, invariants, and tests. Main thread synthesizes their evidence.
-- Stop scouting when findings converge. Use one writer per file or symbol
-  cluster, then an independent reviewer and verifier on frozen bytes.
+- Use a bounded independent lane only when it materially improves progress or
+  resolves a concrete uncertainty. There is no fixed scout, review, or verifier
+  quota; keep small and sequential work in the controlling task.
+- Stop scouting when findings converge. Keep one writer per file or symbol
+  cluster and reuse compatible evidence. Add a focused review or real-app
+  observation only for an unresolved correctness or acceptance claim.
 - Keep credentials, recovery codes, restarts, migration publication, and Git
   index/ref operations serial. Do not delegate user-secret handling.
 - Prefer the smallest demonstrably usable result. Do not turn dormant policy,
@@ -106,9 +108,9 @@ is implemented and proven. The full deferred contract and test matrix live in
 > transfer/release its account/project scope. After
 > that transfer, use bird-in-the-hand priority to get accounts and the complete
 > existing-project inventory live, with the user performing owner
-> credential/recovery-code steps. Use three focused scouts only where the
-> multi-file trigger applies, one writer per cluster, then independent review
-> and verification. Reference prior thread
+> credential/recovery-code steps. Use bounded delegation only when useful,
+> keep one writer per cluster, and obtain only the evidence needed for an
+> unresolved correctness or acceptance claim. Reference prior thread
 > `019fd895-21e8-7f03-86ea-a1296103337e` only as provenance; verify current state.
 
 ### Post-owner prompt
