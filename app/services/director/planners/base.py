@@ -41,20 +41,47 @@ from ..schema import ProductionPlan, ShotPlan
 _GENERIC_ARRAY_SCHEMA = {"type": "array", "items": {"type": "object"}, "minItems": 1}
 
 
+def append_custom_visual_style_guidance(system_prompt, guidance):
+    """Keep frozen borrow guidance separate from authored medium and model guides."""
+    if not isinstance(guidance, str):
+        raise ValueError("custom visual style guidance must be frozen text")
+    if not guidance:
+        return system_prompt
+    if system_prompt is not None and not isinstance(system_prompt, str):
+        raise ValueError("model system prompt must be text")
+    return f"{system_prompt or ''}\n\n{guidance}"
+
+
+def with_custom_visual_style_guidance(generate, guidance):
+    append_custom_visual_style_guidance("", guidance)
+    if generate is None or not guidance:
+        return generate
+
+    def bound_generate(**kwargs):
+        kwargs["system_prompt"] = append_custom_visual_style_guidance(
+            kwargs.get("system_prompt"), guidance,
+        )
+        return generate(**kwargs)
+
+    return bound_generate
+
+
 class BasePlanner(ABC):
     """Abstract base class for all skill planners."""
 
     # Subclasses set this
     skill_type: str = ""
 
-    def __init__(self, llm_generate: Any = None, llm_generate_streaming: Any = None):
+    def __init__(self, llm_generate: Any = None, llm_generate_streaming: Any = None,
+                 custom_visual_style_guidance: str = ""):
         """
         Args:
             llm_generate: callable matching llm_service.generate() signature
             llm_generate_streaming: callable matching llm_service.generate_streaming() signature
+            custom_visual_style_guidance: server-frozen borrow guidance, not visual_style
         """
-        self._generate = llm_generate
-        self._generate_streaming = llm_generate_streaming
+        self._generate = with_custom_visual_style_guidance(llm_generate, custom_visual_style_guidance)
+        self._generate_streaming = with_custom_visual_style_guidance(llm_generate_streaming, custom_visual_style_guidance)
 
     @abstractmethod
     def plan(self, **kwargs) -> ProductionPlan:

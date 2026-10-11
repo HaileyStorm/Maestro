@@ -19,6 +19,7 @@ from typing import Optional, Any
 
 from .schema import ProductionPlan, ShotPlan, RenderedPrompts
 from .planners import MusicVideoPlanner, ShortFilmPlanner, PodcastPlanner, ViralVideoPlanner
+from .planners.base import append_custom_visual_style_guidance, with_custom_visual_style_guidance
 from .renderers import (
     LtxT2VRenderer, LtxI2VRenderer, LtxA2VRenderer,
     LtxRetakeRenderer, LtxExtendRenderer, ImageGenRenderer,
@@ -115,6 +116,7 @@ class DirectorOrchestrator:
         self._generate_streaming = llm_generate_streaming
         self.flags = flags or DEFAULT_FLAGS
         self._video_model = ""
+        self._custom_visual_style_guidance = ""
 
         # Build the refine function for pass 2
         # Use streaming for refinement — Qwen3.5 with --jinja always uses
@@ -130,7 +132,7 @@ class DirectorOrchestrator:
             self._llm_refine = None
 
         # Initialize renderers with refine function
-        refine_fn = self._llm_refine if self.flags.use_llm_refinement else None
+        refine_fn = self._refine_with_style_guidance if self._llm_refine and self.flags.use_llm_refinement else None
         self._renderers = {
             mode: cls(llm_refine=refine_fn)
             for mode, cls in _RENDERER_MAP.items()
@@ -138,11 +140,17 @@ class DirectorOrchestrator:
 
     # ── Planning ─────────────────────────────────────────────────
 
-    def plan(self, skill_type: str, **kwargs) -> ProductionPlan:
+    def _refine_with_style_guidance(self, **kwargs):
+        return with_custom_visual_style_guidance(
+            self._llm_refine, self._custom_visual_style_guidance,
+        )(**kwargs)
+
+    def plan(self, skill_type: str, *, custom_visual_style_guidance: str = "", **kwargs) -> ProductionPlan:
         """Create a ProductionPlan using the appropriate skill planner.
 
         Args:
             skill_type: "music_video" | "short_film" | "podcast" | "viral_video"
+            custom_visual_style_guidance: frozen borrow guidance separate from authored visual_style
             **kwargs: Skill-specific arguments (clips, scene_description, etc.)
 
         Returns:
@@ -156,10 +164,13 @@ class DirectorOrchestrator:
             kwargs.pop("include_h3_shot_table_template", False) is True
         )
         has_h3_style_workflow = kwargs.get("h3_style_workflow_present") is True
+        append_custom_visual_style_guidance("", custom_visual_style_guidance)
+        self._custom_visual_style_guidance = custom_visual_style_guidance
         self._video_model = str(kwargs.get("video_model") or "")
         planner = planner_cls(
             llm_generate=self._generate,
             llm_generate_streaming=self._generate_streaming,
+            custom_visual_style_guidance=custom_visual_style_guidance,
         )
 
         print(f"[Director] Planning with {planner_cls.__name__}...")

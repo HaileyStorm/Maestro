@@ -904,7 +904,10 @@ class family_handler():
 
 
     @staticmethod
-    def load_model(model_filename, model_type, base_model_type, model_def, quantizeTransformer = False, text_encoder_quantization = None, dtype = torch.bfloat16, VAE_dtype = torch.float32, mixed_precision_transformer = False, save_quantized= False, submodel_no_list = None, text_encoder_filename = None, VAE_upsampling = None, **kwargs):
+    def load_model(model_filename, model_type, base_model_type, model_def, quantizeTransformer = False, text_encoder_quantization = None, dtype = torch.bfloat16, VAE_dtype = torch.float32, mixed_precision_transformer = False, save_quantized= False, submodel_no_list = None, text_encoder_filename = None, VAE_upsampling = None, _maestro_director_model_observer = None, **kwargs):
+        if (_maestro_director_model_observer is not None
+                and not callable(_maestro_director_model_observer)):
+            raise ValueError("Director Wan model observer is invalid")
         from .configs import WAN_CONFIGS
 
         if test_class_i2v(base_model_type):
@@ -913,6 +916,8 @@ class family_handler():
             cfg = WAN_CONFIGS['t2v-14B']
             # cfg = WAN_CONFIGS['t2v-1.3B']    
         from . import WanAny2V
+        observer_kwargs = ({"_maestro_director_model_observer": _maestro_director_model_observer}
+            if _maestro_director_model_observer is not None else {})
         wan_model = WanAny2V(
             config=cfg,
             checkpoint_dir="ckpts",
@@ -927,7 +932,8 @@ class family_handler():
             VAE_dtype = VAE_dtype, 
             mixed_precision_transformer = mixed_precision_transformer,
             save_quantized = save_quantized,
-            VAE_upsampling = VAE_upsampling,            
+            VAE_upsampling = VAE_upsampling,
+            **observer_kwargs,
         )
 
         pipe = {"transformer": wan_model.model, "vae": wan_model.vae.model}

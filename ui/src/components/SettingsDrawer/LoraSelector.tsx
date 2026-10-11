@@ -7,7 +7,7 @@ import { formatAge } from '../../lib/format'
 import type { LoraRecommendedWeights, LoraUpdateStatus } from '../../types'
 import { sortLoraNames } from './loraSort'
 import { LoraParameterField } from './LoraParameterField'
-import { createStudioLoraParameterSelection, studioLoraParameterSchema, validateStudioLoraParameters } from '../../api/client'
+import { createStudioLoraParameterSelection, studioLoraParameterSchema, studioVideoLoraRequestCompatible, validateStudioLoraParameters } from '../../api/client'
 import type { LoraInfo } from '../../types'
 import { HOST_TERM_NOTICES } from '../../lib/hostTerms'
 import type { LoraDates, LoraPickerSort } from './loraSort'
@@ -192,6 +192,8 @@ export function LoraSelector() {
   const loraParameters = useStore(s => s.params.lora_parameters)
   const setLoraParameters = useStore(s => s.setLoraParameters)
   const imageMode = useStore(s => s.params.image_mode)
+  const videoParameterPath = useStore(s => studioVideoLoraRequestCompatible(s.params)
+    && !s.startImage && !s.endImage && !s.imageRefs.length && !s.projectAssetRefs.length)
   const promptEnhance = useStore(s => s.studioPromptEnhance)
   const specialisedImagePath = useStore(s => Boolean(
     s.params.progressive_pipeline || s.params.single_stage_pipeline || s.params.reference_pipeline,
@@ -271,7 +273,11 @@ export function LoraSelector() {
   const [loraDetailsError, setLoraDetailsError] = useState('')
   const [parameterCatalog, setParameterCatalog] = useState<{ modelType: string; loras: LoraInfo[] } | null>(null)
   const currentCatalog = parameterCatalog?.modelType === modelType ? parameterCatalog.loras : []
-  const parameterPathAvailable = generationMode === 'image' && imageMode === 1 && !promptEnhance && !specialisedImagePath
+  const parameterMode = generationMode === 'video' ? 'video' : 'image'
+  const parameterPathAvailable = !promptEnhance && !specialisedImagePath && (
+    generationMode === 'image' && imageMode === 1
+    || generationMode === 'video' && videoParameterPath && !h3Adaptive
+  )
   const loraDetailsRequest = useRef(0)
   // Per-filename update_status from the cached LoRA-update manifest. The
   // backend embeds this on every /details response so we don't need to
@@ -462,7 +468,7 @@ export function LoraSelector() {
           for (const lora of loras) {
             if (live.params.model_type !== modelType || !live.params.activated_loras.includes(lora.filename)
               || Object.prototype.hasOwnProperty.call(live.params.lora_parameters ?? {}, lora.filename)) continue
-            const selection = createStudioLoraParameterSelection(lora)
+            const selection = createStudioLoraParameterSelection(lora, parameterMode)
             if (selection) setLoraParameters(modelType, lora.filename, selection)
           }
         }
@@ -520,6 +526,7 @@ export function LoraSelector() {
     h3SelectionError,
     modelType,
     parameterPathAvailable,
+    parameterMode,
     ref2vaState.loras,
   ])
 
@@ -777,13 +784,13 @@ export function LoraSelector() {
                   })}
                   {!architecture && (() => {
                     const lora = currentCatalog.find(item => item.filename === filename)
-                    const schema = lora && studioLoraParameterSchema(lora)
+                    const schema = lora && studioLoraParameterSchema(lora, parameterMode)
                     const selection = loraParameters?.[filename]
-                    const errors = selection ? validateStudioLoraParameters([filename], { [filename]: selection }, currentCatalog) : []
+                    const errors = selection ? validateStudioLoraParameters([filename], { [filename]: selection }, currentCatalog, parameterMode) : []
                     if (!lora?.parameter_schema && !selection) return null
                     if (!parameterPathAvailable || !schema) return (
                       <p role="status" className="mt-2 text-[10px] text-text-muted">{selection
-                        ? 'Saved parameter choices cannot run on this generation path. Remove this LoRA, or return to plain Image generation.'
+                        ? 'Saved parameter choices cannot run on this generation path. Remove this LoRA, or choose a supported plain Image or Video path.'
                         : 'Parameter controls are unavailable for this model or generation path. Strength still applies.'}</p>
                     )
                     if (!selection || selection.parameter_schema_digest !== schema.schema_digest) return (

@@ -108,12 +108,17 @@ def parse_loras_multipliers(loras_multipliers, nb_loras, num_inference_steps, me
     
     return  loras_list_mult_choices_nums, slists_dict, ""
 
-def update_loras_slists(trans, slists_dict, num_inference_steps, phase_switch_step = None, phase_switch_step2 = None):
+def update_loras_slists(trans, slists_dict, num_inference_steps, phase_switch_step = None, phase_switch_step2 = None, *, activation_observer=None):
     from mmgp import offload
     sz = len(slists_dict["phase1"])
     slists = [ expand_slist(slists_dict, i, num_inference_steps, phase_switch_step, phase_switch_step2 ) for i in range(sz)  ]
     nos = [str(l) for l in range(sz)]
     offload.activate_loras(trans, nos, slists ) 
+    if activation_observer is not None:
+        activation_observer(transformer=trans, adapter_ids=nos, schedules=slists,
+                            raw_schedule=slists_dict, steps=num_inference_steps,
+                            phase_switch_step=phase_switch_step,
+                            phase_switch_step2=phase_switch_step2)
 
 
 

@@ -1445,13 +1445,15 @@ class MiniMaxH3Model:
         image_refs_relative_size: float,
         generator: torch.Generator,
         override_last_video_latent: torch.Tensor | None = None,
+        observer=None,
     ):
         presentation: list[dict] = []
         prepared: list[MiniMaxH3PreparedReference] = []
         visual_latents: list[torch.Tensor] = []
         audio_latents: list[torch.Tensor] = []
 
-        for source in image_refs:
+        encoded_image_ordinals = []
+        for image_ordinal, source in enumerate(image_refs, 1):
             image = _tensor_to_pil(source)
             if image is None:
                 continue
@@ -1473,6 +1475,7 @@ class MiniMaxH3Model:
                     latent_width=latent.shape[-1],
                 )
             )
+            encoded_image_ordinals.append(image_ordinal)
 
         for video_index, (source, soundtrack) in enumerate(zip(video_refs, video_soundtracks)):
             video = _as_video_tensor(source)
@@ -1553,6 +1556,17 @@ class MiniMaxH3Model:
             if audio_latents
             else None
         )
+        if observer is not None:
+            try:
+                observer({
+                    "source_image_count": len(image_refs),
+                    "encoded_image_ordinals": tuple(encoded_image_ordinals),
+                })
+            except Exception:
+                try:
+                    observer.fail("reference_observer_emit_failed")
+                except Exception:
+                    pass
         return presentation, prepared, condition_video_rows, condition_audio_rows
 
     @torch.inference_mode()
@@ -2531,6 +2545,7 @@ class MiniMaxH3Model:
                 override_last_video_latent=(
                     cached_handoff.get("video") if use_cached_handoff else None
                 ),
+                observer=_kwargs.get("_h3_reference_observer"),
             )
 
         control_rows = None

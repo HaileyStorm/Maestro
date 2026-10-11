@@ -1,6 +1,11 @@
 import { parseH3PromptRewritePreview, type H3PromptRewritePreview, type H3PromptRewriteApplySelection } from '../lib/h3PromptRewritePreview.ts'
 import type {
+  GenerateParams,
   ArtifactClass,
+  CustomVisualStyleDefinition,
+  CustomVisualStyleSelection,
+  CustomVisualStyleReference,
+  ProjectVisualStyle,
   DirectorImageRoleLoraSelection,
   DirectorRecoveryMetadata,
   OutputArtifactScope,
@@ -4316,8 +4321,9 @@ export function validateLoraParameterValues(
 }
 
 /** Studio uses only the parameters published for generic generation. */
-export function studioLoraParameterSchema(lora: LoraInfo): LoraParameterSchema | undefined {
-  if (!lora.parameter_schema || lora.parameter_execution?.studio_image_generation !== true) return undefined
+export function studioLoraParameterSchema(lora: LoraInfo, mode: 'image' | 'video' = 'image'): LoraParameterSchema | undefined {
+  const available = mode === 'video' ? lora.parameter_execution?.studio_video_generation : lora.parameter_execution?.studio_image_generation
+  if (!lora.parameter_schema || available !== true) return undefined
   return {
     ...lora.parameter_schema,
     parameters: lora.parameter_schema.parameters.filter(parameter => (
@@ -4326,8 +4332,8 @@ export function studioLoraParameterSchema(lora: LoraInfo): LoraParameterSchema |
   }
 }
 
-export function createStudioLoraParameterSelection(lora: LoraInfo): LoraParameterSelection | undefined {
-  const schema = studioLoraParameterSchema(lora)
+export function createStudioLoraParameterSelection(lora: LoraInfo, mode: 'image' | 'video' = 'image'): LoraParameterSelection | undefined {
+  const schema = studioLoraParameterSchema(lora, mode)
   return schema ? {
     parameter_schema_digest: schema.schema_digest,
     parameter_values: getLoraParameterDefaults(schema),
@@ -4339,6 +4345,7 @@ export function validateStudioLoraParameters(
   activated: readonly string[],
   selections: Record<string, LoraParameterSelection> | undefined,
   catalog: readonly LoraInfo[],
+  mode: 'image' | 'video' = 'image',
 ): string[] {
   const errors: string[] = []
   if (selections != null && (typeof selections !== 'object' || Array.isArray(selections))) {
@@ -4346,7 +4353,7 @@ export function validateStudioLoraParameters(
   }
   for (const [filename, selection] of Object.entries(selections ?? {})) {
     const lora = catalog.find(item => item.filename === filename)
-    const schema = lora && studioLoraParameterSchema(lora)
+    const schema = lora && studioLoraParameterSchema(lora, mode)
     if (!activated.includes(filename)) errors.push(`${filename}: remove settings for this unselected LoRA.`)
     else if (!schema) errors.push(`${filename}: parameter controls are unavailable for this model and generation path.`)
     else if (!selection || selection.parameter_schema_digest !== schema.schema_digest) {
@@ -4358,6 +4365,23 @@ export function validateStudioLoraParameters(
     } else errors.push(...validateLoraParameterValues(schema, selection.parameter_values).map(error => `${filename}: ${error}`))
   }
   return errors
+}
+
+export function studioVideoLoraRequestCompatible(params: GenerateParams): boolean {
+  const fields = params as unknown as Record<string, unknown>
+  return !params.model_type?.startsWith('minimax_h3')
+    && params.image_mode === 0 && [0, 2].includes(params.multi_prompts_gen_type ?? 0)
+    && !['mode', 'prompt_enhancer', 'progressive_pipeline', 'single_stage_pipeline', 'reference_pipeline',
+      'image_start', 'image_end', 'project_asset_refs', 'video_source', 'video_end', 'video_guide', 'video_guide2', 'video_guide3',
+      'image_guide', 'image_mask', 'video_mask', 'custom_guide', 'audio_guide', 'audio_guide2',
+      'audio_guide3', 'audio_guide4', 'audio_guide5', 'audio_guide6', 'audio_source', 'image_prompt_type', 'video_prompt_type',
+      'audio_prompt_type', 'audio_conditioning_guide', 'voice_reference', 'retake_video', 'retake_masks_path',
+      'multi_clip_info', 'h3_native_boundary_conditioning',
+      '_continuation', '_ref2va_continuation', 'per_clip_frames', '_shot_prompts'].some(key => {
+        const value = fields[key]
+        return Array.isArray(value) ? value.length > 0 : Boolean(value)
+      })
+    && !(params.image_refs?.length)
 }
 
 /** Build Director's exact role-specific wire row from one server catalog row. */
@@ -5519,6 +5543,57 @@ export async function fetchProjectReferenceAuthoring(
   return res.json()
 }
 
+function projectVisualStyleUrl(project: string, assetId?: string): string {
+  const root = `${BASE}/api/v1/projects/${encodeURIComponent(project)}/visual-styles`
+  return assetId === undefined ? root : `${root}/${encodeURIComponent(assetId)}`
+}
+
+export async function fetchProjectVisualStyleLibrary(project: string, signal?: AbortSignal): Promise<{ styles: ProjectVisualStyle[]; project_instance: string }> {
+  const response = await fetch(projectVisualStyleUrl(project), { signal, cache: 'no-store' })
+  if (!response.ok) throw projectAssetRequestError(response.status, 'Could not load visual styles')
+  return response.json()
+}
+
+export async function fetchProjectVisualStyles(project: string, signal?: AbortSignal): Promise<ProjectVisualStyle[]> {
+  return (await fetchProjectVisualStyleLibrary(project, signal)).styles
+}
+
+export async function resolveProjectVisualStyleReference(
+  project: string,
+  selection: Omit<CustomVisualStyleReference, 'expected_sha256'>,
+  projectInstance?: string,
+): Promise<CustomVisualStyleReference> {
+  const response = await fetch(`${projectVisualStyleUrl(project)}/references/resolve`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json', ...(projectInstance ? { 'X-Maestro-Project-Instance': projectInstance } : {}) },
+    body: JSON.stringify(selection), cache: 'no-store',
+  })
+  if (!response.ok) throw projectAssetRequestError(response.status, 'Could not use this reference')
+  return response.json()
+}
+
+export async function saveProjectVisualStyle(
+  project: string,
+  input: { name: string; definition: CustomVisualStyleDefinition },
+  current?: { asset_id: string; revision: string } | null,
+  projectInstance?: string,
+): Promise<ProjectVisualStyle> {
+  const response = await fetch(projectVisualStyleUrl(project, current?.asset_id), {
+    method: current ? 'PATCH' : 'POST',
+    headers: { 'Content-Type': 'application/json', ...(projectInstance ? { 'X-Maestro-Project-Instance': projectInstance } : {}) },
+    body: JSON.stringify(current ? { ...input, expected_revision: current.revision } : input),
+  })
+  if (!response.ok) throw projectAssetRequestError(response.status, 'Could not save this visual style')
+  return response.json()
+}
+
+export async function deleteProjectVisualStyle(project: string, current: { asset_id: string; revision: string }): Promise<void> {
+  const response = await fetch(projectVisualStyleUrl(project, current.asset_id), {
+    method: 'DELETE', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ expected_revision: current.revision }),
+  })
+  if (!response.ok) throw projectAssetRequestError(response.status, 'Could not delete this visual style')
+}
+
 export async function createProjectAsset(project: string, body: Record<string, unknown>): Promise<ProjectAsset> {
   const res = await fetch(`${BASE}/api/v1/projects/${encodeURIComponent(project)}/assets`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
@@ -6312,6 +6387,7 @@ export interface DirectorPreflightRequest {
 }
 
 export interface DirectorPreflightResponse {
+  hold_planning_supported?: boolean
   status: 'ready'
   resolved: {
     pipeline_type: DirectorPipelineType
@@ -6365,7 +6441,7 @@ export async function fetchPipelineStatus(pid: string): Promise<PipelineStatus> 
   return res.json()
 }
 
-export async function continuePipeline(pid: string, updates?: { clip_plans?: Array<{ video_prompt: string; image_prompt: string }> }): Promise<void> {
+export async function continuePipeline(pid: string, updates?: { clip_plans?: Array<{ video_prompt: string; image_prompt: string }>; hold_video?: boolean }): Promise<void> {
   const res = await fetch(`${BASE}/api/v1/director/pipeline/${encodeURIComponent(pid)}/continue`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -6630,11 +6706,13 @@ export interface DirectorV2PlanRequest {
   frames_minimum?: number
   concept?: string
   visual_style?: string
+  custom_visual_style_selection?: CustomVisualStyleSelection
   /** Exact server-catalog ID only; workflow metadata remains server-owned. */
   h3_style_workflow?: string
   platform?: string
   style?: string
   prompt_type?: string
+  existing_image_prompts?: string[]
   director_flags?: Record<string, boolean>
 }
 

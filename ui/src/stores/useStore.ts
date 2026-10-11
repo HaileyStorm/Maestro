@@ -19,7 +19,7 @@ import {
   directorProfileRoleMismatch, directorProfileStateKeys,
   isDirectorProfile, restoreDirectorProfileSettings,
 } from '../lib/directorProfiles'
-import type { GenerateParams, ProjectAssetGenerateReference, OutputFile, MediaFilter, OutputArtifactScope, AspectRatio, ResolutionPreset, ScailResolutionProfile, GenerationJob, H3SegmentPlan, H3PlanDecision, H3PerformanceEstimate, H3SegmentCountEstimate, H3PerformanceProfile, H3PerformanceProfileId, ModelFamily, ModelDef, GenerationMode, ModelOptions, SystemConfig, SettingsTab, OutputMetadata, MultiClip, ServicesConfig, HostTermId, HostTermsStatus, LlmStatus, LlmModelOption, AudioAnalysisResult, PlannedClip, ClipPlan, DirectorClipImage, DirectorImageGenProgress, DirectorImageRole, DirectorImageRoleLoraSelection, SpeakerMapping, DirectorSkill, DirectorShotImageGuidance, ShortFilmCharacter, ShortFilmPath, CivitAIModel, CivitAIDownload, PipelineListItem, PipelineRepairState, SavedPipelineState, SystemDetectResponse, SystemStats, RecastCharacterMapping, RepaintRegionMapping, AccountAuthResult, AccountContext, AccountProjectMigrationStatus, AccountSession, AccountSummary, ResponsibleUseProjection, SupportAdminProjection, SupportFulfillmentMutationInput, SupportManualContributionInput, SupportPublicProjection, SupportSelfProjection, SupportH3LegalAccessProjection, SupportH3LegalAccessLocationInput } from '../types'
+import type { CustomVisualStyleSelection, GenerateParams, ProjectAssetGenerateReference, OutputFile, MediaFilter, OutputArtifactScope, AspectRatio, ResolutionPreset, ScailResolutionProfile, GenerationJob, H3SegmentPlan, H3PlanDecision, H3PerformanceEstimate, H3SegmentCountEstimate, H3PerformanceProfile, H3PerformanceProfileId, ModelFamily, ModelDef, GenerationMode, ModelOptions, SystemConfig, SettingsTab, OutputMetadata, MultiClip, ServicesConfig, HostTermId, HostTermsStatus, LlmStatus, LlmModelOption, AudioAnalysisResult, PlannedClip, ClipPlan, DirectorClipImage, DirectorImageGenProgress, DirectorImageRole, DirectorImageRoleLoraSelection, SpeakerMapping, DirectorSkill, DirectorShotImageGuidance, ShortFilmCharacter, ShortFilmPath, CivitAIModel, CivitAIDownload, PipelineListItem, PipelineRepairState, SavedPipelineState, SystemDetectResponse, SystemStats, RecastCharacterMapping, RepaintRegionMapping, AccountAuthResult, AccountContext, AccountProjectMigrationStatus, AccountSession, AccountSummary, ResponsibleUseProjection, SupportAdminProjection, SupportFulfillmentMutationInput, SupportManualContributionInput, SupportPublicProjection, SupportSelfProjection, SupportH3LegalAccessProjection, SupportH3LegalAccessLocationInput } from '../types'
 import * as api from '../api/client'
 import { h3CumulativeSelectionError } from '../lib/h3Cumulative'
 import { applyThemePrefs, getStoredPrefs, type FamilyId, type ThemeMode, type ThemePrefs } from '../lib/theme'
@@ -945,6 +945,7 @@ function _generatePromptSurfaceIsVisible(state: {
 }
 
 type StoredDirectorPreviewOperation = api.DirectorV2OperationScope & {
+  promptType?: 'video'
   accountFingerprint: string
   claimToken: string
   settingsFingerprint: string
@@ -1189,11 +1190,12 @@ function _validStoredDirectorPreviewOperation(
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false
   const parsed = value as Record<string, unknown>
   return (
-    Object.keys(parsed).length === 9
+    Object.keys(parsed).length === (parsed.promptType === 'video' ? 10 : 9)
     && Object.keys(parsed).every(key => [
       'requestId', 'workspace', 'projectInstance', 'accountFingerprint',
-      'claimToken', 'settingsFingerprint', 'creativeFingerprint', 'admitted', 'storedAt',
+      'claimToken', 'settingsFingerprint', 'creativeFingerprint', 'admitted', 'storedAt', 'promptType',
     ].includes(key))
+    && (parsed.promptType === undefined || parsed.promptType === 'video')
     && typeof parsed.requestId === 'string'
     && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(parsed.requestId)
     && typeof parsed.workspace === 'string'
@@ -1440,6 +1442,7 @@ function _sameStoredDirectorPreviewOperation(
     && left.claimToken === right.claimToken
     && left.settingsFingerprint === right.settingsFingerprint
     && left.creativeFingerprint === right.creativeFingerprint
+    && left.promptType === right.promptType
     && left.admitted === right.admitted
     && left.storedAt === right.storedAt
   )
@@ -4096,6 +4099,8 @@ interface AppState {
   /** Empty means the Realistic product default unless freeform copy defines a style. */
   directorVisualStyle: string
   directorCustomVisualStyle: string
+  directorSavedVisualStyle: CustomVisualStyleSelection | null
+  directorStyleAuthoringEpoch: number
   directorLoading: boolean
   /** Sub-status for the current loading phase (e.g. "Loading
    *  transcription model (first use downloads ~300MB)..."). Set by
@@ -4201,6 +4206,7 @@ interface AppState {
   directorSetSceneDescription: (prompt: string) => void
   setDirectorVisualStyle: (style: string) => void
   setDirectorCustomVisualStyle: (style: string) => void
+  setDirectorSavedVisualStyle: (selection: CustomVisualStyleSelection | null, expectedScope: string) => boolean
   directorSetReferenceImage: (file: File | null) => void
   directorAddCharacterRef: (file: File) => void
   directorApplyReferenceKit: (entries: Array<{
@@ -4246,8 +4252,8 @@ interface AppState {
   pipelineId: string | null
   pipelineStatus: import('../api/client').PipelineStatus | null
   pipelinePolling: boolean
-  startDirectorPipeline: (mode?: 'now' | 'queue') => Promise<void>
-  continuePipeline: (updates?: { clip_plans?: Array<{ video_prompt: string; image_prompt: string }> }) => Promise<void>
+  startDirectorPipeline: (mode?: 'now' | 'queue' | 'hold_planning') => Promise<void>
+  continuePipeline: (updates?: { clip_plans?: Array<{ video_prompt: string; image_prompt: string }>; hold_video?: boolean }) => Promise<void>
   stopPipeline: () => Promise<boolean | undefined>
   pollPipelineStatus: () => void
 }
@@ -5264,7 +5270,7 @@ async function _directorPreviewSettingsFingerprint(state: AppState): Promise<str
   return _directorPreviewHmacSha256(_directorPreviewSafeSettings(state))
 }
 
-function _directorPreviewCreativeInputs(state: AppState): unknown {
+function _directorPreviewCreativeInputs(state: AppState, promptType: 'both' | 'video' = 'both'): unknown {
   const plannedClips = state.directorPlannedClips
   const storyPlanning = state.directorSkill === 'short_film' && plannedClips.length === 0
   return {
@@ -5272,6 +5278,7 @@ function _directorPreviewCreativeInputs(state: AppState): unknown {
     clips: plannedClips,
     sceneDescription: state.directorSceneDescription,
     storyDescription: storyPlanning ? state.directorSceneDescription : '',
+    savedVisualStyle: state.directorSavedVisualStyle,
     visualStyle: state.directorVisualStyle === 'custom'
       ? state.directorCustomVisualStyle.trim()
       : state.directorVisualStyle,
@@ -5297,7 +5304,10 @@ function _directorPreviewCreativeInputs(state: AppState): unknown {
     fps: storyPlanning ? state.modelOptions?.fps ?? 24 : null,
     framesSteps: storyPlanning ? state.modelOptions?.frames_steps ?? 4 : null,
     framesMinimum: storyPlanning ? state.modelOptions?.frames_minimum ?? 5 : null,
-    promptType: 'both',
+    promptType,
+    ...(promptType === 'video'
+      ? { existingImagePrompts: state.directorClipPlans.map(plan => plan.image_prompt || '') }
+      : {}),
   }
 }
 
@@ -5312,8 +5322,8 @@ function _directorPreviewReferenceObjectId(value: object): number {
   return created
 }
 
-function _directorPreviewActionCreativeInputs(state: AppState): unknown {
-  const creative = _directorPreviewCreativeInputs(state) as Record<string, unknown>
+function _directorPreviewActionCreativeInputs(state: AppState, promptType: 'both' | 'video' = 'both'): unknown {
+  const creative = _directorPreviewCreativeInputs(state, promptType) as Record<string, unknown>
   const stableCreative = { ...creative }
   delete stableCreative.referencePath
   delete stableCreative.characterPaths
@@ -5356,12 +5366,14 @@ type DirectorPreviewRequestFence = {
   workspace: string
   skillType: DirectorSkill
   explicitOutput: boolean
+  promptType: 'both' | 'video'
   isCurrent: () => boolean
 }
 
 function _captureDirectorPreviewRequestFence(
   getState: () => AppState,
   skillType: DirectorSkill,
+  promptType: 'both' | 'video' = 'both',
 ): DirectorPreviewRequestFence {
   const state = getState()
   const workspace = state.activeWorkspace
@@ -5369,12 +5381,13 @@ function _captureDirectorPreviewRequestFence(
   const accountFingerprint = _enhanceAccountFingerprint(state)
   const inputFingerprint = _stableJson({
     settings: _directorPreviewSafeSettings(state),
-    creative: _directorPreviewActionCreativeInputs(state),
+    creative: _directorPreviewActionCreativeInputs(state, promptType),
   })
   return {
     workspace,
     skillType,
     explicitOutput: state.explicitOutput,
+    promptType,
     isCurrent: () => {
       const current = getState()
       return (
@@ -5384,7 +5397,7 @@ function _captureDirectorPreviewRequestFence(
         && current.directorSkill === skillType
         && _stableJson({
           settings: _directorPreviewSafeSettings(current),
-          creative: _directorPreviewActionCreativeInputs(current),
+          creative: _directorPreviewActionCreativeInputs(current, promptType),
         }) === inputFingerprint
       )
     },
@@ -5406,6 +5419,7 @@ function _directorPreviewRequestCreativeInputs(request: DirectorV2PreviewRequest
     sceneDescription: request.scene_description ?? '',
     storyDescription: request.story_description ?? '',
     visualStyle: request.visual_style ?? '',
+    savedVisualStyle: request.custom_visual_style_selection ?? null,
     lyrics: request.lyrics ?? null,
     bpm: request.skill_type === 'music_video' ? request.bpm ?? 120 : null,
     referencePath: request.reference_image_path ?? null,
@@ -5426,11 +5440,14 @@ function _directorPreviewRequestCreativeInputs(request: DirectorV2PreviewRequest
     framesSteps: request.target_duration === undefined ? null : request.frames_steps ?? 4,
     framesMinimum: request.target_duration === undefined ? null : request.frames_minimum ?? 5,
     promptType: request.prompt_type ?? '',
+    ...(request.prompt_type === 'video'
+      ? { existingImagePrompts: request.existing_image_prompts ?? [] }
+      : {}),
   }
 }
 
-async function _directorPreviewCreativeFingerprint(state: AppState): Promise<string> {
-  return _directorPreviewHmacSha256(_directorPreviewCreativeInputs(state))
+async function _directorPreviewCreativeFingerprint(state: AppState, promptType: 'both' | 'video' = 'both'): Promise<string> {
+  return _directorPreviewHmacSha256(_directorPreviewCreativeInputs(state, promptType))
 }
 
 function _directorPreviewInputsReadyForRecovery(state: AppState): boolean {
@@ -5447,11 +5464,11 @@ function _directorPreviewInputsReadyForRecovery(state: AppState): boolean {
   )
 }
 
-function _directorPreviewLiveInputFingerprint(state: AppState): string {
+function _directorPreviewLiveInputFingerprint(state: AppState, promptType: 'both' | 'video' = 'both'): string {
   return _stableJson({
     workspace: state.activeWorkspace,
     settings: _directorPreviewSafeSettings(state),
-    creative: _directorPreviewCreativeInputs(state),
+    creative: _directorPreviewCreativeInputs(state, promptType),
   })
 }
 
@@ -5459,6 +5476,60 @@ type DirectorV2PreviewRequest = Omit<
   api.DirectorV2PlanRequest,
   'request_id' | 'project_instance'
 >
+
+function _mergeDirectorVideoFollowupPlans(
+  previous: Array<{ image_prompt: string; video_prompt: string }>,
+  result: api.DirectorV2PlanResponse['clip_plans'],
+): Array<{ image_prompt: string; video_prompt: string }> {
+  if (!previous.length || previous.length !== result.length) {
+    throw new Error('Video planning changed the number of scenes. The existing image prompts were preserved; try planning again.')
+  }
+  return previous.map((plan, index) => ({ ...plan, video_prompt: result[index].video_prompt || '' }))
+}
+
+async function _runDirectorV2VideoFollowup(
+  getState: () => AppState,
+  lifecycle: Parameters<typeof _runDirectorV2Preview>[1],
+  requestFence: DirectorPreviewRequestFence,
+): Promise<api.DirectorV2PlanResponse> {
+  await _ensureSelectedH3StyleWorkflowReady(getState)
+  _requireCurrentDirectorPreviewRequestFence(requestFence)
+  const imageRoleRequest = await _captureDirectorImageRoleRequest(
+    getState, requestFence.explicitOutput, requestFence,
+  )
+  _requireCurrentDirectorPreviewRequestFence(requestFence)
+  const state = getState()
+  const speakerMappings = Object.fromEntries(state.directorSpeakerMappings
+    .filter(mapping => mapping.name.trim())
+    .map(mapping => [mapping.speakerId, { name: mapping.name, role: mapping.role }]))
+  return _runDirectorV2Preview({
+    workspace: state.activeWorkspace,
+    skill_type: requestFence.skillType,
+    custom_visual_style_selection: state.directorSavedVisualStyle ?? undefined,
+    video_model: state.selectedModelPerMode.video,
+    ...imageRoleRequest.wire,
+    h3_style_workflow: resolveH3StyleWorkflowRequest(
+      state.h3StyleWorkflowCatalog, state.selectedModelPerMode.video, state.h3StyleWorkflow,
+    ),
+    explicit_output: requestFence.explicitOutput,
+    clips: state.directorPlannedClips,
+    scene_description: state.directorSceneDescription,
+    visual_style: state.directorVisualStyle === 'custom'
+      ? state.directorCustomVisualStyle.trim() || undefined
+      : state.directorVisualStyle || undefined,
+    lyrics: state.directorAnalysis?.lyrics ?? undefined,
+    ...(requestFence.skillType === 'music_video' ? { bpm: state.directorAnalysis?.bpm ?? 120 } : {}),
+    reference_image_path: state.directorReferenceImagePath ?? undefined,
+    character_ref_paths: state.directorCharacterRefPaths,
+    character_ref_labels: state.directorCharacterRefLabels,
+    location_ref_paths: state.directorLocationRefPaths,
+    location_ref_labels: state.directorLocationRefLabels,
+    speaker_mappings: Object.keys(speakerMappings).length ? speakerMappings : undefined,
+    ...(requestFence.skillType === 'short_film' ? { characters: state.shortFilmCharacters } : {}),
+    prompt_type: 'video',
+    existing_image_prompts: state.directorClipPlans.map(plan => plan.image_prompt || ''),
+  }, lifecycle, requestFence)
+}
 
 async function _runDirectorV2Preview(
   request: DirectorV2PreviewRequest,
@@ -5471,8 +5542,9 @@ async function _runDirectorV2Preview(
 ): Promise<api.DirectorV2PlanResponse> {
   const accountIdentityEpoch = _accountIdentityEpoch
   const initialState = useStore.getState()
+  const promptType = requestFence.promptType
   const accountFingerprint = _enhanceAccountFingerprint(initialState)
-  const liveInputFingerprint = _directorPreviewLiveInputFingerprint(initialState)
+  const liveInputFingerprint = _directorPreviewLiveInputFingerprint(initialState, promptType)
   const requestCreativeInputs = _stableJson(_directorPreviewRequestCreativeInputs(request))
   const workspace = request.workspace
   let scope: api.DirectorV2OperationScope | null = null
@@ -5488,7 +5560,7 @@ async function _runDirectorV2Preview(
       && _enhanceAccountFingerprint(state) === accountFingerprint
       && state.activeWorkspace === workspace
       && requestFence.isCurrent()
-      && _directorPreviewLiveInputFingerprint(state) === liveInputFingerprint
+      && _directorPreviewLiveInputFingerprint(state, promptType) === liveInputFingerprint
   }
   const stopOnSettingsChange = useStore.subscribe(state => {
     if (_directorPreviewRequestToken === null) return
@@ -5503,7 +5575,7 @@ async function _runDirectorV2Preview(
       lifecycle.stopWaiting()
       return
     }
-    if (_directorPreviewLiveInputFingerprint(state) !== liveInputFingerprint) {
+    if (_directorPreviewLiveInputFingerprint(state, promptType) !== liveInputFingerprint) {
       lifecycle.stopWaiting()
       if (scope) {
         void _removeStoredDirectorPreviewOperation(scope)
@@ -5522,14 +5594,15 @@ async function _runDirectorV2Preview(
       request.workspace !== requestFence.workspace
       || request.skill_type !== requestFence.skillType
       || request.explicit_output !== requestFence.explicitOutput
+      || request.prompt_type !== promptType
     ) throw new DOMException('The browser stopped waiting', 'AbortError')
     _requireCurrentDirectorPreviewRequestFence(requestFence)
     const settingsFingerprint = await _directorPreviewSettingsFingerprint(initialState)
     if (!ownsExactInput()) throw new DOMException('The browser stopped waiting', 'AbortError')
-    if (_stableJson(_directorPreviewCreativeInputs(useStore.getState())) !== requestCreativeInputs) {
+    if (_stableJson(_directorPreviewCreativeInputs(useStore.getState(), promptType)) !== requestCreativeInputs) {
       throw new DOMException('The browser stopped waiting', 'AbortError')
     }
-    const creativeFingerprint = await _directorPreviewCreativeFingerprint(initialState)
+    const creativeFingerprint = await _directorPreviewCreativeFingerprint(initialState, promptType)
     if (!ownsExactInput()) throw new DOMException('The browser stopped waiting', 'AbortError')
     const catalog = await api.fetchLlmModels(workspace, lifecycle.signal)
     if (!ownsExactInput()) throw new DOMException('The browser stopped waiting', 'AbortError')
@@ -5547,6 +5620,7 @@ async function _runDirectorV2Preview(
       accountFingerprint,
       settingsFingerprint,
       creativeFingerprint,
+      ...(promptType === 'video' ? { promptType } : {}),
       storedAt: Date.now(),
     }
     const claimToken = _directorPreviewFingerprintClaimRecord?.token ?? null
@@ -5852,6 +5926,8 @@ function _scrubAccountBoundProjectUi(state: AppState): Partial<AppState> {
     directorSceneDescription: '',
     directorVisualStyle: '',
     directorCustomVisualStyle: '',
+    directorSavedVisualStyle: null,
+    directorStyleAuthoringEpoch: state.directorStyleAuthoringEpoch + 1,
     directorLoadingMessage: null,
     directorError: null,
     directorComponentError: null,
@@ -5958,7 +6034,7 @@ function _directorPipelineSnapshotCurrent(snapshot: AppState, live: AppState): b
     'shortFilmTargetDuration', 'shortFilmNarrative', 'directorImageRoleLoraModels',
     'directorPlannedClips', 'directorSceneDescription', 'directorAudioPath',
     'directorAnalysis', 'directorAutoMode', 'directorSpeakerMappings',
-    'directorVisualStyle', 'directorCustomVisualStyle', 'directorReferenceImage',
+    'directorVisualStyle', 'directorCustomVisualStyle', 'directorSavedVisualStyle', 'directorReferenceImage',
     'directorReferenceImagePath', 'directorCharacterRefs', 'directorCharacterRefPaths',
     'directorCharacterRefLabels', 'directorLocationRefs', 'directorLocationRefPaths',
     'directorLocationRefLabels', 'directorVoiceRef', 'directorVoiceRefPath',
@@ -9294,19 +9370,26 @@ export const useStore = create<AppState>((set, get) => ({
       return
     }
     if (Object.keys(state.params.lora_parameters ?? {}).length > 0) {
-      if (state.generationMode !== 'image' || state.params.image_mode !== 1 || state.studioPromptEnhance
+      const plainImage = state.generationMode === 'image' && state.params.image_mode === 1
+      const plainVideo = state.generationMode === 'video' && api.studioVideoLoraRequestCompatible(state.params)
+        && !state.startImage && !state.endImage && !state.imageRefs.length && !state.projectAssetRefs.length
+      if (!(plainImage || plainVideo) || state.studioPromptEnhance
         || state.params.progressive_pipeline || state.params.single_stage_pipeline || state.params.reference_pipeline) {
-        window.alert('LoRA parameter choices currently work with plain Image generation. Turn off prompt enhancement and specialized image pipelines, or remove these LoRAs before using another path.')
+        window.alert('LoRA parameter choices require plain Image generation or supported text-to-video generation. Turn off prompt enhancement and specialized image pipelines, or remove these LoRAs before using another path.')
         return
       }
       const parameterSnapshot = state.params
       const catalog = await api.fetchLoraDetails(parameterSnapshot.model_type)
       if (!ownsSubmission()) return
-      if (get().params !== parameterSnapshot || get().generationMode !== state.generationMode) {
-        window.alert('Image settings changed while checking LoRA controls. Review them and generate again.')
+      const liveParameterState = get()
+      if (liveParameterState.params !== parameterSnapshot || liveParameterState.generationMode !== state.generationMode
+        || liveParameterState.studioPromptEnhance !== state.studioPromptEnhance
+        || liveParameterState.startImage !== state.startImage || liveParameterState.endImage !== state.endImage
+        || liveParameterState.imageRefs !== state.imageRefs || liveParameterState.projectAssetRefs !== state.projectAssetRefs) {
+        window.alert('Studio settings changed while checking LoRA controls. Review them and generate again.')
         return
       }
-      const errors = api.validateStudioLoraParameters(parameterSnapshot.activated_loras, parameterSnapshot.lora_parameters, catalog.loras)
+      const errors = api.validateStudioLoraParameters(parameterSnapshot.activated_loras, parameterSnapshot.lora_parameters, catalog.loras, plainVideo ? 'video' : 'image')
       if (errors.length > 0) { window.alert(errors.join('\n')); return }
     }
     if (state.h3StyleWorkflow
@@ -14570,6 +14653,8 @@ export const useStore = create<AppState>((set, get) => ({
   directorSceneDescription: '',
   directorVisualStyle: '',
   directorCustomVisualStyle: '',
+  directorSavedVisualStyle: null,
+  directorStyleAuthoringEpoch: 0,
   directorLoading: false,
   directorLoadingMessage: null,
   directorError: null,
@@ -14618,7 +14703,24 @@ export const useStore = create<AppState>((set, get) => ({
       })
       return false
     }
-    const liveInputFingerprint = _directorPreviewLiveInputFingerprint(get())
+    const promptType = stored.promptType ?? 'both'
+    const liveInputFingerprint = _directorPreviewLiveInputFingerprint(get(), promptType)
+    if (promptType === 'video') {
+      const [creativeFingerprint, settingsFingerprint] = await Promise.all([
+        _directorPreviewCreativeFingerprint(get(), promptType),
+        _directorPreviewSettingsFingerprint(get()),
+      ])
+      if (_directorPreviewRecoveryToken !== recoveryToken
+        || !_accountIdentityIsCurrent(accountIdentityEpoch)
+        || _enhanceAccountFingerprint(get()) !== accountFingerprint
+        || get().activeWorkspace !== workspace) return false
+      if (_directorPreviewLiveInputFingerprint(get(), promptType) !== liveInputFingerprint
+        || creativeFingerprint !== stored.creativeFingerprint
+        || settingsFingerprint !== stored.settingsFingerprint) {
+        set({ directorError: 'This saved video preview belongs to different image prompts or settings. The current scene inputs were preserved.' })
+        return false
+      }
+    }
     const currentStored = _findStoredDirectorPreviewOperation(workspace, accountFingerprint)
     if (
       _directorPreviewRecoveryToken !== recoveryToken
@@ -14626,7 +14728,7 @@ export const useStore = create<AppState>((set, get) => ({
       || _enhanceAccountFingerprint(get()) !== accountFingerprint
       || get().activeWorkspace !== workspace
       || !_directorPreviewInputsReadyForRecovery(get())
-      || _directorPreviewLiveInputFingerprint(get()) !== liveInputFingerprint
+      || _directorPreviewLiveInputFingerprint(get(), promptType) !== liveInputFingerprint
       || !_sameStoredDirectorPreviewOperation(currentStored, stored)
     ) return false
     const scope: api.DirectorV2OperationScope = {
@@ -14654,7 +14756,7 @@ export const useStore = create<AppState>((set, get) => ({
         lifecycle.stopWaiting()
         return
       }
-      if (_directorPreviewLiveInputFingerprint(state) !== liveInputFingerprint) {
+      if (_directorPreviewLiveInputFingerprint(state, promptType) !== liveInputFingerprint) {
         inputsChanged = true
         lifecycle.stopWaiting()
         void _removeStoredDirectorPreviewOperation(scope)
@@ -14684,7 +14786,7 @@ export const useStore = create<AppState>((set, get) => ({
         || _enhanceAccountFingerprint(get()) !== accountFingerprint
         || get().activeWorkspace !== scope.workspace
         || !_directorPreviewInputsReadyForRecovery(get())
-        || _directorPreviewLiveInputFingerprint(get()) !== liveInputFingerprint
+        || _directorPreviewLiveInputFingerprint(get(), promptType) !== liveInputFingerprint
         || !_sameDirectorPreviewScope(get().directorPreviewRequestScope, scope)
         || !_sameStoredDirectorPreviewOperation(recoveredStored, stored)
       ) return false
@@ -14694,7 +14796,7 @@ export const useStore = create<AppState>((set, get) => ({
         || !_accountIdentityIsCurrent(accountIdentityEpoch)
         || _enhanceAccountFingerprint(get()) !== accountFingerprint
         || get().activeWorkspace !== scope.workspace
-        || _directorPreviewLiveInputFingerprint(get()) !== liveInputFingerprint
+        || _directorPreviewLiveInputFingerprint(get(), promptType) !== liveInputFingerprint
         || !_sameStoredDirectorPreviewOperation(
           _findStoredDirectorPreviewOperation(scope.workspace, accountFingerprint),
           stored,
@@ -14709,7 +14811,12 @@ export const useStore = create<AppState>((set, get) => ({
           'The recovered Director preview used an unsupported workflow',
         )
       }
-      const plans = result.clip_plans.map(plan => ({
+      if (promptType === 'video' && recoveredSkill !== get().directorSkill) {
+        throw new api.DirectorV2ScopeError('The recovered video preview used a different workflow')
+      }
+      const plans = promptType === 'video'
+        ? _mergeDirectorVideoFollowupPlans(get().directorClipPlans, result.clip_plans)
+        : result.clip_plans.map(plan => ({
         video_prompt: plan.video_prompt || '',
         image_prompt: plan.image_prompt || '',
       }))
@@ -14749,7 +14856,7 @@ export const useStore = create<AppState>((set, get) => ({
         || !_accountIdentityIsCurrent(accountIdentityEpoch)
         || _enhanceAccountFingerprint(get()) !== accountFingerprint
         || get().activeWorkspace !== scope.workspace
-        || _directorPreviewLiveInputFingerprint(get()) !== liveInputFingerprint
+        || _directorPreviewLiveInputFingerprint(get(), promptType) !== liveInputFingerprint
       ) return false
       // The atomic recovery adoption intentionally changes the skill/form
       // discriminator. Detach the edit watcher only after the final exact
@@ -14761,7 +14868,7 @@ export const useStore = create<AppState>((set, get) => ({
         directorPlannedClips: recoveredClips || get().directorPlannedClips,
         directorClipPlans: plans,
         directorShotDeck: recoveredShotDeck,
-        directorStep: 'review',
+        directorStep: promptType === 'video' ? 'review_video' : 'review',
         directorLoading: false,
         directorLoadingMessage: null,
         directorPreviewStatus: null,
@@ -15769,6 +15876,11 @@ export const useStore = create<AppState>((set, get) => ({
   directorSetSceneDescription: (prompt) => set({ directorSceneDescription: prompt, directorShotDeck: null }),
   setDirectorVisualStyle: (style) => set({ directorVisualStyle: style, directorShotDeck: null }),
   setDirectorCustomVisualStyle: (style) => set({ directorCustomVisualStyle: style, directorShotDeck: null }),
+  setDirectorSavedVisualStyle: (selection, expectedScope) => {
+    if (currentDirectorQueueScope() !== expectedScope) return false
+    set({ directorSavedVisualStyle: selection ? { ...selection } : null, directorShotDeck: null })
+    return true
+  },
 
   // Helper: upload all Director reference images (main + characters + locations)
   _uploadDirectorRefs: async (lifecycle, requestFence) => {
@@ -15819,6 +15931,10 @@ export const useStore = create<AppState>((set, get) => ({
     // ?? not || — an explicit user-toggled `false` must be respected on the
     // legacy v1 path; fall back only while servicesConfig is unavailable.
     const useV2 = get().servicesConfig?.use_director_v2 ?? true
+    if (!useV2 && get().directorSavedVisualStyle) {
+      set({ directorError: 'Enable Director v2 or remove the saved visual direction before planning.' })
+      return
+    }
     const lifecycle = useV2
       ? _beginDirectorPreviewRequest(activeWorkspace)
       : _beginDirectorLlmRequest(activeWorkspace)
@@ -15865,6 +15981,7 @@ export const useStore = create<AppState>((set, get) => ({
         const result = await _runDirectorV2Preview({
           workspace: activeWorkspace,
           skill_type: 'music_video',
+          custom_visual_style_selection: get().directorSavedVisualStyle ?? undefined,
           video_model: get().selectedModelPerMode.video,
           ...imageRoleRequest.wire,
           h3_style_workflow: resolveH3StyleWorkflowRequest(
@@ -15940,9 +16057,19 @@ export const useStore = create<AppState>((set, get) => ({
   directorPlanVideoPrompts: async () => {
     const { directorPlannedClips, directorSceneDescription, directorAnalysis, directorClipPlans, directorReferenceImagePath, activeWorkspace } = get()
     if (!directorPlannedClips.length || !directorClipPlans.length) return
-    const lifecycle = _beginDirectorLlmRequest(activeWorkspace)
+    const useV2 = get().servicesConfig?.use_director_v2 ?? true
+    if (!useV2 && get().directorSavedVisualStyle) {
+      set({ directorError: 'Enable Director v2 or remove the saved visual direction before planning.' })
+      return
+    }
+    const lifecycle = useV2
+      ? _beginDirectorPreviewRequest(activeWorkspace)
+      : _beginDirectorLlmRequest(activeWorkspace)
+    const requestFence = useV2
+      ? _captureDirectorPreviewRequestFence(get, 'music_video', 'video')
+      : null
     const requestExplicitOutput = get().explicitOutput
-    set({ directorLoading: true, directorError: null, directorStep: 'plan_video' })
+    set({ directorLoading: true, directorError: null, directorStep: 'plan_video', directorShotDeck: null })
     try {
       // Build speaker_mappings
       const speakerMappings: Record<string, { name: string; role: string }> = {}
@@ -15955,7 +16082,9 @@ export const useStore = create<AppState>((set, get) => ({
       // Phase 2: generate video prompts, passing existing image prompts as context
       const existingImagePrompts = directorClipPlans.map(p => p.image_prompt || '')
       const { directorCharacterRefPaths: crp, directorLocationRefPaths: lrp } = get()
-      const result = await api.planClipPromptsAndImages({
+      const result = useV2
+        ? await _runDirectorV2VideoFollowup(get, lifecycle, requestFence as DirectorPreviewRequestFence)
+        : await api.planClipPromptsAndImages({
         workspace: activeWorkspace,
         clips: directorPlannedClips,
         scene_description: directorSceneDescription,
@@ -15973,13 +16102,14 @@ export const useStore = create<AppState>((set, get) => ({
         existing_image_prompts: existingImagePrompts,
       }, { signal: lifecycle.signal })
       // Merge video prompts into existing clip plans
-      const updatedPlans = directorClipPlans.map((plan, i) => ({
-        ...plan,
-        video_prompt: result.clip_plans[i]?.video_prompt || '',
-      }))
+      if (requestFence) _requireCurrentDirectorPreviewRequestFence(requestFence)
+      const updatedPlans = _mergeDirectorVideoFollowupPlans(directorClipPlans, result.clip_plans)
       if (!lifecycle.ownsWorkspace()) return
       set({
         directorClipPlans: updatedPlans,
+        directorShotDeck: useV2
+          ? h3ShotDeckFromProductionPlan((result as api.DirectorV2PlanResponse).production_plan, activeWorkspace)
+          : null,
         directorStep: 'review_video',
         directorLoading: false,
       })
@@ -16443,6 +16573,8 @@ export const useStore = create<AppState>((set, get) => ({
       directorSceneDescription: '',
       directorVisualStyle: '',
       directorCustomVisualStyle: '',
+      directorSavedVisualStyle: null,
+      directorStyleAuthoringEpoch: get().directorStyleAuthoringEpoch + 1,
       directorLoading: false,
       directorError: null,
       directorComponentError: null,
@@ -16620,6 +16752,10 @@ export const useStore = create<AppState>((set, get) => ({
     // ?? not || — an explicit user-toggled `false` must be respected on the
     // legacy v1 path; fall back only while servicesConfig is unavailable.
     const useV2 = get().servicesConfig?.use_director_v2 ?? true
+    if (!useV2 && get().directorSavedVisualStyle) {
+      set({ directorError: 'Enable Director v2 or remove the saved visual direction before planning.' })
+      return
+    }
     const lifecycle = useV2
       ? _beginDirectorPreviewRequest(activeWorkspace)
       : _beginDirectorLlmRequest(activeWorkspace)
@@ -16665,6 +16801,7 @@ export const useStore = create<AppState>((set, get) => ({
         const result = await _runDirectorV2Preview({
           workspace: activeWorkspace,
           skill_type: 'short_film',
+          custom_visual_style_selection: get().directorSavedVisualStyle ?? undefined,
           video_model: get().selectedModelPerMode.video,
           ...imageRoleRequest.wire,
           h3_style_workflow: resolveH3StyleWorkflowRequest(
@@ -16742,9 +16879,19 @@ export const useStore = create<AppState>((set, get) => ({
     const { directorPlannedClips, directorSceneDescription, directorAnalysis,
             directorClipPlans, directorReferenceImagePath, shortFilmCharacters, activeWorkspace } = get()
     if (!directorPlannedClips.length || !directorClipPlans.length) return
-    const lifecycle = _beginDirectorLlmRequest(activeWorkspace)
+    const useV2 = get().servicesConfig?.use_director_v2 ?? true
+    if (!useV2 && get().directorSavedVisualStyle) {
+      set({ directorError: 'Enable Director v2 or remove the saved visual direction before planning.' })
+      return
+    }
+    const lifecycle = useV2
+      ? _beginDirectorPreviewRequest(activeWorkspace)
+      : _beginDirectorLlmRequest(activeWorkspace)
+    const requestFence = useV2
+      ? _captureDirectorPreviewRequestFence(get, 'short_film', 'video')
+      : null
     const requestExplicitOutput = get().explicitOutput
-    set({ directorLoading: true, directorError: null, directorStep: 'plan_video' })
+    set({ directorLoading: true, directorError: null, directorStep: 'plan_video', directorShotDeck: null })
     try {
       const speakerMappings: Record<string, { name: string; role: string }> = {}
       for (const m of get().directorSpeakerMappings) {
@@ -16755,7 +16902,9 @@ export const useStore = create<AppState>((set, get) => ({
 
       const existingImagePrompts = directorClipPlans.map(p => p.image_prompt || '')
       const { directorCharacterRefPaths: crp2, directorLocationRefPaths: lrp2 } = get()
-      const result = await api.planShortFilmPrompts({
+      const result = useV2
+        ? await _runDirectorV2VideoFollowup(get, lifecycle, requestFence as DirectorPreviewRequestFence)
+        : await api.planShortFilmPrompts({
         workspace: activeWorkspace,
         clips: directorPlannedClips,
         scene_description: directorSceneDescription,
@@ -16772,13 +16921,14 @@ export const useStore = create<AppState>((set, get) => ({
         prompt_type: 'video',
         existing_image_prompts: existingImagePrompts,
       }, { signal: lifecycle.signal })
-      const updatedPlans = directorClipPlans.map((plan, i) => ({
-        ...plan,
-        video_prompt: result.clip_plans[i]?.video_prompt || '',
-      }))
+      if (requestFence) _requireCurrentDirectorPreviewRequestFence(requestFence)
+      const updatedPlans = _mergeDirectorVideoFollowupPlans(directorClipPlans, result.clip_plans)
       if (!lifecycle.ownsWorkspace()) return
       set({
         directorClipPlans: updatedPlans,
+        directorShotDeck: useV2
+          ? h3ShotDeckFromProductionPlan((result as api.DirectorV2PlanResponse).production_plan, activeWorkspace)
+          : null,
         directorStep: 'review_video',
         directorLoading: false,
       })
@@ -16803,6 +16953,10 @@ export const useStore = create<AppState>((set, get) => ({
     // ?? not || — an explicit user-toggled `false` must be respected on the
     // legacy v1 path; fall back only while servicesConfig is unavailable.
     const useV2 = get().servicesConfig?.use_director_v2 ?? true
+    if (!useV2 && get().directorSavedVisualStyle) {
+      set({ directorError: 'Enable Director v2 or remove the saved visual direction before planning.' })
+      return
+    }
     const lifecycle = useV2
       ? _beginDirectorPreviewRequest(activeWorkspace)
       : _beginDirectorLlmRequest(activeWorkspace)
@@ -16840,6 +16994,7 @@ export const useStore = create<AppState>((set, get) => ({
         const result = await _runDirectorV2Preview({
           workspace: activeWorkspace,
           skill_type: 'short_film',
+          custom_visual_style_selection: get().directorSavedVisualStyle ?? undefined,
           video_model: get().selectedModelPerMode.video,
           ...imageRoleRequest.wire,
           h3_style_workflow: resolveH3StyleWorkflowRequest(
@@ -19493,6 +19648,9 @@ export const useStore = create<AppState>((set, get) => ({
         location: locPaths.length > 0,
       },
     })
+    if (mode === 'hold_planning' && directorPreflight.hold_planning_supported !== true) {
+      throw new Error('Planning holds are unavailable until Maestro finishes updating. No story was submitted.')
+    }
     if (directorPreflight.resolved.pipeline_type !== pipelineType) {
       throw new api.DirectorRequestError('director_model_unavailable', 'video_model')
     }
@@ -19584,10 +19742,12 @@ export const useStore = create<AppState>((set, get) => ({
         ? { director_request_id: state.directorRequestId }
         : {}),
       auto_mode: directorAutoMode,
+      ...(mode === 'hold_planning' ? { hold_planning: true } : {}),
       workspace: requestWorkspace,
       private_output: state.privateOutput,
       explicit_output: state.explicitOutput,
       scene_description: directorSceneDescription,
+      custom_visual_style_selection: state.directorSavedVisualStyle ?? undefined,
       visual_style: state.directorVisualStyle === 'custom'
         ? state.directorCustomVisualStyle.trim() || undefined
         : state.directorVisualStyle || undefined,
@@ -19716,12 +19876,22 @@ export const useStore = create<AppState>((set, get) => ({
     const pid = get().pipelineId
     if (!pid) return
     const workspace = get().activeWorkspace
+    set({ directorLoading: true, directorError: null })
     try {
       await api.continuePipeline(pid, updates)
       if (get().pipelineId !== pid || get().activeWorkspace !== workspace) return
-      set({ directorLoading: true, pipelineStatus: null, directorShotDeck: null })
+      const status = get().pipelineStatus
+      set({
+        directorLoading: true,
+        pipelineStatus: status?.status === 'paused'
+          ? { ...status, status: 'running', pause_reason: null }
+          : status,
+      })
     } catch (e) {
       console.error('Failed to continue pipeline:', e)
+      if (get().pipelineId === pid && get().activeWorkspace === workspace) {
+        set({ directorLoading: false, directorError: e instanceof Error ? e.message : 'Could not continue Director.' })
+      }
     }
   },
 
@@ -19933,6 +20103,7 @@ useStore.subscribe((state, previous) => {
   if (state.activeWorkspace === previous.activeWorkspace && state.browsingUploads === previous.browsingUploads) return
   state.closeRetakeDialog()
   if (state.activeWorkspace === previous.activeWorkspace) return
+  useStore.setState({ directorSavedVisualStyle: null, directorStyleAuthoringEpoch: state.directorStyleAuthoringEpoch + 1 })
   if (state.toolsRevoiceRefs.some(reference => reference?.output)) {
     useStore.setState({ toolsRevoiceRefs: state.toolsRevoiceRefs.map(reference => reference?.output ? null : reference) })
   }

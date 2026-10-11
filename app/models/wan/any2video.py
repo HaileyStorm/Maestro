@@ -98,7 +98,19 @@ class WanAny2V:
         VAE_dtype = torch.float32,
         mixed_precision_transformer = False,
         VAE_upsampling = None,
+        _maestro_director_model_observer = None,
     ):
+        if (_maestro_director_model_observer is not None
+                and not callable(_maestro_director_model_observer)):
+            raise ValueError("Director Wan model observer is invalid")
+        if _maestro_director_model_observer is not None:
+            _maestro_director_model_observer("constructor", wrapper=self, config=config,
+                model_filename=model_filename, submodel_no_list=submodel_no_list,
+                model_type=model_type, base_model_type=base_model_type, model_def=model_def,
+                text_encoder_filename=text_encoder_filename, dtype=dtype, VAE_dtype=VAE_dtype,
+                quantize_transformer=quantizeTransformer, save_quantized=save_quantized,
+                mixed_precision_transformer=mixed_precision_transformer,
+                VAE_upsampling=VAE_upsampling)
         self.device = torch.device(f"cuda")
         self.config = config
         self.VAE_dtype = VAE_dtype
@@ -117,6 +129,10 @@ class WanAny2V:
                 tokenizer_path = os.path.dirname(fl.locate_file(os.path.join(text_encoder_folder, "tokenizer_config.json")))
             else:
                 tokenizer_path = os.path.dirname(text_encoder_filename)
+            if _maestro_director_model_observer is not None:
+                _maestro_director_model_observer("text_encoder", checkpoint_path=text_encoder_filename,
+                    tokenizer_path=tokenizer_path, text_len=config.text_len, dtype=config.t5_dtype,
+                    model_class=T5EncoderModel)
             self.text_encoder = T5EncoderModel(text_len=config.text_len, dtype=config.t5_dtype, device=torch.device('cpu'), checkpoint_path=text_encoder_filename, tokenizer_path=tokenizer_path, shard_fn=None)
             self.text_encoder_cache = TextEncoderCache()
         if hasattr(config, "clip_checkpoint") and not model_def.get("i2v_2_2", False) or base_model_type in ["animate"]:
@@ -155,12 +171,20 @@ class WanAny2V:
                 vae_checkpoint = "Wan2.1_VAE.safetensors"                
         self.patch_size = config.patch_size 
         
-        self.vae = vae( vae_pth=fl.locate_file(vae_checkpoint), dtype= VAE_dtype, upsampler_factor = vae_upsampler_factor, device="cpu")
+        vae_path = fl.locate_file(vae_checkpoint)
+        if _maestro_director_model_observer is not None:
+            _maestro_director_model_observer("vae", index=1, checkpoint_path=vae_path,
+                dtype=VAE_dtype, upsampler_factor=vae_upsampler_factor, model_class=vae)
+        self.vae = vae( vae_pth=vae_path, dtype= VAE_dtype, upsampler_factor = vae_upsampler_factor, device="cpu")
         self.vae.upsampling_set = VAE_upsampling
         self.vae.device = self.device # need to set to cuda so that vae buffers are properly moved (although the rest will stay in the CPU)
         self.vae2 = None
         if vae_checkpoint2 is not None:
-            self.vae2 = vae( vae_pth=fl.locate_file(vae_checkpoint2), dtype= VAE_dtype, device="cpu")
+            vae_path2 = fl.locate_file(vae_checkpoint2)
+            if _maestro_director_model_observer is not None:
+                _maestro_director_model_observer("vae", index=2, checkpoint_path=vae_path2,
+                    dtype=VAE_dtype, upsampler_factor=1, model_class=vae)
+            self.vae2 = vae( vae_pth=vae_path2, dtype= VAE_dtype, device="cpu")
             self.vae2.device = self.device
         
         # config_filename= "configs/t2v_1.3B.json"
@@ -205,14 +229,20 @@ class WanAny2V:
             return transformer_model_class.preprocess_sd_with_dtype(dtype, sd)
         kwargs= { "modelClass": transformer_model_class,"do_quantize": quantizeTransformer and not save_quantized, "defaultConfigPath": base_config_file , "ignore_unused_weights": ignore_unused_weights, "writable_tensors": False, "default_dtype": dtype, "preprocess_sd": preprocess_sd, "forcedConfigPath": forcedConfigPath, }
         kwargs_light= { "modelClass": transformer_model_class,"writable_tensors": False, "preprocess_sd": preprocess_sd , "forcedConfigPath" : base_config_file}
+        def load_transformer(index, filenames, **load_kwargs):
+            if _maestro_director_model_observer is not None:
+                _maestro_director_model_observer("transformer", index=index,
+                    model_filename=filenames, load_kwargs=dict(load_kwargs))
+            return offload.fast_load_transformers_model(filenames, **load_kwargs)
+
         if module_source is not None:
-            self.model = offload.fast_load_transformers_model(model_filename[:1] + [fl.locate_file(module_source)], **kwargs)
+            self.model = load_transformer(1, model_filename[:1] + [fl.locate_file(module_source)], **kwargs)
         if module_source2 is not None:
-            self.model2 = offload.fast_load_transformers_model(model_filename[1:2] + [fl.locate_file(module_source2)], **kwargs)
+            self.model2 = load_transformer(2, model_filename[1:2] + [fl.locate_file(module_source2)], **kwargs)
         if source is not None:
-            self.model = offload.fast_load_transformers_model(fl.locate_file(source),  **kwargs_light)
+            self.model = load_transformer(1, fl.locate_file(source),  **kwargs_light)
         if source2 is not None:
-            self.model2 = offload.fast_load_transformers_model(fl.locate_file(source2), **kwargs_light)
+            self.model2 = load_transformer(2, fl.locate_file(source2), **kwargs_light)
 
         if self.model is not None or self.model2 is not None:
             from wgp import save_model
@@ -224,17 +254,17 @@ class WanAny2V:
                 
                 if 0 in submodel_no_list[2:]:
                     shared_modules= {}
-                    self.model = offload.fast_load_transformers_model(model_filename[:1], modules = model_filename[2:], return_shared_modules= shared_modules, **kwargs)
-                    self.model2 = offload.fast_load_transformers_model(model_filename[1:2], modules = shared_modules, **kwargs)
+                    self.model = load_transformer(1, model_filename[:1], modules = model_filename[2:], return_shared_modules= shared_modules, **kwargs)
+                    self.model2 = load_transformer(2, model_filename[1:2], modules = shared_modules, **kwargs)
                     shared_modules = None
                 else:
                     modules_for_1 =[ file_name for file_name, submodel_no in zip(model_filename[2:],submodel_no_list[2:] ) if submodel_no ==1 ]
                     modules_for_2 =[ file_name for file_name, submodel_no in zip(model_filename[2:],submodel_no_list[2:] ) if submodel_no ==2 ]
-                    self.model = offload.fast_load_transformers_model(model_filename[:1], modules = modules_for_1, **kwargs)
-                    self.model2 = offload.fast_load_transformers_model(model_filename[1:2], modules = modules_for_2, **kwargs)
+                    self.model = load_transformer(1, model_filename[:1], modules = modules_for_1, **kwargs)
+                    self.model2 = load_transformer(2, model_filename[1:2], modules = modules_for_2, **kwargs)
 
             else:
-                self.model = offload.fast_load_transformers_model(model_filename,  **kwargs)
+                self.model = load_transformer(1, model_filename,  **kwargs)
         
 
         if self.model is not None:
@@ -524,7 +554,9 @@ class WanAny2V:
         save_masks = False,
         **bbargs
                 ):
-        
+        director_lora_activation = bbargs.pop("_maestro_director_lora_activation", None)
+        if director_lora_activation is not None and not callable(director_lora_activation):
+            raise ValueError("Director LoRA activation observer is invalid")
         model_def = self.model_def
 
         if sample_solver =="euler":
@@ -1213,8 +1245,14 @@ class WanAny2V:
                 denoising_extra = f"Phase {phase_no}/{guide_phases} {'Low Noise' if trans == self.model2 else 'High Noise'}" if self.model2 is not None else f"Phase {phase_no}/{guide_phases}"
                 callback(step_no-1, denoising_extra = denoising_extra)
             return guide_scale, guidance_switch_done, trans, denoising_extra
-        update_loras_slists(self.model, loras_slists, len(original_timesteps), phase_switch_step= phase_switch_step, phase_switch_step2= phase_switch_step2)
-        if self.model2 is not None: update_loras_slists(self.model2, loras_slists, len(original_timesteps), phase_switch_step= phase_switch_step, phase_switch_step2= phase_switch_step2)
+        activation_kwargs = {}
+        if director_lora_activation is not None:
+            activation_timesteps = original_timesteps.detach().cpu().tolist()
+            def observe_lora_activation(**observation):
+                director_lora_activation(timesteps=activation_timesteps, **observation)
+            activation_kwargs["activation_observer"] = observe_lora_activation
+        update_loras_slists(self.model, loras_slists, len(original_timesteps), phase_switch_step= phase_switch_step, phase_switch_step2= phase_switch_step2, **activation_kwargs)
+        if self.model2 is not None: update_loras_slists(self.model2, loras_slists, len(original_timesteps), phase_switch_step= phase_switch_step, phase_switch_step2= phase_switch_step2, **activation_kwargs)
         callback(-1, None, True, override_num_inference_steps = updated_num_steps, denoising_extra = denoising_extra)
 
         def clear():
@@ -1542,14 +1580,6 @@ class WanAny2V:
         return ret
 
     def get_loras_transformer(self, get_model_recursive_prop, base_model_type, model_type, video_prompt_type, model_mode, **kwargs):
-        if base_model_type == "animate":
-            if "#" in video_prompt_type and "1" in video_prompt_type:
-                preloadURLs = get_model_recursive_prop(model_type,  "preload_URLs")
-                if len(preloadURLs) > 0: 
-                    return [fl.locate_file(os.path.basename(preloadURLs[0]))] , [1]
-        elif base_model_type == "vace_ditto_14B":
-            preloadURLs = get_model_recursive_prop(model_type,  "preload_URLs")
-            model_mode = int(model_mode)
-            if len(preloadURLs) > model_mode: 
-                return [fl.locate_file(os.path.basename(preloadURLs[model_mode]))] , [1]
-        return [], []
+        from services.native_video_preparation import select_wan_transformer_loras
+        return select_wan_transformer_loras(get_model_recursive_prop, fl.locate_file,
+            base_model_type, model_type, video_prompt_type, model_mode, **kwargs)

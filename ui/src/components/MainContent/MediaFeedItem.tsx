@@ -80,6 +80,53 @@ function finishedToolDetails(metadata: OutputMetadata | null) {
   }
 }
 
+function recordedStyleReferences(metadata: OutputMetadata | null) {
+  if (metadata?.source !== 'sidecar') return null
+  const fact = metadata.producer_unit_settings?.custom_visual_style_delivery
+  if (!fact || typeof fact !== 'object' || fact.version !== 1
+      || typeof fact.style_digest !== 'string' || !/^[0-9a-f]{64}$/.test(fact.style_digest)
+      || !Array.isArray(fact.references) || fact.references.length > 8) return null
+  const skipReasons = new Map([
+    ['reference_limit', 'This clip reached its reference-image limit'],
+    ['borrow_scope_unsupported', 'This model cannot use the selected reference features'],
+    ['mode_unsupported', 'Reference images were unavailable when this clip was planned'],
+    ['segment_reference_drop', 'Reference images were turned off for this clip'],
+    ['checkpoint_unsupported', 'This clip’s model does not support these reference images'],
+  ])
+  const rows: Array<{ index: number; outcome: string; reason: string }> = []
+  const ordinals = new Set<number>()
+  let applied = 0
+  let unverified = 0
+  for (const [index, row] of fact.references.entries()) {
+    if (!row || typeof row !== 'object' || row.index !== index
+        || typeof row.sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(row.sha256)) return null
+    if (row.delivery === 'applied') {
+      if (row.reason !== '' || !Number.isInteger(row.image_ordinal)
+          || (row.image_ordinal ?? 0) < 1 || (row.image_ordinal ?? 0) > 9
+          || ordinals.has(row.image_ordinal!)) return null
+      ordinals.add(row.image_ordinal!)
+      applied += 1
+      rows.push({ index, outcome: 'Applied as model input', reason: '' })
+    } else if (row.delivery === 'skipped') {
+      const reason = skipReasons.get(row.reason)
+      if (!reason || row.image_ordinal !== null) return null
+      rows.push({ index, outcome: 'Skipped', reason })
+    } else if (row.delivery === 'unverified') {
+      if (row.reason !== 'reference_use_unverified' || row.image_ordinal !== null) return null
+      unverified += 1
+      rows.push({ index, outcome: 'Use unconfirmed', reason: '' })
+    } else return null
+  }
+  const application = applied ? 'references_applied' : unverified ? 'reference_use_unverified' : 'text_only'
+  if (fact.application !== application || (applied > 0 && unverified > 0)) return null
+  if (applied) {
+    if (fact.model_type !== 'minimax_h3_ref2va'
+        || typeof fact.encoding_receipt_sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(fact.encoding_receipt_sha256)
+        || !Number.isInteger(fact.confirmed_windows) || fact.confirmed_windows < 1 || fact.confirmed_windows > 256) return null
+  } else if (fact.encoding_receipt_sha256 !== null || fact.confirmed_windows !== 0) return null
+  return { rows }
+}
+
 interface FinishingHistoryView {
   steps: Array<{ label: string; outcome: string }>
   omittedSteps: number
@@ -425,6 +472,7 @@ export function MediaFeedItem({ file, index, isActive, playbackSuspended, onSele
 
   const params = meta?.params as Record<string, unknown> | null
   const finishing = finishedToolDetails(meta)
+  const styleReferences = file.type === 'video' ? recordedStyleReferences(meta) : null
   const finishingHistory = recordedGenerationFinishing(meta)
   const generationFinishing = finishingHistory.steps
   const isGalleryStillGuideOutput = isH3GalleryStillGuideOutput(meta)
@@ -1479,6 +1527,20 @@ export function MediaFeedItem({ file, index, isActive, playbackSuspended, onSele
           )}
         </div>
       </div>
+      {!privateBlurred && styleReferences && (
+        <details className="border-t border-border bg-bg-secondary px-3 py-2 text-xs text-text-secondary" onClick={event => event.stopPropagation()}>
+          <summary className="cursor-pointer select-none font-medium text-text-primary">Style reference details</summary>
+          <p className="mt-2 text-[11px] text-text-muted">Recorded reference-image use as model inputs for this clip.</p>
+          {styleReferences.rows.length === 0 ? <p className="mt-2 text-[11px]">Text guidance only; no style reference images selected.</p> : (
+            <ol aria-label="Style reference outcomes" className="mt-2 space-y-2 text-[11px]">
+              {styleReferences.rows.map(row => <li key={row.index}>
+                <div className="flex flex-wrap justify-between gap-x-3"><span>Reference {row.index + 1}</span><span>{row.outcome}</span></div>
+                {row.reason && <p className="mt-0.5 text-text-muted">{row.reason}</p>}
+              </li>)}
+            </ol>
+          )}
+        </details>
+      )}
       {!privateBlurred && (finishing || generationFinishing.length > 0 || finishingHistory.omittedSteps > 0 || finishingHistory.branches.length > 0 || finishingHistory.omittedBranches > 0) && (
         <details className="border-t border-border bg-bg-secondary px-3 py-2 text-xs text-text-secondary" onClick={event => event.stopPropagation()}>
           <summary className="cursor-pointer select-none font-medium text-text-primary">Finishing details</summary>

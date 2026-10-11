@@ -11,6 +11,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import re
 
 
 MINIMAX_H3_MAX_REFERENCE_IMAGES = 9
@@ -25,22 +26,48 @@ _AUDIO_INTENTS = {"voice", "drive", "style"}
 _IMAGE_INTENTS = {"identity", "scene", "style", "composition"}
 
 
+def validated_custom_visual_style(reference) -> dict | None:
+    """Validate server-admitted scope metadata without granting source access."""
+    if "custom_visual_style" not in reference:
+        return None
+    envelope = reference["custom_visual_style"]
+    if (reference.get("type") != "image" or reference.get("image_intent") != "style"
+            or not isinstance(envelope, dict)
+            or set(envelope) != {"version", "style_snapshot_digest", "borrow_scope"}
+            or type(envelope["version"]) is not int or envelope["version"] != 1
+            or not isinstance(envelope["style_snapshot_digest"], str)
+            or re.fullmatch(r"[0-9a-f]{64}", envelope["style_snapshot_digest"]) is None):
+        raise ValueError("invalid admitted scoped style reference")
+    scopes = envelope["borrow_scope"]
+    if (not isinstance(scopes, list) or not scopes
+            or any(not isinstance(scope, str) or scope not in {"palette", "materials", "lighting"}
+                   for scope in scopes)
+            or len(set(scopes)) != len(scopes)):
+        raise ValueError("unsupported or ambiguous image borrow scope")
+    role = reference.get("role", "")
+    if not isinstance(role, str) or len(role) > 500:
+        raise ValueError("invalid style reference label")
+    return copy.deepcopy(envelope)
+
+
 def reference_binding_projection(references) -> list[dict]:
     """Snapshot ordered reference metadata used by prompt planning.
 
-    This projection does not validate inputs or inspect files. Callers retain
-    their admission checks; paths identify metadata, not immutable file content.
+    Scoped style envelopes are validated and retained; callers own admission.
+    Paths identify metadata, not immutable file content.
     """
     return [
         copy.deepcopy({
             "type": item.get("type") or item.get("kind"),
             "path": item.get("path"),
-            "role": item.get("role"),
+            "role": item.get("role", "") if "custom_visual_style" in item else item.get("role"),
             "image_intent": item.get("image_intent"),
             "audio_intent": item.get("audio_intent"),
             "include_audio": item.get("include_audio"),
             "audio_path": item.get("audio_path"),
             "has_audio": item.get("has_audio"),
+            **({"custom_visual_style": validated_custom_visual_style(item)}
+               if "custom_visual_style" in item else {}),
         })
         for item in (references or [])
         if isinstance(item, dict)
@@ -95,6 +122,7 @@ def validate_reference_manifest(
     for index, raw in enumerate(references):
         if not isinstance(raw, dict):
             raise ValueError(f"Reference {index + 1} must be an object.")
+        validated_custom_visual_style(raw)
         kind = str(raw.get("type") or raw.get("kind") or "").strip().lower()
         if kind not in allowed:
             raise ValueError(f"Reference {index + 1} must be an image, video, or audio reference.")

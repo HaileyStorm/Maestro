@@ -1,106 +1,93 @@
 ---
 name: api-maestro-git
-description: Continue Maestro repository work safely and use its bounded HTTP and restart-status operations.
+description: Use Maestro Continuum's production HTTP API and MCP with discovery, scoped sessions and reliable operation reconciliation.
 ---
 
-# Maestro API
+# Maestro Continuum API
 
-## Repository Continuation
+Start with the [API guide](../../../../docs/api/README.md) and
+[feature coverage map](../../../../docs/api/coverage.md). The running app also
+serves the guide at `/api/v1/api/documentation/guide`, coverage at
+`/api/v1/api/documentation/coverage`, OpenAPI at `/openapi.json`, and discovery
+at `/api/v1/api/discovery`. Resolve the current URL from Pinokio; do not assume
+an old port. This HTTP API is separate from WanGP's in-process Python API.
 
-Resolve the repository root dynamically; never rely on a checkout-specific host
-path. The root must contain both `AGENTS.md` and the repo-root `.beads/` tracker:
+## Discover before acting
 
-```bash
-REPO_ROOT="$(git rev-parse --show-toplevel)"
-test -f "$REPO_ROOT/AGENTS.md" && test -d "$REPO_ROOT/.beads" || exit 1
-cd "$REPO_ROOT"
-```
+Read discovery, access-context, account/context and workspaces with the same
+operator-authorized session. Use explicit project/workspace scope. Read the
+selected model's catalog entry, options, defaults and applicable host terms.
+Supported, installed, experimental, legally available and runtime-ready are
+separate facts. Health, catalog visibility and a queued ACK do not grant GPU
+execution. Apply the installed gpu-coordinator-client skill before model work.
 
-Before editing, read `AGENTS.md` and run these commands serially:
+Use the maintained `sdk/python` MaestroClient, `sdk/typescript` MaestroClient,
+or the `maestro-continuum-mcp` stdio bridge. Operation IDs, inputs, result
+shapes, permissions and replay policies come from the current OpenAPI contract.
+MCP exposes approved public operations and bounded base64 uploads, never a
+shell, arbitrary host paths, credentials or internal runtime authority.
+For retained Gallery input reuse, `maestro_gallery_to_upload` pins an exact
+authorized media revision into a private session-owned upload, up to 16 MiB.
+Generate in the original project using its returned upload filename. Larger
+media uses the explicit SDK download/upload workflow. Upload acknowledgement
+loss is uncertain; never automatically repeat this composite operation.
+Reconnect to refresh tools after a release. The `--read-only` mode narrows
+available tools; annotations do not override server permissions.
 
-```bash
-bd where
-bd prime
-bd show ISSUE_ID
-git status --short --branch
-```
+## Authentication and locality
 
-Inspect `.working`. Create a short owner/scope sentinel only when it is absent;
-never overwrite another active owner's sentinel. Inventory and preserve every
-pre-existing dirty path. Do not reset, checkout, clean, or implicitly stash
-unrelated work, and stage only explicitly owned files.
+Preserve signed session/account cookies in the operator's owning credential
+mechanism; never print them, copy browser profiles, or put credentials in AI
+prompts/tool arguments. The existing human login, nonce, model-term acceptance
+and recent reauthentication flows remain controlling. Do not activate accounts,
+alter policy or impersonate an owner to make an operation succeed.
 
-## Operations
+Send the exact configured app Origin for HTTP mutations. Browsers set their own
+Origin and cookies. Local, LAN and Cloudflare use the same scoped production
+API; discover concrete owner/local-only restrictions from access-context and
+each operation. A 401/403 is an access problem, not a retry or bypass request.
+Do not forge forwarded headers, paths or project-instance state.
 
-- `GET /api/v1/jobs` lists active Studio generation jobs.
-- `GET /api/v1/status/{job_id}` returns one Studio job's current status.
-- `POST /api/v1/cancel/{job_id}` requests cancellation of a Studio job.
-- `GET /api/v1/outputs` lists gallery media and accepts pagination, filter, search, and workspace query parameters.
-- `GET /api/v1/director/pipeline/{pipeline_id}` returns Director pipeline state.
-- `GET /api/v1/llm/models` returns the path-free Chat catalog and server-owned prompting guides.
-- `POST /api/v1/llm/chat` runs one project-authorized, role-preserving Chat turn.
-- `POST /api/v1/llm/chat-upload` uploads an ephemeral project/session-owned image for a multimodal Chat turn.
-- `GET /api/v1/llm/status` reports load/download state, actual CPU/CUDA backend, effective profile, vision state, and timing metrics without local paths or secrets.
-- `GET /api/v1/system-stats` provides a lightweight readiness and resource check.
-- `GET /openapi.json` is the authoritative runtime contract for additional operations.
+## Long-running operations
 
-## Runtime Inputs
+Generation jobs, Director pipelines, queue entries, LLM operations, preparation
+requests, YuE2 takes and training jobs have distinct IDs and status routes.
+Persist the exact body, caller identity when supported, returned ID and project.
+A submission response is admission, not completed output. Observe progress,
+outputs, holds and manual review with the matching route.
 
-Pass the currently reachable Maestro base URL at runtime. Job and pipeline identifiers are session-specific and must be discovered from API responses.
+For Studio use one UUID4 `generation_request_id` and reconcile
+`GET /api/v1/generate/submissions/{generation_request_id}` with the same project
+and session after uncertainty. Other operations have their own request-ID and
+replay contracts. If an operation lacks durable replay support, inspect its
+existing queue/history and preserve the unresolved submission; do not guess a
+new ID or blindly resubmit. Client timeout never cancels server work.
 
-Chat requests must name an unlocked workspace. Remote callers may select only
-catalog model IDs; arbitrary Hugging Face sources and host paths are local-owner
-capabilities. Image references must come from the Chat upload route and must be
-used with the same project/session that created them.
+Use held submission when deliberately staging work. Releasing a queue or
+continuing a review can start model execution and still requires actual GPU
+and project authority. Cancel only the specifically authorized owned operation;
+a cancel ACK is not proof of terminal drain. Recovery must use the public,
+project-scoped production path and preserve frozen inputs and failed attempts.
+Never replay accepted samples as routine API verification.
 
-## Coordinated Restart Status
+## Repository maintenance
 
-The operator environment supplies the stable-share configuration. Keep its
-secret values and the restart generation untracked, unprinted, and out of
-commits, issue comments, and handoffs. Create one opaque generation at runtime,
-then set and show a bounded public notice before the restart:
+For implementation, read the current AGENTS/CONTRIBUTING and durable worklog,
+verify the exact checkout, dirty paths and structured ownership reservations,
+and use the shared activation audit before any Beads lifecycle mutation.
+Do not run `bd where` to discover a historical tracker, initialize an absent
+tracker, hand-edit claims, erase foreign changes or broadly stage files.
 
-```bash
-RESTART_GENERATION="$(python -c 'from app.scripts.restart_status import new_generation; print(new_generation())')"
-python app/scripts/restart_status.py set --state planned --reason restart \
-  --message "Planned maintenance" --generation "$RESTART_GENERATION"
-python app/scripts/restart_status.py show
-```
+Update authored contracts in `app/continuum_api` when handlers change. Export
+actual running OpenAPI and generate maintained references with
+`scripts/generate_continuum_clients.py --schema docs/api/openapi.json`.
+Source inventory extraction is not complete semantic or execution evidence.
+Apply test-value: zero routine unit/integration suites; use only the narrow
+build or smallest real shipped-app journey justified by changed behavior.
+Preserve formal obligations and runtime guards. Record actual evidence and
+remaining limitations; source/build/API health do not prove native quality.
 
-Serialize restart-status writes; overlapping writers are unsupported. Preserve
-the same untracked generation until recovery. Process visibility alone is not
-health evidence. Verify the intended local health endpoint and, if reporting
-remote recovery, exercise the configured stable access surface. Only then clear
-that exact generation and confirm the resulting state:
-
-```bash
-python app/scripts/restart_status.py clear --generation "$RESTART_GENERATION"
-python app/scripts/restart_status.py show
-unset RESTART_GENERATION
-```
-
-An exact-generation clear that reports `NOT_CLEARED` is a safety stop: do not
-clear a newer notice or retry with another generation.
-
-## Outputs
-
-Responses are JSON except media-file endpoints, which stream the requested asset.
-
-## Evidence and Completion
-
-Keep evidence levels distinct:
-
-- Source inspection, compilation, and mocked tests are static evidence.
-- A local process answering its health endpoint is local-runtime evidence.
-- Exercising the configured LAN or stable-share URL is live-access evidence.
-- Human acceptance must be reported only when a person actually confirmed it.
-
-Run the full applicable tests and all CI-equivalent checks before completion;
-do not use a filtered test as the final gate. After owned changes are committed,
-run repository mutations serially: `git pull --rebase`, `bd sync`, `git push`,
-then `git status --short --branch`. The final status must show the intended
-branch up to date. Never discard or force through unrelated dirty work.
-
-## Notes
-
-Generation and Director pipelines have distinct status endpoints and lifecycle semantics; do not treat a Director pipeline identifier as a Studio job identifier.
+Serialize restarts and Git/tracker writes through existing ownership and
+publication authority. Use Pinokio's existing coordinated restart-status flow,
+verify the actual local/share health, then clear only its exact generation.
+Do not blindly retry an ambiguous restart or push through foreign dirty work.

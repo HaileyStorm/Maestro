@@ -150,10 +150,15 @@ class DurableTransition:
     h3_control_predecessors: Mapping[str, Mapping[str, Any]] | None = None
     h3_control_acknowledge: Callable[[], None] | None = None
     prompt_enhancement_gpu_fence: Callable[[], bool] | None = None
+    director_execution_manifest_fence: Callable[[], bool] | None = None
 
 
 class PromptEnhancementGpuIntentConflict(RuntimeError):
     """A newer lifecycle winner invalidated the prospective GPU checkpoint."""
+
+
+class DirectorExecutionManifestConflict(RuntimeError):
+    """A newer worker state invalidated a prospective Director manifest."""
 
 
 class CreditQueueTransitionConflict(ValueError):
@@ -548,6 +553,7 @@ def _persist_prospective_unlocked(
     h3_control_predecessors=None,
     h3_control_acknowledge=None,
     prompt_enhancement_gpu_fence=None,
+    director_execution_manifest_fence=None,
 ) -> None:
     hook = _durability_hook
     if hook is None:
@@ -563,6 +569,7 @@ def _persist_prospective_unlocked(
         h3_control_predecessors=h3_control_predecessors,
         h3_control_acknowledge=h3_control_acknowledge,
         prompt_enhancement_gpu_fence=prompt_enhancement_gpu_fence,
+        director_execution_manifest_fence=director_execution_manifest_fence,
     ))
 
 
@@ -1811,6 +1818,10 @@ def resource_descriptor(job: Mapping[str, Any]) -> dict[str, Any] | None:
     if preemption_mode not in _PREEMPTION_MODES:
         return None
     state = job.get("resource_state")
+    # Cancellation/finality can be saved before the native worker exits.
+    # Runtime slot ownership ends only after its native context unwinds.
+    if job.get("_generation_slot_owned") and job.get("status") in TERMINAL_STATUSES:
+        state = "resources_releasing"
     if state not in RESOURCE_STATES:
         status = str(job.get("status") or "")
         state = (
@@ -3108,6 +3119,77 @@ def checkpoint_prompt_enhancement_gpu_intent(
         if not unchanged():
             return False
         job["recovery_cursor"] = next_cursor
+        _queue_condition.notify_all()
+        return True
+
+
+def checkpoint_director_execution_manifest(
+    job: MutableMapping[str, Any],
+    *,
+    expected_execution_attempt: int,
+    expected_request_manifest: Mapping[str, Any],
+    request_manifest: Mapping[str, Any],
+    params: Mapping[str, Any],
+) -> bool:
+    """Retain a running Director plan before publishing its new parameters.
+
+    The owner validates the immutable manifest and its exact sealed parameters
+    before calling under the recovery checkpoint lock. A failed or ambiguous
+    durability call propagates without publishing memory; reconcile its exact
+    ticket against the journal instead of submitting another transition.
+    """
+    if (
+        type(expected_execution_attempt) is not int
+        or not 1 <= expected_execution_attempt <= MAX_EXECUTION_ATTEMPT
+        or type(expected_request_manifest) is not dict
+        or not expected_request_manifest
+        or type(request_manifest) is not dict
+        or not request_manifest
+        or type(params) is not dict
+    ):
+        raise ValueError("Director execution manifest inputs are invalid")
+    with _queue_condition, _lifecycle_lock:
+        expected_pointer = deepcopy(expected_request_manifest)
+        next_pointer = deepcopy(request_manifest)
+        next_params = deepcopy(params)
+        fields = ("id", "kind", "status", "cancel_requested", "execution_attempt",
+                  "params", "_recovery_manifest_pointer", _TERMINAL_TRANSITION_MARKER)
+        predecessor = deepcopy({key: job.get(key) for key in fields})
+
+        def unchanged():
+            return (
+                predecessor == {key: job.get(key) for key in fields}
+                and type(job.get("id")) is str and bool(job["id"])
+                and job.get("kind") == "director_child"
+                and job.get("status") == "running"
+                and not is_cancel_requested(job)
+                and job.get(_TERMINAL_TRANSITION_MARKER) is not True
+                and type(job.get("execution_attempt")) is int
+                and job["execution_attempt"] == expected_execution_attempt
+                and job.get("_recovery_manifest_pointer") == expected_pointer
+            )
+
+        if _durability_hook is None or not unchanged():
+            return False
+        candidate = _copy_job_for_transition(job)
+        candidate["params"] = next_params
+        candidate["_recovery_manifest_pointer"] = next_pointer
+        try:
+            _persist_prospective_unlocked(
+                "director_execution_manifest",
+                jobs=(candidate,),
+                request_manifests={job["id"]: next_pointer},
+                director_execution_manifest_fence=unchanged,
+            )
+        except DirectorExecutionManifestConflict:
+            return False
+        # A hook can re-enter cancellation or advance the worker attempt. Do
+        # not publish this older plan over that winner. Unrelated progress
+        # updates survive because only these two fields are published.
+        if not unchanged():
+            return False
+        job["params"] = next_params
+        job["_recovery_manifest_pointer"] = next_pointer
         _queue_condition.notify_all()
         return True
 

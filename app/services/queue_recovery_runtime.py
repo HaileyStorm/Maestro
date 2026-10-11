@@ -1084,7 +1084,9 @@ def protected_artifact_descriptor(
         not isinstance(basename, str)
         or basename != os.path.basename(basename)
         or not basename.startswith(expected_prefix)
-        or not basename.endswith((".mp4", ".mkv", ".webm", ".mov"))
+        or not basename.endswith((
+            ".mp4", ".mkv", ".webm", ".mov", ".wav", ".mp3", ".flac", ".ogg",
+        ))
         or not isinstance(sidecar_basename, str)
         or sidecar_basename != os.path.basename(sidecar_basename)
         or not sidecar_basename.startswith(expected_prefix)
@@ -1229,12 +1231,15 @@ def replay_concat_to_stable_output(
     component_basenames: Sequence[str],
     output_basename: str,
     concatenate: Callable[[list[str], str], bool],
+    replace_existing: bool = True,
 ) -> str:
     """Rerun concat only, using hidden staging and one stable final name.
 
     The caller must first validate the component recovery descriptors. A crash
     after promotion but before journaling is idempotent: the next call replaces
     the same direct-child output and can never create a second gallery final.
+    Callers retaining sealed delivery evidence can instead require atomic
+    no-overwrite promotion and reconcile any existing destination separately.
     """
     root = _validated_project_root(project_directory)
     if (
@@ -1276,7 +1281,13 @@ def replay_concat_to_stable_output(
             os.close(descriptor)
         destination = root / output_basename
         _verify_directory_identity(staging_dir, staging_identity)
-        os.replace(staging, destination)
+        if replace_existing:
+            os.replace(staging, destination)
+        else:
+            # The project-local staging file shares the destination filesystem.
+            # Link publication is atomic and refuses files, links or races at
+            # the destination; never fall back to replacement on failure.
+            os.link(staging, destination, follow_symlinks=False)
         _fsync_directory(root)
         return output_basename
     except OSError:
@@ -1310,7 +1321,9 @@ def replay_delivery_from_protected_native(
         not isinstance(work_basename, str)
         or work_basename != os.path.basename(work_basename)
         or not work_basename.startswith(".maestro-delivery-")
-        or not work_basename.endswith((".mp4", ".mkv", ".webm", ".mov"))
+        or not work_basename.endswith((
+            ".mp4", ".mkv", ".webm", ".mov", ".wav", ".mp3", ".flac", ".ogg",
+        ))
     ):
         raise QueueRecoveryRuntimeError("Recovery delivery work identity is invalid.")
     source = root / str(protected_descriptor["basename"])

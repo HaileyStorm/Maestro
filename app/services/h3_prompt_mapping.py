@@ -19,6 +19,7 @@ from models.minimax_h3.reference_manifest import (
     MINIMAX_H3_MAX_REFERENCE_IMAGES,
     MINIMAX_H3_MAX_REFERENCE_VIDEOS,
     MINIMAX_H3_MAX_REFERENCES,
+    validated_custom_visual_style,
 )
 from services.director.h3_dialogue import (
     _H3_CANONICAL_RECORD_RE,
@@ -249,6 +250,10 @@ def _validated_reference_binding(reference_manifest: object) -> list[dict[str, A
             raise H3PromptMappingError(
                 f"reference_manifest item {index} must be an object"
             )
+        try:
+            validated_custom_visual_style(raw)
+        except ValueError as exc:
+            raise H3PromptMappingError(str(exc)) from exc
         kind = raw.get("type")
         if not isinstance(kind, str) or kind not in _REFERENCE_ORDER:
             raise H3PromptMappingError(
@@ -570,6 +575,19 @@ def _map_h3_prompt_schema(
                 + (", ".join(owned) if owned else "Ref2VA fields")
                 + " has no exact Base field owner"
             )
+        if any("custom_visual_style" in item for item in manifest or []):
+            from services.h3_custom_style_text import scoped_style_relationship
+            picture_no = 0
+            for item in manifest:
+                picture_no += int(item["type"] == "image")
+                scoped = scoped_style_relationship(item, picture_no)
+                if scoped is not None and (
+                    scoped[0] not in source_fields.get("subject_definitions", "")
+                    or scoped[1] not in source_fields.get("retention_analysis", "")
+                ):
+                    raise H3PromptRepresentabilityError(
+                        "Authored Ref2VA text does not preserve the admitted scoped style relationships"
+                    )
         _validate_target(
             prompt,
             target_schema=target,

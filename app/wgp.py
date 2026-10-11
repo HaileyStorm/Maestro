@@ -177,7 +177,9 @@ _loaded_residency_affinity_key = None
 _loaded_h3_dasiwa_checkpoint_admission = None
 _model_residency_store = None
 _model_residency_singleflight = ResidencySingleflight()
-_model_residency_offload_setup_lock = threading.Lock()
+# Owning load cleanup may re-enter setup on the same thread after MMGP fails.
+# Other graph leaders remain excluded for the entire setup and cleanup scope.
+_model_residency_offload_setup_lock = threading.RLock()
 _loaded_model_residency_evidence_template = None
 _loaded_model_residency_evidence_context_id = None
 _model_residency_evidence_contexts = {}
@@ -926,44 +928,15 @@ def get_state_model_type(state):
     key= "model_type" if state.get("active_form", "add") == "add" else "edit_model_type"
     return state[key]
 
-def compute_sliding_window_no(current_video_length, sliding_window_size, discard_last_frames, reuse_frames):
-    left_after_first_window = current_video_length - sliding_window_size + discard_last_frames
-    return 1 + math.ceil(left_after_first_window / (sliding_window_size - discard_last_frames - reuse_frames))
-
-
-def _validate_enhanced_prompt_cardinality(
-    prompt, marker, authoritative_windows,
-):
-    """Validate one server-sealed enhanced prompt without exposing content."""
-    valid_marker = (
-        isinstance(marker, dict)
-        and set(marker) == {"version", "projected_windows"}
-        and marker.get("version") == 1
-        and type(marker.get("projected_windows")) is int
-        and marker["projected_windows"] > 1
-    )
-    if not valid_marker:
-        raise ValueError("Enhanced prompt window contract is invalid")
-    if type(authoritative_windows) is not int or authoritative_windows < 1:
-        raise ValueError("Enhanced prompt window geometry is invalid")
-
-    raw_lines = str(prompt or "").replace("\r\n", "\n").replace(
-        "\r", "\n",
-    ).split("\n")
-    blank_lines = sum(not line.strip() for line in raw_lines)
-    received_windows = len(raw_lines) - blank_lines
-    projected_windows = marker["projected_windows"]
-    if (
-        projected_windows != authoritative_windows
-        or received_windows != authoritative_windows
-        or blank_lines
-    ):
-        raise ValueError(
-            "Enhanced prompt window count mismatch: "
-            f"planned {projected_windows}, expected {authoritative_windows}, "
-            f"received {received_windows}, blank {blank_lines}"
-        )
-    return [line.strip() for line in raw_lines]
+from services.native_video_preparation import (
+    compute_sliding_window_no, _validate_enhanced_prompt_cardinality,
+    quantize_window_settings, resolve_fit_policy, select_sliding_window,
+    initial_window_geometry, prepare_window_prompts, select_window_prompt,
+    next_window_frame_count, control_window_geometry,
+    adopt_media_canvas, source_window_geometry, cap_length_to_audio,
+    window_media_offsets, prepared_window_result,
+    native_lora_phases, append_native_lora_group,
+)
 
 
 def clean_image_list(gradio_list):
@@ -982,7 +955,7 @@ def _get_generate_video_param_names():
     if _generate_video_param_names is None:
         _generate_video_param_names = [
             x for x in inspect.signature(generate_video).parameters
-            if x not in ["task", "send_cmd", "plugin_data", "_h3_face_refine_dispatch", "_h3_face_refine_output"]
+            if x not in ["task", "send_cmd", "plugin_data", "_h3_face_refine_dispatch", "_h3_face_refine_output", "_maestro_director_lora_guard"]
         ]
     return _generate_video_param_names
 
@@ -3177,7 +3150,7 @@ def _parse_args():
 
     return args
 
-def get_lora_dir(model_type):
+def get_lora_dir(model_type, *, create=True):
     base_model_type = get_base_model_type(model_type)
     if base_model_type is None:
         raise Exception("loras unknown")
@@ -3200,12 +3173,12 @@ def get_lora_dir(model_type):
         raise Exception("loras unknown")
     if os.path.isfile(lora_dir):
         raise Exception(f"loras path '{lora_dir}' exists and is not a directory")
-    if not os.path.isdir(lora_dir):
+    if create and not os.path.isdir(lora_dir):
         os.makedirs(lora_dir, exist_ok=True)
     return lora_dir
 
 
-def get_lora_search_dirs(model_type):
+def get_lora_search_dirs(model_type, *, create_primary=True):
     """Primary (writable) lora dir first, then read-only equivalents under
     linked model folders.
 
@@ -3215,7 +3188,7 @@ def get_lora_search_dirs(model_type):
     sidecar metadata always target the primary dir; linked dirs only
     contribute lora files for listing and load-time resolution.
     """
-    primary = get_lora_dir(model_type)
+    primary = get_lora_dir(model_type, create=create_primary)
     dirs = [primary]
     cli_lora_root = getattr(args, "loras", "")
     if isinstance(cli_lora_root, str):
@@ -3239,12 +3212,12 @@ def get_lora_search_dirs(model_type):
     return dirs
 
 
-def resolve_lora_path(model_type, lora_file):
+def resolve_lora_path(model_type, lora_file, *, create_primary=True):
     """Resolve a lora filename across the primary dir and linked read-only
     dirs; the primary copy wins on duplicates. Missing files resolve to the
     primary path, which is also the download target."""
     name = os.path.basename(lora_file)
-    dirs = get_lora_search_dirs(model_type)
+    dirs = get_lora_search_dirs(model_type, create_primary=create_primary)
     for d in dirs:
         p = os.path.join(d, name)
         if os.path.isfile(p):
@@ -6131,6 +6104,8 @@ def _run_model_offload_with_residency(
     store,
     status_callback,
     force_reprofile=False,
+    _maestro_director_offload_capture=None,
+    _maestro_director_offload_context=None,
 ):
     def operation():
         # MMGP setup mutates process-global state. Serialize graph leaders, but
@@ -6158,10 +6133,28 @@ def _run_model_offload_with_residency(
             if callable(status_callback):
                 status_callback(_residency_status(plan))
             try:
-                if plan["action"] == "profile":
-                    result = offload.profile(
-                        pipe, profile_no=profile_no, **offload_kwargs,
+                if _maestro_director_offload_context is not None:
+                    # Observe the final selection under the same setup lock,
+                    # before MMGP. Expected settings come from the separately
+                    # admitted load recipe, never the invocation's kwargs.
+                    if (_maestro_director_offload_capture is None
+                            or not callable(_maestro_director_offload_context)):
+                        raise ValueError("Director offload context requires its owning capture")
+                    _maestro_director_offload_context(
+                        pipeline=pipe, key=copy.deepcopy(key),
+                        profile_no=profile_no, plan=copy.deepcopy(plan),
+                        store=store, selector=_select_model_residency_plan,
+                        force_reprofile=force_reprofile,
                     )
+                if plan["action"] == "profile":
+                    if _maestro_director_offload_capture is None:
+                        result = offload.profile(
+                            pipe, profile_no=profile_no, **offload_kwargs,
+                        )
+                    else:
+                        result = _maestro_director_offload_capture.run(
+                            "profile", pipe, dict(profile_no=profile_no, **offload_kwargs),
+                        )
                 else:
                     direct_kwargs = dict(defaults)
                     direct_kwargs.update(offload_kwargs)
@@ -6186,7 +6179,12 @@ def _run_model_offload_with_residency(
                         direct_kwargs["vram_safety_coefficient"] = min(
                             current, conservative,
                         )
-                    result = offload.all(pipe, **direct_kwargs)
+                    if _maestro_director_offload_capture is None:
+                        result = offload.all(pipe, **direct_kwargs)
+                    else:
+                        result = _maestro_director_offload_capture.run(
+                            "all", pipe, direct_kwargs,
+                        )
             except Exception as error:
                 _record_model_residency_oom(store, key, error)
                 raise
@@ -6395,8 +6393,28 @@ def load_models(
     resolution=None,
     _h3_control_checkpoint=None,
     _h3_control_base_checkpoint=None,
+    _maestro_director_model_observer=None,
+    _maestro_director_offload_capture=None,
+    _maestro_director_load_cleanup=None,
+    _maestro_director_offload_context=None,
     **model_kwargs,
 ):
+    if (_maestro_director_model_observer is not None
+            and not callable(_maestro_director_model_observer)):
+        raise ValueError("Director Wan model observer is invalid")
+    if (_maestro_director_offload_capture is None) != (_maestro_director_load_cleanup is None):
+        raise ValueError("Director Wan capture requires its owning cleanup")
+    if _maestro_director_offload_context is not None and (
+        _maestro_director_offload_capture is None
+        or not callable(_maestro_director_offload_context)
+    ):
+        raise ValueError("Director Wan offload context requires its owning capture")
+    if _maestro_director_offload_capture is not None and (
+        _maestro_director_model_observer is None
+        or not callable(getattr(_maestro_director_offload_capture, "run", None))
+        or not callable(_maestro_director_load_cleanup)
+    ):
+        raise ValueError("Director Wan capture requires its owning observer and cleanup")
     _native_acceptance.require_model_admission()
     global transformer_type, loaded_profile, reload_needed
     global _loaded_model_configuration, _loaded_residency_base_key
@@ -6697,6 +6715,7 @@ def load_models(
     offloadobj = None
     offload_setup_started = False
     model_load_succeeded = False
+    director_load_error = None
     h3_control_residency_identity = None
     try:
         previous_default_device = torch.get_default_device()
@@ -6713,9 +6732,13 @@ def load_models(
                 h3_dasiwa_admission,
                 resolved_primary_model_path,
             )
+        if _maestro_director_model_observer is not None:
+            handler_model_kwargs["_maestro_director_model_observer"] = _maestro_director_model_observer
         wan_model, pipe = model_type_handler.load_model(
                     local_model_file_list, model_type, base_model_type, model_def, quantizeTransformer = quantizeTransformer, text_encoder_quantization = text_encoder_quantization,
                     dtype = transformer_dtype, VAE_dtype = VAE_dtype, mixed_precision_transformer = mixed_precision_transformer, save_quantized = save_quantized, submodel_no_list   = model_submodel_no_list, text_encoder_filename = text_encoder_filename, profile=profile, lm_decoder_engine=lm_decoder_engine_obtained, **handler_model_kwargs )
+        if _maestro_director_model_observer is not None:
+            _maestro_director_model_observer("handler_ready", wrapper=wan_model, pipe=dict(pipe))
         if h3_dasiwa_admission is not None:
             recheck_dasiwa_checkpoint_admission(
                 h3_dasiwa_admission,
@@ -6777,6 +6800,11 @@ def load_models(
         })
         if h3_control_residency_identity is not None:
             wan_model.verify_h3_control_residency_identity(h3_control_residency_identity)
+        director_offload_options = {}
+        if _maestro_director_offload_capture is not None:
+            director_offload_options["_maestro_director_offload_capture"] = _maestro_director_offload_capture
+        if _maestro_director_offload_context is not None:
+            director_offload_options["_maestro_director_offload_context"] = _maestro_director_offload_context
         offloadobj = _run_model_offload_with_residency(
             pipe,
             profile_no=mmgp_profile,
@@ -6785,6 +6813,7 @@ def load_models(
             store=residency_store,
             status_callback=status_reporter.transition,
             force_reprofile=force_residency_reprofile,
+            **director_offload_options,
         )
         status_reporter.check_cancelled()
         if h3_control_residency_identity is not None:
@@ -6797,8 +6826,31 @@ def load_models(
             )
             status_reporter.check_cancelled()
         status_reporter.transition("Model runtime ready")
+        if _maestro_director_model_observer is not None:
+            _maestro_director_model_observer("offload_ready", wrapper=wan_model, pipe=dict(pipe),
+                offloadobj=offloadobj, profile=profile, load_environment=dict(load_environment),
+                offload_kwargs=dict(offload_kwargs))
         model_load_succeeded = True
-    except Exception:
+    except BaseException as load_error:
+        if _maestro_director_offload_capture is not None:
+            director_load_error = load_error
+            try:
+                # The owner retains partial constructor observations and the
+                # exact captured MMGP identity. Never infer it from a global
+                # last-owner pointer or retry a terminal release here.
+                _maestro_director_load_cleanup(
+                    wrapper=wan_model, offloader=offloadobj, pipe=pipe,
+                )
+            except BaseException as cleanup_error:
+                note = vars(BaseException).get("add_note")
+                if note is not None:
+                    note(load_error, "Director owning load cleanup failed: " + type(cleanup_error).__name__)
+            finally:
+                wan_model = offloadobj = pipe = kwargs = loras_transformer = handler_model_kwargs = None
+                director_offload_options = None
+            raise
+        if not isinstance(load_error, Exception):
+            raise
         partial_offloader = offloadobj
         if partial_offloader is None and offload_setup_started:
             partial_offloader = getattr(offload, "last_offload_obj", None)
@@ -6849,10 +6901,24 @@ def load_models(
         raise
     finally:
         try:
-            status_reporter.close()
+            try:
+                status_reporter.close()
+            except BaseException as close_error:
+                if director_load_error is None:
+                    raise
+                note = vars(BaseException).get("add_note")
+                if note is not None:
+                    note(director_load_error, "Director load status cleanup failed: " + type(close_error).__name__)
         finally:
             if not model_load_succeeded:
-                torch.set_default_device(previous_default_device)
+                try:
+                    torch.set_default_device(previous_default_device)
+                except BaseException as device_error:
+                    if director_load_error is None:
+                        raise
+                    note = vars(BaseException).get("add_note")
+                    if note is not None:
+                        note(director_load_error, "Director load device cleanup failed: " + type(device_error).__name__)
     if len(args.gpu) > 0:
         torch.set_default_device(args.gpu)
     transformer_type = model_type
@@ -8773,10 +8839,11 @@ def get_overridden_attention(model_type):
     if override_attention is not None and override_attention not in attention_modes_supported: return None
     return override_attention
 
-def get_transformer_loras(model_type):
+def get_transformer_loras(model_type, *, create_primary=True):
     model_def = get_model_def(model_type)
     transformer_loras_filenames = get_model_recursive_prop(model_type, "loras", return_list=True)
-    transformer_loras_filenames = [ resolve_lora_path(model_type, filename) for filename in transformer_loras_filenames]
+    transformer_loras_filenames = [resolve_lora_path(model_type, filename, create_primary=create_primary)
+                                   for filename in transformer_loras_filenames]
     transformer_loras_multipliers = get_model_recursive_prop(model_type, "loras_multipliers", return_list=True) + [1.] * len(transformer_loras_filenames)
     transformer_loras_multipliers = transformer_loras_multipliers[:len(transformer_loras_filenames)]
     return transformer_loras_filenames, transformer_loras_multipliers
@@ -11215,6 +11282,22 @@ def _notify_h3_profile_observer(observer, event, model_type, profile=None, load_
         pass
 
 
+def _begin_h3_reference_observation(gen, context):
+    observer = gen.get("_h3_reference_observer")
+    if observer is None:
+        return None
+    try:
+        if observer.begin(dict(context)) is not False:
+            return observer
+    except Exception:
+        pass
+    try:
+        observer.fail("reference_observer_begin_failed")
+    except Exception:
+        pass
+    return None
+
+
 def _release_failed_generation_resources():
     """Drop failed-job residency only after the generation stack has unwound."""
     try:
@@ -11278,6 +11361,14 @@ def generate_video(*args, **kwargs):
 
     model_type = _bound_value("model_type")
     profile_observer = _bound_value("_h3_profile_observer")
+    director_lora_guard = _bound_value("_maestro_director_lora_guard")
+    if director_lora_guard is not None:
+        from services.director_video_lora_execution import DirectorLoraConsumer
+        if type(director_lora_guard) is not DirectorLoraConsumer:
+            raise ValueError("Director native LoRA consumer is invalid")
+    director_repeat_marker = _bound_value("after_repeat_output")
+    director_repeat_index = (getattr(director_repeat_marker, "repeat_offset", None)
+        if getattr(director_repeat_marker, "_maestro_single_repeat", False) else None)
     cumulative_dispatch = _bound_value("_h3_cumulative_dispatch")
     interval_guides = _bound_value("_h3_timeline_guides")
     control_dispatch = _bound_value("_h3_control_dispatch")
@@ -11306,16 +11397,28 @@ def generate_video(*args, **kwargs):
                 ),
             )
     except BaseException:
+        if director_lora_guard is not None:
+            director_lora_guard.discard()
         if cumulative_started:
             cumulative_dispatch.discard()
         raise
+    if director_repeat_index is None and (
+            director_repeat_marker is not None
+            or (director_lora_guard is not None and director_lora_guard.incremental_preparation)):
+        _director_resume_offset = _bound_value("repeat_start_offset")
+        if type(_director_resume_offset) is int and _director_resume_offset > 0:
+            director_repeat_index = _director_resume_offset
     while True:
         try:
+            if director_lora_guard is not None:
+                director_lora_guard.start_invocation(director_repeat_index)
             _notify_h3_profile_observer(profile_observer, "reset", model_type)
             result = _generate_video_impl(*bound_args, **bound_kwargs)
             if cumulative_dispatch is not None:
                 cumulative_dispatch.finish(result)
             if result is False:
+                if director_lora_guard is not None:
+                    director_lora_guard.discard_invocation(director_repeat_index)
                 try:
                     _release_failed_generation_resources()
                 except Exception as error:
@@ -11341,6 +11444,8 @@ def generate_video(*args, **kwargs):
                     pass
             return result
         except H3OomReliefRetry as retry:
+            if director_lora_guard is not None:
+                director_lora_guard.discard_invocation(director_repeat_index)
             if interval_guides is not None or control_dispatch is not None or face_refine_dispatch is not None:
                 # Decoded guide geometry is immutable. Never retry it after
                 # changing the canvas, steps or profile behind the owner.
@@ -11399,6 +11504,8 @@ def generate_video(*args, **kwargs):
                 torch.cuda.empty_cache()
                 torch.cuda.ipc_collect()
         except BaseException as error:
+            if director_lora_guard is not None:
+                director_lora_guard.discard_invocation(director_repeat_index)
             if cumulative_dispatch is not None:
                 cumulative_dispatch.discard()
             try:
@@ -11811,7 +11918,17 @@ def _generate_video_impl(
     # Exact sealed crop bundle decoded on its owning worker; never saved.
     _h3_face_refine_dispatch=None,
     _h3_face_refine_output=None,
+    _maestro_director_lora_guard=None,
+    _maestro_director_repeat_output=None,
 ):
+    if _maestro_director_lora_guard is not None:
+        from services.director_video_lora_execution import DirectorLoraConsumer
+        if type(_maestro_director_lora_guard) is not DirectorLoraConsumer:
+            raise ValueError("Director native LoRA consumer is invalid")
+    if (_maestro_director_repeat_output is not None
+            and (_maestro_director_lora_guard is None
+                 or not callable(_maestro_director_repeat_output))):
+        raise ValueError("Director repeat producer callback is invalid")
     if _h3_control_dispatch is not None:
         from services.h3_gallery_control import validate_gallery_control_dispatch
         try:
@@ -11935,6 +12052,8 @@ def _generate_video_impl(
                 completed_repeats,
                 requested_repeats + extra_repeats,
             )
+            if _maestro_director_lora_guard is not None:
+                _maestro_director_lora_guard.require_repeat_count(total_repeats)
             if completed_repeats >= total_repeats:
                 break
 
@@ -11944,6 +12063,8 @@ def _generate_video_impl(
             _single_repeat_marker._maestro_single_repeat = True
             _single_repeat_marker.repeat_offset = completed_repeats
             _single_repeat_marker.repeat_total = total_repeats
+            if _maestro_director_lora_guard is not None:
+                next_seed = _maestro_director_lora_guard.seed_for_repeat(completed_repeats)
             recursive_arguments.update({
                 "repeat_generation": 1,
                 "seed": next_seed,
@@ -12685,7 +12806,6 @@ def _generate_video_impl(
         transformer_loras_filenames, transformer_loras_multipliers = (
             get_transformer_loras(model_type)
         )
-    if guidance_phases < 1: guidance_phases = 1
     # LoRA multipliers may use the ";" phase syntax (e.g. "0.75;0.50" =
     # stage 1 / stage 2 on LTX-2 two-stage models). Parse them against the
     # MODEL's phase capability, not the request's guidance_phases: LTX-2
@@ -12693,26 +12813,32 @@ def _generate_video_impl(
     # phase 2 in its distilled refine stage via update_loras_slists, so
     # gating on the request value hard-failed every two-phase multiplier.
     # Phases beyond what the run actually uses simply never fire.
-    model_def_nb_phases = max(int(model_def.get("guidance_max_phases", guidance_phases) or 1), guidance_phases)
+    guidance_phases, model_def_nb_phases = native_lora_phases(model_def, guidance_phases)
     loras_selected = []
     loras_list_mult_choices_nums = []
     loras_slists = None
     if transformer_loras_filenames != None:
-        loras_list_mult_choices_nums, loras_slists, errors =  parse_loras_multipliers(transformer_loras_multipliers, len(transformer_loras_filenames), num_inference_steps, nb_phases = model_def_nb_phases, model_switch_phase= model_switch_phase )
-        if len(errors) > 0: raise Exception(f"Error parsing Transformer Loras: {errors}")
+        loras_list_mult_choices_nums, loras_slists = append_native_lora_group(
+            transformer_loras_filenames, transformer_loras_multipliers,
+            steps=num_inference_steps, phases=model_def_nb_phases,
+            model_switch_phase=model_switch_phase, label="Transformer Loras")
         loras_selected = transformer_loras_filenames
 
     if hasattr(wan_model, "get_loras_transformer"):
         extra_loras_transformers, extra_loras_multipliers = wan_model.get_loras_transformer(get_model_recursive_prop, **locals())
-        loras_list_mult_choices_nums, loras_slists, errors =  parse_loras_multipliers(extra_loras_multipliers, len(extra_loras_transformers), num_inference_steps, nb_phases = model_def_nb_phases, merge_slist= loras_slists, model_switch_phase= model_switch_phase )
-        if len(errors) > 0: raise Exception(f"Error parsing Extra Transformer Loras: {errors}")
+        loras_list_mult_choices_nums, loras_slists = append_native_lora_group(
+            extra_loras_transformers, extra_loras_multipliers,
+            steps=num_inference_steps, phases=model_def_nb_phases,
+            model_switch_phase=model_switch_phase, schedule=loras_slists, label="Extra Transformer Loras")
         loras_selected += extra_loras_transformers
 
     if len(activated_loras) > 0:
         _require_quad_lora_activation(model_type, activated_loras)
         print(f"[LoRA] Loading {len(activated_loras)} LoRA(s): {[os.path.basename(l) for l in activated_loras]} | multipliers: {loras_multipliers!r}")
-        loras_list_mult_choices_nums, loras_slists, errors =  parse_loras_multipliers(loras_multipliers, len(activated_loras), num_inference_steps, nb_phases = model_def_nb_phases, merge_slist= loras_slists, model_switch_phase= model_switch_phase )
-        if len(errors) > 0: raise Exception(f"Error parsing Loras: {errors}")
+        loras_list_mult_choices_nums, loras_slists = append_native_lora_group(
+            activated_loras, loras_multipliers,
+            steps=num_inference_steps, phases=model_def_nb_phases,
+            model_switch_phase=model_switch_phase, schedule=loras_slists)
         errors = check_loras_exist(model_type, activated_loras, True, send_cmd)
         if len(errors) > 0 : raise gr.Error(errors)
         resolved_activated_loras = []
@@ -12845,6 +12971,8 @@ def _generate_video_impl(
 
     def _unload_generation_loras():
         nonlocal _generation_loras_loaded
+        if _maestro_director_lora_guard is not None:
+            _maestro_director_lora_guard.lora_unloaded()
         try:
             offload.unload_loras_from_model(trans_lora)
             clear_h3_turbo_runtime(trans_lora)
@@ -12862,6 +12990,9 @@ def _generate_video_impl(
             return
 
         def prepare():
+            if _maestro_director_lora_guard is not None:
+                _maestro_director_lora_guard.before_lora_load(
+                    list(resolved_activated_loras), model_type, adapter_paths=list(loras_selected))
             if pdd_admission is not None:
                 if (len(loras_selected) != 1 or trans2_lora is not None
                         or os.path.realpath(loras_selected[0]) != pdd_admission.artifact.resolved):
@@ -12904,6 +13035,9 @@ def _generate_video_impl(
                 activate_h3_turbo_runtime(trans_lora)
             if pdd_admission is not None:
                 activate_pdd_runtime(trans_lora)
+            if _maestro_director_lora_guard is not None:
+                _maestro_director_lora_guard.lora_load_succeeded(
+                    list(resolved_activated_loras), model_type, adapter_paths=list(loras_selected))
 
         if lightx2v_runtime_requested:
             guard_lightx2v_lora_load(prepare, _unload_generation_loras)
@@ -12917,7 +13051,8 @@ def _generate_video_impl(
 
     # Fallible window preprocessing precedes managed adapters with a scoped
     # inference lifetime; ordinary model/user/Turbo load points stay intact.
-    if not (lightx2v_runtime_requested or pdd_runtime_requested):
+    if (_maestro_director_lora_guard is None
+            and not (lightx2v_runtime_requested or pdd_runtime_requested)):
         _load_generation_loras()
 
     seed = None if seed == -1 else seed
@@ -12963,24 +13098,23 @@ def _generate_video_impl(
             f"{recast_warmup_frames} frames "
             f"({published_video_length} published, {video_length} generated)."
         )
-    if _h3_cumulative_dispatch is not None:
-        # Cumulative append uses H3's 17n+5 grid, including short windows.
-        # Generic n*latent_size+1 quantization would split this single call.
-        sliding_window_size = _h3_cumulative_dispatch.sampling_frames(video_length)
-    elif sliding_window_size !=0:
-        sliding_window_size = (sliding_window_size -1) // latent_size * latent_size + 1
+    # Cumulative append retains its 17n+5 grid instead of generic quantization.
+    if sliding_window_overlap != 0:
+        sliding_window_defaults = model_def.get("sliding_window_defaults", {})
+    sliding_window_size, sliding_window_overlap, sliding_window_discard_last_frames = quantize_window_settings(
+        sliding_window_size, sliding_window_overlap, sliding_window_discard_last_frames,
+        latent_size=latent_size,
+        overlap_default=(sliding_window_defaults.get("overlap_default", 0)
+                         if sliding_window_overlap != 0 else 0),
+        cumulative_frames=(_h3_cumulative_dispatch.sampling_frames(video_length)
+                           if _h3_cumulative_dispatch is not None else None),
+    )
     # Requantize audio_frame_offset to match the actual quantized video_length per clip.
     # Only recalculate for uniform-duration clips (multi_prompts_gen_type==3).
     # Clips dispatched from the manifest path (launch.py) already carry correct
     # cumulative offsets that account for variable per-clip durations.
     if multi_clip_info is not None and audio_frame_offset > 0 and not multi_clip_info.get("cumulative_offset"):
         audio_frame_offset = multi_clip_info["index"] * video_length
-    if sliding_window_overlap !=0:
-        sliding_window_defaults = model_def.get("sliding_window_defaults", {})
-        if sliding_window_defaults.get("overlap_default", 0) != sliding_window_overlap:
-            sliding_window_overlap = (sliding_window_overlap -1) // latent_size * latent_size + 1
-    if sliding_window_discard_last_frames !=0:
-        sliding_window_discard_last_frames = sliding_window_discard_last_frames // latent_size * latent_size 
 
     current_video_length = video_length
     # VAE Tiling
@@ -13066,19 +13200,17 @@ def _generate_video_impl(
     # Audio conditioning needs overlap padding before the final window count
     # is known. Its reuse width depends only on the already-normalized window
     # settings; the length-dependent sliding decision stays below.
-    reuse_frames = (
-        min(sliding_window_size - latent_size, sliding_window_overlap)
-        if test_any_sliding_window(model_type) else 0
-    )
-
     # Sliding-window decision moved to after audio/hunyuan processing
     # so that current_video_length adjustments from those paths are
     # reflected in the sliding-window threshold check. The video_source
     # overlap pre-adjustment still happens here because audio processing
     # downstream uses current_video_length directly.
     # (Upstream Wan2GP did this reorder in MegaMix commit ecfe88b.)
-    if test_any_sliding_window(model_type) and video_source is not None:
-        current_video_length += sliding_window_overlap - 1
+    current_video_length, reuse_frames = source_window_geometry(
+        current_video_length, sliding_window_size, sliding_window_overlap,
+        latent_size=latent_size, capable=test_any_sliding_window(model_type),
+        has_source=video_source is not None,
+    )
     original_image_refs = image_refs
     image_refs = None if image_refs is None else ([] + image_refs) # work on a copy as it is going to be modified
     # image_refs = None
@@ -13112,18 +13244,11 @@ def _generate_video_impl(
     # only stops the NameError that otherwise fires on any guide/control
     # video preprocessing.
     video_guide_outpainting_ratio = ""
-    fit_canvas = server_config.get("fit_canvas", 1)  # Default to fit (preserve aspect ratio)
-    if fit_canvas == 0:
-        fit_canvas = 1  # Never stretch — always fit to preserve aspect ratio
-    fit_crop = fit_canvas == 2
-    if fit_crop and outpainting_dims is not None:
-        fit_crop = False
-        fit_canvas = 1
-    # Progressive pipeline with start image: disable fit_canvas since we handle
-    # image fitting + 128-padding ourselves. Otherwise let fit_canvas=1 work normally.
-    if progressive_pipeline and (image_start is not None or _progressive_pad_info is not None):
-        fit_canvas = None
-        fit_crop = False
+    fit_canvas, fit_crop = resolve_fit_policy(
+        server_config.get("fit_canvas", 1),
+        outpainting=outpainting_dims is not None,
+        progressive=progressive_pipeline and (image_start is not None or _progressive_pad_info is not None),
+    )
 
     joint_pass = boost ==1 #and profile != 1 and profile != 3  
     
@@ -13275,8 +13400,10 @@ def _generate_video_impl(
         # source allowed. Now optional: when the user opts into "L",
         # the text prompt drives length and the model continues the
         # audio past the source end (LTX-2.3 supports this natively).
-        if not video_length_not_limited_by_audio:
-            current_video_length = min(int(fps * duration //latent_size) * latent_size + latent_size + 1, current_video_length)
+        current_video_length = cap_length_to_audio(
+            current_video_length, fps=fps, duration=duration,
+            latent_size=latent_size, unlimited=video_length_not_limited_by_audio,
+        )
         if fantasy:
             from models.wan.fantasytalking.infer import parse_audio
             # audio_proj_split_full, audio_context_lens_full = parse_audio(audio_guide, num_frames= max_source_video_frames, fps= fps,  padded_frames_for_embeddings= (reuse_frames if reset_control_aligment else 0), device= processing_device  )
@@ -13303,11 +13430,9 @@ def _generate_video_impl(
     # Now `current_video_length` reflects any audio-driven shortening,
     # so we don't false-positive sliding window for clips that the
     # audio handler already trimmed under the threshold.
-    if test_any_sliding_window(model_type):
-        sliding_window = current_video_length > sliding_window_size
-    else:
-        sliding_window = False
-        sliding_window_size = current_video_length
+    sliding_window, sliding_window_size = select_sliding_window(
+        current_video_length, sliding_window_size, capable=test_any_sliding_window(model_type),
+    )
 
     def _cleanup_generation_resources():
         """Release preparation/runtime state on success, failure, or abort."""
@@ -13330,6 +13455,18 @@ def _generate_video_impl(
             gc.collect()
             torch.cuda.empty_cache()
 
+    _director_loop_offset = 0
+    if (_maestro_director_lora_guard is not None
+            and _maestro_director_lora_guard.incremental_preparation
+            and after_repeat_output is None):
+        if (type(repeat_start_offset) is not int or repeat_start_offset < 0
+                or repeat_start_offset >= repeat_generation):
+            raise ValueError("Director deferred repeat recovery offset is invalid")
+        _director_loop_offset = repeat_start_offset
+    if _maestro_director_lora_guard is not None:
+        _director_seed_repeat = (getattr(after_repeat_output, "repeat_offset", 0)
+            if getattr(after_repeat_output, "_maestro_single_repeat", False) else _director_loop_offset)
+        seed = _maestro_director_lora_guard.seed_for_repeat(_director_seed_repeat)
     seed = set_seed(seed)
 
     torch.set_grad_enabled(False) 
@@ -13373,7 +13510,9 @@ def _generate_video_impl(
     # Each recursive API dispatch is a fresh native generation invocation, so
     # its behavioral repeat index must still run 0 -> 1.  The global offset is
     # display/accounting context only; using it here skips first-repeat image
-    # reference and custom-frame preparation on output two and later.
+    # reference and custom-frame preparation on output two and later. A
+    # resumed deferred Director invocation also starts preparation at zero;
+    # its retained offset reduces the stop count and selects original seeds.
     repeat_no = 0
     # A recursive API repeat owns exactly one native output.  Capture its
     # exclusive stop before entering the loop; deriving it from repeat_no on
@@ -13384,47 +13523,29 @@ def _generate_video_impl(
     discard_last_frames = sliding_window_discard_last_frames
     default_requested_frames_to_generate = current_video_length
     nb_frames_positions = 0
-    if sliding_window:
-        initial_total_windows = compute_sliding_window_no(default_requested_frames_to_generate, sliding_window_size, discard_last_frames, reuse_frames)
-        current_video_length = sliding_window_size
-    else:
-        initial_total_windows = 1
-
-    if _maestro_enhanced_prompt_cardinality is not None:
-        if (
-            not sliding_window
-            or multi_prompts_gen_type != 1
-            or str(base_model_type).startswith("minimax_h3")
-        ):
-            raise ValueError("Enhanced prompt window contract is out of scope")
-        prompts = _validate_enhanced_prompt_cardinality(
-            prompt,
-            _maestro_enhanced_prompt_cardinality,
-            initial_total_windows,
-        )
+    initial_total_windows, current_video_length = initial_window_geometry(
+        default_requested_frames_to_generate, sliding_window_size, discard_last_frames,
+        reuse_frames, sliding=sliding_window,
+    )
 
     # Studio global-timeline prompts arrive as one structured prompt
     # (multi_prompts_gen_type=2). Only now do we know the backend's effective
     # FPS and quantized window/overlap/discard geometry, so this is the first
     # safe place to clip global timestamps into window-local prompts. Director
     # and legacy line-per-window flows use other prompt modes and are unchanged.
-    studio_global_timeline = False
+    prompts, studio_global_timeline = prepare_window_prompts(
+        prompt, prompts, sliding=sliding_window, prompt_mode=multi_prompts_gen_type,
+        base_model_type=base_model_type, enhanced_marker=_maestro_enhanced_prompt_cardinality,
+        total_windows=initial_total_windows, total_frames=default_requested_frames_to_generate,
+        fps=fps, size=sliding_window_size, discard=discard_last_frames, reuse=reuse_frames,
+    )
     if sliding_window and multi_prompts_gen_type == 2:
-        timeline_prompts = prompt_parser.build_global_timeline_window_prompts(
-            prompt,
-            total_frames=default_requested_frames_to_generate,
-            fps=fps,
-            window_size=sliding_window_size,
-            discard_last_frames=discard_last_frames,
-            reuse_frames=reuse_frames,
+        timeline_prompts = prompts if studio_global_timeline else None
+    if studio_global_timeline:
+        print(
+            f"[Studio Timeline] Mapped one global prompt into "
+            f"{len(prompts)} backend windows at {fps:g} fps"
         )
-        if timeline_prompts is not None:
-            prompts = timeline_prompts
-            studio_global_timeline = True
-            print(
-                f"[Studio Timeline] Mapped one global prompt into "
-                f"{len(prompts)} backend windows at {fps:g} fps"
-            )
 
     first_window_video_length = current_video_length
     if (
@@ -13472,28 +13593,215 @@ def _generate_video_impl(
     derive_current_model_residency_evidence_context(
         finalized_residency_evidence_context,
     )
+    def _seal_and_assemble_multi_clip(video_path, configs, *, is_last_window):
+        # Shared by ordinary saves and the guarded actual-window completion.
+        if (
+            isinstance(multi_clip_info, dict)
+            and not is_image and not audio_only and is_last_window
+            and callable(after_segment_output)
+        ):
+            clip_path = video_path[0] if isinstance(video_path, list) else video_path
+            video_path = seal_multi_clip_segment_before_concat(
+                clip_path, multi_clip_info, after_segment_output,
+            )
+        if (
+            multi_clip_info is not None
+            and not is_image
+            and not audio_only
+            and is_last_window
+            # A one-shot Director timeline is already the finished
+            # video. Registering a one-item "group" created a second,
+            # byte-equivalent _multiclip file for no useful purpose.
+            and (
+                int(multi_clip_info.get("total", 0) or 0) > 1
+                or multi_clip_info.get("source_prefix") is not None
+            )
+            and not multi_clip_info.get("defer_concat", False)
+            # Ordinary Director groups use one checkpointed assembly path for
+            # both new and recovered native repeats. H3 retains its own graph.
+            and not (
+                _maestro_director_lora_guard is not None
+                and _maestro_director_lora_guard.incremental_preparation
+                and not multi_clip_info.get("automatic_h3_longform")
+                and _h3_cumulative_dispatch is None
+            )
+        ):
+            clip_path = video_path[0] if isinstance(video_path, list) else video_path
+            clip_store = gen.setdefault("multi_clip_paths", {})
+            group_id = multi_clip_info["group_id"]
+            group = clip_store.setdefault(group_id, {})
+            group[multi_clip_info["index"]] = {
+                "path": clip_path,
+                "prompt": configs.get("prompt", ""),
+                "image_start": image_start or "",
+                "discard_prefix_frames": int(
+                    multi_clip_info.get(
+                        "boundary_overlap_discard_frames", 0,
+                    )
+                    or 0
+                ),
+                "published_frames": int(
+                    multi_clip_info.get("published_frames")
+                    or video_length
+                ),
+            }
+            if len(group) == multi_clip_info["total"]:
+                # All clips in this group are done — concatenate
+                clip_paths = [group[i]["path"] for i in range(multi_clip_info["total"])]
+                # Ref2VA's audio_guide is semantic conditioning, not a
+                # soundtrack. Automatic long H3 clips therefore keep
+                # their generated embedded audio during concatenation;
+                # an explicit audio_source remains an intentional
+                # soundtrack override.
+                preserve_generated_audio = bool(
+                    multi_clip_info.get("preserve_generated_audio")
+                )
+                source_prefix = multi_clip_info.get("source_prefix")
+                concat_audio = (
+                    None
+                    if source_prefix is not None
+                    else (
+                        audio_source
+                        if preserve_generated_audio
+                        else (original_audio_guide or audio_source)
+                    )
+                )
+                concat_ext = os.path.splitext(clip_path)[1]
+                concat_name = (
+                    f"{_recovery_output_prefix}-r{single_repeat_offset if single_repeat_dispatch else _director_loop_offset + max(0, repeat_no - 1)}-multiclip{concat_ext}"
+                    if durable_output_dir is not None
+                    else f"{time_flag}_seed{seed}_multiclip{concat_ext}"
+                )
+                concat_path = os.path.join(
+                    durable_output_dir or save_path, concat_name,
+                )
+                print(f"[Multi-Clip] Concatenating {len(clip_paths)} clips into {concat_path}")
+                concat_succeeded = concatenate_multi_clip_videos(
+                    clip_paths,
+                    concat_path,
+                    concat_audio,
+                    audio_start_sec=multi_clip_info.get("audio_start_sec", 0),
+                    abort_callback=lambda: bool(gen.get("abort", False)),
+                    clip_start_frames=[
+                        group[i]["discard_prefix_frames"]
+                        for i in range(multi_clip_info["total"])
+                    ],
+                    source_prefix=source_prefix,
+                )
+                if concat_succeeded:
+                    print(f"[Multi-Clip] Concatenated video saved: {concat_path}")
+                    try:
+                        concat_safety_stats = enforce_h3_final_audio_safety(
+                            concat_path,
+                            base_model_type,
+                            send_cmd=send_cmd,
+                            state=state,
+                        )
+                    except PostDecodeStageError:
+                        remove_failed_h3_final_output(concat_path)
+                        raise
+                    concat_configs = configs.copy()
+                    concat_configs["prompt"] = (
+                        multi_clip_info.get("global_prompt")
+                        or "\n".join(
+                            group[i]["prompt"]
+                            for i in range(multi_clip_info["total"])
+                        )
+                    )
+                    concat_configs["image_start"] = (
+                        _multi_clip_image_start_metadata(
+                            group, multi_clip_info["total"], source_prefix,
+                        )
+                    )
+                    concat_configs["multi_prompts_gen_type"] = 3
+                    concat_configs["video_length"] = sum(
+                        int(group[i].get("published_frames") or 0)
+                        for i in range(multi_clip_info["total"])
+                    ) + int(
+                        (source_prefix or {}).get("retained_frames", 0)
+                        or 0
+                    )
+                    concat_configs["sliding_window_size"] = (
+                        0
+                        if multi_clip_info.get("automatic_h3_longform")
+                        else video_length
+                    )
+                    if source_prefix is not None or preserve_generated_audio:
+                        concat_configs.pop("audio_guide", None)
+                    elif original_audio_guide:
+                        concat_configs["audio_guide"] = original_audio_guide
+                    if concat_safety_stats is not None:
+                        concat_configs["h3_audio_true_peak"] = dict(
+                            concat_safety_stats
+                        )
+                        if metadata_choice == "json":
+                            concat_json_path = os.path.splitext(
+                                concat_path
+                            )[0] + ".json"
+                            with open(concat_json_path, "w") as metadata_file:
+                                json.dump(
+                                    concat_configs,
+                                    metadata_file,
+                                    indent=4,
+                                )
+                        elif metadata_choice == "metadata":
+                            save_video_metadata(
+                                concat_path, concat_configs, None,
+                            )
+                    with lock:
+                        file_list.append(concat_path)
+                        gen.setdefault("artifact_roles", {})[
+                            concat_path
+                        ] = "final"
+                        if concat_safety_stats is not None:
+                            gen["h3_audio_true_peak"] = dict(
+                                concat_safety_stats
+                            )
+                        file_settings_list.append(concat_configs)
+                    send_cmd("output")
+                    del clip_store[group_id]
+                else:
+                    # Components remain available for diagnosis and a
+                    # later explicit rejoin, but the generation must
+                    # not report success when its requested final was
+                    # never produced (especially with Finals-only as
+                    # the default gallery filter).
+                    raise PostDecodeStageError(
+                        "Unable to concatenate generated segments "
+                        f"for group {group_id}; component clips were retained",
+                        stage="concat", code="concat_cancelled",
+                    )
+
+        return video_path
+
+    _director_repeat_failed = False
     original_prompts = prompts.copy()
     gen["sliding_window"] = sliding_window 
     while not abort: 
         if not single_repeat_dispatch:
             extra_generation += gen.get("extra_orders",0)
             gen["extra_orders"] = 0
-        total_generation = single_repeat_target if single_repeat_dispatch else repeat_generation + extra_generation
+        total_generation = (single_repeat_target if single_repeat_dispatch
+                            else repeat_generation + extra_generation - _director_loop_offset)
         gen["total_generation"] = (
             max(
                 total_generation,
                 int(getattr(after_repeat_output, "repeat_total", total_generation) or total_generation),
             )
-            if single_repeat_dispatch else total_generation
+            if single_repeat_dispatch else total_generation + _director_loop_offset
         )
         gen["header_text"] = ""    
+        if _maestro_director_lora_guard is not None:
+            _maestro_director_lora_guard.require_repeat_count(
+                int(getattr(after_repeat_output, "repeat_total", total_generation))
+                if single_repeat_dispatch else total_generation + _director_loop_offset)
         if repeat_no >= total_generation: break
         repeat_no +=1
         if repeat_no > 1:
             _notify_h3_profile_observer(_h3_profile_observer, "discard", model_type)
         gen["repeat_no"] = (
             single_repeat_offset + repeat_no
-            if single_repeat_dispatch else repeat_no
+            if single_repeat_dispatch else _director_loop_offset + repeat_no
         )
         src_video = src_video2 = src_video3 = src_mask = src_mask2 = src_faces = sparse_video_image = full_generated_audio =None
         prefix_video = pre_video_frame = None
@@ -13504,6 +13812,10 @@ def _generate_video_impl(
         overlapped_latents = None
         context_scale = None
         window_no = 0
+        _director_preparation_finish = None
+        _director_terminal_output = None
+        _director_output_cursor = (
+            len(file_list), len(audio_file_list), len(gen.get("artifact_list") or []))
         extra_windows = 0
         abort_scheduled = False
         guide_start_frame = 0 # pos of of first control video frame of current window  (reuse_frames later than the first processed frame)
@@ -13632,14 +13944,10 @@ def _generate_video_impl(
                 _maestro_enhanced_prompt_cardinality is not None
                 and window_no >= initial_total_windows + extra_windows
             ):
+                _director_preparation_finish = "window_limit"
                 break
-            if _maestro_enhanced_prompt_cardinality is not None:
-                prompt = prompts[window_no]
-            else:
-                prompt = (
-                    prompts[window_no]
-                    if window_no < len(prompts) else prompts[-1]
-                )
+            prompt = select_window_prompt(prompts, window_no,
+                strict=_maestro_enhanced_prompt_cardinality is not None)
             if len(prompts) > 1:
                 if _maestro_enhanced_prompt_cardinality is not None:
                     print(
@@ -13650,6 +13958,9 @@ def _generate_video_impl(
                     print(f"[Sliding Window] window_no={window_no}, prompt_idx={'same' if window_no >= len(prompts) else window_no}, prompt='{prompt[:80]}...'")
             new_extra_windows = gen.get("extra_windows",0)
             gen["extra_windows"] = 0
+            if (new_extra_windows and _maestro_director_lora_guard is not None
+                    and _maestro_director_lora_guard.incremental_preparation):
+                raise ValueError("Director retained task cannot add native windows")
             if (
                 _maestro_enhanced_prompt_cardinality is not None
                 and new_extra_windows
@@ -13663,15 +13974,20 @@ def _generate_video_impl(
             extra_windows += new_extra_windows
             requested_frames_to_generate +=  new_extra_windows * (sliding_window_size - discard_last_frames - reuse_frames)
             sliding_window = sliding_window  or extra_windows > 0
-            if sliding_window and window_no > 0:
-                # num_frames_generated -= reuse_frames
-                if (requested_frames_to_generate - num_frames_generated) <  latent_size:
-                    break
-                current_video_length = min(sliding_window_size, ((requested_frames_to_generate - num_frames_generated + reuse_frames + discard_last_frames) // latent_size) * latent_size + 1 )
+            next_frames = next_window_frame_count(current_video_length,
+                sliding=sliding_window, window_index=window_no,
+                requested=requested_frames_to_generate, generated=num_frames_generated,
+                size=sliding_window_size, discard=discard_last_frames,
+                reuse=reuse_frames, latent_size=latent_size)
+            if next_frames is None:
+                _director_preparation_finish = "latent_tail"
+                break
+            current_video_length = next_frames
 
             total_windows = initial_total_windows + extra_windows
             gen["total_windows"] = total_windows
             if window_no >= total_windows:
+                _director_preparation_finish = "window_limit"
                 break
             window_no += 1
             if window_no > 1:
@@ -13704,6 +14020,7 @@ def _generate_video_impl(
             if hasattr(model_handler, "custom_prompt_preprocess"):
                 prompt = model_handler.custom_prompt_preprocess(**locals())
             image_start_tensor = image_end_tensor = None
+            control_short_tail = False
             resize_keyframe_image = (
                 _resize_h3_timeline_still_guide_image
                 if h3_timeline_still_guide_requested
@@ -13715,9 +14032,10 @@ def _generate_video_impl(
                     if fit_crop: refresh_preview["image_start"] = image_start_tensor
                     image_start_tensor = convert_image_to_tensor(image_start_tensor)
                     if h3_timeline_still_guide_requested:
-                        if sample_fit_canvas is not None and not fake_start_image:
-                            image_size = image_start_tensor.shape[-2:]
-                            sample_fit_canvas = None
+                        image_size, sample_fit_canvas = adopt_media_canvas(
+                            image_size, sample_fit_canvas, image_start_tensor.shape[-2:],
+                            enabled=not fake_start_image,
+                        )
                     else:
                         pre_video_guide =  prefix_video = image_start_tensor.unsqueeze(1)
                 else:
@@ -13735,9 +14053,10 @@ def _generate_video_impl(
                     # SCAIL-2's fake start image is an identity reference, not
                     # an output-frame anchor.  Keep fit_canvas available so the
                     # control video establishes the generated canvas/aspect.
-                    if sample_fit_canvas != None and not fake_start_image:
-                        image_size  = pre_video_guide.shape[-2:]
-                        sample_fit_canvas = None
+                    image_size, sample_fit_canvas = adopt_media_canvas(
+                        image_size, sample_fit_canvas, pre_video_guide.shape[-2:],
+                        enabled=not fake_start_image,
+                    )
                     guide_start_frame =  prefix_video.shape[1]
                     if fake_start_image:
                         source_video_overlap_frames_count = source_video_frames_count = guide_start_frame = 0
@@ -13749,9 +14068,9 @@ def _generate_video_impl(
                     # image_end_tensor =image_end_list[window_no-1].resize((new_width, new_height), resample=Image.Resampling.LANCZOS) 
                     refresh_preview["image_end"] = image_end_tensor 
                     image_end_tensor = convert_image_to_tensor(image_end_tensor)
-                    if sample_fit_canvas != None: 
-                        image_size  = image_end_tensor.shape[-2:]
-                        sample_fit_canvas = None
+                    image_size, sample_fit_canvas = adopt_media_canvas(
+                        image_size, sample_fit_canvas, image_end_tensor.shape[-2:],
+                    )
                 image_end_list= None
             timeline_third_still = (
                 _load_h3_timeline_third_still(custom_settings, *image_size)
@@ -13791,12 +14110,14 @@ def _generate_video_impl(
                     suffix_video_tensor = None
                     suffix_frames_count = 0
 
-            window_start_frame = guide_start_frame - (reuse_frames if window_no > 1 else source_video_overlap_frames_count)
-            guide_end_frame = guide_start_frame + current_video_length - (source_video_overlap_frames_count if window_no == 1 else reuse_frames)
-            alignment_shift = source_video_frames_count if reset_control_aligment else 0
-            aligned_guide_start_frame = guide_start_frame - alignment_shift
-            aligned_guide_end_frame = guide_end_frame - alignment_shift
-            aligned_window_start_frame = window_start_frame - alignment_shift  
+            (window_start_frame, guide_end_frame, alignment_shift,
+             aligned_guide_start_frame, aligned_guide_end_frame,
+             aligned_window_start_frame) = window_media_offsets(
+                guide_start_frame, current_video_length, window_index=window_no,
+                source_overlap=source_video_overlap_frames_count, reuse=reuse_frames,
+                source_frames=source_video_frames_count,
+                timeline_aligned=reset_control_aligment,
+            )
             if audio_guide is not None and model_def.get("audio_guide_window_slicing", False) and not semantic_reference_mode:
                 audio_start_frame = aligned_window_start_frame
                 if reset_control_aligment:
@@ -14029,9 +14350,10 @@ def _generate_video_impl(
                         if preprocess_type2 != None:
                             video_guide_processed2, video_mask_processed2 = preprocess_video_with_mask(ref_pose_tensor, video_guide, video_mask, height=image_size[0], width = image_size[1], max_frames= guide_frames_extract_count, start_frame = guide_frames_extract_start, fit_canvas = sample_fit_canvas, fit_crop = fit_crop, target_fps = fps,  process_type = preprocess_type2, expand_scale = mask_expand, RGB_Mask = True, negate_mask = "N" in video_prompt_type, process_outside_mask = process_outside_mask, outpainting_dims = outpainting_dims, outpainting_ratio = video_guide_outpainting_ratio, proc_no =2, block_size = block_size, to_bbox = "H" in video_prompt_type )
 
-                    if video_guide_processed is not None  and sample_fit_canvas is not None:
-                        image_size = video_guide_processed.shape[-2:]
-                        sample_fit_canvas = None
+                    if video_guide_processed is not None:
+                        image_size, sample_fit_canvas = adopt_media_canvas(
+                            image_size, sample_fit_canvas, video_guide_processed.shape[-2:],
+                        )
 
                     if process_all:
                         cached_video_guide_processed, cached_video_mask_processed, cached_video_guide_processed2, cached_video_mask_processed2 = video_guide_processed, video_mask_processed, video_guide_processed2, video_mask_processed2
@@ -14125,16 +14447,27 @@ def _generate_video_impl(
                     src_video, src_video2 = src_videos 
                     src_mask, src_mask2 = src_masks 
                 src_videos = src_masks = None
-                if src_video is None or window_no >1 and src_video.shape[1] <= sliding_window_overlap and not dont_cat_preguide:
-                    abort = True 
+                control_frames, control_short_tail = control_window_geometry(
+                    current_video_length, None if src_video is None else src_video.shape[1],
+                    window_index=window_no, overlap=sliding_window_overlap,
+                    cat_prefix=not dont_cat_preguide, trim=model_def.get("control_video_trim", False),
+                )
+                if control_frames is None:
+                    if (_maestro_director_lora_guard is not None
+                            and _maestro_director_lora_guard.incremental_preparation
+                            and src_video is not None and window_no > 1
+                            and src_video.shape[1] <= sliding_window_overlap
+                            and not dont_cat_preguide):
+                        # A decoded guide containing only reused overlap is a
+                        # normal end. This iteration prepared no native call.
+                        _director_preparation_finish = "control_exhausted"
+                        window_no -= 1
+                        gen["window_no"] = window_no
+                    abort = True
                     break
-                if model_def.get("control_video_trim", False) :
-                    if src_video is None:
-                        abort = True 
-                        break
-                    elif src_video.shape[1] < current_video_length:
-                        current_video_length = src_video.shape[1]
-                        abort_scheduled = True 
+                current_video_length = control_frames
+                if control_short_tail:
+                    abort_scheduled = True
                 if src_faces is not None:
                     if src_faces.shape[1] < src_video.shape[1]:
                         src_faces = torch.concat( [src_faces,  src_faces[:, -1:].repeat(1, src_video.shape[1] - src_faces.shape[1], 1,1)], dim =1)
@@ -14204,7 +14537,8 @@ def _generate_video_impl(
                 # fallible preprocessing is complete. The enclosing handler
                 # now owns every later error/cancellation, while the guarded
                 # loader cleans even partially installed LightX2V tensors.
-                _load_generation_loras()
+                if _maestro_director_lora_guard is None:
+                    _load_generation_loras()
                 # SCAIL-2's first-window fake start image is only an
                 # identity-reference carrier.  The custom preprocessor has
                 # already sized the control/reference tensors to the
@@ -14314,19 +14648,46 @@ def _generate_video_impl(
                             container=server_config.get("video_container", "mp4"),
                             abort_check=lambda: gen.get("abort", False), timeout=600,
                         )
-                sampling_frame_num = (
-                    current_video_length if _h3_control_dispatch is not None or _h3_face_refine_dispatch is not None else
-                    (align_model_frame_count(current_video_length, model_def, for_generation=True)
-                     if _h3_cumulative_dispatch is None else
-                     _h3_cumulative_dispatch.sampling_frames(current_video_length))
+                _director_prepared_window = prepared_window_result(
+                    current_video_length, image_size,
+                    repeat_index=gen["repeat_no"] - 1, window_index=window_no,
+                    seed=seed, fps=fps, prompt=prompt,
+                    direct_frames=_h3_control_dispatch is not None or _h3_face_refine_dispatch is not None,
+                    align_frames=lambda frames: align_model_frame_count(frames, model_def, for_generation=True),
+                    cumulative_frames=None if _h3_cumulative_dispatch is None else _h3_cumulative_dispatch.sampling_frames,
                 )
+                sampling_frame_num = _director_prepared_window["frames"]
+                if _maestro_director_lora_guard is not None:
+                    _maestro_director_lora_guard.prepare_window(_director_prepared_window)
+                    _load_generation_loras()
+                _h3_reference_observer = None
                 if base_model_type in {"minimax_h3", "minimax_h3_ref2va"}:
-                    begin_decode_capture(_h3_decode_observer, {
-                        "repeat_index": max(0, repeat_no - 1), "window_index": window_no,
+                    _h3_invocation_context = {
+                        "repeat_index": (gen["repeat_no"] - 1 if _maestro_director_lora_guard is not None
+                                         else max(0, repeat_no - 1)), "window_index": window_no,
                         "seed": seed, "frames": sampling_frame_num,
                         "height": image_size[0], "width": image_size[1], "fps": fps,
                         "model_filename": model_filename,
-                    })
+                    }
+                    begin_decode_capture(_h3_decode_observer, dict(_h3_invocation_context))
+                    _h3_reference_observer = _begin_h3_reference_observation(
+                        gen, _h3_invocation_context,
+                    )
+                _director_lora_window_token = None
+                _director_lora_activation = None
+                if _maestro_director_lora_guard is not None:
+                    from services.director_video_lora_execution import NATIVE_FIELDS
+                    _director_native_locals = locals()
+                    prompt, _director_lora_window_token = _maestro_director_lora_guard.before_window(
+                        native={key: _director_native_locals[key] for key in NATIVE_FIELDS},
+                        window={"repeat_index": gen["repeat_no"] - 1, "window_index": window_no,
+                            "seed": seed, "frames": sampling_frame_num,
+                            "height": image_size[0], "width": image_size[1], "fps": fps},
+                        prompt=prompt)
+                    _director_lora_activation = _maestro_director_lora_guard.activation_observer(
+                        _director_lora_window_token,
+                        transformers=(wan_model.model,) if wan_model.model2 is None
+                        else (wan_model.model, wan_model.model2))
                 samples = call_with_lightx2v_cleanup(
                     lightx2v_runtime_requested or pdd_runtime_requested,
                     _unload_generation_loras,
@@ -14334,6 +14695,8 @@ def _generate_video_impl(
                     gen,
                     wan_model,
                     wan_model.generate,
+                    **({"_maestro_director_lora_activation": _director_lora_activation}
+                       if _director_lora_activation is not None else {}),
                     input_prompt = prompt,
                     alt_prompt = alt_prompt,
                     image_start = image_start_tensor,  
@@ -14502,6 +14865,8 @@ def _generate_video_impl(
                         "multi_clip_info": multi_clip_info,
                         "_h3_decode_observer": _h3_decode_observer,
                     }),
+                    **({"_h3_reference_observer": _h3_reference_observer}
+                       if _h3_reference_observer is not None else {}),
                     **({} if _h3_cumulative_dispatch is None else
                        _h3_cumulative_dispatch.model_kwargs(
                            base_model_type=base_model_type,
@@ -14520,8 +14885,14 @@ def _generate_video_impl(
                 )
                 if gen.get("abort", False):
                     abort = True
+                    if _maestro_director_lora_guard is not None:
+                        _maestro_director_lora_guard.discard_invocation(gen["repeat_no"] - 1)
                     break
+                if _maestro_director_lora_guard is not None:
+                    _maestro_director_lora_guard.window_succeeded(_director_lora_window_token)
             except Exception as e:
+                if _maestro_director_lora_guard is not None:
+                    _maestro_director_lora_guard.discard_invocation(gen["repeat_no"] - 1)
                 failure_details = structured_generation_failure(e, task, state)
                 if len(control_audio_tracks) > 0 or len(source_audio_tracks) > 0:
                     cleanup_temp_audio_files(control_audio_tracks + source_audio_tracks)
@@ -14766,6 +15137,12 @@ def _generate_video_impl(
                     any_mmaudio = False
                 else:
                     sample = samples.cpu()
+                    if (_maestro_director_lora_guard is not None
+                            and _maestro_director_lora_guard.incremental_preparation):
+                        if not (is_image or audio_only) and sample.shape[1] < sampling_frame_num:
+                            raise ValueError("Director native window returned an incomplete sample")
+                        if control_short_tail:
+                            _director_preparation_finish = "control_short_tail"
                     abort = abort_scheduled or not (is_image or audio_only) and sample.shape[1] < current_video_length
                     # if True: # for testing
                     #     torch.save(sample, "output.pt")
@@ -14932,6 +15309,7 @@ def _generate_video_impl(
                 inputs.pop("_h3_source_audio_premux_recovery", None)
                 inputs.pop("after_repeat_output", None)
                 inputs.pop("after_segment_output", None)
+                inputs.pop("_maestro_director_repeat_output", None)
                 if recast_warmup_frames > 0:
                     # The warm-up is an internal conditioning detail, not part
                     # of the duration users see or restore from metadata.
@@ -14949,11 +15327,12 @@ def _generate_video_impl(
                 inputs.pop("_h3_control_dispatch", None)
                 inputs.pop("_h3_face_refine_dispatch", None)
                 inputs.pop("_h3_face_refine_output", None)
+                inputs.pop("_maestro_director_lora_guard", None)
                 durable_file_stem = None
                 if durable_output_dir is not None:
                     durable_repeat = (
                         single_repeat_offset
-                        if single_repeat_dispatch else max(0, repeat_no - 1)
+                        if single_repeat_dispatch else _director_loop_offset + max(0, repeat_no - 1)
                     )
                     durable_file_stem = (
                         f"{_recovery_output_prefix}-r{durable_repeat}"
@@ -15284,11 +15663,13 @@ def _generate_video_impl(
                 inputs.pop("mode")
                 inputs.pop("after_repeat_output", None)
                 inputs.pop("after_segment_output", None)
+                inputs.pop("_maestro_director_repeat_output", None)
                 inputs.pop("_h3_cumulative_dispatch", None)
                 inputs.pop("_h3_timeline_guides", None)
                 inputs.pop("_h3_control_dispatch", None)
                 inputs.pop("_h3_face_refine_dispatch", None)
                 inputs.pop("_h3_face_refine_output", None)
+                inputs.pop("_maestro_director_lora_guard", None)
                 inputs["model_type"] = model_type
                 inputs["model_filename"] = (model_filename if _h3_control_dispatch is not None
                                              else get_model_filename(model_type, transformer_quantization, transformer_dtype_policy))
@@ -15658,177 +16039,16 @@ def _generate_video_impl(
 
                 embedded_images = None
 
-                # Multi-clip concatenation: store clip path and concatenate when all clips are done
-                # Only register after the LAST sliding window (or if no sliding window)
+                # Ordinary jobs retain their existing per-save boundary.
+                # Guarded jobs seal only after the real window loop finishes,
+                # including normal control/tail exits before the nominal end.
                 is_last_window = not sliding_window or window_no >= gen.get("total_windows", 1)
-                if (
-                    isinstance(multi_clip_info, dict)
-                    and not is_image and not audio_only and is_last_window
-                    and callable(after_segment_output)
-                ):
-                    clip_path = video_path[0] if isinstance(video_path, list) else video_path
-                    video_path = seal_multi_clip_segment_before_concat(
-                        clip_path, multi_clip_info, after_segment_output,
-                    )
-                if (
-                    multi_clip_info is not None
-                    and not is_image
-                    and not audio_only
-                    and is_last_window
-                    # A one-shot Director timeline is already the finished
-                    # video. Registering a one-item "group" created a second,
-                    # byte-equivalent _multiclip file for no useful purpose.
-                    and (
-                        int(multi_clip_info.get("total", 0) or 0) > 1
-                        or multi_clip_info.get("source_prefix") is not None
-                    )
-                    and not multi_clip_info.get("defer_concat", False)
-                ):
-                    clip_path = video_path[0] if isinstance(video_path, list) else video_path
-                    clip_store = gen.setdefault("multi_clip_paths", {})
-                    group_id = multi_clip_info["group_id"]
-                    group = clip_store.setdefault(group_id, {})
-                    group[multi_clip_info["index"]] = {
-                        "path": clip_path,
-                        "prompt": configs.get("prompt", ""),
-                        "image_start": image_start or "",
-                        "discard_prefix_frames": int(
-                            multi_clip_info.get(
-                                "boundary_overlap_discard_frames", 0,
-                            )
-                            or 0
-                        ),
-                        "published_frames": int(
-                            multi_clip_info.get("published_frames")
-                            or video_length
-                        ),
-                    }
-                    if len(group) == multi_clip_info["total"]:
-                        # All clips in this group are done — concatenate
-                        clip_paths = [group[i]["path"] for i in range(multi_clip_info["total"])]
-                        # Ref2VA's audio_guide is semantic conditioning, not a
-                        # soundtrack. Automatic long H3 clips therefore keep
-                        # their generated embedded audio during concatenation;
-                        # an explicit audio_source remains an intentional
-                        # soundtrack override.
-                        preserve_generated_audio = bool(
-                            multi_clip_info.get("preserve_generated_audio")
-                        )
-                        source_prefix = multi_clip_info.get("source_prefix")
-                        concat_audio = (
-                            None
-                            if source_prefix is not None
-                            else (
-                                audio_source
-                                if preserve_generated_audio
-                                else (original_audio_guide or audio_source)
-                            )
-                        )
-                        concat_ext = os.path.splitext(clip_path)[1]
-                        concat_name = (
-                            f"{_recovery_output_prefix}-r{single_repeat_offset if single_repeat_dispatch else max(0, repeat_no - 1)}-multiclip{concat_ext}"
-                            if durable_output_dir is not None
-                            else f"{time_flag}_seed{seed}_multiclip{concat_ext}"
-                        )
-                        concat_path = os.path.join(
-                            durable_output_dir or save_path, concat_name,
-                        )
-                        print(f"[Multi-Clip] Concatenating {len(clip_paths)} clips into {concat_path}")
-                        concat_succeeded = concatenate_multi_clip_videos(
-                            clip_paths,
-                            concat_path,
-                            concat_audio,
-                            audio_start_sec=multi_clip_info.get("audio_start_sec", 0),
-                            abort_callback=lambda: bool(gen.get("abort", False)),
-                            clip_start_frames=[
-                                group[i]["discard_prefix_frames"]
-                                for i in range(multi_clip_info["total"])
-                            ],
-                            source_prefix=source_prefix,
-                        )
-                        if concat_succeeded:
-                            print(f"[Multi-Clip] Concatenated video saved: {concat_path}")
-                            try:
-                                concat_safety_stats = enforce_h3_final_audio_safety(
-                                    concat_path,
-                                    base_model_type,
-                                    send_cmd=send_cmd,
-                                    state=state,
-                                )
-                            except PostDecodeStageError:
-                                remove_failed_h3_final_output(concat_path)
-                                raise
-                            concat_configs = configs.copy()
-                            concat_configs["prompt"] = (
-                                multi_clip_info.get("global_prompt")
-                                or "\n".join(
-                                    group[i]["prompt"]
-                                    for i in range(multi_clip_info["total"])
-                                )
-                            )
-                            concat_configs["image_start"] = (
-                                _multi_clip_image_start_metadata(
-                                    group, multi_clip_info["total"], source_prefix,
-                                )
-                            )
-                            concat_configs["multi_prompts_gen_type"] = 3
-                            concat_configs["video_length"] = sum(
-                                int(group[i].get("published_frames") or 0)
-                                for i in range(multi_clip_info["total"])
-                            ) + int(
-                                (source_prefix or {}).get("retained_frames", 0)
-                                or 0
-                            )
-                            concat_configs["sliding_window_size"] = (
-                                0
-                                if multi_clip_info.get("automatic_h3_longform")
-                                else video_length
-                            )
-                            if source_prefix is not None or preserve_generated_audio:
-                                concat_configs.pop("audio_guide", None)
-                            elif original_audio_guide:
-                                concat_configs["audio_guide"] = original_audio_guide
-                            if concat_safety_stats is not None:
-                                concat_configs["h3_audio_true_peak"] = dict(
-                                    concat_safety_stats
-                                )
-                                if metadata_choice == "json":
-                                    concat_json_path = os.path.splitext(
-                                        concat_path
-                                    )[0] + ".json"
-                                    with open(concat_json_path, "w") as metadata_file:
-                                        json.dump(
-                                            concat_configs,
-                                            metadata_file,
-                                            indent=4,
-                                        )
-                                elif metadata_choice == "metadata":
-                                    save_video_metadata(
-                                        concat_path, concat_configs, None,
-                                    )
-                            with lock:
-                                file_list.append(concat_path)
-                                gen.setdefault("artifact_roles", {})[
-                                    concat_path
-                                ] = "final"
-                                if concat_safety_stats is not None:
-                                    gen["h3_audio_true_peak"] = dict(
-                                        concat_safety_stats
-                                    )
-                                file_settings_list.append(concat_configs)
-                            send_cmd("output")
-                            del clip_store[group_id]
-                        else:
-                            # Components remain available for diagnosis and a
-                            # later explicit rejoin, but the generation must
-                            # not report success when its requested final was
-                            # never produced (especially with Finals-only as
-                            # the default gallery filter).
-                            raise PostDecodeStageError(
-                                "Unable to concatenate generated segments "
-                                f"for group {group_id}; component clips were retained",
-                                stage="concat", code="concat_cancelled",
-                            )
+                if (_maestro_director_lora_guard is None
+                        or not _maestro_director_lora_guard.incremental_preparation):
+                    video_path = _seal_and_assemble_multi_clip(
+                        video_path, configs, is_last_window=is_last_window)
+                else:
+                    _director_terminal_output = (copy.copy(video_path), configs.copy())
 
                 # Play notification sound for single video
                 try:
@@ -15847,7 +16067,45 @@ def _generate_video_impl(
                     h3_streamed_output_committed = True
                 send_cmd("output")
 
-        seed = set_seed(-1)
+        if (_maestro_director_lora_guard is not None
+                and _maestro_director_lora_guard.incremental_preparation):
+            if gen.get("abort", False):
+                _maestro_director_lora_guard.discard_invocation(gen["repeat_no"] - 1)
+            else:
+                _maestro_director_lora_guard.finish_preparation(
+                    gen["repeat_no"] - 1, reason=_director_preparation_finish)
+                if _director_terminal_output is None:
+                    raise ValueError("Director native output is missing")
+                # Seal the native component before any derived assembly.
+                # A failed concat must preserve authenticated native work.
+                if callable(_maestro_director_repeat_output):
+                    _director_paths = (
+                        file_list[_director_output_cursor[0]:]
+                        + audio_file_list[_director_output_cursor[1]:]
+                        + list(gen.get("artifact_list") or [])[_director_output_cursor[2]:])
+                    _director_output_ack = _maestro_director_repeat_output(
+                        gen["repeat_no"] - 1, list(dict.fromkeys(_director_paths)),
+                        terminal_paths=(list(_director_terminal_output[0])
+                            if isinstance(_director_terminal_output[0], list)
+                            else [_director_terminal_output[0]]))
+                    if _director_output_ack is False:
+                        gen["abort"] = True
+                        _director_repeat_failed = True
+                        break
+                    if isinstance(_director_output_ack, dict):
+                        # Private checkpoints may promote the component. Use
+                        # that acknowledged path for subsequent assembly.
+                        terminal_path, terminal_configs = _director_terminal_output
+                        terminal_path = ([_director_output_ack.get(path, path) for path in terminal_path]
+                            if isinstance(terminal_path, list)
+                            else _director_output_ack.get(terminal_path, terminal_path))
+                        _director_terminal_output = (terminal_path, terminal_configs)
+                video_path = _seal_and_assemble_multi_clip(
+                    *_director_terminal_output, is_last_window=True)
+        if _maestro_director_lora_guard is None:
+            seed = set_seed(-1)
+        elif not single_repeat_dispatch and repeat_no < total_generation:
+            seed = set_seed(_maestro_director_lora_guard.seed_for_repeat(_director_loop_offset + repeat_no))
     pending_extra_orders = gen.get("extra_orders", 0)
     _cleanup_generation_resources()
     if single_repeat_dispatch:
@@ -15855,7 +16113,7 @@ def _generate_video_impl(
         # consumes it only after this complete model task has returned.
         gen["extra_orders"] = pending_extra_orders
 
-    success = h3_streamed_output_committed or not gen.get("abort", False)
+    success = (h3_streamed_output_committed or not gen.get("abort", False)) and not _director_repeat_failed
     if (
         success
         and not single_repeat_dispatch

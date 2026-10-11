@@ -67,6 +67,7 @@ _recovery_verify_child = None
 _recovery_validate_child = None
 _recovery_prepare_h3_scene_rerun = None
 _runtime_admission = None
+_video_lora_child_admission = None
 _director_native_gpu_slot_state = threading.local()
 
 _pipelines: dict = {}
@@ -174,6 +175,9 @@ _pipeline_repairs: dict[str, dict] = {}
 # older request cannot publish into a resumed/replaced pipeline with the same
 # short id.
 _pipeline_llm_contexts: dict[str, dict] = {}
+_pipeline_planning_admissions: dict[str, object] = {}
+_pipeline_gpu_parent_guards: dict[str, object] = {}
+_DIRECTOR_PLANNING_CUSTODY_KEY = "_planning_custody_required"
 _pipeline_llm_tokens: dict[str, object] = {}
 _pipeline_llm_cancel_handles: dict[
     str, tuple[object, LlmCancellationHandle]
@@ -206,6 +210,11 @@ def _director_llm_uses_native_gpu(selection: dict) -> bool:
     )
 
 
+def _director_llm_uses_local_runtime(selection: dict) -> bool:
+    """Local CPU and GPU planning both own a cancellable llama-server."""
+    return str(selection.get("provider") or "local").casefold() == "local"
+
+
 class _DirectorNativeGpuSlot:
     """Join Director CUDA work to launch/WanGP's process-global GPU lane."""
 
@@ -213,6 +222,7 @@ class _DirectorNativeGpuSlot:
         self.enabled = _director_llm_uses_native_gpu(selection)
         self.cancel_checkpoint = cancel_checkpoint
         self._outermost = False
+        self._planning_admission = None
 
     def __enter__(self):
         if not self.enabled:
@@ -233,6 +243,10 @@ class _DirectorNativeGpuSlot:
         try:
             if callable(self.cancel_checkpoint):
                 self.cancel_checkpoint()
+            from services.native_acceptance_reservation import reservation
+            self._planning_admission = getattr(_director_native_gpu_slot_state, "planning_admission", None)
+            if self._planning_admission is not None:
+                reservation.admit_planning(self._planning_admission, _gen_lock)
             if callable(self.cancel_checkpoint):
                 _wgp.acquire_native_gpu_execution_lock(
                     self.cancel_checkpoint,
@@ -240,6 +254,8 @@ class _DirectorNativeGpuSlot:
             else:
                 _wgp.acquire_native_gpu_execution_lock()
         except BaseException:
+            if self._planning_admission is not None:
+                reservation.release_planning(self._planning_admission)
             _gen_lock.release()
             raise
         _director_native_gpu_slot_state.depth = 1
@@ -255,11 +271,160 @@ class _DirectorNativeGpuSlot:
         )
         _director_native_gpu_slot_state.depth = depth
         if self._outermost:
+            guard = getattr(_director_native_gpu_slot_state, "parent_guard", None)
+            if guard is not None and guard.owner.cancelled.is_set():
+                # Retain both GPU locks until the exact owned runtime drains.
+                # Status and Stop remain available; no successor can start.
+                guard.wait_for_owned_drain()
             try:
                 _wgp.native_gpu_execution_lock.release()
             finally:
+                if self._planning_admission is not None:
+                    from services.native_acceptance_reservation import reservation
+                    reservation.release_planning(self._planning_admission)
                 _gen_lock.release()
         return False
+
+
+class DirectorGpuParentGuard:
+    """Keep one planning parent and its exact LLM process under custody.
+
+    CPU selections use the same process custody without acquiring a GPU lane.
+    The installed reservation guardian supplies coherent workload authority. Its
+    receipt is observed separately from generation/model locks. A stalled
+    observation expires after three seconds; owned process shutdown has a
+    separate bounded four-second budget. No authority object crosses HTTP.
+    """
+    def __init__(self, pid, selection):
+        from services import llm_service
+        self.pid, self.selection = pid, selection
+        self.owner = llm_service.LocalRuntimeOwner()
+        self.stop = threading.Event()
+        self.probe_done = threading.Event()
+        self.probe_result = False
+        self.probe_started = 0.0
+        self.last_validated = 0.0
+        self.finished = False
+        with _pipeline_lock:
+            self.admission = _pipeline_planning_admissions.get(pid)
+
+    def checkpoint(self):
+        self.owner.checkpoint()
+        _director_pipeline_cancel_checkpoint(self.pid)
+        if self.admission is not None and time.monotonic() - self.last_validated >= 3:
+            self.owner.abort()
+            self.owner.checkpoint()
+
+    def _probe(self):
+        from services.native_acceptance_reservation import reservation
+        try:
+            self.probe_result = reservation.dispatch_ready()
+        except Exception:
+            self.probe_result = False
+        finally:
+            self.probe_done.set()
+
+    def _watch(self):
+        while not self.stop.wait(0.25):
+            if not _pipeline_lock.acquire(timeout=0.05):
+                self.owner.abort()
+                return
+            try:
+                p = _pipelines.get(self.pid)
+                active = bool(p and p.get("status") not in _DIRECTOR_TERMINAL_STATUSES)
+            finally:
+                _pipeline_lock.release()
+            if not active:
+                self.owner.abort()
+                return
+            if self.admission is None:
+                continue
+            now = time.monotonic()
+            if self.probe_done.is_set():
+                if not self.probe_result:
+                    self.owner.abort()
+                    return
+                # Freshness begins at observation START, never its delayed end.
+                self.last_validated = self.probe_started
+                self.probe_done.clear()
+                self.probe_started = 0.0
+            if now - self.last_validated >= 3:
+                self.owner.abort()
+                return
+            if not self.probe_started:
+                self.probe_started = now
+                threading.Thread(target=self._probe, name="director-authority-observation", daemon=True).start()
+
+    def __enter__(self):
+        from services.native_acceptance_reservation import reservation
+        admission = _require_pipeline_planning_custody(self.pid)
+        if admission is not None and admission is not self.admission:
+            raise RuntimeError("Director planning admission changed before runtime entry")
+        if reservation.target is not None and self.admission is None:
+            raise RuntimeError("Director planning needs its exact parent reservation")
+        self.last_validated = time.monotonic()
+        self.checkpoint()
+        with _pipeline_lock:
+            if self.pid in _pipeline_gpu_parent_guards:
+                raise RuntimeError("Director planning is already under custody")
+            _pipeline_gpu_parent_guards[self.pid] = self
+        _director_native_gpu_slot_state.planning_admission = self.admission
+        _director_native_gpu_slot_state.parent_guard = self
+        self.watcher = threading.Thread(target=self._watch, name="director-runtime-custody", daemon=True)
+        try:
+            self.watcher.start()
+        except BaseException:
+            with _pipeline_lock:
+                _pipeline_gpu_parent_guards.pop(self.pid, None)
+            _director_native_gpu_slot_state.planning_admission = None
+            _director_native_gpu_slot_state.parent_guard = None
+            raise
+        return self
+
+    def finish_runtime(self, failed=False):
+        if self.finished:
+            return
+        self.stop.set()
+        self.watcher.join(timeout=4.5)
+        if self.watcher.is_alive():
+            failed = True
+        with _pipeline_lock:
+            # Successful ordinary ownership ends before the GPU lane opens.
+            # Stop cannot obtain the parent between detachment and removal.
+            if not failed and self.admission is None and not self.owner.cancelled.is_set():
+                self.owner.detach()
+                _pipeline_gpu_parent_guards.pop(self.pid, None)
+        if failed or self.owner.cancelled.is_set():
+            self.owner.abort()
+        elif self.admission is not None:
+            self.owner.abort(retiring=True)
+        if not _director_llm_uses_native_gpu(self.selection):
+            # CPU has no GPU-slot finalizer. Keep the same exact process under
+            # custody until an in-flight abort or failed first drain settles.
+            self.wait_for_owned_drain()
+        with _pipeline_lock:
+            if (_pipeline_gpu_parent_guards.get(self.pid) is self
+                    and (not self.owner.cancelled.is_set() or self.owner.resources_released)):
+                _pipeline_gpu_parent_guards.pop(self.pid, None)
+        self.finished = True
+
+    def __exit__(self, exc_type, exc, tb):
+        self.finish_runtime(exc_type is not None)
+        _director_native_gpu_slot_state.planning_admission = None
+        _director_native_gpu_slot_state.parent_guard = None
+        return False
+
+    def release_drained_custody(self):
+        with _pipeline_lock:
+            if (self.owner.resources_released
+                    and _pipeline_gpu_parent_guards.get(self.pid) is self):
+                _pipeline_gpu_parent_guards.pop(self.pid, None)
+
+    def wait_for_owned_drain(self):
+        while self.owner.cancelled.is_set() and not self.owner.resources_released:
+            self.owner.abort(retiring=self.owner.retired)
+            time.sleep(0.25)
+        self.release_drained_custody()
 
 
 class _DirectorLlmSelection(dict):
@@ -1058,7 +1223,7 @@ def _pipeline_payload_descriptor(pid: str, payload: bytes) -> dict:
     }
 
 
-def _write_pipeline_payload_unlocked(filepath: str, payload: bytes) -> None:
+def _write_pipeline_payload_unlocked(filepath: str, payload: bytes, *, before_replace=None) -> None:
     """Atomically replace one pipeline JSON payload under the file lock."""
     temp_filepath = (
         f"{filepath}.{os.getpid()}.{threading.get_ident()}.tmp"
@@ -1068,6 +1233,8 @@ def _write_pipeline_payload_unlocked(filepath: str, payload: bytes) -> None:
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
+        if before_replace is not None:
+            before_replace()
         os.replace(temp_filepath, filepath)
         if os.name != "nt":
             directory_fd = os.open(
@@ -1086,9 +1253,13 @@ def _write_pipeline_payload_unlocked(filepath: str, payload: bytes) -> None:
                 pass
 
 
-def _write_pipeline_json_unlocked(filepath: str, state: dict) -> None:
+def _write_pipeline_json_unlocked(filepath: str, state: dict, *, before_replace=None) -> None:
     """Atomically replace one pipeline JSON file while its file lock is held."""
-    _write_pipeline_payload_unlocked(filepath, _pipeline_state_payload(state))
+    payload = _pipeline_state_payload(state)
+    if before_replace is None:
+        _write_pipeline_payload_unlocked(filepath, payload)
+    else:
+        _write_pipeline_payload_unlocked(filepath, payload, before_replace=before_replace)
 
 
 def _commit_pipeline_json_unlocked(
@@ -1275,7 +1446,7 @@ def _save_pipeline_state(pid: str) -> bool:
         return _save_pipeline_state_locked(pid)
 
 
-def _write_initial_pipeline_state(pid: str, pipeline: dict) -> tuple[dict, dict]:
+def _write_initial_pipeline_state(pid: str, pipeline: dict, *, before_replace=None) -> tuple[dict, dict]:
     """Commit a recoverable parent before it becomes observable in memory."""
     params = scrub_director_public_credentials(
         pipeline.get("params") or {}
@@ -1303,7 +1474,9 @@ def _write_initial_pipeline_state(pid: str, pipeline: dict) -> tuple[dict, dict]
         "project_id": pid,
         "created_at": pipeline.get("created_at"),
         "completed_at": None,
-        "status": "queued",
+        "status": pipeline.get("status", "queued"),
+        "phase": pipeline.get("phase", "registered"),
+        "pause_reason": pipeline.get("pause_reason"),
         "workspace": pipeline.get("workspace") or "default",
         "source_remote": bool(pipeline.get("source_remote", False)),
         "pipeline_type": params.get("pipeline_type", "music_video"),
@@ -1336,11 +1509,16 @@ def _write_initial_pipeline_state(pid: str, pipeline: dict) -> tuple[dict, dict]
         "output_files": [],
         "total_time_sec": 0,
         "_params_snapshot": params,
+        **({_DIRECTOR_PLANNING_CUSTODY_KEY: True}
+           if pipeline.get(_DIRECTOR_PLANNING_CUSTODY_KEY) is True else {}),
         "recovery": {},
     }
     filepath = os.path.join(out_dir, pipeline_state_filename(pid))
     with _pipeline_file_lock:
-        _write_pipeline_json_unlocked(filepath, state)
+        if before_replace is None:
+            _write_pipeline_json_unlocked(filepath, state)
+        else:
+            _write_pipeline_json_unlocked(filepath, state, before_replace=before_replace)
         descriptor = _pipeline_state_descriptor(out_dir, pid)
     return state, descriptor
 
@@ -1481,6 +1659,8 @@ def _save_pipeline_state_locked(pid: str) -> bool:
         # per-clip frame counts that the flattened per-clip state above does
         # not carry. resume_pipeline() rehydrates from here.
         "_params_snapshot": params,
+        **({_DIRECTOR_PLANNING_CUSTODY_KEY: True}
+           if p.get(_DIRECTOR_PLANNING_CUSTODY_KEY) is True else {}),
         # Director JSON remains the semantic authority.  This bounded block
         # records only scheduling identities and already-verified child
         # artifact descriptors; prompts and request paths stay in the
@@ -2407,6 +2587,19 @@ def _rerun_clip_video_impl(out_dir: str, pid: str, clip_index: int, prompt_overr
     if isinstance(snapshot.get("_h3_longform"), dict):
         return _rerun_h3_scene_video_impl(out_dir, pid, clip_index, state, prompt_override=prompt_override)
 
+    prior_repair = ((state.get("recovery") or {}).get("video_repairs") or {}).get(str(clip_index))
+    if ("_director_video_lora_snapshot" in snapshot
+            and isinstance(prior_repair, dict) and prior_repair.get("state") == "submitted"):
+        retained = prior_repair.get("params")
+        if (not isinstance(retained, dict) or prior_repair.get("authored_prompt") != prompt
+                or retained.get("model_type") != video_model):
+            raise RuntimeError("This clip has an unfinished repair with different inputs. Resolve that attempt before changing it.")
+        output_files = _submit_director_parameterized_clip_repair(
+            copy.deepcopy(retained), state, out_dir, pid, clip_index,
+            authored_prompt=prompt, prompt_override=prompt_override,
+        )
+        return _finish_director_clip_repair(output_files, out_dir, pid, clip_index, prompt_override, persist=False)
+
     # Determine the output directory
     pipeline_file = _find_pipeline_file(out_dir, pid)
     clip_out_dir = os.path.dirname(pipeline_file) if pipeline_file else out_dir
@@ -2509,8 +2702,14 @@ def _rerun_clip_video_impl(out_dir: str, pid: str, clip_index: int, prompt_overr
         "repeat_generation": 1,
         "negative_prompt": "",
         "activated_loras": video_loras.get("activated_loras", []),
-        "loras_multipliers": " ".join(
-            m.split(";")[0] for m in (video_loras.get("loras_multipliers", "") or "").split(" ") if m
+        "loras_multipliers": (
+            video_loras.get("loras_multipliers", "") or ""
+            if model_def.get("lock_guidance_phases") is True
+            and model_def.get("guidance_max_phases") == 2
+            else " ".join(
+                m.split(";")[0]
+                for m in (video_loras.get("loras_multipliers", "") or "").split(" ") if m
+            )
         ),
         "_director_pipeline_id": pid,
         "_director_detached_operation": True,
@@ -2613,21 +2812,122 @@ def _rerun_clip_video_impl(out_dir: str, pid: str, clip_index: int, prompt_overr
             if voice_timing:
                 gen_params.setdefault("custom_settings", {})["director_source_voice_timing"] = voice_timing
 
+    _bind_director_custom_style_video(gen_params, snapshot)
+    _bind_director_video_lora_parent(gen_params, snapshot)
     try:
-        output_files = _submit_and_wait(
-            gen_params, timeout_s=3600, out_dir=clip_out_dir,
-        )
+        if "_director_video_lora_parent_snapshot" in gen_params:
+            output_files = _submit_director_parameterized_clip_repair(
+                gen_params, state, out_dir, pid, clip_index,
+                authored_prompt=prompt, prompt_override=prompt_override,
+            )
+        else:
+            output_files = _submit_and_wait(
+                gen_params, timeout_s=3600, out_dir=clip_out_dir,
+            )
     finally:
-        if slice_path and os.path.isfile(slice_path):
+        # Retained repair inputs must outlive an unresolved submission. The
+        # ordinary temporary-slice path keeps its existing cleanup behavior.
+        retained_repair = "_director_video_lora_parent_snapshot" in gen_params
+        if not retained_repair and slice_path and os.path.isfile(slice_path):
             try:
                 os.remove(slice_path)
             except OSError:
                 pass
-        if vocal_slice_path and os.path.isfile(vocal_slice_path):
+        if not retained_repair and vocal_slice_path and os.path.isfile(vocal_slice_path):
             try:
                 os.remove(vocal_slice_path)
             except OSError:
                 pass
+    return _finish_director_clip_repair(output_files, out_dir, pid, clip_index, prompt_override,
+                                       persist=not retained_repair)
+
+
+def _submit_director_parameterized_clip_repair(
+    params, state, out_dir, pid, clip_index, *, authored_prompt, prompt_override,
+):
+    """Submit or attach one immutable owner-authorized parameterized repair."""
+    filepath = _find_pipeline_file(out_dir, pid)
+    project_dir = os.path.dirname(filepath) if filepath else out_dir
+    snapshot = state.get("_params_snapshot") or {}
+    repairs = (state.get("recovery") or {}).get("video_repairs") or {}
+    prior = repairs.get(str(clip_index))
+    pending = prior if isinstance(prior, dict) and prior.get("state") == "submitted" else None
+    if pending is None:
+        previous_revision = prior.get("revision", 0) if isinstance(prior, dict) else 0
+        if type(previous_revision) is not int or previous_revision < 0:
+            raise ValueError("Saved clip repair revision is invalid")
+        revision = previous_revision + 1
+        unit = {"kind": "video_clip_rerun", "variant": revision, "index": clip_index}
+        params.update(_director_recovery_unit=unit, _director_recovery_parent_id=pid,
+            _director_recovery_job_id=_director_child_job_id(pid, unit, 0), _director_recovery_attempt=0)
+        params["_maestro_session_id"] = snapshot.get("_maestro_session_id")
+        params["_maestro_access_policy"] = copy.deepcopy(snapshot.get("_maestro_access_policy") or {})
+        pending = {"version": 1, "revision": revision, "state": "submitted", "unit": unit,
+            "attempt": 0, "job_id": params["_director_recovery_job_id"],
+            "params": copy.deepcopy(params), "authored_prompt": authored_prompt,
+            "prompt_override": prompt_override}
+
+        def save_intent(current):
+            existing = (current.get("recovery") or {}).get("video_repairs") or {}
+            if existing.get(str(clip_index)) != prior:
+                raise RuntimeError("Clip repair intent changed before publication.")
+            current.setdefault("recovery", {}).setdefault("video_repairs", {})[str(clip_index)] = copy.deepcopy(pending)
+
+        if _update_saved_pipeline(out_dir, pid, save_intent) is None:
+            raise RuntimeError("Clip repair intent could not be saved.")
+    unit = _normalized_child_unit(pending.get("unit"))
+    if (unit is None or unit.get("kind") != "video_clip_rerun" or unit.get("index") != clip_index
+            or type(pending.get("revision")) is not int or unit.get("variant") != pending["revision"]
+            or pending.get("attempt") != 0 or pending.get("job_id") != _director_child_job_id(pid, unit, 0)):
+        raise ValueError("Saved clip repair intent is invalid")
+    params.update(_director_recovery_unit=unit, _director_recovery_parent_id=pid,
+        _director_recovery_job_id=pending["job_id"], _director_recovery_attempt=0,
+        _maestro_session_id=snapshot.get("_maestro_session_id"),
+        _maestro_access_policy=copy.deepcopy(snapshot.get("_maestro_access_policy") or {}))
+    with _pipeline_lock:
+        control = _pipeline_repairs.get(pid)
+        if control is not None:
+            params["_director_repair_operation_id"] = control.get("operation_id")
+    try:
+        outputs = _submit_and_wait(params, timeout_s=3600,
+            workspace=state.get("workspace") or "default", out_dir=project_dir)
+    except (DirectorChildGenerationError, GenerationCancelledError) as error:
+        outcome = "cancelled" if isinstance(error, GenerationCancelledError) else "failed"
+
+        def save_terminal(current):
+            saved = (current.get("recovery") or {}).get("video_repairs") or {}
+            if saved.get(str(clip_index)) == pending:
+                saved[str(clip_index)] = dict(pending, state=outcome)
+
+        _update_saved_pipeline(out_dir, pid, save_terminal)
+        raise
+    # Unknown/ambiguous failures leave the submitted intent intact for attach.
+    if not outputs:
+        raise RuntimeError("Clip repair completed without a recorded output.")
+    def save_result(current):
+        saved = (current.get("recovery") or {}).get("video_repairs") or {}
+        if saved.get(str(clip_index)) != pending:
+            raise RuntimeError("Clip repair intent changed before replacement.")
+        # Adopt the verified output in the same durable checkpoint that ends
+        # retention. A crash must not drop the child between these steps.
+        _apply_director_clip_repair_result(current, clip_index, outputs[-1], prompt_override)
+        saved[str(clip_index)] = dict(pending, state="completed", output_files=list(outputs))
+
+    if _update_saved_pipeline(out_dir, pid, save_result) is None:
+        raise RuntimeError("Clip repair result could not be saved.")
+    return outputs
+
+
+def _apply_director_clip_repair_result(state, clip_index, filename, prompt_override):
+    state["clips"][clip_index]["video_filename"] = filename
+    state["clips"][clip_index]["video_stale"] = False
+    if filename not in state.get("output_files", []):
+        state.setdefault("output_files", []).append(filename)
+    if prompt_override:
+        state["clips"][clip_index]["video_prompt"] = prompt_override
+
+
+def _finish_director_clip_repair(output_files, out_dir, pid, clip_index, prompt_override, *, persist=True):
     # Sliding-window generations save CUMULATIVE progress files (each save
     # is the video so far) — the LAST file is the complete clip. With the
     # single-window sizing above there is normally exactly one file, but
@@ -2640,14 +2940,11 @@ def _rerun_clip_video_impl(out_dir: str, pid: str, clip_index: int, prompt_overr
             "Video generation completed without a recorded output."
         )
 
-    def _update(s):
-        s["clips"][clip_index]["video_filename"] = new_filename
-        s["clips"][clip_index]["video_stale"] = False
-        if new_filename not in s.get("output_files", []):
-            s.setdefault("output_files", []).append(new_filename)
-        if prompt_override:
-            s["clips"][clip_index]["video_prompt"] = prompt_override
-    _update_saved_pipeline(out_dir, pid, _update)
+    if persist:
+        def _update(s):
+            _apply_director_clip_repair_result(s, clip_index, new_filename, prompt_override)
+        if _update_saved_pipeline(out_dir, pid, _update) is None:
+            raise RuntimeError("Verified clip replacement could not be saved.")
 
     return {"filename": new_filename, "clip_index": clip_index}
 
@@ -2681,6 +2978,12 @@ def _rerun_h3_scene_video_impl(out_dir: str, pid: str, clip_index: int, state: d
     if not isinstance(controls, dict):
         raise RuntimeError("Director scene repair controls are unavailable.")
     gen_params = copy.deepcopy(controls)
+    if pending is None:
+        # Original controls are provenance for a fresh repair, not its intent.
+        # Attaching a submitted repair retains and validates that repair's seal.
+        gen_params.pop("_director_video_lora_child_snapshot", None)
+    _bind_director_custom_style_video(gen_params, snapshot, require_existing=True)
+    _bind_director_video_lora_parent(gen_params, snapshot, require_existing=True)
     for key in list(gen_params):
         if key.startswith(("_h3_rerun_", "_director_recovery_", "_director_repair_")):
             gen_params.pop(key)
@@ -3670,6 +3973,7 @@ def init(
     recovery_validate_child=None,
     recovery_prepare_h3_scene_rerun=None,
     runtime_admission=None,
+    video_lora_child_admission=None,
 ):
     """Called by launch.py to wire up shared references."""
     global _jobs, _run_generation, _wgp, _gen_lock, _active_gen_states
@@ -3678,6 +3982,7 @@ def init(
     global _recovery_remove_parent
     global _recovery_submit_child, _recovery_verify_child
     global _recovery_validate_child, _recovery_prepare_h3_scene_rerun, _runtime_admission
+    global _video_lora_child_admission
     _jobs = jobs_dict
     _run_generation = run_gen_fn
     _wgp = wgp_module
@@ -3693,6 +3998,7 @@ def init(
     _recovery_validate_child = recovery_validate_child
     _recovery_prepare_h3_scene_rerun = recovery_prepare_h3_scene_rerun
     _runtime_admission = runtime_admission
+    _video_lora_child_admission = video_lora_child_admission
 
 
 class _DirectorOutputs(list):
@@ -3783,7 +4089,7 @@ def _director_child_job_id(pid: str, unit: dict, attempt: int) -> str:
 
 
 def _recovered_child_outputs(
-    pid: str, unit: dict, out_dir: str,
+    pid: str, unit: dict, out_dir: str, *, custom_style_video_snapshot=None, video_lora_child_snapshot=None,
 ) -> _DirectorOutputs | None:
     if not callable(_recovery_validate_child):
         return None
@@ -3794,9 +4100,17 @@ def _recovered_child_outputs(
         entry = dict((recovery.get("children") or {}).get(token) or {})
     if entry.get("state") != "completed":
         return None
+    if video_lora_child_snapshot is not None:
+        raise ValueError("Completed Director LoRA output requires native producer evidence")
     verified = _recovery_validate_child(out_dir, entry.get("evidence"))
     if not isinstance(verified, dict):
         return None
+    from services.custom_visual_styles import digest
+    expected_style = digest(custom_style_video_snapshot) if custom_style_video_snapshot is not None else None
+    if verified.get("custom_visual_style_video_digest") != expected_style:
+        # A completed intent cannot become a new submission merely because its
+        # saved style disagrees. Preserve the attempt for explicit recovery.
+        raise ValueError("Completed Director child visual style identity changed")
     outputs = verified.get("outputs")
     if not isinstance(outputs, list) or not outputs:
         return None
@@ -3937,11 +4251,24 @@ def _submit_and_wait(
         )
     except (TypeError, ValueError):
         external_attempt = 0
+    # Keep the three initial caller reads as the detached cancellation handshake.
+    # Admit the final child packet before any completed-output fast return.
+    if ("_director_video_lora_parent_snapshot" in params or "_director_video_lora_child_snapshot" in params
+            or params.get("generation_mode") == "video" and bool(params.get("lora_parameters"))):
+        if not callable(_video_lora_child_admission):
+            raise ValueError("Director video LoRA child admission is unavailable")
+        parent_snapshot = _pipelines.get(pipeline_id) or {}
+        parent_params = dict(parent_snapshot.get("params") or {})
+        _video_lora_child_admission(params, pipeline_id=pipeline_id, workspace=workspace,
+            project_dir=out_dir, session_id=params.get("_maestro_session_id") or parent_params.get("_maestro_session_id"),
+            unit=recovery_unit)
     recovery_entry = None
     recovery_attempt = 0
     if pipeline_id and recovery_unit and out_dir and not _detached_operation:
         recovered = _recovered_child_outputs(
             pipeline_id, recovery_unit, out_dir,
+            custom_style_video_snapshot=params.get("_director_custom_style_video_snapshot"),
+            video_lora_child_snapshot=params.get("_director_video_lora_child_snapshot"),
         )
         if recovered is not None:
             return recovered
@@ -4001,6 +4328,13 @@ def _submit_and_wait(
     access_policy = params.pop("_maestro_access_policy", None) or pipeline_params.get("_maestro_access_policy")
     owner_session_id = params.pop("_maestro_session_id", None) or pipeline_params.get("_maestro_session_id")
     source_remote = bool(pipeline_snapshot.get("source_remote", False))
+    hold_video = bool(
+        not _detached_operation
+        and recovery_unit and recovery_unit.get("kind") == "video_generation"
+        and pipeline_params.get("hold_video") is True
+    )
+    if hold_video and not callable(_recovery_submit_child):
+        raise RuntimeError("Director video queue registration is unavailable")
     job = {
         "id": job_id,
         "status": "queued",
@@ -4025,6 +4359,7 @@ def _submit_and_wait(
         # Director thread.  Carry the captured parent origin explicitly so
         # local queue priority still applies to every child generation.
         "source_remote": source_remote,
+        "queue_held": hold_video,
     }
     if recovery_unit:
         job["recovery_unit"] = {
@@ -4186,6 +4521,10 @@ def _submit_and_wait(
             # resource re-admission a fresh wait window without creating a
             # second Director child or resetting parent progress.
             deadline = max(deadline, time.monotonic() + timeout_s)
+        if j.get("status") == "queued" and j.get("queue_held") is True:
+            # A deliberate queue hold is not a stalled generation. Start the
+            # bounded no-progress window when the owner releases this child.
+            deadline = time.monotonic() + timeout_s
         if j["status"] == "completed":
             outputs = _director_job_outputs(j)
             if recovery_managed:
@@ -4526,6 +4865,35 @@ def _pipeline_llm_call(
     function,
     /,
     *args,
+    **kwargs,
+):
+    # Planning already owns the complete sequence. Later prompt-polish passes
+    # need their own custody span instead of relying on a closed planner guard.
+    with _pipeline_lock:
+        selection = dict((_pipeline_llm_contexts.get(pid) or {}).get("selection") or {})
+    if (not _director_llm_uses_local_runtime(selection)
+            or getattr(_director_native_gpu_slot_state, "parent_guard", None) is not None):
+        return _pipeline_llm_call_body(pid, phase, pass_name, function, *args, **kwargs)
+    from services import llm_service
+    with DirectorGpuParentGuard(pid, selection) as guard:
+        with llm_service.local_runtime_owner(guard.owner), _DirectorNativeGpuSlot(selection, guard.checkpoint):
+            failed = True
+            try:
+                result = _pipeline_llm_call_body(pid, phase, pass_name, function, *args, **kwargs)
+                guard.checkpoint()
+                failed = False
+                return result
+            finally:
+                guard.finish_runtime(failed)
+
+
+def _pipeline_llm_call_body(
+    pid: str,
+    phase: str,
+    pass_name: str,
+    function,
+    /,
+    *args,
     allow_response_assist: bool = True,
     liveness_kwarg: Optional[str] = None,
     **kwargs,
@@ -4648,6 +5016,9 @@ def _start_pipeline_worker(pid: str, *, resume: bool = False) -> None:
         daemon=False,
     )
     with _pipeline_lock:
+        pipeline = _pipelines.get(pid)
+        if pipeline is not None and pipeline.get("status") == "cancelled":
+            return
         if pid in _pipeline_threads:
             raise RuntimeError(f"Pipeline {pid} already has a worker")
         if _pipeline_child_jobs.get(pid):
@@ -4779,12 +5150,15 @@ def discard_director_queue(base_out_dir: str) -> None:
         _director_queues.pop(resolved_base, None)
         _director_queue_bindings.pop(resolved_base, None)
 
-def _write_director_queue_locked(base_out_dir: str, state: dict) -> None:
+def _write_director_queue_locked(base_out_dir: str, state: dict, *, before_replace=None) -> None:
     resolved_base = os.path.realpath(base_out_dir)
     os.makedirs(resolved_base, exist_ok=True)
     # Bind queued work before dispatch can create its first child/recovery receipt.
     ensure_project_instance_marker(resolved_base)
-    _write_pipeline_json_unlocked(_director_queue_path(resolved_base), state)
+    if before_replace is None:
+        _write_pipeline_json_unlocked(_director_queue_path(resolved_base), state)
+    else:
+        _write_pipeline_json_unlocked(_director_queue_path(resolved_base), state, before_replace=before_replace)
     _director_queue_bindings[resolved_base] = _director_queue_binding(resolved_base)
 
 def _load_director_queue_locked(base_out_dir: str) -> dict:
@@ -4872,7 +5246,17 @@ def get_director_queue_entry(base_out_dir: str, entry_id: str) -> Optional[dict]
         state = _load_director_queue_locked(base_out_dir)
         for entry in state.get("entries") or []:
             if isinstance(entry, dict) and entry.get("id") == entry_id:
-                return scrub_director_public_credentials(entry)
+                public = scrub_director_public_credentials(entry)
+                params = public.get("params")
+                if isinstance(params, dict):
+                    params.pop("_director_custom_style_snapshot", None)
+                    for key in {"_director_video_lora_snapshot", "_director_video_lora_parent_snapshot", "_director_video_lora_child_snapshot"}:
+                        params.pop(key, None)
+                    params.pop("_director_custom_style_video_snapshot", None)
+                    params.pop("_director_custom_style_inputs", None)
+                    params.pop("_director_custom_style_image_paths", None)
+                    params.pop("_maestro_session_id", None)
+                return public
     return None
 
 def _director_queue_admissions(state: dict) -> dict:
@@ -4902,8 +5286,12 @@ def _director_queue_admission_result(state: dict, request_id: str, *, reused: bo
     return result
 
 
-def enqueue_director_pipeline(base_out_dir: str, params: dict, *, request_id: Optional[str] = None) -> dict:
-    """Freeze one held request; the same admission ID never creates another entry."""
+def enqueue_director_pipeline(base_out_dir: str, params: dict, *, request_id: Optional[str] = None, admit_params=None, discard_admission=None) -> dict:
+    """Freeze one held request; retries reuse its original admission.
+
+    The server admission callback freezes project-owned selections only after
+    deduplication. Its snapshot is durable state, never part of wire identity.
+    """
     if request_id is not None and (not isinstance(request_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", request_id)):
         raise ValueError("Director queue request ID is invalid")
     params_digest = hashlib.sha256(json.dumps(params, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")).hexdigest()
@@ -4919,47 +5307,69 @@ def enqueue_director_pipeline(base_out_dir: str, params: dict, *, request_id: Op
         entry_id = uuid.uuid4().hex[:8]
         while any(entry.get("id") == entry_id for entry in state.get("entries", []) if isinstance(entry, dict)) or any(record["entry_id"] == entry_id for record in records.values()):
             entry_id = uuid.uuid4().hex[:8]
-        frozen = copy.deepcopy(params)
-        frozen["auto_mode"] = True  # queued work must not wait for browser review
-        frozen["_director_queue_entry_id"] = entry_id
-        _bind_director_llm_selection(frozen)
-        _materialize_director_assets(frozen, base_out_dir, entry_id, container="_director_queue_assets")
-        entry = {
-            "id": entry_id, "status": "held", "message": "Ready",
-            "created_at": time.time(), "started_at": None, "completed_at": None,
-            "pipeline_id": None, "error": None, "params": frozen,
-        }
-        if request_id is not None:
-            entry["admission_request_id"] = request_id
-        # Publish cache state only after the complete entry and receipt commit.
-        next_state = copy.deepcopy(state)
-        next_state.setdefault("entries", []).append(entry)
-        if request_id is not None:
-            next_state.setdefault("admissions", {})[request_id] = {"entry_id": entry_id, "params_sha256": params_digest}
-        resolved_base = os.path.realpath(base_out_dir)
+        admitted = None
+        publication_started = False
+        def mark_publication():
+            nonlocal publication_started
+            publication_started = True
         try:
-            _write_director_queue_locked(base_out_dir, next_state)
-        except Exception:
-            # Directory fsync may fail after atomic replacement. Recognize the
-            # exact durable payload without running restart recovery on a live worker.
+            frozen = copy.deepcopy(params)
+            if admit_params is not None:
+                frozen = admit_params(frozen)
+                admitted = frozen
+                if not isinstance(frozen, dict):
+                    raise ValueError("Director admission must return frozen parameters")
+                frozen = copy.deepcopy(frozen)
+            frozen["auto_mode"] = True  # queued work must not wait for browser review
+            frozen["_director_queue_entry_id"] = entry_id
+            _bind_director_llm_selection(frozen)
+            _materialize_director_assets(frozen, base_out_dir, entry_id, container="_director_queue_assets")
+            entry = {
+                "id": entry_id, "status": "held", "message": "Ready",
+                "created_at": time.time(), "started_at": None, "completed_at": None,
+                "pipeline_id": None, "error": None, "params": frozen,
+            }
+            if request_id is not None:
+                entry["admission_request_id"] = request_id
+            # Publish cache state only after the complete entry and receipt commit.
+            next_state = copy.deepcopy(state)
+            next_state.setdefault("entries", []).append(entry)
+            if request_id is not None:
+                next_state.setdefault("admissions", {})[request_id] = {"entry_id": entry_id, "params_sha256": params_digest}
+            resolved_base = os.path.realpath(base_out_dir)
             try:
-                with open(_director_queue_path(resolved_base), "rb") as handle:
-                    committed = handle.read() == _pipeline_state_payload(next_state)
-                if committed:
-                    _director_queues[resolved_base] = next_state
-                    _director_queue_bindings[resolved_base] = _director_queue_binding(resolved_base)
-            except OSError:
-                pass
+                if discard_admission is None:
+                    _write_director_queue_locked(base_out_dir, next_state)
+                else:
+                    _write_director_queue_locked(base_out_dir, next_state, before_replace=mark_publication)
+            except Exception:
+                # Directory fsync may fail after atomic replacement. Recognize the
+                # exact durable payload without running restart recovery on a live worker.
+                try:
+                    with open(_director_queue_path(resolved_base), "rb") as handle:
+                        committed = handle.read() == _pipeline_state_payload(next_state)
+                    if committed:
+                        _director_queues[resolved_base] = next_state
+                        _director_queue_bindings[resolved_base] = _director_queue_binding(resolved_base)
+                except OSError:
+                    pass
+                raise
+            _director_queues[resolved_base] = next_state
+            if request_id is not None:
+                return _director_queue_admission_result(next_state, request_id, reused=False)
+            return _public_director_queue_state(next_state)
+        except BaseException:
+            if admitted is not None and discard_admission is not None and not publication_started:
+                discard_admission(admitted)
             raise
-        _director_queues[resolved_base] = next_state
-        if request_id is not None:
-            return _director_queue_admission_result(next_state, request_id, reused=False)
-        return _public_director_queue_state(next_state)
 
 def update_director_queue_entry(
     base_out_dir: str,
     entry_id: str,
     params: dict,
+    *,
+    admit_params=None,
+    discard_admission=None,
 ) -> dict:
     """Replace a non-running held project with a newly frozen edit."""
 
@@ -4967,7 +5377,7 @@ def update_director_queue_entry(
     frozen["auto_mode"] = True
     frozen["_director_queue_entry_id"] = entry_id
     with _director_queue_lock:
-        state = _load_director_queue_locked(base_out_dir)
+        state = copy.deepcopy(_load_director_queue_locked(base_out_dir))
         entry = next(
             (
                 item for item in state.get("entries") or []
@@ -4981,30 +5391,64 @@ def update_director_queue_entry(
             raise PipelineBusyError(
                 "The queued Director project has already started and cannot be edited."
             )
-        _bind_director_llm_selection(frozen)
-        # Reuse the entry-owned directory. Unchanged restored assets are
-        # already there (copy_one safely no-ops for source == target), while
-        # replacements receive deterministic names. Any superseded files stay
-        # isolated inside this entry and are reclaimed when it is removed.
-        _materialize_director_assets(
-            frozen,
-            base_out_dir,
-            entry_id,
-            container="_director_queue_assets",
-        )
-        should_run = bool(state.get("running") and not state.get("paused"))
-        entry.update({
-            "status": "queued" if should_run else "held",
-            "message": "Queued" if should_run else "Ready (edited)",
-            "updated_at": time.time(),
-            "started_at": None,
-            "completed_at": None,
-            "pipeline_id": None,
-            "error": None,
-            "params": frozen,
-        })
-        _write_director_queue_locked(base_out_dir, state)
-        return _public_director_queue_state(state)
+        admitted = None
+        publication_started = False
+        def mark_publication():
+            nonlocal publication_started
+            publication_started = True
+        try:
+            if admit_params is not None:
+                frozen = admit_params(frozen)
+                admitted = frozen
+                if not isinstance(frozen, dict):
+                    raise ValueError("Director admission must return frozen parameters")
+                frozen = copy.deepcopy(frozen)
+                frozen["auto_mode"] = True
+                frozen["_director_queue_entry_id"] = entry_id
+            _bind_director_llm_selection(frozen)
+            # Reuse the entry-owned directory. Unchanged restored assets are
+            # already there (copy_one safely no-ops for source == target), while
+            # replacements receive deterministic names. Any superseded files stay
+            # isolated inside this entry and are reclaimed when it is removed.
+            _materialize_director_assets(
+                frozen,
+                base_out_dir,
+                entry_id,
+                container="_director_queue_assets",
+            )
+            should_run = bool(state.get("running") and not state.get("paused"))
+            entry.update({
+                "status": "queued" if should_run else "held",
+                "message": "Queued" if should_run else "Ready (edited)",
+                "updated_at": time.time(),
+                "started_at": None,
+                "completed_at": None,
+                "pipeline_id": None,
+                "error": None,
+                "params": frozen,
+            })
+            try:
+                if discard_admission is None:
+                    _write_director_queue_locked(base_out_dir, state)
+                else:
+                    _write_director_queue_locked(base_out_dir, state, before_replace=mark_publication)
+            except Exception:
+                resolved_base = os.path.realpath(base_out_dir)
+                try:
+                    with open(_director_queue_path(resolved_base), "rb") as handle:
+                        committed = handle.read() == _pipeline_state_payload(state)
+                    if committed:
+                        _director_queues[resolved_base] = state
+                        _director_queue_bindings[resolved_base] = _director_queue_binding(resolved_base)
+                except OSError:
+                    pass
+                raise
+            _director_queues[os.path.realpath(base_out_dir)] = state
+            return _public_director_queue_state(state)
+        except BaseException:
+            if admitted is not None and discard_admission is not None and not publication_started:
+                discard_admission(admitted)
+            raise
 
 def _set_director_queue_entry(
     base_out_dir: str,
@@ -5333,139 +5777,325 @@ def _create_director_video_execution_profile(
     return profile
 
 
-def start_pipeline(params: dict) -> str:
+def _director_runtime_admit(params, *, source_remote=False, workspace=None,
+                            project_dir=None, pipeline_id=None):
+    if not callable(_runtime_admission):
+        return
+    video_loras = params.get("video_loras")
+    if (params.get("custom_visual_style_selection") is not None or "_director_custom_style_snapshot" in params
+            or "_director_video_lora_snapshot" in params
+            or isinstance(video_loras, dict) and bool(video_loras.get("lora_parameters"))):
+        _runtime_admission(params, source_remote=source_remote, workspace=workspace,
+                           project_dir=project_dir, pipeline_id=pipeline_id)
+    else:
+        _runtime_admission(params, source_remote=source_remote)
+
+
+def _director_custom_visual_style_guidance(params):
+    from services.custom_visual_styles import style_guidance
+    snapshot = params.get("_director_custom_style_snapshot")
+    if snapshot is None:
+        return ""
+    # Runtime admission already verified the parent, scope and complete stage
+    # binding. Read the retained contents, never the mutable library card.
+    return style_guidance(snapshot["stages"]["video"])
+
+
+def _validate_director_custom_style_inputs(value, *, parent_digest, video_snapshot, scope_digest=None):
+    """Check the retained input envelope; storage authority is checked separately."""
+    from services.custom_visual_styles import digest, validate_snapshot
+
+    if not isinstance(value, dict):
+        raise ValueError("Saved visual style inputs are unavailable")
+    body = copy.deepcopy(value)
+    expected = body.pop("digest", None)
+    stage = validate_snapshot(video_snapshot)
+    if (expected != digest(body)
+            or set(body) != {"version", "retention_id", "parent_snapshot_digest",
+                             "video_snapshot_digest", "scope_digest", "inputs", "sources"}
+            or type(body.get("version")) is not int or body["version"] != 1
+            or not isinstance(body.get("retention_id"), str)
+            or re.fullmatch(r"[0-9a-f]{32}", body["retention_id"]) is None
+            or body["parent_snapshot_digest"] != parent_digest
+            or body["video_snapshot_digest"] != video_snapshot["digest"]
+            or not isinstance(body["scope_digest"], str)
+            or re.fullmatch(r"[0-9a-f]{64}", body["scope_digest"]) is None
+            or (scope_digest is not None and body["scope_digest"] != scope_digest)
+            or not isinstance(body["inputs"], list) or not isinstance(body["sources"], list)
+            or not 1 <= len(body["inputs"]) <= 8
+            or len(body["inputs"]) != len(stage["references"])
+            or len(body["sources"]) != len(body["inputs"])):
+        raise ValueError("Saved visual style input binding changed")
+    for index, (descriptor, source, reference) in enumerate(zip(
+            body["inputs"], body["sources"], stage["references"])):
+        expected_source = {key: copy.deepcopy(reference[key])
+                           for key in ("selection", "sha256", "terms", "access_policy")}
+        if (source != expected_source or not isinstance(descriptor, dict)
+                or descriptor.get("scope") != "director_custom_style_image"
+                or descriptor.get("field") != f"_director_custom_style_image_paths:{index}"
+                or descriptor.get("retention_id") != body["retention_id"]
+                or descriptor.get("style_snapshot_digest") != video_snapshot["digest"]
+                or descriptor.get("sha256") != reference["sha256"]
+                or type(descriptor.get("size")) is not int or not 0 < descriptor["size"] <= 64 * 1024 * 1024
+                or not isinstance(descriptor.get("path"), str) or not os.path.isabs(descriptor["path"])):
+            raise ValueError("Saved visual style source binding changed")
+    return copy.deepcopy(value)
+
+
+def _director_custom_style_video_snapshot(params):
+    """Project the admitted immutable video stage for a private child job.
+
+    A child's physical checkpoint may differ from the selected parent model.
+    Keep the selected stage unchanged; native delivery must independently
+    decide whether that actual checkpoint can use its references.
+    """
+    from services.custom_visual_styles import digest, validate_snapshot
+
+    snapshot = params.get("_director_custom_style_snapshot")
+    if snapshot is None:
+        return None
+    if not isinstance(snapshot, dict):
+        raise ValueError("Saved visual style contents are unavailable")
+    body = copy.deepcopy(snapshot)
+    expected_digest = body.pop("digest", None)
+    if expected_digest != digest(body):
+        raise ValueError("Saved visual style contents changed")
+    stages = body.get("stages")
+    bindings = body.get("stage_bindings")
+    if (set(body) != {"version", "scope_digest", "stage_bindings", "selector", "stages"}
+            or type(body.get("version")) is not int or body["version"] != 1
+            or not isinstance(stages, dict)
+            or not isinstance(bindings, dict) or "video" not in stages
+            or not isinstance(bindings.get("video"), dict)):
+        raise ValueError("Saved visual style video stage is unavailable")
+    stage = validate_snapshot(stages["video"])
+    binding = bindings["video"]
+    if (stage["phase"] != "planned" or stage["model_type"] != binding.get("model_type")
+            or stage["mode"] != binding.get("mode")
+            or (params.get("video_model") is not None
+                and stage["model_type"] != params["video_model"])):
+        raise ValueError("Saved visual style video stage changed")
+    result = {"version": 1, "parent_snapshot_digest": expected_digest,
+              "video_snapshot": copy.deepcopy(stages["video"])}
+    if "_director_custom_style_inputs" in params:
+        result["retained_inputs"] = _validate_director_custom_style_inputs(
+            params["_director_custom_style_inputs"], parent_digest=expected_digest,
+            video_snapshot=stages["video"], scope_digest=body["scope_digest"])
+    return result
+
+
+def _bind_director_video_lora_parent(gen_params, params, *, require_existing=False):
+    import copy
+    import re
+    from services.generation_presets import normalize_generation_lora_parameters
+
+    key = "_director_video_lora_parent_snapshot"
+    loras = params.get("video_loras", {})
+    if not isinstance(loras, dict):
+        raise ValueError("Director video LoRA selection is invalid")
+    wire = normalize_generation_lora_parameters(loras.get("lora_parameters", {}))
+    snapshot = params.get("_director_video_lora_snapshot")
+    if snapshot is None:
+        if wire or key in gen_params:
+            raise ValueError("Director video LoRA admission is missing")
+        return
+    if (not isinstance(snapshot, dict) or set(snapshot) != {"binding", "digest"}
+            or not isinstance(snapshot.get("binding"), dict)
+            or not isinstance(snapshot.get("digest"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", snapshot["digest"]) is None):
+        raise ValueError("Director video LoRA admission is invalid")
+    binding = snapshot["binding"]
+    if (binding.get("video_model") != params.get("video_model")
+            or binding.get("activated_loras") != loras.get("activated_loras")
+            or binding.get("loras_multipliers") != loras.get("loras_multipliers", "")
+            or binding.get("lora_parameters") != wire):
+        raise ValueError("Director video LoRA selection changed after admission")
+    expected = {"activated_loras": binding["activated_loras"],
+                "loras_multipliers": binding["loras_multipliers"],
+                "lora_parameters": wire}
+    if require_existing or key in gen_params:
+        if (gen_params.get(key) != snapshot
+                or any(gen_params.get(name) != value for name, value in expected.items())):
+            raise ValueError("Retained Director child LoRA selection changed")
+        return
+    # The legacy builder can trim a phase schedule. Parameterized requests carry
+    # the complete frozen schedule; the consuming model validates its phases.
+    gen_params.update(copy.deepcopy(expected))
+    gen_params[key] = copy.deepcopy(snapshot)
+
+
+def _bind_director_custom_style_video(gen_params, params, *, require_existing=False):
+    """Carry exact intent; never upgrade planned/text-only state to delivery."""
+    expected = _director_custom_style_video_snapshot(params)
+    key = "_director_custom_style_video_snapshot"
+    if ((require_existing or key in gen_params)
+            and gen_params.get(key) != expected):
+        raise ValueError("Director video request visual style changed")
+    if expected is not None:
+        gen_params[key] = expected
+        retained = expected.get("retained_inputs")
+        if retained is not None:
+            paths = [descriptor["path"] for descriptor in retained["inputs"]]
+            if require_existing and gen_params.get("_director_custom_style_image_paths") != paths:
+                raise ValueError("Director video request visual style inputs changed")
+            gen_params["_director_custom_style_image_paths"] = paths
+
+
+def start_pipeline(params: dict, *, discard_admission=None) -> str:
     """Start a new director pipeline. Returns pipeline_id."""
-    params = scrub_director_public_credentials(params)
-    # Internal resume metadata must never be accepted from a fresh API request.
-    # Otherwise a caller could nominate unrelated workspace media as this
-    # pipeline's generated anchor and later influence repair/cleanup behavior.
-    params.pop("generated_reference_image_filename", None)
-    params.pop("_director_shot_image_policy", None)
-    from services.director.nsfw_guidance import EXPLICIT_GUIDANCE_SNAPSHOT_KEY
-    llm_services_snapshot = _director_llm_services_snapshot()
-    # A caller may not nominate this private decision bit. Recompute it from
-    # the literal request flag and authoritative consent/provider policy, then
-    # persist the result in the initial Director state snapshot.
-    params.pop(EXPLICIT_GUIDANCE_SNAPSHOT_KEY, None)
-    explicit_guidance = _fresh_explicit_guidance_decision(params)
-    params[EXPLICIT_GUIDANCE_SNAPSHOT_KEY] = explicit_guidance
-    if explicit_guidance:
-        # Bind the authorized request to the same non-public provider that
-        # passed the gate. This prevents a client provider override—and a
-        # later settings change during recovery—from sending explicit guidance
-        # to a public provider.
-        params["llm_provider"] = str(
-            llm_services_snapshot.get("llm_provider") or "local"
-        ).strip().lower()
-    if params.get(_DIRECTOR_LLM_SELECTION_RECEIPT_KEY) is not None:
-        held_selection = _director_llm_selection(params)
-        params["llm_provider"] = held_selection["provider"]
-        params["llm_model_id"] = held_selection["model_id"]
-        params["llm_device"] = held_selection["device"]
-        _strip_director_llm_secrets(params)
-    else:
-        _bind_director_llm_selection(params, llm_services_snapshot)
-    params["_director_shot_image_policy"] = _resolve_fresh_shot_image_policy(params)
-    if callable(_runtime_admission):
-        _runtime_admission(params, source_remote=False)
-    _validate_director_models(params)
-    _create_director_video_execution_profile(params)
-    pid = uuid.uuid4().hex[:8]
+    admission_params = params
+    publication_started = False
+    def mark_publication():
+        nonlocal publication_started
+        publication_started = True
+    try:
+        params = scrub_director_public_credentials(params)
+        if "hold_planning" in params and type(params["hold_planning"]) is not bool:
+            raise ValueError("Planning hold must be true or false")
+        hold_planning = params.get("hold_planning") is True
+        if hold_planning and (
+            params.get("prepared_clip_plans") or params.get("prepared_planned_clips")
+        ):
+            raise ValueError("A held story must be planned before using prepared clips")
+        # Internal resume metadata must never be accepted from a fresh API request.
+        # Otherwise a caller could nominate unrelated workspace media as this
+        # pipeline's generated anchor and later influence repair/cleanup behavior.
+        params.pop("generated_reference_image_filename", None)
+        params.pop("_director_shot_image_policy", None)
+        from services.director.nsfw_guidance import EXPLICIT_GUIDANCE_SNAPSHOT_KEY
+        llm_services_snapshot = _director_llm_services_snapshot()
+        # A caller may not nominate this private decision bit. Recompute it from
+        # the literal request flag and authoritative consent/provider policy, then
+        # persist the result in the initial Director state snapshot.
+        params.pop(EXPLICIT_GUIDANCE_SNAPSHOT_KEY, None)
+        explicit_guidance = _fresh_explicit_guidance_decision(params)
+        params[EXPLICIT_GUIDANCE_SNAPSHOT_KEY] = explicit_guidance
+        if explicit_guidance:
+            # Bind the authorized request to the same non-public provider that
+            # passed the gate. This prevents a client provider override—and a
+            # later settings change during recovery—from sending explicit guidance
+            # to a public provider.
+            params["llm_provider"] = str(
+                llm_services_snapshot.get("llm_provider") or "local"
+            ).strip().lower()
+        if params.get(_DIRECTOR_LLM_SELECTION_RECEIPT_KEY) is not None:
+            held_selection = _director_llm_selection(params)
+            params["llm_provider"] = held_selection["provider"]
+            params["llm_model_id"] = held_selection["model_id"]
+            params["llm_device"] = held_selection["device"]
+            _strip_director_llm_secrets(params)
+        else:
+            _bind_director_llm_selection(params, llm_services_snapshot)
+        params["_director_shot_image_policy"] = _resolve_fresh_shot_image_policy(params)
+        _director_runtime_admit(params, workspace=params.get("workspace"))
+        _validate_director_models(params)
+        _create_director_video_execution_profile(params)
+        pid = uuid.uuid4().hex[:8]
 
-    # Capture workspace at submission time — not at execution time
-    workspace = params.pop("workspace", None)
-    # Capture this before spawning the Director worker. Pinokio starts
-    # ``python launch.py``, so the live ContextVar belongs to ``__main__``;
-    # importing ``launch`` here would create a second module whose default is
-    # always local. Module-import test/dev servers instead expose ``launch``.
-    source_remote = False
-    live_launch_module = None
-    for module_name in ("__main__", "launch"):
-        module = sys.modules.get(module_name)
-        request_remote = getattr(module, "_request_remote", None)
-        if request_remote is None:
-            continue
-        live_launch_module = module
-        try:
-            source_remote = bool(request_remote.get())
-        except (AttributeError, LookupError):
-            source_remote = False
-        break
+        # Capture workspace at submission time — not at execution time
+        # Parameter admission retains the project identity through recovery.
+        workspace = (params.get("workspace") if "_director_video_lora_snapshot" in params
+                     else params.pop("workspace", None))
+        # Capture this before spawning the Director worker. Pinokio starts
+        # ``python launch.py``, so the live ContextVar belongs to ``__main__``;
+        # importing ``launch`` here would create a second module whose default is
+        # always local. Module-import test/dev servers instead expose ``launch``.
+        source_remote = False
+        live_launch_module = None
+        for module_name in ("__main__", "launch"):
+            module = sys.modules.get(module_name)
+            request_remote = getattr(module, "_request_remote", None)
+            if request_remote is None:
+                continue
+            live_launch_module = module
+            try:
+                source_remote = bool(request_remote.get())
+            except (AttributeError, LookupError):
+                source_remote = False
+            break
 
-    if workspace:
-        # Resolve the output directory now, while we know the intended workspace
-        workspace_dir = getattr(live_launch_module, "_workspace_dir", None)
-        if not callable(workspace_dir):
-            raise RuntimeError("Director workspace resolver is unavailable")
-        out_dir = workspace_dir(workspace)
-        print(f"[Pipeline] Workspace={workspace}, out_dir={out_dir}, wgp.save_path={_wgp.save_path}")
-    else:
-        out_dir = _wgp.save_path
-        workspace = None
-        print(f"[Pipeline] No workspace, using wgp.save_path={out_dir}")
+        if workspace:
+            # Resolve the output directory now, while we know the intended workspace
+            workspace_dir = getattr(live_launch_module, "_workspace_dir", None)
+            if not callable(workspace_dir):
+                raise RuntimeError("Director workspace resolver is unavailable")
+            out_dir = workspace_dir(workspace)
+            print(f"[Pipeline] Workspace={workspace}, out_dir={out_dir}, wgp.save_path={_wgp.save_path}")
+        else:
+            out_dir = _wgp.save_path
+            workspace = None
+            print(f"[Pipeline] No workspace, using wgp.save_path={out_dir}")
 
-    params.setdefault("_director_project_id", pid)
-    _materialize_director_assets(params, out_dir, pid)
-    prepared_plans = params.get("prepared_clip_plans")
-    if not isinstance(prepared_plans, list):
-        prepared_plans = []
-    prepared_timeline = params.get("prepared_planned_clips")
-    if not isinstance(prepared_timeline, list):
-        prepared_timeline = []
+        params.setdefault("_director_project_id", pid)
+        _materialize_director_assets(params, out_dir, pid)
+        prepared_plans = params.get("prepared_clip_plans")
+        if not isinstance(prepared_plans, list):
+            prepared_plans = []
+        prepared_timeline = params.get("prepared_planned_clips")
+        if not isinstance(prepared_timeline, list):
+            prepared_timeline = []
 
-    pipeline = {
-        "id": pid,
-        "status": "queued",
-        "phase": "registered",
-        "auto_mode": params.get("auto_mode", True),
-        "progress": {"current": 0, "total": 0, "message": "Starting...", "step": 0, "total_steps": 0},
-        "clip_plans": copy.deepcopy(prepared_plans),
-        "_planned_clips": copy.deepcopy(prepared_timeline),
-        "clip_images": [],         # filenames of generated start images
-        "output_files": [],
-        "error": None,
-        "created_at": time.time(),
-        "params": params,
-        "pause_reason": None,
-        "workspace": workspace,
-        "out_dir": out_dir,
-        "source_remote": source_remote,
-        "llm_progress": None,
-    }
-
-    # The parent JSON and queue identity must both be durable before the
-    # pipeline is published, its worker starts, or the route can acknowledge
-    # the id.  The callback writes no prompt/path material to the journal.
-    initial_state, state_descriptor = _write_initial_pipeline_state(
-        pid, pipeline,
-    )
-    if callable(_recovery_register_parent):
-        try:
-            recovery_parent = _recovery_register_parent(
-                pid, pipeline, initial_state, state_descriptor,
-            )
-            if not isinstance(recovery_parent, dict):
-                raise RuntimeError(
-                    "Director recovery parent registration failed"
-                )
-        except BaseException:
-            _remove_pipeline_state_file(out_dir, pid)
-            raise
-        pipeline["_recovery_parent"] = recovery_parent
-        pipeline["_recovery"] = {
-            "parent_job_id": recovery_parent.get("id"),
-            "children": {},
-            "inputs": list(recovery_parent.get("inputs") or []),
+        pipeline = {
+            "id": pid,
+            "status": "paused" if hold_planning else "queued",
+            "phase": "registered",
+            "auto_mode": params.get("auto_mode", True),
+            "progress": {"current": 0, "total": 0, "message": "Planning held" if hold_planning else "Starting...", "step": 0, "total_steps": 0},
+            "clip_plans": copy.deepcopy(prepared_plans),
+            "_planned_clips": copy.deepcopy(prepared_timeline),
+            "clip_images": [],         # filenames of generated start images
+            "output_files": [],
+            "error": None,
+            "created_at": time.time(),
+            "params": params,
+            "pause_reason": "before_planning" if hold_planning else None,
+            "workspace": workspace,
+            "out_dir": out_dir,
+            "source_remote": source_remote,
+            "llm_progress": None,
         }
 
-    with _pipeline_lock:
-        _pipelines[pid] = pipeline
+        # The parent JSON and queue identity must both be durable before the
+        # pipeline is published, its worker starts, or the route can acknowledge
+        # the id.  The callback writes no prompt/path material to the journal.
+        if discard_admission is None:
+            initial_state, state_descriptor = _write_initial_pipeline_state(pid, pipeline)
+        else:
+            initial_state, state_descriptor = _write_initial_pipeline_state(
+                pid, pipeline, before_replace=mark_publication,
+            )
+        if callable(_recovery_register_parent):
+            try:
+                recovery_parent = _recovery_register_parent(
+                    pid, pipeline, initial_state, state_descriptor,
+                )
+                if not isinstance(recovery_parent, dict):
+                    raise RuntimeError(
+                        "Director recovery parent registration failed"
+                    )
+            except BaseException:
+                _remove_pipeline_state_file(out_dir, pid)
+                raise
+            pipeline["_recovery_parent"] = recovery_parent
+            pipeline["_recovery"] = {
+                "parent_job_id": recovery_parent.get("id"),
+                "children": {},
+                "inputs": list(recovery_parent.get("inputs") or []),
+            }
 
-    # Non-daemon so pipeline survives browser disconnect during overnight runs.
-    _start_pipeline_worker(pid)
+        with _pipeline_lock:
+            _pipelines[pid] = pipeline
 
-    return pid
+        # Non-daemon so pipeline survives browser disconnect during overnight runs.
+        if not hold_planning:
+            _start_pipeline_worker(pid)
 
+        return pid
+
+    except BaseException:
+        if discard_admission is not None and not publication_started:
+            discard_admission(admission_params)
+        raise
 
 def get_pipeline(pid: str) -> Optional[dict]:
     with _pipeline_lock:
@@ -5473,19 +6103,56 @@ def get_pipeline(pid: str) -> Optional[dict]:
         return dict(p) if p else None
 
 
-def continue_pipeline(pid: str, updates: Optional[dict] = None):
+def _require_pipeline_planning_custody(pid: str):
+    from services.native_acceptance_reservation import _PlanningAdmission, reservation
+    with _pipeline_lock:
+        pipeline = _pipelines.get(pid)
+        if not pipeline or pipeline.get(_DIRECTOR_PLANNING_CUSTODY_KEY) is not True:
+            return
+        admission = _pipeline_planning_admissions.get(pid)
+        if (type(admission) is not _PlanningAdmission or admission.reservation is not reservation
+                or admission.params is not pipeline.get("params")
+                or admission.pid != pid or reservation.target is None
+                or not reservation._planning_matches(admission)):
+            raise RuntimeError("Interrupted Director planning requires its live parent admission")
+        return admission
+
+
+def continue_pipeline(pid: str, updates: Optional[dict] = None, *, planning_admission=None):
     """Resume a paused pipeline, optionally with updated clip_plans."""
     start_recovered = False
+    before_planning = False
     rollback = None
     with _pipeline_lock:
         p = _pipelines.get(pid)
         if not p or p["status"] != "paused":
             return False
-        if callable(_runtime_admission):
-            _runtime_admission(
-                p.get("params") or {},
-                source_remote=bool(p.get("source_remote", False)),
-            )
+        if updates is not None and not isinstance(updates, dict):
+            raise ValueError("Director continuation must be an object")
+        before_planning = p.get("pause_reason") == "before_planning"
+        from services.native_acceptance_reservation import _PlanningAdmission, reservation
+        if planning_admission is not None and not before_planning:
+            raise ValueError("Director planning admission requires the planning hold")
+        if before_planning and (reservation.target is not None
+                or planning_admission is not None
+                or p.get(_DIRECTOR_PLANNING_CUSTODY_KEY) is True):
+            if (type(planning_admission) is not _PlanningAdmission
+                    or planning_admission.reservation is not reservation
+                    or planning_admission.params is not p.get("params")
+                    or planning_admission.pid != pid or reservation.target is None
+                    or not reservation._planning_matches(planning_admission)):
+                raise ValueError("Director planning needs its exact parent admission")
+        if before_planning and updates:
+            raise ValueError("Start the held story without replacing its saved request")
+        if updates and "hold_video" in updates:
+            if type(updates["hold_video"]) is not bool:
+                raise ValueError("Video queue hold must be true or false")
+            if p.get("pause_reason") != "review_images":
+                raise ValueError("Video can be queued after image review")
+        _director_runtime_admit(
+            p.get("params") or {}, source_remote=bool(p.get("source_remote", False)),
+            workspace=p.get("workspace") or "default", project_dir=p.get("out_dir"), pipeline_id=pid,
+        )
         rollback = {
             "clip_plans": p.get("clip_plans"),
             "status": p.get("status"),
@@ -5494,21 +6161,36 @@ def continue_pipeline(pid: str, updates: Optional[dict] = None):
             "resume_after_pause": p.get("_resume_after_pause"),
             "recovered_present": "_recovered_without_worker" in p,
             "recovered_without_worker": p.get("_recovered_without_worker"),
+            "hold_present": "hold_video" in p["params"],
+            "hold_video": p["params"].get("hold_video"),
+            "planning_custody_present": _DIRECTOR_PLANNING_CUSTODY_KEY in p,
+            "planning_custody": p.get(_DIRECTOR_PLANNING_CUSTODY_KEY),
         }
         if updates:
             if "clip_plans" in updates:
                 p["clip_plans"] = updates["clip_plans"]
+            if "hold_video" in updates:
+                # The live worker retains this parameter object across its
+                # review pause; update it before opening the resume boundary.
+                p["params"]["hold_video"] = updates["hold_video"]
+        p["_review_continue_pending"] = True
+        if planning_admission is not None:
+            _pipeline_planning_admissions[pid] = planning_admission
+            p[_DIRECTOR_PLANNING_CUSTODY_KEY] = True
         p["status"] = "running"
         p["_resume_after_pause"] = p.get("pause_reason")
         p["pause_reason"] = None
-        start_recovered = bool(p.pop("_recovered_without_worker", False))
-    if start_recovered:
-        try:
-            _require_pipeline_checkpoint(pid, "review-continue")
-        except BaseException:
-            with _pipeline_lock:
-                current = _pipelines.get(pid)
-                if current is p:
+        start_recovered = bool(p.pop("_recovered_without_worker", False)) or before_planning
+    try:
+        _require_pipeline_checkpoint(pid, "review-continue")
+    except BaseException:
+        with _pipeline_lock:
+            current = _pipelines.get(pid)
+            if current is p:
+                if _pipeline_planning_admissions.get(pid) is planning_admission:
+                    _pipeline_planning_admissions.pop(pid, None)
+                current.pop("_review_continue_pending", None)
+                if current.get("status") == "running":
                     current["clip_plans"] = rollback["clip_plans"]
                     current["status"] = rollback["status"]
                     current["pause_reason"] = rollback["pause_reason"]
@@ -5524,8 +6206,26 @@ def continue_pipeline(pid: str, updates: Optional[dict] = None):
                         ]
                     else:
                         current.pop("_recovered_without_worker", None)
-            raise
-        _start_pipeline_worker(pid, resume=True)
+                    if rollback["hold_present"]:
+                        current["params"]["hold_video"] = rollback["hold_video"]
+                    else:
+                        current["params"].pop("hold_video", None)
+                    if rollback["planning_custody_present"]:
+                        current[_DIRECTOR_PLANNING_CUSTODY_KEY] = rollback["planning_custody"]
+                    else:
+                        current.pop(_DIRECTOR_PLANNING_CUSTODY_KEY, None)
+        raise
+    with _pipeline_lock:
+        current = _pipelines.get(pid)
+        if current is not p:
+            return False
+        current.pop("_review_continue_pending", None)
+        if current.get("status") != "running":
+            return False
+    if start_recovered:
+        # A held fresh parent has never planned. Prepared/recovered clip data
+        # cannot turn its first release into a planning-result adoption.
+        _start_pipeline_worker(pid, resume=not before_planning)
     return True
 
 
@@ -5633,6 +6333,8 @@ def _resume_pipeline_reserved(
         return False, "Terminal pipelines cannot be resumed; use repair."
     if saved_status == "paused":
         return False, "Paused pipelines must be continued explicitly."
+    if data.get(_DIRECTOR_PLANNING_CUSTODY_KEY) is True:
+        return False, "Interrupted planning requires its live parent admission."
     if not isinstance(data.get("_params_snapshot"), dict):
         return False, (
             "This pipeline was created before resume support and can't be "
@@ -5641,9 +6343,9 @@ def _resume_pipeline_reserved(
     params = _director_params_from_saved_state(data)
     if callable(_runtime_admission):
         try:
-            _runtime_admission(
-                params,
-                source_remote=bool(data.get("source_remote", False)),
+            _director_runtime_admit(
+                params, source_remote=bool(data.get("source_remote", False)),
+                workspace=data.get("workspace") or "default", project_dir=out_dir, pipeline_id=pid,
             )
         except Exception:
             return False, "Saved Director models or LoRAs are not ready."
@@ -5741,14 +6443,18 @@ def restore_registered_pipeline(
     saved_status = str(data.get("status") or "queued")
     terminal = saved_status in {"completed", "failed", "cancelled"}
     paused = saved_status == "paused"
+    blocked_custody = data.get(_DIRECTOR_PLANNING_CUSTODY_KEY) is True and not terminal
+    if blocked_custody and not blocked_reason:
+        blocked_reason = "Interrupted planning cannot restart without its original admission."
     blocked_manual = bool(blocked_reason) and not terminal
     can_start_worker = not (
         terminal or paused or blocked_remote or blocked_manual
     )
     if can_start_worker and callable(_runtime_admission):
-        _runtime_admission(
-            params,
-            source_remote=bool(data.get("source_remote", False)),
+        _director_runtime_admit(
+            params, source_remote=bool(data.get("source_remote", False)),
+            workspace=data.get("workspace") or "default",
+            project_dir=os.path.dirname(state_path), pipeline_id=pid,
         )
     saved_clips = data.get("clips", []) or []
     clip_plans = [{
@@ -5821,7 +6527,8 @@ def restore_registered_pipeline(
         "id": pid,
         "status": runtime_status,
         "phase": (
-            "blocked_input_changed" if blocked_manual
+            "blocked_planning_admission" if blocked_custody
+            else "blocked_input_changed" if blocked_manual
             else "blocked_remote_reauth" if blocked_remote
             else data.get("phase") or saved_status
         ),
@@ -5859,6 +6566,8 @@ def restore_registered_pipeline(
         "oom_info": restored_oom_info,
         "created_at": data.get("created_at") or time.time(),
         "params": params,
+        **({_DIRECTOR_PLANNING_CUSTODY_KEY: True}
+           if data.get(_DIRECTOR_PLANNING_CUSTODY_KEY) is True else {}),
         "pause_reason": data.get("pause_reason"),
         "workspace": (
             None if data.get("workspace") in (None, "default")
@@ -5877,7 +6586,8 @@ def restore_registered_pipeline(
         "_recovery_block_reason": blocked_reason or None,
         "_recovery_saved_phase": data.get("phase") or saved_status,
         "recovery_state": (
-            "blocked_input_changed" if blocked_manual
+            "blocked_planning_admission" if blocked_custody
+            else "blocked_input_changed" if blocked_manual
             else "blocked_remote_reauth" if blocked_remote
             else "paused" if paused
             else "terminal" if terminal
@@ -5988,7 +6698,9 @@ def start_restored_pipeline(pid: str) -> bool:
         source_remote = bool(pipeline.get("source_remote", False))
     if callable(_runtime_admission):
         try:
-            _runtime_admission(params, source_remote=source_remote)
+            _director_runtime_admit(params, source_remote=source_remote,
+                                    workspace=pipeline.get("workspace") or "default",
+                                    project_dir=pipeline.get("out_dir"), pipeline_id=pid)
         except Exception:
             block_pipeline_recovery(
                 pid,
@@ -6025,6 +6737,7 @@ def _abort_pipeline_jobs(pid: str):
 
 def stop_pipeline(pid: str) -> bool:
     cancel_handle = None
+    parent_guard = None
     with _pipeline_lock:
         p = _pipelines.get(pid)
         if not p or p.get("status") in ("completed", "failed", "cancelled"):
@@ -6041,10 +6754,16 @@ def stop_pipeline(pid: str) -> bool:
             "total_steps": 0,
         }
         cancel_handle = _cancel_pipeline_llm_progress(pid)
+        parent_guard = _pipeline_gpu_parent_guards.get(pid)
+        if parent_guard is not None:
+            parent_guard.owner.retired = False
+            parent_guard.owner.cancelled.set()
         _pipeline_llm_contexts.pop(pid, None)
     # Closing a provider response may briefly block while its socket tears
     # down. Keep that work outside the pipeline registry lock so unrelated
     # pipelines and status reads remain available.
+    if parent_guard is not None:
+        parent_guard.owner.abort()
     if cancel_handle is not None:
         cancel_handle.cancel()
     _abort_pipeline_jobs(pid)
@@ -6104,11 +6823,9 @@ def _run_pipeline(pid: str, resume: bool = False):
         except Exception:
             pass  # disk_usage can fail on odd mounts; don't block on the check itself
 
-        # ── Wait for GPU if jobs are running ────────────────────────────
-        # LLM needs GPU (CUDA), so we must wait for generation queue to drain.
-        # In auto mode this is expected (fire-and-forget). In non-auto mode
-        # the user is waiting interactively, so we still wait but they can cancel.
-        if not _wait_for_gpu(pid):
+        # Retained queued jobs do not own resources needed by CPU planning.
+        planning_selection = _director_llm_selection(params)
+        if _director_llm_uses_native_gpu(planning_selection) and not _wait_for_gpu(pid):
             return  # cancelled while waiting
 
         # ── Phase 1: LLM Planning ──────────────────────────────────────
@@ -6231,6 +6948,7 @@ def _run_pipeline(pid: str, resume: bool = False):
                         video_loras=video_loras, image_loras=image_loras,
                         image_paths=ref_paths or None,
                         characters=characters,
+                        custom_visual_style_guidance=_director_custom_visual_style_guidance(params),
                         preserve_video_character_names=(
                             str(video_model).lower().startswith("minimax_h3")
                             and shot_image_policy in {
@@ -6254,7 +6972,14 @@ def _run_pipeline(pid: str, resume: bool = False):
             # For inject modes, polish happened inside the planner — note it in the log
             _update_pipeline(pid, _polish_mode_used=polish_mode)
 
-        _update_pipeline(pid, clip_plans=clip_plans)
+        with _pipeline_lock:
+            current = _pipelines.get(pid)
+            if current is None or current.get("status") == "cancelled":
+                return
+            current["clip_plans"] = clip_plans
+            # The same durable checkpoint releases the planning-only marker
+            # with actual completed plans; manual review remains resumable.
+            current.pop(_DIRECTOR_PLANNING_CUSTODY_KEY, None)
         _require_pipeline_checkpoint(pid, "committed-plan")
 
         # Check cancellation
@@ -6425,6 +7150,7 @@ def _run_pipeline(pid: str, resume: bool = False):
             if _pipelines[pid]["status"] == "cancelled":
                 return
 
+            clip_plans = _pipelines[pid]["clip_plans"]
             # Review can be open for hours; a gallery cleanup or manual rename
             # during that pause must not silently turn a planned I2V shot into
             # unconditioned T2V.
@@ -6515,8 +7241,12 @@ def _run_pipeline(pid: str, resume: bool = False):
         _failure_details = _director_failure_details(
             e, code=_DIRECTOR_PIPELINE_FAILED_CODE,
         )
+        _failure_message = _DIRECTOR_PIPELINE_FAILED_MESSAGE
+        from services.llm_service import RuntimePreparationError
+        if isinstance(e, RuntimePreparationError):
+            _failure_message = _failure_details["detail"]
         _update_pipeline(pid, status="failed",
-                         error=_DIRECTOR_PIPELINE_FAILED_MESSAGE,
+                         error=_failure_message,
                          error_code=str(
                              _failure_details.get("code")
                              or _DIRECTOR_PIPELINE_FAILED_CODE
@@ -6525,12 +7255,13 @@ def _run_pipeline(pid: str, resume: bool = False):
                          oom_info=_oom_info,
                          _completed_at=time.time(),
                          progress={"current": 0, "total": 0,
-                                   "message": _DIRECTOR_PIPELINE_FAILED_MESSAGE,
+                                   "message": _failure_message,
                                    "step": 0, "total_steps": 0})
         _save_pipeline_state(pid)  # Save on failure too
     finally:
         with _pipeline_lock:
             _pipeline_llm_tokens.pop(pid, None)
+            _pipeline_planning_admissions.pop(pid, None)
             _pipeline_llm_cancel_handles.pop(pid, None)
             _pipeline_llm_contexts.pop(pid, None)
             current = _pipeline_threads.get(pid)
@@ -6545,7 +7276,9 @@ def _wait_for_resume(pid: str, poll_interval: float = 1.0):
             p = _pipelines.get(pid)
             if not p:
                 return
-            if p["status"] != "paused":
+            if p["status"] != "paused" and not (
+                p.get("status") == "running" and p.get("_review_continue_pending")
+            ):
                 return
         time.sleep(poll_interval)
 
@@ -6700,6 +7433,26 @@ def _ensure_llm_loaded(params: dict, cancel_checkpoint=None) -> dict:
 
 
 def _run_planning(pid: str, params: dict, pipeline_type: str):
+    _require_pipeline_planning_custody(pid)
+    from services import llm_service
+    selection = _director_llm_selection(params)
+    if not _director_llm_uses_local_runtime(selection):
+        return _run_planning_body(pid, params, pipeline_type)
+    with DirectorGpuParentGuard(pid, selection) as guard:
+        with llm_service.local_runtime_owner(guard.owner), _DirectorNativeGpuSlot(selection, guard.checkpoint):
+            failed = True
+            try:
+                result = _run_planning_body(pid, params, pipeline_type)
+                guard.checkpoint()
+                failed = False
+                return result
+            finally:
+                # Finish custody while the GPU lane is still held. A failed
+                # drain cannot release that lane to a replacement runtime.
+                guard.finish_runtime(failed)
+
+
+def _run_planning_body(pid: str, params: dict, pipeline_type: str):
     """Run LLM planning and return (clip_plans, planned_clips).
 
     Uses the new DirectorOrchestrator when use_director_v2 flag is set,
@@ -6840,6 +7593,7 @@ def _run_planning_v2(pid: str, params: dict, pipeline_type: str):
         "video_model": params.get("video_model", ""),
         "image_model": _director_image_role_model(params, "editor"),
         "visual_style": params.get("visual_style", ""),
+        "custom_visual_style_guidance": _director_custom_visual_style_guidance(params),
         "h3_style_workflow_present": _director_h3_style_workflow_present(params),
         "multishot_lora_mode": multishot_lora_mode,
     }
@@ -10333,8 +11087,14 @@ def _run_video_generation(pid: str, params: dict, clip_plans: list[dict],
     # ── Build gen_params based on mode ──────────────────────────────
     lora_params = {
         "activated_loras": video_loras.get("activated_loras", []),
-        "loras_multipliers": " ".join(
-            m.split(";")[0] for m in (video_loras.get("loras_multipliers", "") or "").split(" ") if m
+        "loras_multipliers": (
+            video_loras.get("loras_multipliers", "") or ""
+            if model_def.get("lock_guidance_phases") is True
+            and model_def.get("guidance_max_phases") == 2
+            else " ".join(
+                m.split(";")[0]
+                for m in (video_loras.get("loras_multipliers", "") or "").split(" ") if m
+            )
         ),
     }
 
@@ -10477,6 +11237,8 @@ def _run_video_generation(pid: str, params: dict, clip_plans: list[dict],
             gen_params.setdefault("custom_settings", {})["director_final_soundtrack"] = True
             gen_params["multi_clip_audio_start_sec"] = audio_start_sec
 
+    _bind_director_custom_style_video(gen_params, params)
+    _bind_director_video_lora_parent(gen_params, params)
     h3_longform = _prepare_director_h3_longform(
         gen_params,
         params=params,

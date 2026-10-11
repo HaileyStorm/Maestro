@@ -858,68 +858,20 @@ Lawful-use, separately licensed Ref2VA, and applicable BFL/Krea model-license no
 
 Maestro respects Pinokio's `PINOKIO_SHARE_LOCAL` environment variable. Set it to `false` (in the per-app or global ENVIRONMENT file) to bind the server to loopback only; set to `true` for LAN access. Pinokio's own daemon proxy is a separate concern that may also need to honor the variable depending on your setup.
 
-## API examples
+## Maestro Continuum API
 
-The React UI uses the same project-scoped API. In active migration state, sign in first; the signed `maestro_account_session` cookie identifies the account session while the server validates sealed project membership on every request. The legacy `maestro_session` project-grant cookie applies only before account migration is active.
+The [Continuum API guide](docs/api/README.md) is the entrypoint for setup,
+authentication, discovery, Python/TypeScript clients, curl workflows and MCP.
+It covers the [shipped feature map](docs/api/coverage.md) and generated
+[operation reference](docs/api/operations.md). The running app serves the guide
+at `/api/v1/api/documentation/guide`, discovery at `/api/v1/api/discovery`,
+and the current contract at `/openapi.json` (`/docs` is interactive).
 
-```bash
-# Resolve whichever surface is active. Default proxy mode remains on the stable
-# Worker; explicit redirect rollback resolves to the current Quick Tunnel.
-STABLE='https://YOUR-WORKER.YOUR-SUBDOMAIN.workers.dev'
-EFFECTIVE=$(curl -fsS -L -c cookies.txt -o /dev/null -w '%{url_effective}' \
-  "$STABLE/api/v1/access-context")
-BASE=${EFFECTIVE%/api/v1/access-context}
-
-# Discover access capabilities without exposing host paths or secrets
-curl -fsS -b cookies.txt "$BASE/api/v1/access-context"
-
-# After signing in through the account UI, list only an account-authorized
-# project's final outputs. The browser session cookie is revocable server state.
-curl -fsS -b cookies.txt "$BASE/api/v1/outputs?workspace=my-project&artifact_scope=final"
-
-# Permanently remove an unused upload from the same session that uploaded it.
-# Use the returned filename; 409 means the file is retained or use cannot be checked.
-curl -fsS -b cookies.txt -H "Origin: $BASE" -X DELETE \
-  "$BASE/api/v1/uploads/RETURNED-FILENAME.png"
-
-# Create and animate a bounded Blender scene; no Python/code field is accepted
-curl -fsS -b cookies.txt -H "Origin: $BASE" -H 'Content-Type: application/json' \
-  -d '{"workspace":"my-project","clear_scene":true,"objects":[{"name":"Block","primitive":"cube","location":[0,0,0]}]}' \
-  "$BASE/api/v1/blender/scene"
-curl -fsS -b cookies.txt -H "Origin: $BASE" -H 'Content-Type: application/json' \
-  -d '{"workspace":"my-project","frame_start":0,"frame_end":240,"objects":[{"name":"Block","keyframes":[{"frame":0,"location":[0,0,0]},{"frame":240,"location":[4,0,0]}]}]}' \
-  "$BASE/api/v1/blender/animate"
-```
-
-To flip a listed video, use its exact `name` and `revision` from the outputs
-response. The authenticated account needs generation permission in that project:
-
-```bash
-curl -fsS -b cookies.txt -H "Origin: $BASE" -H 'Content-Type: application/json' \
-  -d '{"workspace":"my-project","name":"clip.mp4","revision":"<revision from outputs>"}' \
-  "$BASE/api/v1/tools/hflip"
-```
-
-The response contains `job_id`; poll `GET /api/v1/status/{job_id}` for the new
-output filename. A stale selection returns 409 at submission; a later source
-change fails the job rather than flipping a different revision. No model or GPU is used. MP4/M4V, MOV, and WebM keep a compatible
-container; other video containers produce Matroska so audio can remain copied.
-
-To generate a native H3 bridge, select two videos in one project and submit
-their exact Gallery `name` and `revision` values. The example generates 124
-frames, of which 80 (about 3.3 seconds at 24 fps) are added between the cuts:
-
-```bash
-curl -fsS -b cookies.txt -H "Origin: $BASE" -H 'Content-Type: application/json' \
-  -d '{"workspace":"my-project","model_type":"minimax_h3_ref2va","clip_a":{"name":"first.mp4","revision":"<first revision>"},"clip_b":{"name":"next.mp4","revision":"<next revision>"},"prompt":"A continuous camera move connects the two shots","generated_frames":124}' \
-  "$BASE/api/v1/h3/bridge"
-```
-
-The response contains a `job_id` for the project Queue. Each source must have
-at least 56 frames after normalization to 24 fps. The result is a separate
-MP4; the source videos remain available.
-
-Python and JavaScript clients use the same JSON bodies with their normal cookie-aware HTTP client (`requests.Session` or `fetch(..., {credentials: 'include'})`). Blender preview sampling is `POST /api/v1/blender/render` with `frames` containing 2–32 integers; previews are stamped with project/privacy metadata and registered as project reference candidates by default.
+Continuum's HTTP API uses the same project authorization, model terms, queues
+and execution paths as the UI. It is separate from the WanGP in-process
+Python API. Installation, service health and a queued acknowledgement do not
+establish model readiness or GPU authority. A client timeout does not cancel
+work; reconcile the original request identity before another mutation.
 
 ## Credits
 

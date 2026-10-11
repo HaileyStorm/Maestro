@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "maestro-continuum"
+version = "1.0.0"
+description = "Maestro Continuum HTTP client and contract-driven MCP bridge"
+requires-python = ">=3.10"
+dependencies = ["httpx>=0.27,<1"]
+
+[project.optional-dependencies]
+mcp = ["mcp>=1.12.4,<2", "jsonschema>=4.23,<5"]
+
+[project.scripts]
+maestro-continuum-mcp = "maestro_continuum.mcp:main"
+maestro-continuum-login = "maestro_continuum.client:login_main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["maestro_continuum*"]
+
+[tool.setuptools.package-data]
+maestro_continuum = ["operations.json"]

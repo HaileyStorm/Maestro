@@ -355,7 +355,15 @@ from services.support_webhooks import (
 # "/share/", "/api/v1/output-shares/"
 install_quiet_access_filter()
 
-api = FastAPI(title="Maestro API", version="1.0.0")
+api = FastAPI(
+    title="Maestro API", version="1.0.0",
+    swagger_ui_parameters={
+        "filter": True,
+        "docExpansion": "none",
+        "displayOperationId": True,
+        "defaultModelsExpandDepth": -1,
+    },
+)
 
 from services import upload_usage
 api.add_middleware(upload_usage.UploadUsageMiddleware)
@@ -1786,6 +1794,7 @@ from services.job_lifecycle import (
     GENERATED_MEDIA_EXTENSIONS,
     clear_job_residency,
     checkpoint_recovery_job,
+    checkpoint_director_execution_manifest,
     collect_job_outputs,
     configure_durability_hook,
     durable_queue_state,
@@ -2140,6 +2149,7 @@ _RECOVERY_UNIT_FIXED_ARTIFACT_ROLES = {
     "h3_scene": "component",
     "h3_concat": "final",
     "h3_delivery": "final",
+    "director_concat": "final",
     "h3_source_audio_premux": "temporary",
 }
 _RECOVERY_ARTIFACT_ROLES = {"final", "component", "window", "temporary"}
@@ -4908,7 +4918,7 @@ _RECOVERABLE_INPUT_KEYS = frozenset({
     "audio_path", "reference_image_path", "character_ref_paths",
     "location_ref_paths", "image_paths", "_blend_clip_a", "_blend_clip_b",
     "hflip_source_path", "editor_source_path", "editor_audio_path", "editor_image_path", "browser_copy_source_path",
-    "_tool_input_paths",
+    "_tool_input_paths", "_director_custom_style_image_paths",
     "_h3_bridge_clip_a", "_h3_bridge_clip_b",
     "_h3_rerun_predecessor_path",
 })
@@ -5150,7 +5160,34 @@ def _queue_recovery_input_descriptors(job: dict, owner_digest: str) -> list[dict
     )
     job_id = str(job.get("id") or "")
     descriptors = []
+    retained_style = None
+    if ("_director_custom_style_image_paths" in params or "_director_custom_style_inputs" in params
+            or isinstance(params.get("_director_custom_style_video_snapshot"), dict)
+            and "retained_inputs" in params["_director_custom_style_video_snapshot"]):
+        retained_style = _director_retained_style_inputs(params)
+        if retained_style is not None:
+            from services.custom_visual_styles import digest
+            expected_scope = {"project_id": str(job.get("workspace") or params.get("workspace") or ""),
+                              "workspace_id": "main", "owner_digest": owner_digest,
+                              "project_instance": _queue_recovery_existing_project_identity(out_dir)}
+            if (job.get("kind") not in {"director_child", "director_pipeline"}
+                    or retained_style["scope_digest"] != digest(expected_scope)):
+                raise QueueRecoveryRuntimeError("Saved visual style image ownership changed.")
     for field, path in _queue_recovery_file_values(params):
+        if field.startswith("_director_custom_style_image_paths:"):
+            from services.director_style_input_snapshot import validate_style_image_snapshot
+            envelope = retained_style
+            index = int(field.rsplit(":", 1)[1])
+            descriptor = envelope["inputs"][index] if envelope and index < len(envelope["inputs"]) else None
+            if (job.get("kind") not in {"director_child", "director_pipeline"}
+                    or not isinstance(descriptor, dict) or descriptor.get("path") != path
+                    or not validate_style_image_snapshot(descriptor, project_directory=out_dir,
+                        retention_id=envelope["retention_id"], owner_digest=owner_digest,
+                        project_digest=_queue_recovery_existing_project_identity(out_dir),
+                        style_snapshot_digest=envelope["video_snapshot_digest"], field=field)):
+                raise QueueRecoveryRuntimeError("Saved visual style image identity changed.")
+            descriptors.append(copy.deepcopy(descriptor))
+            continue
         if field.startswith("_h3_rerun_predecessor_path:"):
             from services.director_h3_input_snapshot import INPUT_FIELD, validate_predecessor_snapshot
             admission = params.get("_h3_rerun_input")
@@ -5278,6 +5315,12 @@ def _queue_recovery_manifest_validator(
         if size != descriptor.get("size") or digest != descriptor.get("sha256"):
             return False
         scope = descriptor.get("scope")
+        if scope == "director_custom_style_image":
+            from services.director_style_input_snapshot import validate_style_image_snapshot
+            return validate_style_image_snapshot(descriptor, project_directory=project_dir,
+                retention_id=descriptor.get("retention_id"), owner_digest=owner_digest,
+                project_digest=_queue_recovery_existing_project_identity(project_dir),
+                style_snapshot_digest=descriptor.get("style_snapshot_digest"), field=descriptor.get("field"))
         if scope == "director_h3_predecessor":
             from services.director_h3_input_snapshot import validate_predecessor_snapshot
             return validate_predecessor_snapshot(descriptor,
@@ -5393,7 +5436,13 @@ def _queue_recovery_register_and_publish(
     # submissions. It runs before registry, manifest, thread, or network work.
     _require_job_model_recipe_terms(job)
     lora_params = job.get("params") or {}
-    if lora_params.get("lora_parameters") or "_studio_lora_parameter_snapshot" in lora_params:
+    director_video_parameters = recovery_kind == "director_child" and (
+        "_director_video_lora_parent_snapshot" in lora_params
+        or "_director_video_lora_child_snapshot" in lora_params
+        or lora_params.get("generation_mode") == "video" and bool(lora_params.get("lora_parameters")))
+    if director_video_parameters:
+        _validate_director_video_lora_child_job(job)
+    elif lora_params.get("lora_parameters") or "_studio_lora_parameter_snapshot" in lora_params:
         if recovery_kind == "studio_generation_preparation":
             raise HTTPException(status_code=400, detail="LoRA parameters cannot use prompt preparation yet")
         _seal_studio_image_lora_parameters(lora_params)
@@ -6253,6 +6302,1222 @@ def _director_snapshot_has_legacy_artifacts(snapshot) -> bool:
     return False
 
 
+
+def _director_video_lora_current_parent(params, *, pipeline_id, workspace, project_dir, session_id, unit):
+    from services.director_pipeline import pipeline_state_filename, _normalized_child_unit, _director_child_job_id
+
+    scope = _director_custom_visual_style_scope(workspace, project_dir, session_id,
+                                               pipeline_id=pipeline_id)
+    parent_id = _director_recovery_parent_job_id(pipeline_id)
+    snapshots, tombstoned = _queue_recovery_coordinator.read_only_snapshot()
+    parent = snapshots.get(parent_id)
+    if (parent_id in tombstoned or not isinstance(parent, dict)
+            or parent.get("id") != parent_id or parent.get("kind") != "director_pipeline"
+            or parent.get("workspace") != workspace
+            or parent.get("owner_principal") != scope["owner_digest"]
+            or parent.get("project_instance") != scope["project_instance"]):
+        raise ValueError("Director video LoRA parent authority changed")
+    cursor = parent.get("recovery_cursor")
+    if (not isinstance(cursor, dict) or cursor.get("pipeline_id") != pipeline_id
+            or cursor.get("delete_pending")):
+        raise ValueError("Director video LoRA parent cursor changed")
+    state, descriptor, pending = _load_director_recovery_cursor_state(
+        project_dir, pipeline_state_filename(pipeline_id), cursor)
+    parent_params = state.get("_params_snapshot") if isinstance(state, dict) else None
+    if (not isinstance(parent_params, dict) or state.get("pipeline_id") != pipeline_id
+            or parent_params.get("_director_video_lora_snapshot")
+                != params.get("_director_video_lora_parent_snapshot")):
+        raise ValueError("Director video LoRA child disagrees with retained parent")
+    if parent.get("cancel_requested") or parent.get("status") in {"cancelled", "canceled"}:
+        # Original-run cancellation must not cancel a new owner-authorized
+        # detached repair. Its exact submitted revision remains in the sealed
+        # parent cursor; request flags alone never confer that authority.
+        kind = unit.get("kind") if isinstance(unit, dict) else None
+        table = {"video_scene_rerun": "scene_repairs", "video_clip_rerun": "video_repairs"}.get(kind)
+        repairs = (state.get("recovery") or {}).get(table) if table else None
+        repair = repairs.get(str(unit["index"])) if isinstance(repairs, dict) else None
+        if (params.get("_director_detached_operation") is not True
+                or not isinstance(repair, dict) or repair.get("state") != "submitted"
+                or not isinstance(repair.get("unit"), dict)
+                or any(type(repair["unit"].get(key)) is not int or repair["unit"][key] < 0
+                       for key in ("index", "variant"))
+                or _normalized_child_unit(repair["unit"]) != unit
+                or type(repair.get("revision")) is not int or repair["revision"] <= 0
+                or unit.get("variant") != repair["revision"] or repair.get("attempt") != 0
+                or repair.get("job_id") != _director_child_job_id(pipeline_id, unit, 0)):
+            raise ValueError("Director video LoRA cancelled parent has no current repair authority")
+        if kind == "video_scene_rerun":
+            plan = params.get("_h3_longform")
+            request_digest = hashlib.sha256(json.dumps(plan, sort_keys=True,
+                separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
+            selection = plan.get("scene_rerun") if isinstance(plan, dict) else None
+            if (not isinstance(selection, dict) or selection.get("scene_index") != unit["index"]
+                    or selection.get("original_plan_sha256") != repair.get("original_plan_sha256")
+                    or request_digest != repair.get("request_sha256")):
+                raise ValueError("Director video LoRA scene repair request changed")
+        else:
+            retained = repair.get("params")
+            ignored = {"_maestro_session_id", "_maestro_access_policy", "_director_repair_operation_id",
+                       "_director_video_lora_child_snapshot", "_director_video_lora_task_plans", "_director_video_lora_task_inventory",
+                       "_director_video_lora_native_plans", "_director_video_lora_preparation_plans", "_director_video_lora_consumption_plans", "_director_recovery_unit",
+                       "_director_recovery_parent_id", "_director_recovery_job_id", "_director_recovery_attempt",
+                       H3_OFFLOAD_PLAN_PARAM_KEY, "_h3_lightx2v_identity"}
+            project = lambda value: {key: item for key, item in value.items() if key not in ignored}
+            if not isinstance(retained, dict) or project(retained) != project(params):
+                raise ValueError("Director video LoRA clip repair request changed")
+        from services import director_pipeline as director
+        control = director._pipeline_repairs.get(pipeline_id)
+        if isinstance(control, dict):
+            if (not control.get("operation_id")
+                    or control["operation_id"] != params.get("_director_repair_operation_id")):
+                raise ValueError("Director video LoRA current repair operation changed")
+            if control.get("cancel_event") is not None and control["cancel_event"].is_set():
+                raise ValueError("Director video LoRA current repair was cancelled")
+    binding = _validate_director_video_lora_parameters(parent_params, current_scope=scope)
+    return binding, scope
+
+
+def _director_video_lora_child_binding(params, *, pipeline_id, workspace, project_dir, session_id, unit):
+    from services.generation_presets import normalize_generation_lora_parameters
+    from services.director_pipeline import _normalized_child_unit
+
+    unit = _normalized_child_unit(unit)
+    parent, scope = _director_video_lora_current_parent(params, pipeline_id=pipeline_id,
+        workspace=workspace, project_dir=project_dir, session_id=session_id, unit=unit)
+    if (unit is None or params.get("_director_pipeline_id") != pipeline_id
+            or params.get("generation_mode") != "video"):
+        raise ValueError("Director video LoRA child identity is unavailable")
+    wire = normalize_generation_lora_parameters(params.get("lora_parameters", {}))
+    if (params.get("activated_loras") != parent["activated_loras"]
+            or params.get("loras_multipliers", "") != parent["loras_multipliers"]
+            or wire != parent["lora_parameters"]):
+        raise ValueError("Director video LoRA child controls changed")
+    # Resolve the consuming model through its real catalog. A mode switch may
+    # consume the same admitted files; a similarly named copy is insufficient.
+    consuming = {
+        "workspace": workspace, "pipeline_type": parent["pipeline_type"],
+        "seamless": parent["seamless"], "video_model": params.get("model_type"),
+        "video_loras": {"activated_loras": parent["activated_loras"],
+                       "loras_multipliers": parent["loras_multipliers"],
+                       "lora_parameters": wire},
+    }
+    contexts = {selection["id"]: selection["parameter_commitment_context"]
+                for selection in parent["selections"]}
+    actual = _director_video_lora_parameter_binding(consuming, current_scope=scope, contexts=contexts)
+    if actual["sources"] != parent["sources"]:
+        raise ValueError("Director child model consumes different LoRA sources")
+    semantic = ("id", "multiplier", "requested_scope", "resolved_scopes",
+                "parameter_schema_digest", "expected_source_sha256", "parameter_commitment_context",
+                "parameter_values", "parameter_values_digest", "parameter_expansion_digest",
+                "parameter_expansions", "skipped_reason")
+    project = lambda selections: [{key: selection.get(key) for key in semantic} for selection in selections]
+    if project(actual["selections"]) != project(parent["selections"]):
+        raise ValueError("Director child LoRA contract changed")
+    # Lifecycle credentials and separately authenticated server staging are
+    # not creative intent. Retain the entire H3 plan, authored media paths,
+    # prompt partitioning and sampling settings.
+    ignored = {"_maestro_session_id", "_maestro_access_policy", "_director_detached_operation",
+               "_director_repair_operation_id", "_director_video_lora_parent_snapshot",
+               "_director_video_lora_child_snapshot", "_director_video_lora_task_plans", "_director_video_lora_task_inventory",
+               "_director_video_lora_native_plans", "_director_video_lora_preparation_plans", "_director_video_lora_consumption_plans",
+               H3_OFFLOAD_PLAN_PARAM_KEY, "_h3_lightx2v_identity",
+               "_h3_rerun_input", "_h3_rerun_predecessor_path"}
+    requested = {key: value for key, value in params.items() if key not in ignored}
+    return json.loads(json.dumps({
+        "version": 1, "pipeline_id": pipeline_id, "unit": unit, "scope": scope,
+        "parent_digest": params["_director_video_lora_parent_snapshot"]["digest"],
+        "consumption": actual, "requested": requested,
+    }, allow_nan=False))
+
+
+def _restore_director_video_lora_task_id(job, task, child_snapshot, task_index):
+    """Restore identity before any task-owned observer is constructed."""
+    records = (job.get("params") or {}).get("_director_video_lora_task_plans", {})
+    if type(records) is not dict:
+        raise QueueRecoveryRuntimeError("Director retained task records are invalid.")
+    key = str(task_index)
+    if key not in records:
+        return
+    record = records[key]
+    if (type(record) is not dict or set(record) != {"binding", "digest"}
+            or type(record.get("binding")) is not dict or type(record.get("digest")) is not str
+            or not hmac.compare_digest(record["digest"], _project_reference_private_commitment(record["binding"]))
+            or record["binding"].get("child_digest") != child_snapshot["digest"]):
+        raise QueueRecoveryRuntimeError("Director retained task seal changed.")
+    original = record["binding"].get("task")
+    task_id = original.get("runtime_task_id") if isinstance(original, dict) else None
+    if (type(task_id) not in (int, str) or (type(task_id) is int and task_id < 0)
+            or (type(task_id) is str and not task_id)):
+        raise QueueRecoveryRuntimeError("Director retained task identity is invalid.")
+    task["id"] = task_id
+
+
+def _retain_director_video_lora_record(job, child_snapshot, task_index, field, build_record):
+    """Commit task-owned records through the existing manifest/journal path.
+
+    The callback reads the current admitted predecessor under the checkpoint
+    lock. An uncertain acknowledgement preserves its exact candidate and stops;
+    recovery must load a committed successor before this worker can continue.
+    """
+    if (type(task_index) is not int or task_index < 0
+            or field not in {"_director_video_lora_task_plans", "_director_video_lora_task_inventory",
+                             "_director_video_lora_native_plans",
+                             "_director_video_lora_preparation_plans", "_director_video_lora_consumption_plans"}):
+        raise QueueRecoveryRuntimeError("Director retained record coordinate is invalid.")
+    task_key = str(task_index)
+    with _queue_recovery_checkpoint_lock:
+        pointer = copy.deepcopy(job.get("_recovery_manifest_pointer"))
+        attempt = job.get("execution_attempt")
+        authoritative = _queue_recovery_coordinator.journal.recover().jobs.get(job["id"])
+        pending = job.get("_director_video_lora_task_retention_pending")
+        if pending is not None:
+            if type(pending) is not dict:
+                raise QueueRecoveryRuntimeError("Director retention fence is invalid.")
+            observed = authoritative.get("request_manifest") if isinstance(authoritative, dict) else None
+            pending_field = pending.get("field", "_director_video_lora_task_plans")
+            if pending.get("candidate") == observed and observed != pointer:
+                raise QueueRecoveryRuntimeError(
+                    "Director retention committed; reload its journal manifest before resuming."
+                )
+            if (pending.get("candidate") != observed or observed != pointer
+                    or (job.get("params") or {}).get(pending_field, {}).get(pending.get("task_key")) != pending.get("record")):
+                raise QueueRecoveryRuntimeError("Director retention candidate needs recovery; do not resubmit.")
+            job.pop("_director_video_lora_task_retention_pending", None)
+        if (not isinstance(authoritative, dict)
+                or authoritative.get("request_manifest") != pointer
+                or authoritative.get("execution_attempt") != attempt
+                or authoritative.get("status") != "running"):
+            raise QueueRecoveryRuntimeError("Director retention predecessor changed.")
+        manifest = load_request_manifest(job["out_dir"], pointer, expected_job_id=job["id"])
+        admitted = manifest["params"]
+        if (admitted != job.get("params")
+                or admitted.get("_director_video_lora_child_snapshot") != child_snapshot):
+            raise QueueRecoveryRuntimeError("Director retention requires the current admitted manifest.")
+        records = admitted.get(field, {})
+        if type(records) is not dict:
+            raise QueueRecoveryRuntimeError("Director retained records are invalid.")
+        retained = records.get(task_key)
+        if task_key in records and type(retained) is not dict:
+            raise QueueRecoveryRuntimeError("Director retained record is invalid.")
+        record = build_record(retained, admitted)
+        if type(record) is not dict:
+            raise QueueRecoveryRuntimeError("Director retained record is not retainable.")
+        if retained == record:
+            return copy.deepcopy(record)
+        successor = copy.deepcopy(admitted)
+        successor[field] = {**copy.deepcopy(records), task_key: record}
+        job["_director_video_lora_task_retention_pending"] = {
+            "predecessor": pointer, "field": field, "task_key": task_key, "record": record,
+        }
+        candidate = write_sealed_request_manifest(job["out_dir"], job_id=job["id"],
+            params=successor, inputs=manifest["inputs"])
+        job["_director_video_lora_task_retention_pending"]["candidate"] = candidate
+        if not checkpoint_director_execution_manifest(job,
+                expected_execution_attempt=attempt, expected_request_manifest=pointer,
+                request_manifest=candidate, params=successor):
+            raise QueueRecoveryRuntimeError("Director retention was not acknowledged.")
+        job.pop("_director_video_lora_task_retention_pending", None)
+        return copy.deepcopy(record)
+
+
+def _director_video_lora_task_topology(params, task_index):
+    info = params.get("multi_clip_info")
+    repeats = params.get("repeat_generation", 1)
+    if type(repeats) is not int or repeats < 1:
+        raise QueueRecoveryRuntimeError("Director queue repeat coverage is invalid.")
+    return {"task_index": task_index, "repeat_count": repeats,
+            "group": ({key: info.get(key) for key in (
+                "group_id", "index", "total", "automatic_h3_longform", "defer_concat")}
+                | {"has_source_prefix": info.get("source_prefix") is not None})
+            if isinstance(info, dict) else None}
+
+
+def _retain_director_video_lora_task_inventory(job, child_snapshot, queue):
+    """Acknowledge the full ordered queue before preparing its first task."""
+    tasks = [_director_video_lora_task_topology(task["params"], index)
+             for index, task in enumerate(queue)]
+    if not tasks:
+        raise QueueRecoveryRuntimeError("Director queue inventory is empty.")
+    binding = {"version": 1, "child_digest": child_snapshot["digest"], "tasks": tasks}
+    expected = {"binding": binding, "digest": _project_reference_private_commitment(binding)}
+
+    def build(retained, admitted):
+        if retained is not None and retained != expected:
+            raise QueueRecoveryRuntimeError("Director retained queue topology changed.")
+        return expected
+
+    return _retain_director_video_lora_record(job, child_snapshot, 0,
+        "_director_video_lora_task_inventory", build)
+
+
+def _retain_director_video_lora_task(job, task, validated_params, child_snapshot, task_index):
+    """Retain the actual validated task before choosing or reusing its seeds."""
+    from services.director_video_lora_execution import retained_task_recipe, validated_task_binding
+
+    excluded = {
+        "_director_video_lora_task_plans", "_director_video_lora_task_inventory", "_director_video_lora_native_plans",
+        "_director_video_lora_preparation_plans", "_director_video_lora_consumption_plans", "_director_video_lora_snapshot",
+        "_director_video_lora_parent_snapshot", "_director_video_lora_child_snapshot",
+        "_maestro_session_id", "_maestro_access_policy", "_director_detached_operation",
+        "_director_repair_operation_id", H3_OFFLOAD_PLAN_PARAM_KEY, "_h3_lightx2v_identity",
+        "_h3_rerun_input", "_h3_rerun_predecessor_path",
+    }
+
+    def build(retained, admitted):
+        binding = validated_task_binding(task, validated_params,
+            attachment_keys=wgp.ATTACHMENT_KEYS, excluded_fields=excluded)
+        return retained_task_recipe(binding, child_digest=child_snapshot["digest"],
+            retained=retained, commitment=_project_reference_private_commitment)
+
+    return _retain_director_video_lora_record(job, child_snapshot, task_index,
+        "_director_video_lora_task_plans", build)
+
+
+def _require_director_video_lora_task_recipe(admitted, child_snapshot, task_index, task_recipe):
+    if (type(task_recipe) is not dict or set(task_recipe) != {"binding", "digest"}
+            or type(task_recipe.get("binding")) is not dict or type(task_recipe.get("digest")) is not str
+            or not hmac.compare_digest(task_recipe["digest"],
+                _project_reference_private_commitment(task_recipe["binding"]))
+            or task_recipe["binding"].get("child_digest") != child_snapshot["digest"]
+            or admitted.get("_director_video_lora_task_plans", {}).get(str(task_index)) != task_recipe):
+        raise QueueRecoveryRuntimeError("Director current task recipe changed.")
+
+
+def _retain_director_video_lora_native_plan(job, child_snapshot, task_index, task_recipe, plan):
+    """Retain an independently derived native contract for this exact task."""
+    from services.director_video_lora_execution import canonical
+
+    plan = json.loads(canonical(plan))
+
+    def build(retained, admitted):
+        _require_director_video_lora_task_recipe(admitted, child_snapshot, task_index, task_recipe)
+        if (plan.get("version") != 2 or plan.get("child_digest") != child_snapshot["digest"]
+                or plan.get("task_digest") != task_recipe["digest"]
+                or plan.get("repeat_seeds") != task_recipe["binding"]["repeat_seeds"]):
+            raise QueueRecoveryRuntimeError("Director native plan does not belong to its retained task.")
+        expected = {"binding": plan, "digest": _project_reference_private_commitment(plan)}
+        if retained is not None and retained != expected:
+            raise QueueRecoveryRuntimeError("Director retained native contract changed.")
+        return expected
+
+    return _retain_director_video_lora_record(job, child_snapshot, task_index,
+        "_director_video_lora_native_plans", build)
+
+
+def _retain_director_video_lora_preparation(job, child_snapshot, task_index, task_recipe, expected):
+    """Acknowledge a real prepared window only after its manifest is durable."""
+    from services.director_video_lora_execution import canonical, digest
+
+    expected = json.loads(canonical(expected))
+    binding = expected.get("binding")
+    if (set(expected) != {"binding", "digest"} or type(binding) is not dict
+            or set(binding) != {"version", "child_digest", "task_digest", "preparation"}
+            or type(binding["version"]) is not int or binding["version"] != 1
+            or binding["child_digest"] != child_snapshot["digest"]
+            or binding["task_digest"] != task_recipe["digest"]
+            or expected["digest"] != digest(binding)):
+        raise QueueRecoveryRuntimeError("Director preparation acknowledgement is invalid.")
+    preparation = binding["preparation"]
+    if type(preparation) is not dict or set(preparation) not in ({"window"}, {"finish"}):
+        raise QueueRecoveryRuntimeError("Director preparation record is invalid.")
+    kind = next(iter(preparation))
+    data = preparation[kind]
+    repeat = data.get("repeat_index") if type(data) is dict else None
+    if type(repeat) is not int or not 0 <= repeat < len(task_recipe["binding"]["repeat_seeds"]):
+        raise QueueRecoveryRuntimeError("Director preparation repeat changed.")
+    if kind == "window":
+        index = data.get("window_index")
+        if type(index) is not int or index < 1:
+            raise QueueRecoveryRuntimeError("Director preparation window changed.")
+        entry_key = f"{repeat}:window:{index}"
+    else:
+        entry_key = f"{repeat}:finish"
+
+    def build(retained, admitted):
+        _require_director_video_lora_task_recipe(admitted, child_snapshot, task_index, task_recipe)
+        native_record = admitted.get("_director_video_lora_native_plans", {}).get(str(task_index))
+        if (type(native_record) is not dict or set(native_record) != {"binding", "digest"}
+                or type(native_record.get("binding")) is not dict or type(native_record.get("digest")) is not str
+                or not hmac.compare_digest(native_record["digest"],
+                    _project_reference_private_commitment(native_record["binding"]))
+                or native_record["binding"].get("child_digest") != child_snapshot["digest"]
+                or native_record["binding"].get("task_digest") != task_recipe["digest"]):
+            raise QueueRecoveryRuntimeError("Director preparation requires its current retained native contract.")
+        value = {"version": 1, "child_digest": child_snapshot["digest"],
+                 "task_digest": task_recipe["digest"], "entries": {}}
+        if retained is not None:
+            if (set(retained) != {"binding", "digest"} or type(retained.get("binding")) is not dict
+                    or type(retained.get("digest")) is not str
+                    or not hmac.compare_digest(retained["digest"],
+                        _project_reference_private_commitment(retained["binding"]))):
+                raise QueueRecoveryRuntimeError("Director retained preparation seal changed.")
+            value = copy.deepcopy(retained["binding"])
+            if (set(value) != {"version", "child_digest", "task_digest", "entries"}
+                    or type(value["version"]) is not int or value["version"] != 1
+                    or value["child_digest"] != child_snapshot["digest"]
+                    or value["task_digest"] != task_recipe["digest"] or type(value["entries"]) is not dict):
+                raise QueueRecoveryRuntimeError("Director retained preparation identity changed.")
+        entries = value["entries"]
+        if entry_key in entries:
+            if entries[entry_key] != expected:
+                raise QueueRecoveryRuntimeError("Director retained preparation cannot be replaced.")
+            return retained
+        windows = sorted((row["binding"]["preparation"]["window"] for key, row in entries.items()
+                          if key.startswith(f"{repeat}:window:")), key=lambda row: row["window_index"])
+        if kind == "window":
+            if (f"{repeat}:finish" in entries or index != len(windows) + 1
+                    or data.get("seed") != task_recipe["binding"]["repeat_seeds"][repeat]):
+                raise QueueRecoveryRuntimeError("Director prepared window sequence changed.")
+        elif (not windows or data.get("windows_digest") != digest(windows)
+                or data.get("reason") not in {"window_limit", "latent_tail", "control_short_tail", "control_exhausted"}):
+            raise QueueRecoveryRuntimeError("Director preparation finish does not cover its retained windows.")
+        entries[entry_key] = expected
+        return {"binding": value, "digest": _project_reference_private_commitment(value)}
+
+    _retain_director_video_lora_record(job, child_snapshot, task_index,
+        "_director_video_lora_preparation_plans", build)
+    return copy.deepcopy(expected)
+
+
+def _retain_director_video_lora_consumption(
+        job, child_snapshot, task_index, task_recipe, receipt, media_paths,
+        *, terminal_paths, output_roles):
+    """Seal actual native consumption and media through the admitted manifest.
+
+    This private record is producer evidence, not output publication. Deferred
+    and component outputs remain private until their existing delivery path.
+    """
+    from services.director_video_lora_execution import (
+        canonical, digest, _media_binding, require_adapter_fingerprints,
+    )
+
+    receipt = json.loads(canonical(receipt))
+    proof = receipt.get("binding")
+    repeat = proof.get("repeat_index") if type(proof) is dict else None
+    if (set(receipt) != {"binding", "digest"} or type(proof) is not dict
+            or receipt["digest"] != digest(proof) or type(repeat) is not int
+            or not 0 <= repeat < len(task_recipe["binding"]["repeat_seeds"])
+            or type(media_paths) is not list or not media_paths):
+        raise QueueRecoveryRuntimeError("Director completed native repeat is invalid.")
+    media = []
+    fingerprints = []
+    names = set()
+    output_root = os.path.realpath(job["out_dir"])
+    for path in media_paths:
+        pinned = _media_binding(path, include_fingerprint=True)
+        fingerprints.append({"path": pinned["path"], "resolved_path": pinned["resolved_path"],
+                             "identity": pinned["fingerprint"]})
+        name = os.path.basename(path)
+        if (not name or name in names or pinned.get("kind") != "file"
+                or os.path.splitext(name)[1].lower() not in GENERATED_MEDIA_EXTENSIONS
+                or os.path.commonpath([output_root, pinned["resolved_path"]]) != output_root
+                or pinned["bytes"] <= 0):
+            raise QueueRecoveryRuntimeError("Director completed native media is invalid.")
+        names.add(name)
+        media.append({"basename": name, "bytes": pinned["bytes"], "sha256": pinned["sha256"]})
+    media.sort(key=lambda row: row["basename"])
+    if type(terminal_paths) is not list or any(type(path) is not str for path in terminal_paths):
+        raise QueueRecoveryRuntimeError("Director native terminal media is invalid.")
+    terminals = [os.path.basename(path) for path in terminal_paths]
+    if (not terminals
+            or len(set(terminals)) != len(terminals) or not set(terminals) <= names
+            or type(output_roles) is not dict or set(output_roles) != names
+            or any(role not in _RECOVERY_ARTIFACT_ROLES for role in output_roles.values())):
+        raise QueueRecoveryRuntimeError("Director native terminal media is invalid.")
+
+    def build(retained, admitted):
+        require_adapter_fingerprints(fingerprints)
+        _require_director_video_lora_task_recipe(admitted, child_snapshot, task_index, task_recipe)
+        if not hmac.compare_digest(child_snapshot["digest"],
+                _project_reference_private_commitment(child_snapshot["binding"])):
+            raise QueueRecoveryRuntimeError("Director completed child seal changed.")
+        native = admitted.get("_director_video_lora_native_plans", {}).get(str(task_index))
+        preparation = admitted.get("_director_video_lora_preparation_plans", {}).get(str(task_index))
+        for record in (native, preparation):
+            if (type(record) is not dict or set(record) != {"binding", "digest"}
+                    or type(record["binding"]) is not dict or type(record["digest"]) is not str
+                    or not hmac.compare_digest(record["digest"],
+                        _project_reference_private_commitment(record["binding"]))
+                    or record["binding"].get("child_digest") != child_snapshot["digest"]
+                    or record["binding"].get("task_digest") != task_recipe["digest"]):
+                raise QueueRecoveryRuntimeError("Director completed native preparation changed.")
+        plan = native["binding"]
+        expected = {"version": 2, "child_digest": child_snapshot["digest"],
+                    "task_digest": task_recipe["digest"], "repeat_index": repeat,
+                    "user_adapter_offset": plan["user_adapter_offset"]}
+        for key in ("sources", "expansions", "native", "repeat_seeds", "adapter_ids", "adapter_sources"):
+            expected[key + "_digest"] = digest(plan[key])
+        if any(proof.get(key) != value for key, value in expected.items()):
+            raise QueueRecoveryRuntimeError("Director consumption does not match its native task.")
+        entries = preparation["binding"]["entries"]
+        windows = sorted((row["binding"]["preparation"]["window"] for key, row in entries.items()
+                          if key.startswith(f"{repeat}:window:")), key=lambda row: row["window_index"])
+        finish = entries.get(f"{repeat}:finish", {}).get("binding", {}).get("preparation", {}).get("finish")
+        if (not windows or proof.get("prepared_windows") != windows
+                or proof.get("preparation_finish") != finish or type(finish) is not dict
+                or finish.get("windows_digest") != digest(windows)):
+            raise QueueRecoveryRuntimeError("Director consumption does not cover its prepared windows.")
+        consumed = []
+        for window in windows:
+            prompt = window["prompt"]
+            expanded = prompt + " " + " ".join(plan["expansions"]) if plan["expansions"] else prompt
+            consumed.append({"window": {key: window[key] for key in
+                ("repeat_index", "window_index", "seed", "frames", "height", "width", "fps")},
+                "native_digest": digest(plan["native"]), "authored_prompt_digest": digest(prompt),
+                "consumed_prompt_digest": digest(expanded)})
+        if set(proof) != set(expected) | {"windows", "prepared_windows", "preparation_finish"} or proof["windows"] != consumed:
+            raise QueueRecoveryRuntimeError("Director consumption window identity changed.")
+        value = {"version": 1, "child_digest": child_snapshot["digest"],
+                 "task_digest": task_recipe["digest"], "entries": {}}
+        if retained is not None:
+            if (set(retained) != {"binding", "digest"} or type(retained["binding"]) is not dict
+                    or type(retained["digest"]) is not str
+                    or not hmac.compare_digest(retained["digest"],
+                        _project_reference_private_commitment(retained["binding"]))):
+                raise QueueRecoveryRuntimeError("Director retained consumption seal changed.")
+            value = copy.deepcopy(retained["binding"])
+            if (set(value) != {"version", "child_digest", "task_digest", "entries"}
+                    or type(value["version"]) is not int or value["version"] != 1
+                    or value["child_digest"] != child_snapshot["digest"]
+                    or value["task_digest"] != task_recipe["digest"] or type(value["entries"]) is not dict):
+                raise QueueRecoveryRuntimeError("Director retained consumption identity changed.")
+        entry = {"receipt": receipt, "media": media, "native_digest": native["digest"],
+                 "preparation_digest": preparation["digest"],
+                 "terminal_media": sorted(terminals), "output_roles": dict(output_roles)}
+        sealed = {"binding": entry, "digest": _project_reference_private_commitment(entry)}
+        key = str(repeat)
+        if key in value["entries"]:
+            if value["entries"][key] != sealed:
+                raise QueueRecoveryRuntimeError("Director completed repeat cannot be replaced.")
+            return retained
+        if set(value["entries"]) != {str(index) for index in range(repeat)}:
+            raise QueueRecoveryRuntimeError("Director completed repeat prefix is incomplete.")
+        value["entries"][key] = sealed
+        return {"binding": value, "digest": _project_reference_private_commitment(value)}
+
+    return _retain_director_video_lora_record(job, child_snapshot, task_index,
+        "_director_video_lora_consumption_plans", build)
+
+
+def _director_h3_inventory_groups(job):
+    """Resolve variant-major H3 coordinates from the signed physical inventory."""
+    admitted = job.get("params") or {}
+    child = admitted.get("_director_video_lora_child_snapshot")
+    inventory = admitted.get("_director_video_lora_task_inventory")
+    if (type(child) is not dict or set(child) != {"binding", "digest"}
+            or type(child["digest"]) is not str
+            or not hmac.compare_digest(child["digest"], _project_reference_private_commitment(child["binding"]))
+            or type(inventory) is not dict or set(inventory) != {"0"}):
+        raise QueueRecoveryRuntimeError("Director H3 inventory is not authenticated.")
+    record = inventory["0"]
+    if (type(record) is not dict or set(record) != {"binding", "digest"}
+            or type(record["digest"]) is not str
+            or not hmac.compare_digest(record["digest"], _project_reference_private_commitment(record["binding"]))):
+        raise QueueRecoveryRuntimeError("Director H3 inventory seal changed.")
+    binding = record["binding"]
+    if (type(binding) is not dict or set(binding) != {"version", "child_digest", "tasks"}
+            or binding["version"] != 1 or binding["child_digest"] != child["digest"]
+            or type(binding["tasks"]) is not list or not 0 < len(binding["tasks"]) <= 4096):
+        raise QueueRecoveryRuntimeError("Director H3 inventory membership changed.")
+    groups = {}
+    for task_index, topology in enumerate(binding["tasks"]):
+        if type(topology) is not dict or topology.get("task_index") != task_index:
+            raise QueueRecoveryRuntimeError("Director H3 task ordering changed.")
+        info = topology.get("group")
+        if not isinstance(info, dict) or info.get("automatic_h3_longform") is not True:
+            continue
+        group_id, index, total = info.get("group_id"), info.get("index"), info.get("total")
+        if (type(group_id) is not str or not group_id or type(index) is not int
+                or type(total) is not int or not 0 <= index < total <= 4096
+                or topology.get("repeat_count") != 1):
+            raise QueueRecoveryRuntimeError("Director H3 physical coordinates changed.")
+        groups.setdefault(group_id, []).append((task_index, index, total))
+    repair = (admitted.get("_h3_longform") or {}).get("scene_rerun")
+    repair_indices = (_director_h3_scene_repair_selection(job)["physical_indices"]
+                      if repair is not None else None)
+    resolved = []
+    for group_id, members in groups.items():
+        total = members[0][2]
+        indices = [row[1] for row in members]
+        if (any(row[2] != total for row in members)
+                or indices != (repair_indices if repair_indices is not None else list(range(total)))
+                or [row[0] for row in members] != list(range(members[0][0], members[0][0] + len(members)))):
+            raise QueueRecoveryRuntimeError("Director H3 group coverage changed.")
+        resolved.append({"group_id": group_id, "total": total, "members": members})
+    if not resolved or (repair_indices is not None and len(resolved) != 1):
+        raise QueueRecoveryRuntimeError("Director H3 output inventory is unresolved.")
+    return resolved
+
+
+def _director_h3_task_coordinate(job, task_index, recipe):
+    admitted = job.get("params") or {}
+    child = admitted["_director_video_lora_child_snapshot"]
+    _require_director_video_lora_task_recipe(admitted, child, task_index, recipe)
+    params = recipe["binding"]["task"]["params"]
+    topology = _director_video_lora_task_topology(params, task_index)
+    if topology != admitted["_director_video_lora_task_inventory"]["0"]["binding"]["tasks"][task_index]:
+        raise QueueRecoveryRuntimeError("Director H3 retained topology changed.")
+    info = params["multi_clip_info"]
+    groups = _director_h3_inventory_groups(job)
+    for variant, group in enumerate(groups):
+        if any(row[0] == task_index for row in group["members"]):
+            if (info.get("group_id") != group["group_id"]
+                    or type(info.get("output_index")) is not int or info["output_index"] != variant
+                    or type(info.get("output_total")) is not int or info["output_total"] != len(groups)
+                    or len(recipe["binding"]["repeat_seeds"]) != 1):
+                raise QueueRecoveryRuntimeError("Director H3 output variant changed.")
+            return variant, info["index"]
+    raise QueueRecoveryRuntimeError("Director H3 task is outside its physical inventory.")
+
+
+def _director_h3_output_binding(job, unit_id, media, peak, *, probe=None):
+    child = job["params"]["_director_video_lora_child_snapshot"]
+    if (type(child) is not dict or set(child) != {"binding", "digest"}
+            or not hmac.compare_digest(child["digest"], _project_reference_private_commitment(child["binding"]))
+            or type(unit_id) is not str or re.fullmatch(r"unit:v1:[0-9a-f]{64}", unit_id) is None
+            or type(media) is not list or len(media) != 1
+            or type(peak) is not dict or peak.get("verified") is not True
+            or any(peak.get(key) != value for key, value in _h3_true_peak_policy_identity().items())):
+        raise QueueRecoveryRuntimeError("Director H3 assembled output evidence is unresolved.")
+    row = media[0]
+    if (type(row) is not dict or set(row) != {"basename", "bytes", "sha256"}
+            or type(row["basename"]) is not str or not row["basename"]
+            or row["basename"] != os.path.basename(row["basename"])
+            or os.path.splitext(row["basename"])[1].lower() not in {".mp4", ".webm", ".mkv", ".mov"}
+            or type(row["bytes"]) is not int or row["bytes"] <= 0
+            or type(row["sha256"]) is not str or re.fullmatch(r"[0-9a-f]{64}", row["sha256"]) is None):
+        raise QueueRecoveryRuntimeError("Director H3 assembled output membership changed.")
+    binding = {"version": 1, "child_digest": child["digest"], "unit_id": unit_id,
+               "media": media, "h3_audio_true_peak": peak}
+    if probe is not None:
+        if (type(probe) is not dict or probe.get("validation") != "valid"
+                or probe.get("fps") != 24 or type(probe.get("frame_count")) is not int
+                or probe["frame_count"] <= 0
+                or probe.get("artifact_sha256") != "sha256:" + row["sha256"]
+                or probe.get("artifact_size_bytes") != row["bytes"]):
+            raise QueueRecoveryRuntimeError("Director H3 scene probe differs from its output.")
+        binding["media_probe"] = probe
+    return binding
+
+
+def _director_h3_output_attestation(job, unit_id, names, project_dir, peak, *,
+                                    media_paths=None, kind="h3_concat", probe=None):
+    """Seal actual assembled bytes at the existing sidecar/checkpoint boundary."""
+    attestation = {"h3_audio_true_peak": dict(peak)}
+    if probe is not None:
+        attestation["media"] = dict(probe)
+    if ((job.get("params") or {}).get("_director_video_lora_child_snapshot") is None
+            or (job.get("params") or {}).get("_h3_cumulative_append") is True):
+        return attestation
+    if (kind not in {"h3_concat", "h3_scene"} or (kind == "h3_scene" and probe is None)
+            or type(names) is not list or len(names) != 1):
+        raise QueueRecoveryRuntimeError("Director H3 assembled output scope is ambiguous.")
+    name = names[0]
+    if type(name) is not str or not name or name != os.path.basename(name):
+        raise QueueRecoveryRuntimeError("Director H3 assembled output name is invalid.")
+    path = (media_paths or {}).get(name, os.path.join(project_dir, name))
+    size, digest = _recovery_sha256_file(path)
+    binding = _director_h3_output_binding(job, unit_id,
+        [{"basename": name, "bytes": size, "sha256": digest}], attestation["h3_audio_true_peak"],
+        probe=probe)
+    attestation["director_" + kind + "_output"] = {
+        "binding": binding, "digest": _project_reference_private_commitment(binding)}
+    return attestation
+
+
+def _director_h3_concat_matches(job, unit, *, verified_units=None, consumed_continuations=frozenset()):
+    """Keep the native H3 concat, requiring its exact signed task ancestry."""
+    try:
+        groups = _director_h3_inventory_groups(job)
+        variant = unit["variant"]
+        if (unit["kind"] != "h3_concat" or type(variant) is not int
+                or not 0 <= variant < len(groups) or unit["index"] != 0
+                or (job["params"].get("_h3_longform") or {}).get("scene_rerun") is not None):
+            return False
+        recipes = job["params"]["_director_video_lora_task_plans"]
+        parents, last_info = [], None
+        for task_index, segment_index, _ in groups[variant]["members"]:
+            recipe = recipes[str(task_index)]
+            if _director_h3_task_coordinate(job, task_index, recipe) != (variant, segment_index):
+                return False
+            parent = _director_checked_recovery_unit(job, kind="h3_segment", variant=variant,
+                index=segment_index, project_dir=job["out_dir"], verified_units=verified_units,
+                consumed_continuations=consumed_continuations)
+            if (parent is None or len(parent["artifacts"]) != 1
+                    or parent["settings"]["director_lora_consumption"]["binding"]["task_index"] != task_index):
+                return False
+            parents.append(parent)
+            last_info = recipe["binding"]["task"]["params"]["multi_clip_info"]
+        if unit["dependencies"] != [parent["unit_id"] for parent in parents]:
+            return False
+        expected = {
+            "audio_start_ms": int(1000 * float(last_info.get("audio_start_sec", 0) or 0)),
+            "component_hashes": [parent["artifacts"][0]["sha256"] for parent in parents],
+            "clip_start_frames": [parent["settings"]["discard_prefix_frames"] for parent in parents],
+            "clip_tail_frames": [parent["settings"]["trim_tail_frames"] for parent in parents],
+            "preserve_generated_audio": bool(last_info.get("preserve_generated_audio")),
+            "h3_audio_true_peak_policy": _h3_true_peak_policy_identity(),
+        }
+        source_prefix = parents[0]["settings"].get("source_prefix")
+        if source_prefix is not None:
+            expected["source_prefix"] = source_prefix
+        peak = (unit.get("attestation") or {}).get("h3_audio_true_peak")
+        output = unit["attestation"]["director_h3_concat_output"]
+        media = [{"basename": row["basename"], "bytes": row["size"], "sha256": row["sha256"]}
+                 for row in unit["artifacts"]]
+        if (type(output) is not dict or set(output) != {"binding", "digest"}
+                or output["binding"] != _director_h3_output_binding(job, unit["unit_id"], media, peak)
+                or type(output["digest"]) is not str
+                or not hmac.compare_digest(output["digest"], _project_reference_private_commitment(output["binding"]))
+                or unit["unit_id"] != recovery_unit_id(job["id"], "h3_concat", variant=variant,
+                    dependencies=unit["dependencies"], settings=unit["settings"])):
+            return False
+        return (unit["settings"] == expected and len(unit["artifacts"]) == 1
+                and isinstance(peak, dict) and peak.get("verified") is True
+                and all(peak.get(key) == value for key, value in expected["h3_audio_true_peak_policy"].items())
+                and {row["unit_id"] for row in _h3_dependency_closed_recovery_units(parents + [unit])}
+                    == {row["unit_id"] for row in parents + [unit]})
+    except (QueueRecoveryRuntimeError, OSError, KeyError, TypeError, ValueError, IndexError, OverflowError):
+        return False
+
+
+def _director_h3_scene_matches(job, unit, *, verified_units=None, consumed_continuations=frozenset()):
+    """Authenticate assembled scene bytes and their exact signed physical parents."""
+    from services.director_h3_scene_assembly import director_h3_scene_specs, scene_receipt_matches
+    try:
+        groups = _director_h3_inventory_groups(job)
+        variant, index = unit["variant"], unit["index"]
+        if (unit["kind"] != "h3_scene" or type(variant) is not int
+                or not 0 <= variant < len(groups) or type(index) is not int or index < 0):
+            return False
+        physical = unit["settings"]["physical_indices"]
+        if (type(physical) is not list or not physical
+                or any(type(value) is not int for value in physical)
+                or physical != list(range(physical[0], physical[0] + len(physical)))):
+            return False
+        members = [row for row in groups[variant]["members"] if row[1] in physical]
+        if [row[1] for row in members] != physical:
+            return False
+        parents = []
+        for task_index, segment_index, _ in members:
+            recipe = job["params"]["_director_video_lora_task_plans"][str(task_index)]
+            if _director_h3_task_coordinate(job, task_index, recipe) != (variant, segment_index):
+                return False
+            parent = _director_checked_recovery_unit(job, kind="h3_segment", variant=variant,
+                index=segment_index, project_dir=job["out_dir"], verified_units=verified_units,
+                consumed_continuations=consumed_continuations)
+            if (parent is None or len(parent["artifacts"]) != 1
+                    or parent["settings"]["director_lora_consumption"]["binding"]["task_index"] != task_index):
+                return False
+            parents.append(parent)
+        expected = next(spec for spec in director_h3_scene_specs(job["params"]["_h3_longform"],
+            {parent["index"]: parent for parent in parents},
+            audio_start_sec=job["params"].get("multi_clip_audio_start_sec", 0.0)) if spec["index"] == index)
+        settings = dict(unit["settings"])
+        settings.pop("source_audio_sha256", None)
+        settings.pop("h3_audio_true_peak_policy", None)
+        output = unit["attestation"]["director_h3_scene_output"]
+        media = [{"basename": row["basename"], "bytes": row["size"], "sha256": row["sha256"]}
+                 for row in unit["artifacts"]]
+        binding = _director_h3_output_binding(job, unit["unit_id"], media,
+            unit["attestation"]["h3_audio_true_peak"], probe=unit["attestation"]["media"])
+        return (settings == expected["settings"] and unit["dependencies"] == expected["dependencies"]
+                and scene_receipt_matches(unit)
+                and type(output) is dict and set(output) == {"binding", "digest"}
+                and output["binding"] == binding and type(output["digest"]) is str
+                and hmac.compare_digest(output["digest"], _project_reference_private_commitment(binding))
+                and unit["unit_id"] == recovery_unit_id(job["id"], "h3_scene", variant=variant,
+                    index=index, dependencies=unit["dependencies"], settings=unit["settings"]))
+    except (QueueRecoveryRuntimeError, OSError, KeyError, TypeError, ValueError, IndexError, OverflowError, StopIteration):
+        return False
+
+
+def _director_h3_scene_finishing_role(job, unit):
+    """A sealed selected rerun is Final; ordinary scene cards are components."""
+    selection = _director_h3_scene_repair_selection(job)
+    if selection is None:
+        return "component"
+    if (unit["variant"] != 0 or unit["index"] != selection["scene_index"]
+            or unit["settings"]["physical_indices"] != selection["physical_indices"]):
+        raise QueueRecoveryRuntimeError("Director scene rerun finishing scope changed.")
+    return "final"
+
+
+def _director_native_producer_settings(job, *, task_index, repeat_index,
+        kind, variant, index, artifact_names, settings):
+    """Bind a producer coordinate to its authenticated native consumption."""
+    admitted = job.get("params") or {}
+    child = admitted.get("_director_video_lora_child_snapshot")
+    task = admitted.get("_director_video_lora_task_plans", {}).get(str(task_index))
+    if (type(task_index) is not int or task_index < 0
+            or type(repeat_index) is not int or repeat_index < 0
+            or type(child) is not dict or set(child) != {"binding", "digest"}
+            or type(child["digest"]) is not str
+            or not hmac.compare_digest(child["digest"],
+                _project_reference_private_commitment(child["binding"]))):
+        raise QueueRecoveryRuntimeError("Director producer identity is invalid.")
+    _require_director_video_lora_task_recipe(admitted, child, task_index, task)
+    if kind == "h3_segment" and admitted.get("_h3_cumulative_append") is not True:
+        if (repeat_index != 0 or _director_h3_task_coordinate(job, task_index, task) != (variant, index)):
+            raise QueueRecoveryRuntimeError("Director H3 producer belongs to another physical task.")
+    consumption = admitted.get("_director_video_lora_consumption_plans", {}).get(str(task_index))
+    native = admitted.get("_director_video_lora_native_plans", {}).get(str(task_index))
+    preparation = admitted.get("_director_video_lora_preparation_plans", {}).get(str(task_index))
+    for record in (consumption, native, preparation):
+        if (type(record) is not dict or set(record) != {"binding", "digest"}
+                or type(record["binding"]) is not dict or type(record["digest"]) is not str
+                or not hmac.compare_digest(record["digest"],
+                    _project_reference_private_commitment(record["binding"]))
+                or record["binding"].get("child_digest") != child["digest"]
+                or record["binding"].get("task_digest") != task["digest"]):
+            raise QueueRecoveryRuntimeError("Director producer native records changed.")
+    entry = consumption["binding"]["entries"].get(str(repeat_index))
+    if (type(entry) is not dict or set(entry) != {"binding", "digest"}
+            or type(entry["binding"]) is not dict or type(entry["digest"]) is not str
+            or not hmac.compare_digest(entry["digest"],
+                _project_reference_private_commitment(entry["binding"]))
+            or entry["binding"].get("native_digest") != native["digest"]):
+        raise QueueRecoveryRuntimeError("Director producer repeat seal changed.")
+    receipt = entry["binding"]["receipt"]["binding"]
+    entries = preparation["binding"]["entries"]
+    # Later repeats may append preparation; this repeat's coverage is immutable.
+    if (receipt.get("repeat_index") != repeat_index
+            or receipt.get("child_digest") != child["digest"]
+            or receipt.get("task_digest") != task["digest"]
+            or entries.get(f"{repeat_index}:finish", {}).get("binding", {}).get("preparation", {}).get("finish")
+               != receipt.get("preparation_finish")
+            or any(entries.get(f"{repeat_index}:window:{window['window_index']}", {}).get("binding", {}).get("preparation", {}).get("window") != window
+                   for window in receipt["prepared_windows"])):
+        raise QueueRecoveryRuntimeError("Director producer prepared coverage changed.")
+    if (type(artifact_names) is not list or not artifact_names
+            or len(set(artifact_names)) != len(artifact_names)):
+        raise QueueRecoveryRuntimeError("Director producer media membership is invalid.")
+    selected = [row for row in entry["binding"]["media"] if row["basename"] in artifact_names]
+    if {row["basename"] for row in selected} != set(artifact_names):
+        raise QueueRecoveryRuntimeError("Director producer media was not consumed by this repeat.")
+    binding = {"version": 1, "child_digest": child["digest"], "task_digest": task["digest"],
+               "task_index": task_index, "repeat_index": repeat_index,
+               "kind": kind, "variant": variant, "index": index,
+               "consumption_digest": entry["digest"], "native_digest": native["digest"],
+               "media": sorted(selected, key=lambda row: row["basename"])}
+    sealed = {"binding": binding, "digest": _project_reference_private_commitment(binding)}
+    return {**dict(settings or {}), "director_lora_consumption": sealed}
+
+
+def _director_native_producer_matches(job, unit, *, verified_units=None, consumed_continuations=frozenset()):
+    """Require consumed native bytes before existing recovery adopts a unit."""
+    if unit.get("kind") == "director_concat":
+        return _director_concat_receipt_matches(job, unit, verified_units=verified_units)
+    if unit.get("kind") == "director_delivery":
+        return _director_delivery_receipt_matches(job, unit, verified_units=verified_units,
+            consumed_continuations=consumed_continuations)
+    if (unit.get("kind") == "h3_concat"
+            and (job.get("params") or {}).get("_director_video_lora_child_snapshot") is not None
+            and (job.get("params") or {}).get("_h3_cumulative_append") is not True):
+        return _director_h3_concat_matches(job, unit, verified_units=verified_units,
+            consumed_continuations=consumed_continuations)
+    if (unit.get("kind") == "h3_scene"
+            and (job.get("params") or {}).get("_director_video_lora_child_snapshot") is not None
+            and (job.get("params") or {}).get("_h3_cumulative_append") is not True):
+        return _director_h3_scene_matches(job, unit, verified_units=verified_units,
+            consumed_continuations=consumed_continuations)
+    proof = (unit.get("settings") or {}).get("director_lora_consumption")
+    child = (job.get("params") or {}).get("_director_video_lora_child_snapshot")
+    if proof is None:
+        return child is None or unit.get("kind") not in {"ordinary_repeat", "h3_segment"}
+    try:
+        if type(proof) is not dict or set(proof) != {"binding", "digest"}:
+            return False
+        binding = proof["binding"]
+        if (type(binding) is not dict or type(proof["digest"]) is not str
+                or not hmac.compare_digest(proof["digest"],
+                    _project_reference_private_commitment(binding))):
+            return False
+        artifacts = unit["artifacts"]
+        names = [row["basename"] for row in artifacts]
+        expected = _director_native_producer_settings(job,
+            task_index=binding["task_index"], repeat_index=binding["repeat_index"],
+            kind=unit["kind"], variant=unit["variant"], index=unit["index"],
+            artifact_names=names, settings={})["director_lora_consumption"]
+        if proof != expected:
+            return False
+        actual = sorted(({"basename": row["basename"], "bytes": row["size"], "sha256": row["sha256"]}
+                         for row in artifacts), key=lambda row: row["basename"])
+        if actual == binding["media"]:
+            return True
+        # Controlled finishing may replace native bytes. The existing reseal
+        # path retains an authenticated link to exactly those delivered bytes.
+        delivery = (unit.get("attestation") or {}).get("director_lora_delivery")
+        expected_delivery = {"version": 1, "unit_id": unit["unit_id"],
+                             "consumption_digest": binding["consumption_digest"],
+                             "native_media": binding["media"], "delivery_media": actual}
+        return (type(delivery) is dict and set(delivery) == {"binding", "digest"}
+                and delivery["binding"] == expected_delivery
+                and type(delivery["digest"]) is str
+                and hmac.compare_digest(delivery["digest"],
+                    _project_reference_private_commitment(delivery["binding"])))
+    except (QueueRecoveryRuntimeError, KeyError, TypeError, ValueError, IndexError):
+        return False
+
+
+def _director_native_delivery_attestation(job, unit, artifacts):
+    """Seal controlled finishing bytes before replacing producer metadata."""
+    proof = (unit.get("settings") or {}).get("director_lora_consumption")
+    if proof is None:
+        return unit.get("attestation")
+    predecessor = next((row for row in _queue_recovery_units(job)
+                        if row.get("unit_id") == unit["unit_id"]), None)
+    if (predecessor is None or predecessor.get("settings") != unit.get("settings")
+            or not _director_native_producer_matches(job, predecessor)):
+        raise QueueRecoveryRuntimeError("Director finishing predecessor is not authenticated.")
+    media = sorted(({"basename": row["basename"], "bytes": row["size"], "sha256": row["sha256"]}
+                    for row in artifacts), key=lambda row: row["basename"])
+    binding = {"version": 1, "unit_id": unit["unit_id"],
+               "consumption_digest": proof["binding"]["consumption_digest"],
+               "native_media": proof["binding"]["media"], "delivery_media": media}
+    return {**dict(predecessor.get("attestation") or {}), "director_lora_delivery": {
+        "binding": binding, "digest": _project_reference_private_commitment(binding)}}
+
+
+def _director_checked_recovery_unit(job, *, kind, variant, index, project_dir, verified_units=None,
+                                   consumed_continuations=frozenset()):
+    """Use physical project evidence, or a caller-verified quarantine byte set."""
+    if verified_units is None:
+        return _queue_recovery_unit_matches(job, kind=kind, variant=variant, index=index,
+            project_dir=project_dir, quarantine_invalid=False,
+            consumed_continuations=consumed_continuations)
+    matches = [unit for unit in verified_units.values()
+               if unit["kind"] == kind and unit["variant"] == variant and unit["index"] == index]
+    if len(matches) != 1:
+        return None
+    unit = matches[0]
+    if (unit["unit_id"] != recovery_unit_id(job["id"], kind, variant=variant, index=index,
+            dependencies=unit["dependencies"], settings=unit["settings"])
+            or ("continuation" in unit and not _queue_recovery_continuation_descriptor_matches(
+                unit["continuation"], unit["unit_id"], project_dir,
+                allow_retired=unit["unit_id"] in consumed_continuations))
+            or not _director_native_producer_matches(job, unit, verified_units=verified_units,
+                consumed_continuations=consumed_continuations)):
+        return None
+    return unit
+
+
+def _director_completed_repeat_prefix(job, *, task_index, task_recipe, project_dir, verified_units=None):
+    """Recover ordinary native repeats only from authenticated producer media."""
+    admitted = job.get("params") or {}
+    child = admitted.get("_director_video_lora_child_snapshot")
+    _require_director_video_lora_task_recipe(admitted, child, task_index, task_recipe)
+    units = [unit for unit in _queue_recovery_units(job)
+             if unit.get("kind") == "ordinary_repeat" and unit.get("variant") == task_index]
+    record = admitted.get("_director_video_lora_consumption_plans", {}).get(str(task_index))
+    if record is None:
+        if units:
+            raise QueueRecoveryRuntimeError("Director producer has no retained native consumption.")
+        return [], []
+    if (type(record) is not dict or set(record) != {"binding", "digest"}
+            or type(record["binding"]) is not dict or type(record["digest"]) is not str
+            or not hmac.compare_digest(record["digest"],
+                _project_reference_private_commitment(record["binding"]))
+            or record["binding"].get("child_digest") != child["digest"]
+            or record["binding"].get("task_digest") != task_recipe["digest"]):
+        raise QueueRecoveryRuntimeError("Director completed repeat identity changed.")
+    entries = record["binding"].get("entries")
+    if (type(entries) is not dict
+            or set(entries) != {str(index) for index in range(len(entries))}
+            or any(type(unit.get("index")) is not int
+                   or str(unit["index"]) not in entries for unit in units)):
+        raise QueueRecoveryRuntimeError("Director completed repeats are not a contiguous prefix.")
+    receipts, accepted_units = [], []
+    for repeat_index in range(len(entries)):
+        candidates = [unit for unit in units if unit["index"] == repeat_index]
+        if len(candidates) != 1:
+            # A retained native seal is never permission to redraw its media.
+            raise QueueRecoveryRuntimeError("Director completed repeat producer is unresolved.")
+        unit = _director_checked_recovery_unit(job, kind="ordinary_repeat",
+            variant=task_index, index=repeat_index, project_dir=project_dir,
+            verified_units=verified_units)
+        if unit is None:
+            raise QueueRecoveryRuntimeError("Director completed repeat media changed.")
+        entry = entries[str(repeat_index)]
+        names = [row["basename"] for row in unit["artifacts"]]
+        if (set(names) != {row["basename"] for row in entry["binding"]["media"]}
+                or unit["settings"]["director_lora_consumption"]["binding"]["task_index"] != task_index
+                or unit["settings"]["director_lora_consumption"]["binding"]["repeat_index"] != repeat_index):
+            raise QueueRecoveryRuntimeError("Director completed repeat membership changed.")
+        receipts.append(copy.deepcopy(entry["binding"]["receipt"]))
+        accepted_units.append(copy.deepcopy(unit))
+    return receipts, accepted_units
+
+
+def _director_recovered_repeat_media(job, task_index, unit):
+    entry = job["params"]["_director_video_lora_consumption_plans"][str(task_index)]["binding"]["entries"][str(unit["index"])]["binding"]
+    terminals, roles = entry.get("terminal_media"), entry.get("output_roles")
+    names = {artifact["basename"] for artifact in unit["artifacts"]}
+    if (type(terminals) is not list or not terminals
+            or any(type(name) is not str for name in terminals)
+            or len(set(terminals)) != len(terminals) or not set(terminals) <= names
+            or type(roles) is not dict or set(roles) != names
+            or any(role not in _RECOVERY_ARTIFACT_ROLES for role in roles.values())):
+        raise QueueRecoveryRuntimeError("Director recovered terminal media is unresolved.")
+    return terminals, roles
+
+
+def _director_concat_spec(job, group_id, repeat_index, project_dir, *, verified_units=None):
+    """Bind one derived output to ordered, authenticated native clip parents."""
+    admitted = job.get("params") or {}
+    child = admitted.get("_director_video_lora_child_snapshot")
+    recipes = admitted.get("_director_video_lora_task_plans")
+    if (type(group_id) is not str or not group_id
+            or type(repeat_index) is not int or repeat_index < 0
+            or type(recipes) is not dict or type(child) is not dict):
+        raise QueueRecoveryRuntimeError("Director assembly identity is unresolved.")
+    selected = []
+    for key, recipe in recipes.items():
+        task_index = int(key)
+        if str(task_index) != key or task_index < 0:
+            raise QueueRecoveryRuntimeError("Director assembly task coordinates changed.")
+        _require_director_video_lora_task_recipe(admitted, child, task_index, recipe)
+        params = recipe["binding"]["task"]["params"]
+        info = params.get("multi_clip_info")
+        if isinstance(info, dict) and info.get("group_id") == group_id:
+            selected.append((task_index, recipe, params, info))
+    if not selected:
+        raise QueueRecoveryRuntimeError("Director assembly has no retained group.")
+    total = selected[0][3].get("total")
+    if (type(total) is not int or total < 1 or len(selected) != total
+            or any(type(row[3].get("index")) is not int or row[3].get("total") != total
+                   or row[3].get("automatic_h3_longform") or row[3].get("defer_concat")
+                   for row in selected)):
+        raise QueueRecoveryRuntimeError("Director assembly group coverage changed.")
+    selected.sort(key=lambda row: row[3]["index"])
+    if [row[3]["index"] for row in selected] != list(range(total)):
+        raise QueueRecoveryRuntimeError("Director assembly clip ordering changed.")
+    counts = {len(row[1]["binding"]["repeat_seeds"]) for row in selected}
+    if len(counts) != 1 or repeat_index >= next(iter(counts)):
+        raise QueueRecoveryRuntimeError("Director assembly repeat coverage changed.")
+    if total == 1 and selected[0][3].get("source_prefix") is None:
+        raise QueueRecoveryRuntimeError("Director single clip requires no derived assembly.")
+    members, dependencies = [], []
+    for task_index, recipe, params, info in selected:
+        _, units = _director_completed_repeat_prefix(job, task_index=task_index,
+            task_recipe=recipe, project_dir=project_dir, verified_units=verified_units)
+        if repeat_index >= len(units):
+            raise QueueRecoveryRuntimeError("Director assembly is missing a completed native clip.")
+        unit = units[repeat_index]
+        if (unit.get("attestation") or {}).get("director_lora_delivery"):
+            raise QueueRecoveryRuntimeError("Director component finishing recovery is unresolved.")
+        terminals, _ = _director_recovered_repeat_media(job, task_index, unit)
+        videos = [artifact for artifact in unit["artifacts"]
+                  if artifact["basename"] in terminals and os.path.splitext(artifact["basename"])[1].lower()
+                  in {".mp4", ".webm", ".mkv", ".mov"}]
+        if len(videos) != 1:
+            raise QueueRecoveryRuntimeError("Director assembly terminal video is ambiguous.")
+        discard = info.get("boundary_overlap_discard_frames", 0) or 0
+        published = info.get("published_frames") or params.get("video_length")
+        if type(discard) is not int or discard < 0 or type(published) is not int or published <= 0:
+            raise QueueRecoveryRuntimeError("Director assembly frame geometry is invalid.")
+        video = videos[0]
+        dependencies.append(unit["unit_id"])
+        members.append({"task_index": task_index, "task_digest": recipe["digest"],
+            "repeat_index": repeat_index, "unit_id": unit["unit_id"], "clip_index": info["index"],
+            "basename": video["basename"], "bytes": video["size"], "sha256": video["sha256"],
+            "discard_prefix_frames": discard, "published_frames": published})
+    last_params, last_info = selected[-1][2:]
+    controls = {key: last_params.get(key) for key in ("model_type", "audio_source", "audio_guide")}
+    controls["multi_clip_info"] = last_info
+    binding = {"version": 1, "child_digest": child["digest"], "group_id": group_id,
+        "repeat_index": repeat_index, "members": members,
+        "assembly_controls_digest": _project_reference_private_commitment(controls)}
+    settings = {"director_concat": {"binding": binding,
+        "digest": _project_reference_private_commitment(binding)}}
+    return {"variant": selected[0][0], "index": repeat_index,
+        "dependencies": dependencies, "settings": settings}
+
+
+def _director_concat_dependencies_match(unit, parents):
+    try:
+        proof = unit["settings"]["director_concat"]
+        binding = proof["binding"]
+        if (set(proof) != {"binding", "digest"} or binding.get("version") != 1
+                or not hmac.compare_digest(proof["digest"], _project_reference_private_commitment(binding))
+                or unit["dependencies"] != [parent["unit_id"] for parent in parents]
+                or len(binding["members"]) != len(parents) or not parents):
+            return False
+        for position, (member, parent) in enumerate(zip(binding["members"], parents)):
+            if (member["clip_index"] != position or parent.get("kind") != "ordinary_repeat"
+                    or parent.get("variant") != member["task_index"]
+                    or parent.get("index") != member["repeat_index"]
+                    or member["repeat_index"] != unit["index"] or parent["unit_id"] != member["unit_id"]
+                    or not any(artifact["basename"] == member["basename"] and artifact["size"] == member["bytes"]
+                               and artifact["sha256"] == member["sha256"] for artifact in parent["artifacts"])):
+                return False
+        return True
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def _director_concat_receipt_matches(job, unit, *, verified_units=None):
+    try:
+        binding = unit["settings"]["director_concat"]["binding"]
+        expected = _director_concat_spec(job, binding["group_id"], unit["index"], job["out_dir"],
+            verified_units=verified_units)
+        if any(unit[key] != expected[key] for key in ("variant", "index", "dependencies", "settings")):
+            return False
+        output = (unit.get("attestation") or {}).get("director_concat_output")
+        media = sorted(({"basename": artifact["basename"], "bytes": artifact["size"], "sha256": artifact["sha256"]}
+                        for artifact in unit["artifacts"]), key=lambda row: row["basename"])
+        sealed = {"version": 1, "spec_digest": unit["settings"]["director_concat"]["digest"], "media": media}
+        return (len(media) == 1 and type(output) is dict and set(output) == {"binding", "digest"}
+                and output["binding"] == sealed and type(output["digest"]) is str
+                and hmac.compare_digest(output["digest"], _project_reference_private_commitment(sealed)))
+    except (QueueRecoveryRuntimeError, KeyError, TypeError, ValueError):
+        return False
+
+
+def _build_director_video_lora_consumer(job, child_snapshot, task_index, task_recipe):
+    """Retain the complete native stack for an actual validated Director task."""
+    from services.director_video_lora_execution import (
+        DirectorLoraConsumer, build_native_task_plan, require_adapter_fingerprints,
+    )
+
+    child_snapshot = copy.deepcopy(child_snapshot)
+    task_recipe = copy.deepcopy(task_recipe)
+    _require_director_video_lora_task_recipe(job["params"], child_snapshot, task_index, task_recipe)
+    if not hmac.compare_digest(child_snapshot["digest"],
+            _project_reference_private_commitment(child_snapshot["binding"])):
+        raise QueueRecoveryRuntimeError("Director child seal changed before native planning.")
+    model_type = task_recipe["binding"]["task"]["params"]["model_type"]
+    catalog_definition = copy.deepcopy(wgp.get_model_def(model_type))
+    plan, transformer_count, fingerprints = build_native_task_plan(
+        task_recipe, child_snapshot, runtime=wgp)
+    require_adapter_fingerprints(fingerprints)
+    if wgp.get_model_def(model_type) != catalog_definition:
+        raise QueueRecoveryRuntimeError("Director catalog changed during native planning.")
+    native_record = _retain_director_video_lora_native_plan(
+        job, child_snapshot, task_index, task_recipe, plan)
+    execution_attempt = job.get("execution_attempt")
+    acknowledged_preparation = {}
+    preparation_seen = False
+
+    def validate_current():
+        nonlocal preparation_seen
+        admitted = job.get("params") or {}
+        _require_director_video_lora_task_recipe(admitted, child_snapshot, task_index, task_recipe)
+        if (admitted.get("_director_video_lora_child_snapshot") != child_snapshot
+                or not hmac.compare_digest(child_snapshot["digest"],
+                    _project_reference_private_commitment(child_snapshot["binding"]))
+                or admitted.get("_director_video_lora_native_plans", {}).get(str(task_index)) != native_record
+                or not hmac.compare_digest(native_record["digest"],
+                    _project_reference_private_commitment(native_record["binding"]))
+                or job.get("execution_attempt") != execution_attempt
+                or is_cancel_requested(job)
+                or wgp.get_model_def(model_type) != catalog_definition):
+            raise QueueRecoveryRuntimeError("Director current native task changed.")
+        preparation = admitted.get("_director_video_lora_preparation_plans", {}).get(str(task_index))
+        if preparation is None:
+            if preparation_seen:
+                raise QueueRecoveryRuntimeError("Director acknowledged preparation disappeared.")
+        else:
+            binding = preparation.get("binding") if type(preparation) is dict else None
+            if (type(binding) is not dict or set(preparation) != {"binding", "digest"}
+                    or set(binding) != {"version", "child_digest", "task_digest", "entries"}
+                    or type(binding["version"]) is not int or binding["version"] != 1
+                    or binding["child_digest"] != child_snapshot["digest"]
+                    or binding["task_digest"] != task_recipe["digest"]
+                    or type(binding["entries"]) is not dict or type(preparation["digest"]) is not str
+                    or not hmac.compare_digest(preparation["digest"],
+                        _project_reference_private_commitment(binding))
+                    or any(binding["entries"].get(key) != value
+                           for key, value in acknowledged_preparation.items())):
+                raise QueueRecoveryRuntimeError("Director acknowledged preparation changed.")
+            acknowledged_preparation.update(copy.deepcopy(binding["entries"]))
+            preparation_seen = True
+        require_adapter_fingerprints(fingerprints)
+        return {key: copy.deepcopy(plan[key])
+                for key in ("child_digest", "task_digest", "sources", "adapter_sources")}
+
+    consumer = DirectorLoraConsumer(plan, validate_current=validate_current,
+        transformer_count=transformer_count,
+        retain_preparation=lambda expected: _retain_director_video_lora_preparation(
+            job, child_snapshot, task_index, task_recipe, expected))
+    validate_current()
+    return consumer
+
+
+def _admit_director_video_lora_child(params, *, pipeline_id, workspace, project_dir, session_id, unit):
+    key = "_director_video_lora_child_snapshot"
+    if "_director_video_lora_parent_snapshot" not in params:
+        if params.get("lora_parameters") or key in params:
+            raise ValueError("Director video LoRA parent admission is missing")
+        return None
+    binding = _director_video_lora_child_binding(params, pipeline_id=pipeline_id,
+        workspace=workspace, project_dir=project_dir, session_id=session_id, unit=unit)
+    expected = {"binding": binding, "digest": _project_reference_private_commitment(binding)}
+    if key in params:
+        if params[key] != expected:
+            raise ValueError("Retained Director video LoRA child intent changed")
+    else:
+        params[key] = expected
+    return expected
+
+
+def _validate_director_video_lora_child_job(job):
+    from services.director_pipeline import _normalized_child_unit, _director_child_job_id
+    params = job.get("params") or {}
+    snapshot = params.get("_director_video_lora_child_snapshot")
+    if (not isinstance(snapshot, dict) or set(snapshot) != {"binding", "digest"}
+            or not isinstance(snapshot.get("binding"), dict)
+            or not isinstance(snapshot.get("digest"), str)
+            or not hmac.compare_digest(snapshot["digest"],
+                _project_reference_private_commitment(snapshot["binding"]))):
+        raise ValueError("Director video LoRA child admission is missing or changed")
+    binding = snapshot["binding"]
+    admitted_unit = binding.get("unit")
+    if (not isinstance(admitted_unit, dict)
+            or any(type(admitted_unit.get(key)) is not int or admitted_unit[key] < 0
+                   for key in ("index", "variant"))):
+        raise ValueError("Director video LoRA retained child unit is missing")
+    unit = _normalized_child_unit(admitted_unit)
+    pipeline_id = params.get("_director_pipeline_id")
+    identity = re.fullmatch(r"director-" + re.escape(str(pipeline_id)) + r"-(0|[1-9][0-9]{0,8})-[0-9a-f]{24}", str(job.get("id") or ""))
+    if (unit != admitted_unit or job.get("kind") != "director_child" or identity is None
+            or job["id"] != _director_child_job_id(pipeline_id, unit, int(identity[1]))):
+        raise ValueError("Director video LoRA retained child unit changed")
+    # recovery_unit advances to the latest completed native safe unit. The
+    # admitted logical unit and immutable job ID continue to identify intent.
+    retained_unit = job.get("recovery_unit")
+    if isinstance(retained_unit, dict) and retained_unit.get("kind") == "director_child_intent":
+        if any(retained_unit.get(key) != unit[key] for key in ("index", "variant")) or retained_unit.get("director_kind") != unit["kind"] or retained_unit.get("attempt") != int(identity[1]):
+            raise ValueError("Director video LoRA submitted child unit changed")
+    return _admit_director_video_lora_child(params,
+        pipeline_id=pipeline_id, workspace=job.get("workspace"),
+        project_dir=job.get("out_dir"), session_id=job.get("session_id"), unit=unit)
+
+
+def _require_director_video_lora_child_manifest(existing, incoming):
+    key = "_director_video_lora_child_snapshot"
+    expected = (incoming.get("params") or {}).get(key)
+    retained = (existing.get("params") or {}).get(key)
+    if expected is None and retained is None:
+        return
+    _validate_director_video_lora_child_job(incoming)
+    # A restored job may no longer retain its browser session. Validate its
+    # immutable intent under the freshly admitted incoming owner, without
+    # changing the restored job or treating missing credentials as new scope.
+    current_params = dict(existing.get("params") or {})
+    current_params["_director_repair_operation_id"] = (incoming.get("params") or {}).get("_director_repair_operation_id")
+    current_existing = dict(existing, session_id=incoming.get("session_id"), params=current_params)
+    _validate_director_video_lora_child_job(current_existing)
+    manifest = load_request_manifest(existing["out_dir"],
+        existing.get("_recovery_manifest_pointer") or {}, expected_job_id=existing["id"])
+    scope = expected["binding"]["scope"]
+    validate_manifest_inputs(manifest, lambda descriptor: _queue_recovery_manifest_validator(
+        dict(descriptor), owner_digest=scope["owner_digest"], workspace=incoming["workspace"],
+        project_dir=existing["out_dir"]))
+    if retained != expected or manifest["params"].get(key) != expected:
+        raise ValueError("Director child manifest contains a different LoRA intent")
+
+
 @_upload_registration_guard
 def _director_recovery_register_parent(
     pid: str,
@@ -6273,6 +7538,9 @@ def _director_recovery_register_parent(
     project_digest = _queue_recovery_project_identity(workspace, project_dir)
     parent_id = _director_recovery_parent_job_id(pid)
     input_descriptors = _queue_recovery_input_descriptors({
+        "id": parent_id,
+        "kind": "director_pipeline",
+        "workspace": workspace,
         "params": params,
         "out_dir": project_dir,
     }, owner_digest)
@@ -6365,6 +7633,27 @@ def _director_recovery_checkpoint_parent(
     })
     cursor.pop("pending_state", None)
     cursor.pop("h3_pending_scene_repairs", None)
+    cursor.pop("director_pending_clip_repairs", None)
+    recovery = state.get("recovery")
+    repairs = recovery.get("video_repairs") if isinstance(recovery, dict) else None
+    retained_repairs = []
+    if isinstance(repairs, dict):
+        from services.director_pipeline import _director_child_job_id
+        for clip, repair in repairs.items():
+            if not isinstance(repair, dict) or repair.get("state") != "submitted":
+                continue
+            unit = repair.get("unit")
+            if (not isinstance(unit, dict) or unit.get("kind") != "video_clip_rerun"
+                    or type(unit.get("index")) is not int or str(unit["index"]) != clip
+                    or not 0 <= unit["index"] < len(state.get("clips") or [])
+                    or type(repair.get("revision")) is not int or repair["revision"] < 1
+                    or unit.get("variant") != repair["revision"] or repair.get("attempt") != 0
+                    or repair.get("job_id") != _director_child_job_id(pid, unit, 0)):
+                continue
+            retained_repairs.append({"job_id": repair["job_id"], "index": unit["index"],
+                                     "revision": repair["revision"]})
+    if retained_repairs:
+        cursor["director_pending_clip_repairs"] = retained_repairs
     params = state.get("_params_snapshot")
     committed = params.get("_h3_longform") if isinstance(params, dict) else None
     if isinstance(committed, dict):
@@ -6509,6 +7798,9 @@ def _director_recovery_submit_child(
     h3_scene_rerun_worker=None,
 ) -> dict:
     """Attach to one deterministic child, or durably register it once."""
+    # This trusted entry point owns the incoming kind before either fresh
+    # registration or immutable-manifest attachment validates child identity.
+    job["kind"] = "director_child"
     try:
         from services import director_pipeline as _director_service
 
@@ -6547,8 +7839,12 @@ def _director_recovery_submit_child(
             raise QueueRecoveryRuntimeError(
                 "Director child identity conflicts with recovered queue state."
             )
+        _require_director_video_lora_child_manifest(existing, job)
         incoming_plan = (job.get("params") or {}).get("_h3_longform")
         existing_plan = (existing.get("params") or {}).get("_h3_longform")
+        if ((job.get("params") or {}).get("_director_custom_style_video_snapshot")
+                != (existing.get("params") or {}).get("_director_custom_style_video_snapshot")):
+            raise QueueRecoveryRuntimeError("Director child visual style identity changed.")
         if (h3_scene_rerun_admission is not None
                 or isinstance(incoming_plan, dict) and "scene_rerun" in incoming_plan
                 or isinstance(existing_plan, dict) and "scene_rerun" in existing_plan):
@@ -6592,17 +7888,21 @@ def _director_recovery_submit_child(
                     ) from error
             existing["session_id"] = session_id
             existing["access_policy"] = dict(job.get("access_policy") or {})
+            held = existing.get("_recovery_original_held") is True
             _queue_recovery_checkpoint(
                 existing,
                 status="queued",
-                queue_held=False,
-                recovery_state="retrying",
-                message="Queued for Director recovery",
+                queue_held=held,
+                recovery_state="restored" if held else "retrying",
+                message="Video held in Queue" if held else "Queued for Director recovery",
             )
-            if not update_queue_job(existing, held=False):
+            if not update_queue_job(existing, held=held):
                 raise QueueRecoveryRuntimeError(
                     "Director child recovery could not be queued."
                 )
+            if held:
+                existing["_recovery_worker_pending"] = True
+                return existing
             if h3_scene_rerun_before_worker is not None and h3_scene_rerun_before_worker(existing) is False:
                 return existing
             try:
@@ -6625,7 +7925,6 @@ def _director_recovery_submit_child(
                     "Director child recovery worker could not start."
                 ) from error
         return existing
-    job["kind"] = "director_child"
     job["recovery_unit"] = {
         "kind": "director_child_intent",
         "state": "submitted",
@@ -6634,6 +7933,10 @@ def _director_recovery_submit_child(
         "director_kind": str(unit.get("kind") or ""),
         "attempt": max(0, int(attempt)),
     }
+    held = job.get("queue_held") is True
+    if held:
+        job["message"] = "Video held in Queue"
+        job["_recovery_worker_pending"] = True
     _queue_recovery_register_and_publish(
         job,
         recovery_kind="director_child",
@@ -6641,6 +7944,7 @@ def _director_recovery_submit_child(
         h3_scene_rerun_admission=h3_scene_rerun_admission,
         before_worker=h3_scene_rerun_before_worker,
         worker=h3_scene_rerun_worker,
+        defer_worker=held,
     )
     return _jobs[job_id]
 
@@ -6730,6 +8034,9 @@ def _assemble_director_h3_scenes(
         if concatenate(component_paths, staged_path) is not True:
             raise QueueRecoveryRuntimeError("H3 scene concat failed.")
         cancel_check()
+        attestation = _director_h3_output_attestation(job, unit_id, [output_name], project_dir,
+            attestation["h3_audio_true_peak"], media_paths={output_name: staged_path},
+            kind="h3_scene", probe=attestation["media"])
         write_sidecars([output_name], recovery_units={output_name: {
             "unit_id": unit_id, "kind": "h3_scene", "variant": variant, "index": scene_index,
             "settings": settings, "dependencies": spec["dependencies"],
@@ -6801,6 +8108,18 @@ def _director_recovery_verified_child(job: dict, project_dir: str) -> dict | Non
     """Return only terminal outputs backed by completed queue safe units."""
     if str(job.get("status") or "") != "completed":
         return None
+    style_snapshot = (job.get("params") or {}).get("_director_custom_style_video_snapshot")
+    style_evidence = {}
+    if style_snapshot is not None:
+        try:
+            from services.custom_visual_styles import digest
+            manifest = load_request_manifest(project_dir, job.get("_recovery_manifest_pointer") or {},
+                                             expected_job_id=str(job.get("id") or ""))
+            if manifest["params"].get("_director_custom_style_video_snapshot") != style_snapshot:
+                return None
+            style_evidence["custom_visual_style_video_digest"] = digest(style_snapshot)
+        except (OSError, ValueError, TypeError, QueueRecoveryRuntimeError):
+            return None
     private_plan = (job.get("params") or {}).get("_h3_longform")
     repair_selection = None
     repair_graph = None
@@ -6874,6 +8193,7 @@ def _director_recovery_verified_child(job: dict, project_dir: str) -> dict | Non
         "h3_scene_output_files": scene_outputs,
         "scene_recovery_units": copy.deepcopy(units) if scene_outputs else [],
         "artifacts": evidence,
+        **style_evidence,
     }
 
 
@@ -6891,6 +8211,10 @@ def _director_recovery_validate_child(
         or not isinstance(artifacts, list)
         or len(outputs) != len(artifacts)
     ):
+        return None
+    style_digest = evidence.get("custom_visual_style_video_digest")
+    if style_digest is not None and (not isinstance(style_digest, str)
+                                    or re.fullmatch(r"[0-9a-f]{64}", style_digest) is None):
         return None
     for filename, descriptor in zip(outputs, artifacts):
         if (
@@ -6910,6 +8234,7 @@ def _director_recovery_validate_child(
         "h3_scene_output_files": scenes,
         "scene_recovery_units": copy.deepcopy(evidence.get("scene_recovery_units") or []) if scenes else [],
         "artifacts": [dict(item) for item in artifacts],
+        **({"custom_visual_style_video_digest": style_digest} if style_digest is not None else {}),
     }
 
 
@@ -7033,8 +8358,11 @@ def _director_recovery_h3_rerun_source(
     params = manifest["params"]
     original = params.get("_h3_longform")
     origin = params.get("multi_clip_audio_start_sec", 0.0)
+    from services.director_pipeline import _director_custom_style_video_snapshot
     if (params.get("_director_pipeline_id") != identity["pipeline_id"]
             or original != identity["original_plan"]
+            or params.get("_director_custom_style_video_snapshot")
+                != _director_custom_style_video_snapshot(state.get("_params_snapshot") or {})
             or type(origin) not in {int, float}
             or origin != identity["selection"]["audio_origin_sec"]):
         raise QueueRecoveryRuntimeError("Director H3 original request disagrees with saved provenance.")
@@ -7149,7 +8477,11 @@ def _director_recovery_prepare_h3_scene_rerun(state: dict, plan: dict, project_d
             manifest = load_request_manifest(project_dir, existing.get("_recovery_manifest_pointer") or {},
                 expected_job_id=existing["id"])
             params = manifest["params"]
-            if params.get("_h3_longform") != plan or params.get("_director_pipeline_id") != identity["pipeline_id"]:
+            from services.director_pipeline import _director_custom_style_video_snapshot
+            if (params.get("_h3_longform") != plan
+                    or params.get("_director_pipeline_id") != identity["pipeline_id"]
+                    or params.get("_director_custom_style_video_snapshot")
+                        != _director_custom_style_video_snapshot(state.get("_params_snapshot") or {})):
                 raise QueueRecoveryRuntimeError("Director repair attempt request changed.")
             if existing.get("status") == "completed":
                 if _queue_recovery_completed_h3_graph(existing, project_dir) is None:
@@ -7402,6 +8734,19 @@ def _director_h3_scene_repair_outputs(job: dict, project_dir: str, candidates) -
         if len(artifacts) != 1:
             return []
         name = artifacts[0]["basename"]
+        deliveries = [unit for unit in _queue_recovery_units(job)
+                      if unit.get("kind") == "director_delivery"]
+        if deliveries:
+            if len(deliveries) != 1:
+                return []
+            delivery = _director_checked_recovery_unit(job, kind="director_delivery", variant=0,
+                index=0, project_dir=project_dir)
+            if delivery is None:
+                return []
+            outputs = _director_finishing_output_map(delivery)
+            name = outputs["replacements"].get(name)
+            if not name or outputs["finals"] != [name] or outputs["roles"].get(name) != "final":
+                return []
         mapping = job.get("h3_scene_output_files") or {}
         if mapping != {str(selection["scene_index"]): name} or name not in candidates:
             return []
@@ -7924,6 +9269,96 @@ _queue_recovery_final_adoption_startup_summary = {
 }
 
 
+def _director_quarantined_job_requires_proof(job_id, *, workspace, project_dir, project_digest):
+    """Do not let stripped sidecar proof change an admitted Director request."""
+    snapshots, tombstoned = _queue_recovery_coordinator.read_only_snapshot()
+    snapshot = snapshots.get(job_id)
+    if job_id in tombstoned:
+        return True
+    if snapshot is None:
+        # A reserved Director identity without its journal cannot assert legacy
+        # status. Its signed manifest/producer graph must establish recovery.
+        return job_id.startswith("director-")
+    if snapshot.get("kind") != "director_child":
+        return False
+    try:
+        if snapshot.get("workspace") != workspace or snapshot.get("project_instance") != project_digest:
+            return True
+        manifest = load_request_manifest(project_dir, snapshot["request_manifest"], expected_job_id=job_id)
+        params = manifest["params"]
+        if any(key in params for key in (
+                "_director_video_lora_child_snapshot", "_director_video_lora_parent_snapshot")):
+            return True
+        # Strength-only requests may retain the valid empty parameter map.
+        # Nonempty or malformed selections cannot assert that legacy status.
+        parameters = params.get("lora_parameters", {})
+        return type(parameters) is not dict or bool(parameters)
+    except (QueueRecoveryRuntimeError, OSError, KeyError, TypeError, ValueError):
+        return True
+
+
+def _director_quarantined_finishing_graph(job_id, candidates, *, workspace, project_dir, project_digest):
+    """Authenticate a byte-verified quarantine graph without reopening inputs."""
+    try:
+        if not candidates or len(candidates) > 4096 or any(not item.get("director") for item in candidates):
+            return None
+        units = {}
+        for item in candidates:
+            continuation = item.get("continuation")
+            unit = units.setdefault(item["unit_id"], {
+                "unit_id": item["unit_id"], "kind": item["kind"], "variant": item["unit_variant"],
+                "index": item["unit_index"], "state": "completed", "dependencies": list(item["dependencies"]),
+                "settings": item["settings"], "attestation": item["attestation"], "artifacts": [],
+                **({"continuation": dict(continuation)} if continuation is not None else {})})
+            if (unit["kind"] != item["kind"] or unit["variant"] != item["unit_variant"]
+                    or unit["index"] != item["unit_index"] or unit["dependencies"] != list(item["dependencies"])
+                    or unit["settings"] != item["settings"] or unit["attestation"] != item["attestation"]
+                    or unit.get("continuation") != continuation):
+                return None
+            unit["artifacts"].append({"basename": item["dest_media"], "size": item["media_size"],
+                "sha256": item["media_sha256"], "sidecar_basename": item["dest_sidecar"],
+                "sidecar_size": item["sidecar_size"], "sidecar_sha256": item["sidecar_sha256"],
+                "producer_unit_id": item["unit_id"]})
+        for unit in units.values():
+            items = [item for item in candidates if item["unit_id"] == unit["unit_id"]]
+            names = {row["basename"] for row in unit["artifacts"]}
+            if (len(names) != len(items) or any(set(item["artifact_names"]) != names for item in items)):
+                return None
+        snapshots, tombstoned = _queue_recovery_coordinator.read_only_snapshot()
+        if job_id in tombstoned:
+            return None
+        snapshot = snapshots.get(job_id)
+        if snapshot is not None:
+            if (snapshot.get("kind") != "director_child" or snapshot.get("workspace") != workspace
+                    or snapshot.get("project_instance") != project_digest or snapshot.get("cancel_requested")
+                    or str(snapshot.get("status") or "").casefold() in {"cancelled", "canceled"}):
+                return None
+            pointers = [snapshot["request_manifest"]]
+        else:
+            pointers = [entry["pointer"] for entry in discover_request_manifest_pointers(
+                project_dir, maximum_candidates=1024) if entry["job_id"] == job_id]
+        accepted = []
+        for pointer in pointers:
+            try:
+                manifest = load_request_manifest(project_dir, pointer, expected_job_id=job_id)
+                params = manifest["params"]
+                owner = (snapshot["owner_principal"] if snapshot is not None else
+                         params["_director_video_lora_child_snapshot"]["binding"]["scope"]["owner_digest"])
+                check = dict(snapshot or {}, id=job_id, kind="director_child", workspace=workspace,
+                    out_dir=project_dir, params=params, _recovery_owner_digest=owner,
+                    _recovery_project_digest=project_digest, recovery_cursor=dict(
+                        (snapshot or {}).get("recovery_cursor") or {}, completed_units=list(units.values())))
+                graph = _director_completed_finishing_graph(check, project_dir, units, verified_units=units)
+                if any(graph["artifact_roles"].get(item["dest_media"]) != item["role"] for item in candidates):
+                    continue
+                accepted.append(graph)
+            except (QueueRecoveryRuntimeError, OSError, KeyError, TypeError, ValueError):
+                continue
+        return accepted[0] if len(accepted) == 1 else None
+    except (QueueRecoveryRuntimeError, OSError, KeyError, TypeError, ValueError):
+        return None
+
+
 def _queue_recovery_adopt_quarantined_finals(
     projects: Mapping[str, tuple[str, str]],
     *,
@@ -7945,6 +9380,10 @@ def _queue_recovery_adopt_quarantined_finals(
             summary = _adopt_quarantined_final_groups(
                 project[0],
                 workspace=workspace,
+                director_validator=lambda job_id, candidates: _director_quarantined_finishing_graph(
+                    job_id, candidates, workspace=workspace, project_dir=project[0], project_digest=project[1]),
+                director_job_classifier=lambda job_id: _director_quarantined_job_requires_proof(
+                    job_id, workspace=workspace, project_dir=project[0], project_digest=project[1]),
             )
         except (OSError, ValueError, TypeError, QueueRecoveryRuntimeError):
             aggregate["failed_projects"] += 1
@@ -8322,14 +9761,29 @@ def _queue_recovery_materialize_job(
     blocked_code = "project_missing_or_recreated"
     manifest = None
     integrity_recovery_failed = False
+    completed_graph = None
+    director_delivery_evidence = any(isinstance(unit, dict) and unit.get("kind") == "director_delivery"
+        for unit in [*_queue_recovery_units(runtime), runtime.get("recovery_unit") or {}])
     if current is not None and hmac.compare_digest(current[1], expected_project):
         runtime["out_dir"] = current[0]
-        completed_graph = None
         graph_verifier = globals().get("_queue_recovery_completed_h3_graph")
-        if callable(graph_verifier) and not integrity_failed_snapshot:
+        director_completion_manifest_ready = True
+        if director_delivery_evidence:
+            # The content-free journal omits task recipes. Read only the exact
+            # immutable manifest; completion proof must not reopen consumed inputs.
+            try:
+                manifest = load_request_manifest(current[0],
+                    snapshot.get("request_manifest") or {}, expected_job_id=job_id)
+                runtime["params"] = dict(manifest["params"])
+            except (QueueRecoveryRuntimeError, OSError, KeyError, TypeError, ValueError):
+                director_completion_manifest_ready = False
+        if callable(graph_verifier) and not integrity_failed_snapshot and director_completion_manifest_ready:
             completed_graph = graph_verifier(runtime, current[0])
         if completed_graph is not None:
             adopted_outputs = completed_graph["output_files"]
+            if completed_graph.get("director_finishing") is True:
+                for field in ("artifact_files", "clip_output_files", "join_output_file"):
+                    runtime[field] = copy.deepcopy(completed_graph[field])
             if completed_graph.get("h3_scene_output_files"):
                 runtime["h3_scene_output_files"] = dict(completed_graph["h3_scene_output_files"])
             runtime["recovery_cursor"] = dict(
@@ -8343,6 +9797,7 @@ def _queue_recovery_materialize_job(
             runtime["_recovery_completed_h3_graph"] = True
         if (
             verified_h3_final_adoption
+            and not (completed_graph is not None and completed_graph.get("director_finishing") is True)
             and not snapshot.get("cancel_requested")
             and (completed_graph is not None
                  or str(snapshot.get("status") or "").casefold()
@@ -8464,6 +9919,16 @@ def _queue_recovery_materialize_job(
             except QueueRecoveryRuntimeError:
                 blocked_reason = "Recovery request or input validation failed"
                 blocked_code = "input_missing_or_changed"
+
+    if (director_delivery_evidence and completed_graph is None and not snapshot.get("cancel_requested")
+            and (str(snapshot.get("status") or "").casefold() == "completed"
+                 or (snapshot.get("status") == "queued" and snapshot.get("queue_held") is True
+                     and snapshot.get("_recovery_reason_code") == "final_output_recovery_incomplete"))):
+        runtime.update(status="queued", queue_held=True, resource_state="queued", recovery_state="blocked",
+            reruns_denoise=False, output_files=[], clip_output_files={}, join_output_file=None,
+            _recovery_reason_code="final_output_recovery_incomplete",
+            message="Final output recovery is incomplete", error=None)
+        return runtime, False
 
     if not blocked_reason and verified_h3_final_adoption:
         runtime["output_files"] = list(adopted_outputs)
@@ -9218,7 +10683,12 @@ def _director_recovery_restore_parent(
     except (OSError, ValueError, TypeError, QueueRecoveryRuntimeError):
         return None
 
-    blocked_reason = ""
+    blocked_reason = (
+        "This interrupted planning attempt requires fresh execution authority."
+        if state.get("_planning_custody_required") is True
+        and str(state.get("status") or "") not in {"completed", "failed", "cancelled"}
+        else ""
+    )
     manifest = None
     try:
         manifest = load_request_manifest(
@@ -10349,6 +11819,55 @@ def _publish_h3_cumulative_final(
     return unit
 
 
+def _queue_recovery_continuation_descriptor_matches(continuation, dependency, project_dir, *, allow_retired=False):
+    """Allow missing consumed staging bytes only within an exact sealed closure."""
+    if not isinstance(continuation, dict) or continuation.get("dependency") != dependency:
+        return False
+    mode = continuation.get("mode")
+    if mode == "prompt_only":
+        if set(continuation) != {"dependency", "mode"}:
+            return False
+        return True
+    if type(mode) is not str or mode not in {"last_frame", "semantic_still", "temporal_tail", "native_av_overlap"}:
+        return False
+    if (
+        not continuation.get("basename")
+        or type(continuation.get("size")) is not int
+        or continuation["size"] <= 0
+        or type(continuation.get("sha256")) is not str
+        or len(continuation["sha256"]) != 64
+        or any(char not in "0123456789abcdef" for char in continuation["sha256"])
+    ):
+        return False
+    if mode == "native_av_overlap":
+        from services.h3_boundary_policy import (
+            H3_NATIVE_FPS, H3_NATIVE_AUDIO_SAMPLE_RATE,
+            H3_NATIVE_OVERLAP_FRAMES, H3_NATIVE_HISTORY_FRAMES,
+        )
+        expected = {
+            "fps": H3_NATIVE_FPS, "audio_sample_rate": H3_NATIVE_AUDIO_SAMPLE_RATE,
+            "audio_channels": 2, "overlap_frames": H3_NATIVE_OVERLAP_FRAMES,
+            "discard_frames": H3_NATIVE_HISTORY_FRAMES,
+        }
+        if any(type(continuation.get(key)) is not int or continuation[key] != value
+               for key, value in expected.items()):
+            return False
+    try:
+        path = _queue_recovery_continuation_path(
+            project_dir, continuation,
+        )
+        # Only a complete sealed successor graph can retire consumed
+        # staging bytes. Existing corrupt files are never excused.
+        if allow_retired and not os.path.lexists(path):
+            return True
+        size, digest = _recovery_sha256_file(path)
+    except QueueRecoveryRuntimeError:
+        return False
+    if size != continuation.get("size") or digest != continuation.get("sha256"):
+        return False
+    return True
+
+
 def _queue_recovery_unit_matches(
     job: dict,
     *,
@@ -10489,6 +12008,12 @@ def _queue_recovery_unit_matches(
                     if isinstance(descriptor, dict):
                         _quarantine_recovery_artifact(project_dir, descriptor)
             return None
+        if not _director_native_producer_matches(job, unit, consumed_continuations=consumed_continuations):
+            return None
+        if (any(key in (unit.get("settings") or {}) for key in (
+                    "custom_visual_style_reference_encoding", "custom_visual_style_delivery"))
+                and not _h3_style_recovery_encoding_matches(job, unit)):
+            return None
         continuation = unit.get("continuation")
         unit_settings = unit.get("settings")
         cumulative = unit_settings.get("cumulative_append") if isinstance(unit_settings, dict) else None
@@ -10598,51 +12123,10 @@ def _queue_recovery_unit_matches(
             except (QueueRecoveryRuntimeError, TypeError, ValueError):
                 return None
             return unit
-        if "continuation" in unit:
-            if not isinstance(continuation, dict) or continuation.get("dependency") != unit_id:
-                return None
-            mode = continuation.get("mode")
-            if mode == "prompt_only":
-                if set(continuation) != {"dependency", "mode"}:
-                    return None
-                return unit
-            if type(mode) is not str or mode not in {"last_frame", "semantic_still", "temporal_tail", "native_av_overlap"}:
-                return None
-            if (
-                not continuation.get("basename")
-                or type(continuation.get("size")) is not int
-                or continuation["size"] <= 0
-                or type(continuation.get("sha256")) is not str
-                or len(continuation["sha256"]) != 64
-                or any(char not in "0123456789abcdef" for char in continuation["sha256"])
-            ):
-                return None
-            if mode == "native_av_overlap":
-                from services.h3_boundary_policy import (
-                    H3_NATIVE_FPS, H3_NATIVE_AUDIO_SAMPLE_RATE,
-                    H3_NATIVE_OVERLAP_FRAMES, H3_NATIVE_HISTORY_FRAMES,
-                )
-                expected = {
-                    "fps": H3_NATIVE_FPS, "audio_sample_rate": H3_NATIVE_AUDIO_SAMPLE_RATE,
-                    "audio_channels": 2, "overlap_frames": H3_NATIVE_OVERLAP_FRAMES,
-                    "discard_frames": H3_NATIVE_HISTORY_FRAMES,
-                }
-                if any(type(continuation.get(key)) is not int or continuation[key] != value
-                       for key, value in expected.items()):
-                    return None
-            try:
-                path = _queue_recovery_continuation_path(
-                    project_dir, continuation,
-                )
-                # Only a complete sealed successor graph can retire consumed
-                # staging bytes. Existing corrupt files are never excused.
-                if unit_id in consumed_continuations and not os.path.lexists(path):
-                    return unit
-                size, digest = _recovery_sha256_file(path)
-            except QueueRecoveryRuntimeError:
-                return None
-            if size != continuation.get("size") or digest != continuation.get("sha256"):
-                return None
+        if "continuation" in unit and not _queue_recovery_continuation_descriptor_matches(
+                unit["continuation"], unit["unit_id"], project_dir,
+                allow_retired=unit["unit_id"] in consumed_continuations):
+            return None
         return unit
     return None
 
@@ -10850,6 +12334,43 @@ def _queue_recovery_checkpoint_unit(
         isinstance(continuation, dict) and continuation.get("mode") == "cumulative_append"
     ):
         _queue_recovery_verify_h3_cumulative(job, unit, project_dir, expected_authority=expected_h3_cumulative_authority)
+    proof = (settings or {}).get("director_lora_consumption")
+    if proof is not None and not _director_native_producer_matches(job, unit):
+        # Only the existing deliberate finishing/role reseal path supplies
+        # expected_artifacts after checking the prior sealed producer sidecars.
+        predecessor = next((previous for previous in _queue_recovery_units(job)
+                            if previous.get("unit_id") == unit_id), None)
+        if (expected_artifacts is None or predecessor is None
+                or not _director_native_producer_matches(job, predecessor)):
+            raise QueueRecoveryRuntimeError("Director delivery has no authenticated native predecessor.")
+        actual_media = sorted(({"basename": row["basename"], "bytes": row["size"], "sha256": row["sha256"]}
+                               for row in artifacts), key=lambda row: row["basename"])
+        delivery_binding = {"version": 1, "unit_id": unit_id,
+                            "consumption_digest": proof["binding"]["consumption_digest"],
+                            "native_media": proof["binding"]["media"], "delivery_media": actual_media}
+        unit["attestation"] = {**dict(unit.get("attestation") or {}),
+            "director_lora_delivery": {"binding": delivery_binding,
+                "digest": _project_reference_private_commitment(delivery_binding)}}
+        if not _director_native_producer_matches(job, unit):
+            raise QueueRecoveryRuntimeError("Director delivered media commitment changed.")
+        # Carry the exact delivery seal in sidecars before the journal ACK so
+        # the existing orphan reconciliation can recover this successor.
+        successor_artifacts = []
+        for artifact in artifacts:
+            meta_path = os.path.join(project_dir, artifact["sidecar_basename"])
+            raw_meta = _read_exact_file(meta_path, maximum_bytes=MAX_MANIFEST_BYTES)
+            if (len(raw_meta) != artifact["sidecar_size"]
+                    or hashlib.sha256(raw_meta).hexdigest() != artifact["sidecar_sha256"]):
+                raise QueueRecoveryRuntimeError("Director delivery sidecar changed before retention.")
+            meta = json.loads(raw_meta)
+            meta["producer_unit_attestation"] = copy.deepcopy(unit["attestation"])
+            _atomic_write_json(meta_path, meta)
+            successor = _recovery_artifact_descriptor(project_dir, basename=artifact["basename"],
+                sidecar_basename=artifact["sidecar_basename"], producer_unit_id=unit_id)
+            if (successor["size"] != artifact["size"] or successor["sha256"] != artifact["sha256"]):
+                raise QueueRecoveryRuntimeError("Director delivered media changed while retaining its seal.")
+            successor_artifacts.append(successor)
+        unit["artifacts"] = successor_artifacts
     units = [
         item for item in _queue_recovery_units(job)
         if not (
@@ -11222,6 +12743,16 @@ def _queue_recovery_expected_artifact_role(kind: str, meta: dict) -> str | None:
     if kind == "ordinary_repeat":
         declared = meta.get("producer_artifact_class")
         return declared if declared in _RECOVERY_ARTIFACT_ROLES else None
+    if kind == "director_delivery":
+        try:
+            proof = meta["producer_unit_attestation"]["director_delivery"]
+            if (set(proof) != {"binding", "digest"}
+                    or not hmac.compare_digest(proof["digest"], _project_reference_private_commitment(proof["binding"]))):
+                return None
+            matches = [row for row in proof["binding"]["media"] if row["basename"] == meta["output_filename"]]
+            return matches[0]["role"] if len(matches) == 1 and matches[0]["role"] in _RECOVERY_ARTIFACT_ROLES else None
+        except (KeyError, TypeError, ValueError):
+            return None
     return None
 
 
@@ -11303,10 +12834,11 @@ def _queue_recovery_repair_unit_roles(
 
 
 def _h3_dependency_closed_recovery_units(verified: list[dict]) -> list[dict]:
-    """Remove H3 units whose exact predecessor evidence is unavailable."""
+    """Remove derived units whose exact predecessor evidence is unavailable."""
     dependency_closed = [
         unit for unit in verified
         if not str(unit.get("kind") or "").startswith("h3_")
+        and unit.get("kind") not in {"director_concat", "director_delivery"}
     ]
     accepted_by_id = {
         str(unit.get("unit_id") or ""): unit
@@ -11315,6 +12847,7 @@ def _h3_dependency_closed_recovery_units(verified: list[dict]) -> list[dict]:
     pending_h3 = [
         unit for unit in verified
         if str(unit.get("kind") or "").startswith("h3_")
+        or unit.get("kind") in {"director_concat", "director_delivery"}
     ]
     while pending_h3:
         admitted = []
@@ -11331,7 +12864,13 @@ def _h3_dependency_closed_recovery_units(verified: list[dict]) -> list[dict]:
             settings = unit.get("settings")
             if not isinstance(settings, dict):
                 settings = {}
-            if kind == "h3_segment" and dependencies:
+            if kind == "director_concat":
+                if not _director_concat_dependencies_match(unit, [accepted_by_id[key] for key in dependencies]):
+                    continue
+            elif kind == "director_delivery":
+                if not _director_delivery_dependencies_match(unit, [accepted_by_id[key] for key in dependencies]):
+                    continue
+            elif kind == "h3_segment" and dependencies:
                 predecessor = accepted_by_id[dependencies[-1]]
                 actual_hashes = sorted(
                     str(artifact.get("sha256") or "")
@@ -11450,6 +12989,294 @@ def _h3_dependency_closed_recovery_units(verified: list[dict]) -> list[dict]:
     return dependency_closed
 
 
+def _director_completed_concat_positions(job, project_dir, sealed):
+    """Require complete signed task coverage before adopting grouped Finals."""
+    admitted = job.get("params") or {}
+    child = admitted.get("_director_video_lora_child_snapshot")
+    recipes = admitted.get("_director_video_lora_task_plans")
+    inventory_records = admitted.get("_director_video_lora_task_inventory")
+    if (type(child) is not dict or type(child.get("binding")) is not dict
+            or type(child.get("digest")) is not str
+            or not hmac.compare_digest(child["digest"], _project_reference_private_commitment(child["binding"]))
+            or type(recipes) is not dict or not recipes):
+        raise QueueRecoveryRuntimeError("Director completed task coverage is unresolved.")
+    if type(inventory_records) is not dict or set(inventory_records) != {"0"}:
+        raise QueueRecoveryRuntimeError("Director completed queue inventory is missing.")
+    inventory = inventory_records["0"]
+    if (type(inventory) is not dict or set(inventory) != {"binding", "digest"}
+            or type(inventory.get("binding")) is not dict or type(inventory.get("digest")) is not str
+            or not hmac.compare_digest(inventory["digest"], _project_reference_private_commitment(inventory["binding"]))):
+        raise QueueRecoveryRuntimeError("Director completed queue inventory changed.")
+    inventory_binding = inventory["binding"]
+    tasks = inventory_binding.get("tasks")
+    if (set(inventory_binding) != {"version", "child_digest", "tasks"}
+            or type(inventory_binding.get("version")) is not int or inventory_binding["version"] != 1
+            or inventory_binding.get("child_digest") != child["digest"]
+            or type(tasks) is not list or not tasks
+            or set(recipes) != {str(index) for index in range(len(tasks))}):
+        raise QueueRecoveryRuntimeError("Director completed queue coverage changed.")
+    groups = {}
+    for key, recipe in recipes.items():
+        task_index = int(key)
+        if task_index < 0 or str(task_index) != key:
+            raise QueueRecoveryRuntimeError("Director completed task coordinates changed.")
+        _require_director_video_lora_task_recipe(admitted, child, task_index, recipe)
+        task_params = recipe["binding"]["task"]["params"]
+        if (tasks[task_index] != _director_video_lora_task_topology(task_params, task_index)
+                or len(recipe["binding"]["repeat_seeds"]) != tasks[task_index]["repeat_count"]):
+            raise QueueRecoveryRuntimeError("Director completed task topology changed.")
+        info = task_params.get("multi_clip_info")
+        if (type(info) is not dict or type(info.get("group_id")) is not str
+                or not info["group_id"] or info.get("automatic_h3_longform")
+                or info.get("defer_concat")
+                or (info.get("total") == 1 and info.get("source_prefix") is None)):
+            raise QueueRecoveryRuntimeError("Director task needs a different completed graph.")
+        groups.setdefault(info["group_id"], recipe)
+    roots = []
+    parents = set()
+    for group_id, recipe in groups.items():
+        for repeat_index in range(len(recipe["binding"]["repeat_seeds"])):
+            spec = _director_concat_spec(job, group_id, repeat_index, project_dir)
+            unit_id = recovery_unit_id(str(job.get("id") or ""), "director_concat", **spec)
+            unit = sealed.get(unit_id)
+            if (unit is None or unit.get("kind") != "director_concat"
+                    or any(unit.get(key) != spec[key] for key in spec)
+                    or len(unit.get("artifacts") or []) != 1):
+                raise QueueRecoveryRuntimeError("Director completed assembly coverage changed.")
+            roots.append(unit)
+            parents.update(spec["dependencies"])
+    if not roots or set(sealed) != parents | {unit["unit_id"] for unit in roots}:
+        raise QueueRecoveryRuntimeError("Director completed graph has incomplete or extra units.")
+    roots.sort(key=lambda unit: (unit["variant"], unit["index"]))
+    return {unit["unit_id"]: (len(roots), position) for position, unit in enumerate(roots)}
+
+
+def _director_completed_finishing_graph(job: dict, project_dir: str, sealed: dict, *, verified_units=None) -> dict:
+    """Prove complete task/repeat coverage and delivered roles from retained seals."""
+    deliveries = [unit for unit in sealed.values() if unit.get("kind") == "director_delivery"]
+    if (not sealed or len(sealed) > 4096 or len(deliveries) != 1
+            or any(unit.get("kind") not in {"ordinary_repeat", "director_concat", "director_delivery",
+                "h3_segment", "h3_concat", "h3_scene"} for unit in sealed.values())):
+        raise QueueRecoveryRuntimeError("Director completed finishing graph is ambiguous.")
+    check = dict(job, out_dir=project_dir, recovery_cursor=dict(job.get("recovery_cursor") or {},
+        completed_units=list(sealed.values())))
+    admitted = check.get("params") or {}
+    child = admitted["_director_video_lora_child_snapshot"]
+    inventory = admitted["_director_video_lora_task_inventory"]
+    recipes = admitted["_director_video_lora_task_plans"]
+    if (type(child) is not dict or set(child) != {"binding", "digest"}
+            or not hmac.compare_digest(child["digest"], _project_reference_private_commitment(child["binding"]))
+            or type(inventory) is not dict or set(inventory) != {"0"}
+            or type(inventory["0"]) is not dict or set(inventory["0"]) != {"binding", "digest"}
+            or not hmac.compare_digest(inventory["0"]["digest"],
+                _project_reference_private_commitment(inventory["0"]["binding"]))):
+        raise QueueRecoveryRuntimeError("Director completed inventory is not authenticated.")
+    binding = inventory["0"]["binding"]
+    scope = child["binding"]["scope"]
+    from services.director_pipeline import _normalized_child_unit, _director_child_job_id
+    unit = child["binding"]["unit"]
+    pipeline_id = admitted["_director_pipeline_id"]
+    identity = re.fullmatch(r"director-" + re.escape(str(pipeline_id)) + r"-(0|[1-9][0-9]{0,8})-[0-9a-f]{24}", str(job["id"]))
+    if (job.get("kind") != "director_child" or child["binding"]["pipeline_id"] != pipeline_id
+            or scope != {"project_id": job["workspace"], "workspace_id": "main",
+                         "project_instance": job["_recovery_project_digest"],
+                         "owner_digest": job["_recovery_owner_digest"]}
+            or _normalized_child_unit(unit) != unit or identity is None
+            or job["id"] != _director_child_job_id(pipeline_id, unit, int(identity[1]))):
+        raise QueueRecoveryRuntimeError("Director completed child ownership changed.")
+    tasks = binding["tasks"]
+    if (set(binding) != {"version", "child_digest", "tasks"} or binding["version"] != 1
+            or binding["child_digest"] != child["digest"] or type(tasks) is not list or not tasks
+            or type(recipes) is not dict or set(recipes) != {str(index) for index in range(len(tasks))}):
+        raise QueueRecoveryRuntimeError("Director completed task coverage changed.")
+    if admitted.get("_h3_cumulative_append") is True:
+        raise QueueRecoveryRuntimeError("Director cumulative completion requires its distinct native graph.")
+    closed = _h3_dependency_closed_recovery_units(list(sealed.values()))
+    if {unit["unit_id"] for unit in closed} != set(sealed):
+        raise QueueRecoveryRuntimeError("Director completed dependencies are incomplete.")
+    consumed = frozenset(unit["dependencies"][-1] for unit in closed
+        if unit["kind"] == "h3_segment" and unit["dependencies"]
+        and sealed[unit["dependencies"][-1]]["kind"] == "h3_segment"
+        and sealed[unit["dependencies"][-1]]["variant"] == unit["variant"]
+        and sealed[unit["dependencies"][-1]]["index"] + 1 == unit["index"])
+    h3_groups = (_director_h3_inventory_groups(check) if any(
+        (topology.get("group") or {}).get("automatic_h3_longform") is True for topology in tasks) else [])
+    repair = _director_h3_scene_repair_selection(check) if h3_groups else None
+    if (repair is not None and repair["predecessor_index"] is not None
+            and check["recovery_cursor"].get("h3_scene_repair_handoff") is None):
+        # An orphaned completed graph can retain the admitted boundary in its
+        # first new producer. Use it only in this detached completion view;
+        # the signed derived/delivery closure below must authenticate it.
+        first = [unit for unit in sealed.values() if unit["kind"] == "h3_segment"
+                 and unit["variant"] == 0 and unit["index"] == repair["physical_indices"][0]]
+        if len(first) != 1:
+            raise QueueRecoveryRuntimeError("Director completed repair boundary is ambiguous.")
+        external = first[0]["settings"].get("external_predecessor_input")
+        if not isinstance(external, dict) or not isinstance(external.get("handoff"), dict):
+            raise QueueRecoveryRuntimeError("Director completed repair boundary is missing.")
+        check["recovery_cursor"]["h3_scene_repair_handoff"] = copy.deepcopy(external["handoff"])
+    h3_parents = {}
+    parents, roles, groups = {}, {}, {}
+    for task_index, topology in enumerate(tasks):
+        recipe = recipes[str(task_index)]
+        _require_director_video_lora_task_recipe(admitted, child, task_index, recipe)
+        params = recipe["binding"]["task"]["params"]
+        if (topology != _director_video_lora_task_topology(params, task_index)
+                or len(recipe["binding"]["repeat_seeds"]) != topology["repeat_count"]):
+            raise QueueRecoveryRuntimeError("Director completed topology changed.")
+        info = params.get("multi_clip_info")
+        if isinstance(info, dict) and info.get("automatic_h3_longform") is True:
+            variant, segment_index = _director_h3_task_coordinate(check, task_index, recipe)
+            segment = _director_checked_recovery_unit(check, kind="h3_segment", variant=variant,
+                index=segment_index, project_dir=project_dir, verified_units=verified_units,
+                consumed_continuations=consumed)
+            if segment is None or len(segment["artifacts"]) != 1:
+                raise QueueRecoveryRuntimeError("Director completed graph is missing a physical H3 child.")
+            proof = segment["settings"]["director_lora_consumption"]["binding"]
+            consumption = admitted["_director_video_lora_consumption_plans"][str(task_index)]["binding"]["entries"]
+            if (proof["task_index"] != task_index or proof["repeat_index"] != 0 or set(consumption) != {"0"}
+                    or any(segment["settings"].get(key) != value
+                           for key, value in _h3_segment_recovery_settings(info).items())):
+                raise QueueRecoveryRuntimeError("Director completed H3 native coverage changed.")
+            previous = h3_parents.setdefault(variant, {})
+            expected_dependencies = ([previous[segment_index - 1]["unit_id"]]
+                                     if previous else [])
+            external = _director_h3_scene_repair_dependency(check, segment_index) if repair is not None else None
+            if (segment["dependencies"] != expected_dependencies
+                    or segment["settings"].get("external_predecessor_input")
+                       != (external["external_predecessor_input"] if external is not None else None)):
+                raise QueueRecoveryRuntimeError("Director completed H3 predecessor changed.")
+            declared = consumption["0"]["binding"]["output_roles"]
+            name = segment["artifacts"][0]["basename"]
+            if declared.get(name) != "component" or name in roles:
+                raise QueueRecoveryRuntimeError("Director completed H3 child role changed.")
+            previous[segment_index] = segment
+            parents[segment["unit_id"]] = segment
+            roles[name] = "component"
+            continue
+        _, repeats = _director_completed_repeat_prefix(check, task_index=task_index,
+            task_recipe=recipe, project_dir=project_dir, verified_units=verified_units)
+        if len(repeats) != topology["repeat_count"]:
+            raise QueueRecoveryRuntimeError("Director completed graph is missing native repeats.")
+        for unit in repeats:
+            parents[unit["unit_id"]] = unit
+            _, declared_roles = _director_recovered_repeat_media(check, task_index, unit)
+            if set(roles) & set(declared_roles):
+                raise QueueRecoveryRuntimeError("Director completed media has duplicate producers.")
+            roles.update(declared_roles)
+        if isinstance(info, dict):
+            # Standalone deferred physical components retain their declared
+            # native roles; they do not imply an unrequested joined producer.
+            if info.get("defer_concat") is True:
+                continue
+            if info.get("total") != 1 or info.get("source_prefix") is not None:
+                group_id = info.get("group_id")
+                if type(group_id) is not str or not group_id:
+                    raise QueueRecoveryRuntimeError("Director completed assembly group changed.")
+                if group_id in groups and groups[group_id] != topology["repeat_count"]:
+                    raise QueueRecoveryRuntimeError("Director completed assembly repeat count changed.")
+                groups[group_id] = topology["repeat_count"]
+    for group_id, repeat_count in groups.items():
+        for repeat_index in range(repeat_count):
+            spec = _director_concat_spec(check, group_id, repeat_index, project_dir, verified_units=verified_units)
+            unit_id = recovery_unit_id(str(job["id"]), "director_concat", **spec)
+            unit = sealed.get(unit_id)
+            if (unit is None or any(unit.get(key) != spec[key] for key in spec)
+                    or len(unit.get("artifacts") or []) != 1):
+                raise QueueRecoveryRuntimeError("Director completed assembly is missing.")
+            parents[unit_id] = unit
+            name = unit["artifacts"][0]["basename"]
+            if name in roles:
+                raise QueueRecoveryRuntimeError("Director completed assembly name is ambiguous.")
+            roles[name] = "final"
+    scene_slots = {}
+    for variant, group in enumerate(h3_groups):
+        segments = h3_parents.get(variant, {})
+        if list(segments) != [row[1] for row in group["members"]]:
+            raise QueueRecoveryRuntimeError("Director completed H3 variant coverage changed.")
+        deferred = [bool(recipes[str(row[0])]["binding"]["task"]["params"]["multi_clip_info"].get("defer_concat"))
+                    for row in group["members"]]
+        if any(deferred) != all(deferred):
+            raise QueueRecoveryRuntimeError("Director completed H3 assembly intent changed.")
+        if repair is None and not all(deferred):
+            concat = _director_checked_recovery_unit(check, kind="h3_concat", variant=variant,
+                index=0, project_dir=project_dir, verified_units=verified_units,
+                consumed_continuations=consumed)
+            if concat is None:
+                raise QueueRecoveryRuntimeError("Director completed H3 final assembly is missing.")
+            name = concat["artifacts"][0]["basename"]
+            if name in roles:
+                raise QueueRecoveryRuntimeError("Director completed H3 final name is ambiguous.")
+            parents[concat["unit_id"]] = concat
+            roles[name] = "final"
+        plan = admitted.get("_h3_longform")
+        if isinstance(plan, dict) and isinstance(plan.get("segment_source_indices"), list):
+            from services.director_h3_scene_assembly import director_h3_scene_specs
+            specs = director_h3_scene_specs(plan, segments,
+                audio_start_sec=admitted.get("multi_clip_audio_start_sec", 0.0))
+            if not specs or (repair is not None and [spec["index"] for spec in specs] != [repair["scene_index"]]):
+                raise QueueRecoveryRuntimeError("Director completed H3 authored scene coverage changed.")
+            for spec in specs:
+                scene = _director_checked_recovery_unit(check, kind="h3_scene", variant=variant,
+                    index=spec["index"], project_dir=project_dir, verified_units=verified_units,
+                    consumed_continuations=consumed)
+                if scene is None:
+                    raise QueueRecoveryRuntimeError("Director completed H3 scene assembly is missing.")
+                name = scene["artifacts"][0]["basename"]
+                if name in roles:
+                    raise QueueRecoveryRuntimeError("Director completed H3 scene name is ambiguous.")
+                parents[scene["unit_id"]] = scene
+                roles[name] = _director_h3_scene_finishing_role(check, scene)
+                scene_slots[str(spec["index"])] = name
+    delivery = deliveries[0]
+    if set(sealed) != set(parents) | {delivery["unit_id"]}:
+        raise QueueRecoveryRuntimeError("Director completed graph has incomplete or extra units.")
+    for unit in sealed.values():
+        verified = _director_checked_recovery_unit(check, kind=unit["kind"], variant=unit["variant"],
+            index=unit["index"], project_dir=project_dir, verified_units=verified_units,
+            consumed_continuations=consumed)
+        if verified != unit:
+            raise QueueRecoveryRuntimeError("Director completed producer media changed.")
+    if repair is not None and repair["predecessor_index"] is not None:
+        handoff = check["recovery_cursor"]["h3_scene_repair_handoff"]
+        identity = _director_h3_scene_repair_input_identity(admitted["_h3_rerun_input"]["snapshot"])
+        if not _queue_recovery_continuation_descriptor_matches(handoff, identity, project_dir,
+                allow_retired=True):
+            raise QueueRecoveryRuntimeError("Director completed repair handoff changed.")
+    contract = delivery["settings"]["director_finishing"]["binding"]
+    targets = contract["targets"]
+    if ({target["basename"] for target in targets} != set(roles)
+            or len(targets) != len(roles)
+            or contract["file_names"] != [target["basename"] for target in targets]
+            or any(target["role"] != roles[target["basename"]] for target in targets)):
+        raise QueueRecoveryRuntimeError("Director completed finishing scope changed.")
+    pending = _queue_recovery_delivery_pending(job)
+    if pending is not None:
+        plan = _director_finishing_plan_from_pending(job, pending)
+        if (plan["unit_id"] != delivery["unit_id"] or plan["settings"] != delivery["settings"]
+                or plan["dependencies"] != delivery["dependencies"]
+                or pending.get("state") != "protected_native" or not pending.get("publication")):
+            raise QueueRecoveryRuntimeError("Director completed cleanup belongs to another transaction.")
+    outputs = _director_finishing_output_map(delivery)
+    clips = {key: outputs["replacements"].get(name, name)
+             for key, name in (job.get("clip_output_files") or {}).items()}
+    if any(name not in outputs["files"] for name in clips.values()):
+        raise QueueRecoveryRuntimeError("Director completed clip map changed.")
+    join = outputs["replacements"].get(job.get("join_output_file"), job.get("join_output_file"))
+    if join and join not in outputs["finals"]:
+        raise QueueRecoveryRuntimeError("Director completed final map changed.")
+    scene_outputs = {key: outputs["replacements"][name] for key, name in scene_slots.items()}
+    retained_scenes = job.get("h3_scene_output_files") or {}
+    if (not isinstance(retained_scenes, dict) or (retained_scenes and set(retained_scenes) != set(scene_slots))
+            or any(name not in {scene_slots[key], scene_outputs[key]} for key, name in retained_scenes.items())):
+        raise QueueRecoveryRuntimeError("Director completed scene map changed.")
+    return {"completed_units": closed, "output_files": outputs["finals"],
+            "artifact_files": list(dict.fromkeys([*roles, *outputs["files"]])),
+            "artifact_roles": {**roles, **outputs["roles"]},
+            "clip_output_files": clips, "join_output_file": join,
+            "h3_scene_output_files": scene_outputs, "director_finishing": True}
+
+
 def _queue_recovery_completed_h3_graph(job: dict, project_dir: str) -> dict | None:
     """Verify completed Finals without requiring consumed staging images.
 
@@ -11464,7 +13291,7 @@ def _queue_recovery_completed_h3_graph(job: dict, project_dir: str) -> dict | No
     ) or job.get("cancel_requested"):
         return None
     cursor = job.get("recovery_cursor") or {}
-    if not isinstance(cursor, dict) or isinstance(cursor.get("delivery_pending"), dict):
+    if not isinstance(cursor, dict):
         return None
     originals = _queue_recovery_units(job)
     last = job.get("recovery_unit")
@@ -11475,9 +13302,23 @@ def _queue_recovery_completed_h3_graph(job: dict, project_dir: str) -> dict | No
         if unit.get("state") == "completed"
         and type(unit.get("unit_id")) is str
     }
+    if any(unit.get("kind") == "director_delivery" for unit in sealed.values()):
+        try:
+            return _director_completed_finishing_graph(job, project_dir, sealed)
+        except (QueueRecoveryRuntimeError, OSError, KeyError, TypeError, ValueError):
+            return None
+    if isinstance(cursor.get("delivery_pending"), dict):
+        return None
     private_plan = (job.get("params") or {}).get("_h3_longform")
     repair_selection = None
-    if isinstance(private_plan, dict) and private_plan.get("scene_rerun") is not None:
+    director_positions = None
+    if any(unit.get("kind") == "director_concat" for unit in sealed.values()):
+        try:
+            director_positions = _director_completed_concat_positions(job, project_dir, sealed)
+        except (QueueRecoveryRuntimeError, OSError, KeyError, TypeError, ValueError):
+            return None
+        finals = [sealed[unit_id] for unit_id in director_positions]
+    elif isinstance(private_plan, dict) and private_plan.get("scene_rerun") is not None:
         try:
             repair_selection = _director_h3_scene_repair_selection(job)
         except (QueueRecoveryRuntimeError, KeyError, TypeError, ValueError):
@@ -11533,7 +13374,7 @@ def _queue_recovery_completed_h3_graph(job: dict, project_dir: str) -> dict | No
             dependencies, settings = meta.get("producer_unit_dependencies"), meta.get("producer_unit_settings")
             names = meta.get("producer_unit_artifact_names")
             if (
-                kind not in {"h3_segment", "h3_concat", "h3_scene", "h3_delivery", "ordinary_repeat"}
+                kind not in {"h3_segment", "h3_concat", "h3_scene", "h3_delivery", "ordinary_repeat", "director_concat"}
                 or type(variant) is not int or variant < 0
                 or type(index) is not int or index < 0
                 or not isinstance(dependencies, list)
@@ -11550,7 +13391,7 @@ def _queue_recovery_completed_h3_graph(job: dict, project_dir: str) -> dict | No
                     "state": "completed", "artifacts": []}
             if "producer_unit_continuation" in meta:
                 unit["continuation"] = meta["producer_unit_continuation"]
-            if kind == "h3_scene":
+            if kind == "h3_scene" or director_positions is not None:
                 unit["attestation"] = meta.get("producer_unit_attestation")
             identity_keys = ("producer_unit_kind", "producer_unit_variant", "producer_unit_index",
                              "producer_unit_dependencies", "producer_unit_settings",
@@ -11570,7 +13411,11 @@ def _queue_recovery_completed_h3_graph(job: dict, project_dir: str) -> dict | No
                     return None
                 unit["artifacts"].append(descriptor)
                 if unit_id in final_ids:
-                    if repair_selection is not None:
+                    if director_positions is not None:
+                        if kind != "director_concat" or unit_id not in director_positions:
+                            return None
+                        total, position = director_positions[unit_id]
+                    elif repair_selection is not None:
                         if kind != "h3_scene" or variant != 0 or index != repair_selection["scene_index"]:
                             return None
                         total, position = 1, 0
@@ -11589,6 +13434,8 @@ def _queue_recovery_completed_h3_graph(job: dict, project_dir: str) -> dict | No
                     outputs.append(name)
             original = sealed.get(unit_id)
             if original is not None:
+                if director_positions is not None and original.get("attestation") != unit.get("attestation"):
+                    return None
                 for key in ("kind", "variant", "index", "dependencies", "settings", "continuation"):
                     if original.get(key) != unit.get(key):
                         return None
@@ -11618,7 +13465,7 @@ def _queue_recovery_completed_h3_graph(job: dict, project_dir: str) -> dict | No
         for unit in units.values():
             check = dict(job, recovery_cursor=dict(cursor, completed_units=(
                 list(units.values())
-                if repair_selection is not None or unit["kind"] == "h3_scene" or (isinstance(job.get("params"), dict)
+                if director_positions is not None or repair_selection is not None or unit["kind"] == "h3_scene" or (isinstance(job.get("params"), dict)
                     and job["params"].get("_h3_cumulative_append") is True)
                 else [unit]
             )))
@@ -11992,7 +13839,11 @@ def _queue_recovery_reconcile_cursor(job: dict, project_dir: str, *, adopt_stage
             continue
         if settings:
             recovered["settings"] = dict(settings)
-        if kind == "h3_scene":
+        signature = ("producer_unit_attestation" in meta, meta.get("producer_unit_attestation"))
+        if recovered.setdefault("_attestation_signature", copy.deepcopy(signature)) != signature:
+            invalid_recovered_units.add(unit_id)
+            continue
+        if kind == "h3_scene" or "producer_unit_attestation" in meta:
             attestation = meta.get("producer_unit_attestation")
             if not isinstance(attestation, dict):
                 invalid_recovered_units.add(unit_id)
@@ -12013,6 +13864,7 @@ def _queue_recovery_reconcile_cursor(job: dict, project_dir: str, *, adopt_stage
         recovered["artifacts"].append(artifact)
     for unit_id, unit in recovered_by_unit.items():
         unit.pop("_continuation_signature", None)
+        unit.pop("_attestation_signature", None)
         expected_artifacts = set(unit.pop("_expected_artifacts", ()))
         actual_artifacts = {
             str(artifact.get("basename") or "")
@@ -12049,11 +13901,24 @@ def _queue_recovery_reconcile_cursor(job: dict, project_dir: str, *, adopt_stage
                         identities.append((name, size, digest))
                     return sorted(identities)
                 old_media, new_media = media_identity(original), media_identity(unit)
-                if old_media is None or new_media is None or old_media != new_media:
+                if old_media is None or new_media is None:
                     continue
+                if old_media != new_media:
+                    # Finishing can seal replacement bytes before the journal
+                    # acknowledges them. Adopt only that authenticated successor.
+                    if not (
+                        (original.get("settings") or {}).get("director_lora_consumption")
+                        and original.get("settings") == unit.get("settings")
+                        and all(original.get(key) == unit.get(key)
+                                for key in ("unit_id", "kind", "variant", "index"))
+                        and [row[0] for row in old_media] == [row[0] for row in new_media]
+                        and _director_native_producer_matches(job, original)
+                        and _director_native_producer_matches(job, unit)
+                    ):
+                        continue
             check_job = dict(job, recovery_cursor=dict(job.get("recovery_cursor") or {}, completed_units=(
                 [unit] + verified + [candidate for key, candidate in recovered_by_unit.items() if key != unit_id]
-                if unit["kind"] == "h3_scene" or (isinstance(job.get("params"), dict)
+                if unit["kind"] in {"h3_scene", "director_concat", "director_delivery"} or (isinstance(job.get("params"), dict)
                     and job["params"].get("_h3_cumulative_append") is True)
                 else [unit]
             )))
@@ -13413,11 +15278,93 @@ def _h3_source_audio_premux_settings(params: dict) -> dict | None:
     }
 
 
+def _h3_task_style_skip_reason(job, task):
+    """Read physical conditioning choices from the saved request, not a flag."""
+    native = task.get("params") or {}
+    segment_plan = (job.get("params") or {}).get("_h3_longform")
+    if isinstance(segment_plan, dict):
+        index = (native.get("multi_clip_info") or {}).get("index")
+        segments = segment_plan.get("segment_models")
+        if (type(index) is not int or index < 0 or not isinstance(segments, list)
+                or index >= len(segments) or not isinstance(segments[index], dict)):
+            raise QueueRecoveryRuntimeError("Saved visual style segment binding is unavailable.")
+        if segments[index].get("drop_semantic_refs") is True:
+            return "segment_reference_drop"
+    if native.get("model_type") != "minimax_h3_ref2va":
+        return "checkpoint_unsupported"
+    return None
+
+
+def _prepare_h3_task_custom_style(job, task, descriptors, project_dir):
+    """Derive native fields from exact retained inputs for one physical task."""
+    from services.custom_visual_styles import digest, validate_snapshot
+    from services.h3_custom_style_handoff import prepare_style_handoff
+    from shared.utils.audio_video import extract_audio_tracks
+
+    params = job.get("params") or {}
+    projection = params.get("_director_custom_style_video_snapshot")
+    if projection is None:
+        return None
+    stage = projection.get("video_snapshot") if isinstance(projection, dict) else None
+    body = validate_snapshot(stage)
+    if not any(ref["delivery"] == "planned" for ref in body["references"]):
+        # Old text-only snapshots retain their original delivery contract.
+        return None
+    native = task.get("params") or {}
+    if _h3_task_style_skip_reason(job, task) is not None:
+        # A cut may still choose Ref2VA for its predecessor still after
+        # dropping authored references; a frame checkpoint cannot apply them.
+        return None
+    envelope = _director_retained_style_inputs(params)
+    scope = {"project_id": str(job.get("workspace") or ""), "workspace_id": "main",
+             "owner_digest": str(job.get("_recovery_owner_digest") or ""),
+             "project_instance": _queue_recovery_existing_project_identity(project_dir)}
+    if (job.get("kind") != "director_child" or envelope is None
+            or envelope["scope_digest"] != digest(scope)):
+        raise QueueRecoveryRuntimeError("Saved visual style image ownership changed.")
+    pairs = []
+
+    def validate_descriptor(descriptor):
+        original = descriptor
+        for private, derived in pairs:
+            if descriptor == derived:
+                original = private
+                break
+        return (original in descriptors and _queue_recovery_manifest_validator(
+            original, owner_digest=scope["owner_digest"], workspace=scope["project_id"],
+            project_dir=project_dir) is True)
+
+    def resolve_current(reference, field):
+        expected = {key: copy.deepcopy(reference[key])
+                    for key in ("selection", "sha256", "terms", "access_policy")}
+        matches = [index for index, source in enumerate(envelope["sources"]) if source == expected]
+        if len(matches) != 1:
+            raise QueueRecoveryRuntimeError("Saved visual style source binding changed.")
+        private = envelope["inputs"][matches[0]]
+        if sum(item == private for item in descriptors) != 1 or not validate_descriptor(private):
+            raise QueueRecoveryRuntimeError("Saved visual style image identity changed.")
+        derived = {**copy.deepcopy(private), "field": field}
+        pairs.append((copy.deepcopy(private), derived))
+        return {"source": expected, "descriptor": derived}
+
+    # A Ref2VA boundary may fall back from a video tail to a semantic still.
+    # Reserve both slots before decoding the initial immutable image baseline.
+    reserved = 1 if native.get("_ref2va_continuation") else 0
+    prepared = prepare_style_handoff(stage, native, descriptors,
+        resolve_current=resolve_current, validate_descriptor=validate_descriptor,
+        has_audio=lambda value: extract_audio_tracks(value, query_only=True) > 0,
+        reserved_image_slots=reserved, reserved_mixed_slots=reserved)
+    prepared["descriptor_bindings"] = pairs
+    return prepared
+
+
 def _bind_h3_task_prompt_mapping(
     job, task, source_snapshot, initial_images, source_plan, descriptors, project_dir,
+    *, semantic_manifest=None, descriptor_bindings=None,
 ):
     """Bind resolved source and pinned references before WGP validates a task."""
     from services.h3_mapping_dispatch import bind_h3_mapping_task
+    from models.minimax_h3.reference_manifest import MINIMAX_H3_MAX_REFERENCE_IMAGES
     from services.h3_reference_binding import (
         materialize_h3_reference_image, materialize_h3_reference_files,
         cleanup_h3_reference_files,
@@ -13453,6 +15400,19 @@ def _bind_h3_task_prompt_mapping(
         path = _queue_recovery_continuation_path(project_dir, continuation)
 
     def validate_descriptor(descriptor):
+        for private, derived in descriptor_bindings or ():
+            if descriptor == derived:
+                field = re.fullmatch(r"image_refs:(0|[1-9][0-9]*)", str(derived.get("field") or ""))
+                if (private not in descriptors
+                        or private.get("scope") != "director_custom_style_image"
+                        or not str(private.get("field") or "").startswith("_director_custom_style_image_paths:")
+                        or field is None or int(field.group(1)) >= MINIMAX_H3_MAX_REFERENCE_IMAGES
+                        or derived != {**private, "field": derived["field"]}):
+                    return False
+                return _queue_recovery_manifest_validator(
+                    private, owner_digest=str(job.get("_recovery_owner_digest") or ""),
+                    workspace=str(job.get("workspace") or ""), project_dir=project_dir,
+                )
         if descriptor in descriptors:
             return _queue_recovery_manifest_validator(
                 descriptor, owner_digest=str(job.get("_recovery_owner_digest") or ""),
@@ -13479,7 +15439,141 @@ def _bind_h3_task_prompt_mapping(
             job_id=str(job.get("id") or ""),
         ),
         cleanup_files=cleanup_h3_reference_files,
+        semantic_manifest=semantic_manifest,
     )
+
+
+def _h3_task_style_observation(task, sidecar_params, handoff, gen, model_def, *, cumulative=False):
+    """Observe only the admitted Ref2VA path with unchanged image ordinals."""
+    from services.h3_style_observation import H3StyleReferenceObservation
+
+    params = task.get("params") or {}
+    if (handoff is None or cumulative or params.get("model_type") != "minimax_h3_ref2va"
+            or "I" not in str(params.get("video_prompt_type") or "")
+            or "F" in str(params.get("video_prompt_type") or "")
+            or params.get("frames_positions")
+            or model_def.get("custom_frames_injection")
+            or model_def.get("custom_image_ref_postprocessor")):
+        return None
+    # Read the final mapper manifest, which also includes any late predecessor
+    # image. Its source keys, rather than mixed-media list positions, are the
+    # adapter's image ordinals on this untransformed path.
+    manifest = (sidecar_params.get("_h3_prompt_mapping_record") or {}).get("reference_manifest")
+    if not isinstance(manifest, list):
+        return None
+    prepared = handoff.get("prepared") or []
+    digests = {entry.get("style_digest") for entry in prepared if isinstance(entry, dict)}
+    if len(digests) != 1:
+        return None
+    digest = next(iter(digests))
+    ordinals = []
+    for entry in manifest:
+        style = entry.get("custom_visual_style") if isinstance(entry, dict) else None
+        if style is None:
+            continue
+        key = re.fullmatch(r"image_refs:(0|[1-9][0-9]*)", str(entry.get("source_key") or ""))
+        if key is None or style.get("style_snapshot_digest") != digest:
+            return None
+        ordinals.append(int(key.group(1)) + 1)
+    if len(ordinals) != len(prepared):
+        return None
+
+    def current_repeat():
+        value = gen.get("repeat_no")
+        if type(value) is not int or value < 1:
+            raise ValueError("H3 global repeat identity is unavailable")
+        return value - 1
+
+    try:
+        return H3StyleReferenceObservation(task_id=str(task.get("id") or ""),
+            style_digest=digest, expected_image_count=len(params.get("image_refs") or []),
+            style_ordinals=tuple(sorted(ordinals)), repeat_index=current_repeat)
+    except (TypeError, ValueError):
+        return None
+
+
+def _h3_style_observed_settings(settings, observation, repeat_index, *, expected_windows,
+                                job=None, task=None):
+    """Join native evidence and clip facts only at a successful video producer."""
+    from services.h3_style_observation import H3StyleReferenceObservation
+
+    result = dict(settings)
+    if isinstance(observation, H3StyleReferenceObservation):
+        candidate = observation.receipt(repeat_index)
+        if (candidate is not None and type(expected_windows) is int
+                and expected_windows > 0 and len(candidate["windows"]) == expected_windows):
+            result["custom_visual_style_reference_encoding"] = candidate
+    if job is not None and task is not None:
+        projection = (job.get("params") or {}).get("_director_custom_style_video_snapshot")
+        if projection is not None:
+            from services.h3_style_observation import build_style_delivery_fact
+
+            result["custom_visual_style_delivery"] = build_style_delivery_fact(
+                projection.get("video_snapshot"),
+                model_type=(task.get("params") or {}).get("model_type"),
+                skip_reason=_h3_task_style_skip_reason(job, task),
+                encoding_receipt=result.get("custom_visual_style_reference_encoding"),
+            )
+    return result
+
+
+def _h3_style_recovery_encoding_matches(job, unit):
+    """Validate clip facts only after the caller verifies its producer media."""
+    settings = unit.get("settings") or {}
+    has_encoding = "custom_visual_style_reference_encoding" in settings
+    has_delivery = "custom_visual_style_delivery" in settings
+    if not has_encoding and not has_delivery:
+        return True  # Historical producers make no reference-use claim.
+    from services.custom_visual_styles import validate_snapshot
+    from services.h3_style_observation import validate_style_reference_receipt, build_style_delivery_fact
+
+    try:
+        projection = (job.get("params") or {}).get("_director_custom_style_video_snapshot")
+        snapshot = projection["video_snapshot"]
+        body = validate_snapshot(snapshot)
+        if (job.get("kind") != "director_child"
+                or unit.get("kind") not in {"ordinary_repeat", "h3_segment"}
+                or unit.get("state") != "completed"
+                or not any(str(item.get("basename") or "").lower().endswith(
+                    (".mp4", ".webm", ".mov", ".mkv")) for item in unit.get("artifacts") or [])):
+            return False
+        candidate = None
+        if has_encoding:
+            if body["model_type"] != "minimax_h3_ref2va":
+                return False
+            candidate = validate_style_reference_receipt(
+                settings["custom_visual_style_reference_encoding"], style_digest=snapshot["digest"],
+            )
+            planned = [ref for ref in body["references"] if ref["delivery"] == "planned"]
+            if len(candidate["style_ordinals"]) != len(planned):
+                return False
+            if unit["kind"] == "ordinary_repeat" and candidate["global_repeat_index"] != unit.get("index"):
+                return False
+        if has_delivery:
+            params = job.get("params") or {}
+            physical = {"model_type": params.get("model_type") or body["model_type"]}
+            plan = params.get("_h3_longform")
+            if isinstance(plan, dict):
+                index = unit.get("index")
+                segments = plan.get("segment_models")
+                if (unit["kind"] != "h3_segment" or type(index) is not int or index < 0
+                        or not isinstance(segments, list) or index >= len(segments)
+                        or not isinstance(segments[index], dict)):
+                    return False
+                physical = {"model_type": segments[index]["model_type"],
+                            "multi_clip_info": {"index": index}}
+            expected_delivery = build_style_delivery_fact(snapshot,
+                model_type=physical["model_type"],
+                skip_reason=_h3_task_style_skip_reason(job, {"params": physical}),
+                encoding_receipt=candidate)
+            if settings["custom_visual_style_delivery"] != expected_delivery:
+                return False
+        return unit.get("unit_id") == recovery_unit_id(
+            str(job.get("id") or ""), unit["kind"], variant=unit.get("variant"),
+            index=unit.get("index"), dependencies=unit.get("dependencies") or [], settings=settings,
+        )
+    except (KeyError, TypeError, ValueError):
+        return False
 
 
 def _load_h3_mapping_manifest_inputs(job: dict) -> tuple[str, list[dict]]:
@@ -14274,6 +16368,752 @@ def _apply_h3_delivery_finishing(
     return outcomes
 
 
+def _director_finishing_plan(job: dict, project_dir: str, file_names: list[str],
+                             final_video_names: list[str]) -> dict:
+    """Freeze effective finishing and each target against pristine producers."""
+    import math
+
+    child = (job.get("params") or {}).get("_director_video_lora_child_snapshot")
+    if (type(child) is not dict or set(child) != {"binding", "digest"}
+            or type(child["binding"]) is not dict or type(child["digest"]) is not str
+            or not hmac.compare_digest(child["digest"],
+                _project_reference_private_commitment(child["binding"]))):
+        raise QueueRecoveryRuntimeError("Director finishing child is not authenticated.")
+    requested = child["binding"].get("requested")
+    if (type(requested) is not dict or requested.get("generation_mode", "video") != "video"
+            or type(file_names) is not list or not file_names
+            or any(type(name) is not str or name != os.path.basename(name)
+                   or not name or name.startswith(".") for name in file_names)
+            or len(set(file_names)) != len(file_names)
+            or type(final_video_names) is not list
+            or any(type(name) is not str for name in final_video_names)
+            or len(set(final_video_names)) != len(final_video_names)
+            or not set(final_video_names) <= set(file_names)):
+        raise QueueRecoveryRuntimeError("Director finishing output scope is unresolved.")
+    videos = {name for name in file_names
+              if os.path.splitext(name)[1].lower() in {".mp4", ".webm", ".mkv"}}
+    if (not set(final_video_names) <= videos
+            or (requested.get("_director_final_video_postprocess", 0) == 1
+                and not final_video_names)):
+        raise QueueRecoveryRuntimeError("Director finishing final video scope is missing.")
+    final_targets = (set(final_video_names)
+                     if requested.get("_director_final_video_postprocess", 0) == 1 else videos)
+    inventory = (job.get("params") or {}).get("_director_video_lora_task_inventory", {})
+    if any((topology.get("group") or {}).get("automatic_h3_longform") is True
+           for topology in inventory.get("0", {}).get("binding", {}).get("tasks", [])):
+        # Automatic H3's physical children are retained components. Upscale,
+        # fit and grain apply to Finals; voice/audio finishing still covers all.
+        final_targets = set(final_video_names)
+    optional = _build_h3_delivery_finishing(job, requested)
+    method = str(requested.get("spatial_upsampling") or "")
+    method = method if method and wgp.flashvsr.is_upsampling(method) else ""
+    resolution = str(requested.get("delivery_resolution") or "").lower()
+    fit = str(requested.get("delivery_fit") or "").lower()
+    if resolution and (not method or resolution not in {
+            "1920x1080", "2688x1536", "3840x2160"}
+            or fit not in {"upscale_exact", "center_crop"}):
+        raise QueueRecoveryRuntimeError("Director finishing delivery target is invalid.")
+    normalization = None
+    if requested.get("tts_dynaudnorm"):
+        normalization = {name: requested.get(key, default) for name, key, default in (
+            ("threshold", "tts_comp_threshold", -25), ("attack", "tts_comp_attack", 5),
+            ("release", "tts_comp_release", 100), ("makeup", "tts_comp_makeup", 4))}
+        if any(type(value) not in {int, float} or not math.isfinite(value)
+               for value in normalization.values()):
+            raise QueueRecoveryRuntimeError("Director audio normalization is invalid.")
+    sources, dependencies, targets = [], [], []
+    units = _queue_recovery_units(job)
+    for name in file_names:
+        candidates = [(unit, artifact) for unit in units
+                      if unit.get("state") == "completed"
+                      and unit.get("kind") in {"ordinary_repeat", "director_concat", "h3_segment", "h3_concat", "h3_scene"}
+                      and not (unit.get("kind") == "h3_scene"
+                               and (job.get("params") or {}).get("_h3_cumulative_append") is True)
+                      for artifact in unit.get("artifacts") or []
+                      if artifact.get("basename") == name]
+        if len(candidates) != 1:
+            raise QueueRecoveryRuntimeError("Director finishing parent membership is ambiguous.")
+        unit, artifact = candidates[0]
+        if (not _director_native_producer_matches(job, unit)
+                or not validate_artifact_descriptor(project_dir, artifact,
+                    producer_unit_id=unit["unit_id"])):
+            raise QueueRecoveryRuntimeError("Director finishing parent changed.")
+        if unit["kind"] in {"ordinary_repeat", "h3_segment"}:
+            native = unit["settings"]["director_lora_consumption"]["binding"]["media"]
+            expected = next((row for row in native if row["basename"] == name), None)
+            if expected != {"basename": name, "bytes": artifact["size"], "sha256": artifact["sha256"]}:
+                raise QueueRecoveryRuntimeError("Director finishing requires pristine native bytes.")
+            if unit["kind"] == "ordinary_repeat":
+                _, roles = _director_recovered_repeat_media(job, unit["variant"], unit)
+                role = roles[name]
+            else:
+                proof = unit["settings"]["director_lora_consumption"]["binding"]
+                entry = job["params"]["_director_video_lora_consumption_plans"][str(proof["task_index"])]["binding"]["entries"][str(proof["repeat_index"])]["binding"]
+                role = entry["output_roles"][name]
+                if role != "component":
+                    raise QueueRecoveryRuntimeError("Director H3 physical child is not a component.")
+        elif unit["kind"] == "h3_scene":
+            role = _director_h3_scene_finishing_role(job, unit)
+        else:
+            role = "final"
+        if name in final_video_names and role != "final":
+            raise QueueRecoveryRuntimeError("Director finishing component was selected as final.")
+        steps = []
+        if name in final_targets:
+            if method:
+                steps.append("upscale")
+            if resolution:
+                steps.append("delivery_fit")
+            if optional and "film_grain" in optional:
+                steps.append("film_grain")
+        if name in videos and optional and "voice_clone" in optional:
+            steps.append("voice_clone")
+        if normalization and os.path.splitext(name)[1].lower() in {".wav", ".mp3", ".flac", ".ogg"}:
+            steps.append("audio_normalization")
+        sources.append(copy.deepcopy(artifact))
+        dependencies.append(unit["unit_id"])
+        targets.append({"basename": name, "role": role, "steps": steps})
+    if (requested.get("_director_final_video_postprocess", 0) == 1
+            and set(final_video_names) != {target["basename"] for target in targets
+                if target["role"] == "final" and target["basename"] in videos}):
+        raise QueueRecoveryRuntimeError("Director finishing omitted a final video.")
+    contract = {"version": 1, "child_digest": child["digest"],
+                "file_names": list(file_names), "final_video_names": list(final_video_names),
+                "targets": targets, "spatial_upsampling": method,
+                "delivery_resolution": resolution, "delivery_fit": fit,
+                "optional_finishing": optional, "audio_normalization": normalization}
+    identity = {**contract, "optional_finishing": _h3_delivery_finishing_identity(optional)}
+    proof = {"binding": identity, "digest": _project_reference_private_commitment(identity)}
+    settings = {"publication_schema": 2, "native_hashes": [source["sha256"] for source in sources],
+                "director_finishing": proof}
+    unit_id = recovery_unit_id(str(job.get("id") or ""), "director_delivery",
+                              dependencies=dependencies, settings=settings)
+    staging = []
+    for index, source in enumerate(sources):
+        extension = os.path.splitext(source["basename"])[1]
+        prefix = f".maestro-delivery-{job['id']}-{unit_id[-12:]}-{index}"
+        staging.append({"original_basename": source["basename"], "source": source,
+                        "native_basename": prefix + ".native" + extension,
+                        "native_sidecar_basename": prefix + ".native.meta.json",
+                        "work_basename": prefix + ".work" + extension,
+                        "final_basename": f"h3-delivery-{unit_id.rsplit(':', 1)[-1]}-{index}{extension}"})
+    return {"director_finishing": contract, "publication_schema": 2,
+            "dependencies": dependencies, "settings": settings,
+            "staging": staging, "unit_id": unit_id}
+
+
+def _director_require_finishing_plan(job: dict, project_dir: str, plan: dict) -> None:
+    """Rebuild from signed intent and live parents before consuming any pass."""
+    contract = plan.get("director_finishing") if isinstance(plan, dict) else None
+    if type(contract) is not dict:
+        raise QueueRecoveryRuntimeError("Director finishing contract is missing.")
+    expected = _director_finishing_plan(job, project_dir,
+        contract.get("file_names"), contract.get("final_video_names"))
+    if plan != expected:
+        raise QueueRecoveryRuntimeError("Director finishing identity changed.")
+
+
+def _director_protect_finishing_native(job: dict, project_dir: str, plan: dict) -> list[dict]:
+    """Commit exact intent before preserving parents, then commit protected copies."""
+    _director_require_finishing_plan(job, project_dir, plan)
+    previous = _queue_recovery_delivery_pending(job)
+    if previous is not None and (previous.get("state") != "staging_native"
+            or previous.get("unit_id") != plan["unit_id"]
+            or previous.get("settings") != plan["settings"]
+            or previous.get("dependencies") != plan["dependencies"]
+            or previous.get("staging") != plan["staging"]
+            or previous.get("director_finishing") != plan["director_finishing"]
+            or previous.get("publication_schema") != 2):
+        raise QueueRecoveryRuntimeError("Director finishing has an unresolved predecessor.")
+    _queue_recovery_checkpoint_delivery_intent(job, plan)
+    staged = _stage_h3_delivery_native_outputs_v2(
+        job, project_dir, plan["director_finishing"]["file_names"], plan)
+    _director_require_finishing_plan(job, project_dir, plan)
+    _queue_recovery_checkpoint_delivery_pending(job, project_dir, staged, plan)
+    return staged
+
+
+def _director_process_finishing_from_protected_native(
+    job: dict, project_dir: str, staged: list[dict], plan: dict,
+) -> list[dict]:
+    """Produce hidden finished work from pristine copies; never publish here."""
+    import shutil
+    import subprocess
+
+    _director_require_finishing_plan(job, project_dir, plan)
+    if (len(staged) != len(plan["staging"])
+            or any(item.get("parent_basename") != entry["original_basename"]
+                   or item.get("file_name") != entry["final_basename"]
+                   or item.get("work_basename") != entry["work_basename"]
+                   or os.path.abspath(item.get("work_path", "")) != os.path.join(project_dir, entry["work_basename"])
+                   or (item.get("recovery_descriptor") or {}).get("basename") != entry["native_basename"]
+                   or (item.get("recovery_descriptor") or {}).get("sidecar_basename") != entry["native_sidecar_basename"]
+                   or (item.get("recovery_descriptor") or {}).get("original_basename") != entry["final_basename"]
+                   or (item.get("recovery_descriptor") or {}).get("producer_unit_id") != plan["unit_id"]
+                   or (item.get("recovery_descriptor") or {}).get("size") != entry["source"]["size"]
+                   or (item.get("recovery_descriptor") or {}).get("sha256") != entry["source"]["sha256"]
+                   for item, entry in zip(staged, plan["staging"]))):
+        raise QueueRecoveryRuntimeError("Director finishing work membership changed.")
+    contract = plan["director_finishing"]
+    pending = _queue_recovery_delivery_pending(job)
+    if (not isinstance(pending, dict) or pending.get("state") != "protected_native"
+            or pending.get("publication_schema") != 2 or "publication" in pending
+            or pending.get("unit_id") != plan["unit_id"]
+            or pending.get("settings") != plan["settings"]
+            or pending.get("dependencies") != plan["dependencies"]
+            or pending.get("director_finishing") != contract
+            or pending.get("sources") != [entry["source"] for entry in plan["staging"]]
+            or pending.get("artifacts") != [item["recovery_descriptor"] for item in staged]
+            or pending.get("work_basenames") != [entry["work_basename"] for entry in plan["staging"]]):
+        raise QueueRecoveryRuntimeError("Director protected finishing checkpoint is unresolved.")
+    def cancelled():
+        return bool(is_cancel_requested(job) or job.get("resource_state") == "preemption_requested")
+    if any(step in {"upscale", "voice_clone"} for target in contract["targets"] for step in target["steps"]):
+        if cancelled():
+            raise InterruptedError("Director finishing cancelled")
+        _release_h3_delivery_vram()
+    for item, target in zip(staged, contract["targets"]):
+        item["finishing_outcomes"] = []
+        def deliver(native_path, work_path):
+            if cancelled():
+                raise InterruptedError("Director finishing cancelled")
+            shutil.copyfile(native_path, work_path)
+            descriptor = item["recovery_descriptor"]
+            if _recovery_sha256_file(work_path) != (descriptor["size"], descriptor["sha256"]):
+                raise QueueRecoveryRuntimeError("Director protected native changed during replay.")
+            outcomes = []
+            for step in target["steps"]:
+                if cancelled() or not update_job(job, phase="Finishing", message="Finishing generated media..."):
+                    raise InterruptedError("Director finishing cancelled")
+                before = _recovery_sha256_file(work_path)
+                applied, failure = False, None
+                try:
+                    if step == "upscale":
+                        _apply_spatial_upsampling_to_file(work_path, contract["spatial_upsampling"],
+                            job=job, abort_check=cancelled)
+                        applied = True
+                    elif step == "delivery_fit":
+                        if not any(row["step"] == "upscale" and row["outcome"] == "applied" for row in outcomes):
+                            raise QueueRecoveryRuntimeError("Director exact delivery has no completed upscale.")
+                        _apply_delivery_fit_to_file(work_path, contract["delivery_resolution"],
+                            contract["delivery_fit"], job=job)
+                        applied = True
+                    elif step in {"film_grain", "voice_clone"}:
+                        optional = {"schema_version": 1, step: contract["optional_finishing"][step]}
+                        outcomes.extend(_apply_h3_delivery_finishing(job, work_path, optional))
+                        continue
+                    elif step == "audio_normalization":
+                        config = contract["audio_normalization"]
+                        temporary = work_path + ".normalize" + os.path.splitext(work_path)[1]
+                        try:
+                            result = subprocess.run(["ffmpeg", "-y", "-i", work_path,
+                                "-af", f"acompressor=threshold={config['threshold']}dB:ratio=3:attack={config['attack']}:release={config['release']}:makeup={config['makeup']},alimiter=limit=0.95",
+                                temporary], capture_output=True, timeout=120, check=False)
+                            if result.returncode == 0 and os.path.isfile(temporary):
+                                os.replace(temporary, work_path)
+                                applied = True
+                        finally:
+                            try:
+                                os.remove(temporary)
+                            except FileNotFoundError:
+                                pass
+                except (InterruptedError, _H3DeliveryFailure):
+                    raise
+                except Exception as error:
+                    failure = error
+                if cancelled():
+                    raise InterruptedError("Director finishing cancelled")
+                if not applied and (step == "delivery_fit" or _recovery_sha256_file(work_path) != before):
+                    raise QueueRecoveryRuntimeError("Director finishing did not confirm the requested result.") from failure
+                outcomes.append({"step": step, "outcome": "applied" if applied else "not_applied"})
+            if cancelled():
+                raise InterruptedError("Director finishing cancelled")
+            item["finishing_outcomes"] = outcomes
+            return True
+        replay_delivery_from_protected_native(project_dir,
+            protected_descriptor=item["recovery_descriptor"],
+            work_basename=item["work_basename"], deliver=deliver)
+    _director_require_finishing_plan(job, project_dir, plan)
+    return staged
+
+
+def _director_delivery_dependencies_match(unit: dict, parents: list[dict]) -> bool:
+    """Match ordered finishing targets to their exact native parent media."""
+    try:
+        settings = unit["settings"]
+        proof = settings["director_finishing"]
+        targets = proof["binding"]["targets"]
+        hashes = settings["native_hashes"]
+        if (set(proof) != {"binding", "digest"}
+                or not hmac.compare_digest(proof["digest"], _project_reference_private_commitment(proof["binding"]))
+                or len(targets) != len(parents) or len(targets) != len(hashes)
+                or unit["dependencies"] != [parent["unit_id"] for parent in parents]):
+            return False
+        for target, parent, expected_hash in zip(targets, parents, hashes):
+            matches = [row for row in parent["artifacts"] if row["basename"] == target["basename"]]
+            if (parent["kind"] not in {"ordinary_repeat", "director_concat", "h3_segment", "h3_concat", "h3_scene"}
+                    or len(matches) != 1 or matches[0]["sha256"] != expected_hash):
+                return False
+        return True
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def _director_finishing_h3_names(job: dict, unit: dict) -> list[str]:
+    """Resolve H3 Finals from signed parent task coordinates, never filenames."""
+    by_id = {parent["unit_id"]: parent for parent in _queue_recovery_units(job)}
+    recipes = job["params"]["_director_video_lora_task_plans"]
+    names = []
+    for index, (target, dependency) in enumerate(zip(
+            unit["settings"]["director_finishing"]["binding"]["targets"], unit["dependencies"])):
+        parent = by_id[dependency]
+        if parent["kind"] == "ordinary_repeat":
+            task_indices = [parent["variant"]]
+        elif parent["kind"] == "h3_segment":
+            task_indices = [parent["settings"]["director_lora_consumption"]["binding"]["task_index"]]
+        elif parent["kind"] == "h3_concat":
+            task_indices = [member[0] for member in _director_h3_inventory_groups(job)[parent["variant"]]["members"]]
+        elif parent["kind"] == "h3_scene":
+            if target["role"] != _director_h3_scene_finishing_role(job, parent):
+                raise QueueRecoveryRuntimeError("Director H3 scene finishing role changed.")
+            task_indices = [member[0] for member in _director_h3_inventory_groups(job)[parent["variant"]]["members"]
+                            if member[1] in parent["settings"]["physical_indices"]]
+        else:
+            task_indices = [member["task_index"] for member in parent["settings"]["director_concat"]["binding"]["members"]]
+        if (target["role"] == "final" and os.path.splitext(target["basename"])[1].lower() in {".mp4", ".webm", ".mkv", ".mov"}
+                and any(recipes[str(task_index)]["binding"]["task"]["params"].get("model_type")
+                    in _H3_LONG_STUDIO_MODELS for task_index in task_indices)):
+            names.append(f"h3-delivery-{unit['unit_id'].rsplit(':', 1)[-1]}-{index}{os.path.splitext(target['basename'])[1]}")
+    return names
+
+
+def _director_h3_integrity_binding(job: dict, unit: dict) -> dict | None:
+    names = set(_director_finishing_h3_names(job, unit))
+    if not names:
+        return None
+    media = unit["attestation"]["director_delivery"]["binding"]["media"]
+    selected = [row for row in media if row["basename"] in names]
+    if len(selected) != len(names):
+        raise QueueRecoveryRuntimeError("Director H3 final coverage changed.")
+    return {"version": 1, "spec_digest": unit["settings"]["director_finishing"]["digest"],
+            "media": selected, "validation": "valid"}
+
+
+def _director_delivery_receipt_matches(job: dict, unit: dict, *, verified_units=None,
+                                      consumed_continuations=frozenset()) -> bool:
+    """Authenticate delivered bytes, scopes and outcomes without rerunning effects."""
+    try:
+        proof = unit["settings"]["director_finishing"]
+        child = job["params"]["_director_video_lora_child_snapshot"]
+        if (unit["kind"] != "director_delivery" or unit["variant"] != 0 or unit["index"] != 0
+                or set(proof) != {"binding", "digest"}
+                or not hmac.compare_digest(proof["digest"], _project_reference_private_commitment(proof["binding"]))
+                or not hmac.compare_digest(child["digest"], _project_reference_private_commitment(child["binding"]))
+                or proof["binding"]["child_digest"] != child["digest"]
+                or unit["unit_id"] != recovery_unit_id(job["id"], "director_delivery",
+                    dependencies=unit["dependencies"], settings=unit["settings"])):
+            return False
+        targets = proof["binding"]["targets"]
+        output = unit["attestation"]["director_delivery"]
+        if (set(output) != {"binding", "digest"}
+                or not hmac.compare_digest(output["digest"], _project_reference_private_commitment(output["binding"]))
+                or set(output["binding"]) != {"version", "unit_id", "spec_digest", "media"}
+                or output["binding"]["version"] != 1
+                or output["binding"]["unit_id"] != unit["unit_id"]
+                or output["binding"]["spec_digest"] != proof["digest"]
+                or len(output["binding"]["media"]) != len(targets)
+                or len(unit["artifacts"]) != len(targets)):
+            return False
+        actual = {artifact["basename"]: artifact for artifact in unit["artifacts"]}
+        if len(actual) != len(targets):
+            return False
+        for index, (target, row) in enumerate(zip(targets, output["binding"]["media"])):
+            name = f"h3-delivery-{unit['unit_id'].rsplit(':', 1)[-1]}-{index}{os.path.splitext(target['basename'])[1]}"
+            artifact = actual.get(name)
+            outcomes = row.get("outcomes")
+            if (set(row) != {"basename", "bytes", "sha256", "role", "outcomes"}
+                    or row["basename"] != name or row["role"] != target["role"]
+                    or artifact is None or artifact["size"] != row["bytes"] or artifact["sha256"] != row["sha256"]
+                    or type(outcomes) is not list or len(outcomes) != len(target["steps"])
+                    or any(set(outcome) != {"step", "outcome"} or outcome["step"] != step
+                           or outcome["outcome"] not in {"applied", "not_applied"}
+                           or (step == "delivery_fit" and outcome["outcome"] != "applied")
+                           for outcome, step in zip(outcomes, target["steps"]))):
+                return False
+            if "delivery_fit" in target["steps"] and not any(
+                    outcome == {"step": "upscale", "outcome": "applied"} for outcome in outcomes):
+                return False
+        integrity = _director_h3_integrity_binding(job, unit)
+        if integrity is not None:
+            receipt = unit["attestation"].get("director_h3_output_integrity")
+            if (type(receipt) is not dict or set(receipt) != {"binding", "digest"}
+                    or receipt["binding"] != integrity
+                    or not hmac.compare_digest(receipt["digest"], _project_reference_private_commitment(integrity))):
+                return False
+        by_id = {parent["unit_id"]: parent for parent in _queue_recovery_units(job)
+                 if parent.get("kind") in {"ordinary_repeat", "director_concat", "h3_segment", "h3_concat", "h3_scene"}}
+        parents = [by_id[key] for key in unit["dependencies"]]
+        return (_director_delivery_dependencies_match(unit, parents)
+                and all(_director_checked_recovery_unit(job, kind=parent["kind"],
+                    variant=parent["variant"], index=parent["index"], project_dir=job["out_dir"],
+                    verified_units=verified_units, consumed_continuations=consumed_continuations)
+                    is not None for parent in {parent["unit_id"]: parent for parent in parents}.values()))
+    except (QueueRecoveryRuntimeError, OSError, KeyError, TypeError, ValueError):
+        return False
+
+
+def _director_finishing_output_map(unit: dict) -> dict:
+    proof = unit["settings"]["director_finishing"]["binding"]
+    media = unit["attestation"]["director_delivery"]["binding"]["media"]
+    return {"files": [row["basename"] for row in media],
+            "finals": [row["basename"] for row in media if row["role"] == "final"],
+            "roles": {row["basename"]: row["role"] for row in media},
+            "replacements": {target["basename"]: row["basename"]
+                             for target, row in zip(proof["targets"], media)}}
+
+
+def _director_commit_finishing_publication(job: dict, project_dir: str,
+                                          staged: list[dict], plan: dict) -> dict | None:
+    """Adopt complete exact-intent media first; a partial transaction needs rollback."""
+    pending = _queue_recovery_delivery_pending(job)
+    if (not isinstance(pending, dict) or pending.get("unit_id") != plan["unit_id"]
+            or pending.get("settings") != plan["settings"]
+            or pending.get("director_finishing") != plan["director_finishing"]
+            or pending.get("dependencies") != plan["dependencies"]):
+        raise QueueRecoveryRuntimeError("Director publication intent changed.")
+    records = (pending.get("publication") or {}).get("items")
+    if not isinstance(records, list) or len(records) != len(staged):
+        raise QueueRecoveryRuntimeError("Director publication receipt is incomplete.")
+    complete = True
+    sealed = []
+    for item, record in zip(staged, records):
+        final = record.get("director_sealed_sidecar")
+        private = record.get("director_private_sidecar")
+        if (not isinstance(final, dict) or not isinstance(private, dict)
+                or record.get("basename") != item["file_name"]
+                or hashlib.sha256(json.dumps(final, indent=2).encode()).hexdigest() != record["sealed_sidecar_sha256"]
+                or hashlib.sha256(json.dumps(private, indent=2).encode()).hexdigest() != record["private_sidecar_sha256"]):
+            raise QueueRecoveryRuntimeError("Director publication metadata changed.")
+        media_exists = os.path.lexists(item["source_path"])
+        sidecar_exists = os.path.lexists(item["source_meta"])
+        if media_exists and (not sidecar_exists or _recovery_sha256_file(item["source_path"]) != (
+                record["media_size"], record["media_sha256"])):
+            raise QueueRecoveryRuntimeError("Director publication destination changed.")
+        if sidecar_exists and _recovery_sha256_file(item["source_meta"])[1] not in {
+                record["private_sidecar_sha256"], record["sealed_sidecar_sha256"]}:
+            raise QueueRecoveryRuntimeError("Director publication sidecar changed.")
+        complete = complete and media_exists and sidecar_exists
+        sealed.append(final)
+    if not complete:
+        return None
+    # Check the actual derived media commitment before promoting any policy.
+    artifacts = [_recovery_artifact_descriptor(project_dir, basename=item["file_name"],
+                  sidecar_basename=os.path.basename(item["source_meta"]), producer_unit_id=plan["unit_id"])
+                 for item in staged]
+    attestation = sealed[0]["producer_unit_attestation"]
+    unit = {"unit_id": plan["unit_id"], "kind": "director_delivery", "variant": 0, "index": 0,
+            "state": "completed", "dependencies": plan["dependencies"], "settings": plan["settings"],
+            "attestation": attestation, "artifacts": artifacts}
+    if (any(sidecar.get("producer_unit_attestation") != attestation for sidecar in sealed)
+            or not _director_delivery_receipt_matches(job, unit)):
+        raise QueueRecoveryRuntimeError("Director finishing receipt is not authenticated.")
+    for item, record in zip(staged, records):
+        if (not os.path.isfile(item["rollback_meta"]) or os.path.islink(item["rollback_meta"])
+                or _recovery_sha256_file(item["rollback_meta"])[1] != record["private_sidecar_sha256"]):
+            raise QueueRecoveryRuntimeError("Director publication rollback receipt changed.")
+    with _sample_campaign_transition_lock:
+        if is_cancel_requested(job) or job.get("resource_state") == "preemption_requested":
+            raise InterruptedError("Director finishing cancelled")
+        for item, record, sidecar in zip(staged, records, sealed):
+            if is_cancel_requested(job) or job.get("resource_state") == "preemption_requested":
+                raise InterruptedError("Director finishing cancelled")
+            if (os.path.islink(item["source_path"]) or os.path.islink(item["source_meta"])
+                    or not os.path.isfile(item["source_path"]) or not os.path.isfile(item["source_meta"])
+                    or _recovery_sha256_file(item["source_path"]) != (record["media_size"], record["media_sha256"])
+                    or _recovery_sha256_file(item["source_meta"])[1] not in {
+                        record["private_sidecar_sha256"], record["sealed_sidecar_sha256"]}):
+                raise QueueRecoveryRuntimeError("Director publication changed before sealing.")
+            _atomic_write_json(item["source_meta"], sidecar)
+        expected_artifacts = {item["file_name"]: _recovery_artifact_descriptor(project_dir,
+            basename=item["file_name"], sidecar_basename=os.path.basename(item["source_meta"]),
+            producer_unit_id=plan["unit_id"]) for item in staged}
+        verified = dict(unit, artifacts=list(expected_artifacts.values()))
+        if not _director_delivery_receipt_matches(job, verified):
+            raise QueueRecoveryRuntimeError("Director publication changed while sealing.")
+        committed = _queue_recovery_checkpoint_unit(job, kind="director_delivery", variant=0, index=0,
+            project_dir=project_dir, artifact_names=[item["file_name"] for item in staged],
+            dependencies=plan["dependencies"], settings=plan["settings"], attestation=attestation,
+            expected_artifacts=expected_artifacts)
+        if committed is None:
+            raise QueueRecoveryRuntimeError("Director finishing checkpoint was not acknowledged.")
+        job["_h3_delivery_publication"] = {"staged": staged, "director_finishing": True,
+            "final_names": [item["file_name"] for item in staged]}
+    return _director_finishing_output_map(committed)
+
+
+def _director_publish_finishing_outputs(job: dict, project_dir: str,
+                                        staged: list[dict], plan: dict) -> dict:
+    """Persist exact child receipts before no-overwrite media publication."""
+    from services.atomic_file_publish import publish_file_no_replace
+
+    _director_require_finishing_plan(job, project_dir, plan)
+    pending = _queue_recovery_delivery_pending(job)
+    if (not isinstance(pending, dict) or pending.get("state") != "protected_native"
+            or pending.get("unit_id") != plan["unit_id"] or pending.get("publication")
+            or pending.get("settings") != plan["settings"]
+            or pending.get("dependencies") != plan["dependencies"]
+            or pending.get("director_finishing") != plan["director_finishing"]
+            or pending.get("sources") != [entry["source"] for entry in plan["staging"]]
+            or pending.get("artifacts") != [item["recovery_descriptor"] for item in staged]
+            or pending.get("work_basenames") != [entry["work_basename"] for entry in plan["staging"]]
+            or len(staged) != len(plan["staging"])):
+        raise QueueRecoveryRuntimeError("Director publication needs an exact protected checkpoint.")
+    media = []
+    for item, target in zip(staged, plan["director_finishing"]["targets"]):
+        size, sha = _recovery_sha256_file(item["work_path"])
+        media.append({"basename": item["file_name"], "bytes": size, "sha256": sha,
+                      "role": target["role"], "outcomes": copy.deepcopy(item["finishing_outcomes"])})
+    binding = {"version": 1, "unit_id": plan["unit_id"],
+               "spec_digest": plan["settings"]["director_finishing"]["digest"], "media": media}
+    attestation = {"director_delivery": {"binding": binding,
+                   "digest": _project_reference_private_commitment(binding)}}
+    candidate = {"unit_id": plan["unit_id"], "kind": "director_delivery", "variant": 0, "index": 0,
+                 "dependencies": plan["dependencies"], "settings": plan["settings"], "attestation": attestation,
+                 "artifacts": [{"basename": row["basename"], "size": row["bytes"], "sha256": row["sha256"]}
+                               for row in media]}
+    integrity_binding = _director_h3_integrity_binding(job, candidate)
+    if integrity_binding is not None:
+        names = {row["basename"] for row in integrity_binding["media"]}
+        work_names = [os.path.basename(item["work_path"]) for item in staged if item["file_name"] in names]
+        if _h3_final_output_integrity(project_dir, work_names).get("validation") != "valid":
+            raise QueueRecoveryRuntimeError("Director finished H3 video integrity failed.")
+        for item, row in zip(staged, media):
+            if item["file_name"] in names and _recovery_sha256_file(item["work_path"]) != (row["bytes"], row["sha256"]):
+                raise QueueRecoveryRuntimeError("Director H3 media changed during integrity verification.")
+        attestation["director_h3_output_integrity"] = {"binding": integrity_binding,
+            "digest": _project_reference_private_commitment(integrity_binding)}
+    if not _director_delivery_receipt_matches(job, candidate):
+        raise QueueRecoveryRuntimeError("Director finishing outcomes changed before publication.")
+    records = []
+    for item, row in zip(staged, media):
+        if any(os.path.lexists(item[key]) for key in ("source_path", "source_meta", "rollback_meta")):
+            raise QueueRecoveryRuntimeError("Director publication destination already exists.")
+        with open(item["native_meta"], encoding="utf-8") as handle:
+            sidecar = json.load(handle)
+        sidecar = copy.deepcopy(sidecar)
+        sidecar.pop("delivery_native_source", None)
+        sidecar.update({"job_id": str(job["id"]), "output_filename": item["file_name"],
+            "producer_artifact_class": row["role"], "artifact_class": row["role"],
+            "producer_unit_id": plan["unit_id"], "producer_unit_kind": "director_delivery",
+            "producer_unit_variant": 0, "producer_unit_index": 0,
+            "producer_unit_artifact_names": sorted(entry["basename"] for entry in media),
+            "producer_unit_dependencies": copy.deepcopy(plan["dependencies"]),
+            "producer_unit_settings": copy.deepcopy(plan["settings"]),
+            "producer_unit_attestation": copy.deepcopy(attestation),
+            "producer_media_size": row["bytes"], "producer_media_sha256": row["sha256"],
+            "postprocessing": {"version": 1, "steps": row["outcomes"]}})
+        stamp_sidecar_policy(sidecar, dict(job.get("access_policy") or {}),
+                             workspace=str(job.get("workspace") or "default"))
+        private = copy.deepcopy(sidecar)
+        private.update({"producer_artifact_class": "temporary", "artifact_class": "temporary"})
+        stamp_sidecar_policy(private, {"private": True, "explicit": bool(sidecar.get("explicit")),
+                                      "owner_session_id": str(job.get("session_id") or "")},
+                             workspace=str(job.get("workspace") or "default"))
+        final_sha = hashlib.sha256(json.dumps(sidecar, indent=2).encode()).hexdigest()
+        records.append({"basename": item["file_name"], "media_size": row["bytes"],
+            "media_sha256": row["sha256"], "private_sidecar_sha256": hashlib.sha256(json.dumps(private, indent=2).encode()).hexdigest(),
+            "final_sidecar_sha256": final_sha, "sealed_sidecar_sha256": final_sha,
+            "director_private_sidecar": private, "director_sealed_sidecar": sidecar})
+    _queue_recovery_checkpoint_delivery_publication(job, records)
+    # Any lost ACK after this point is reconciled from these exact records;
+    # do not automatically retract a possibly committed successor.
+    for item, record in zip(staged, records):
+        if is_cancel_requested(job) or job.get("resource_state") == "preemption_requested":
+            raise InterruptedError("Director finishing cancelled")
+        _atomic_create_json(item["source_meta"], record["director_private_sidecar"])
+        _atomic_create_json(item["rollback_meta"], record["director_private_sidecar"])
+        publish_file_no_replace(item["work_path"], item["source_path"])
+    result = _director_commit_finishing_publication(job, project_dir, staged, plan)
+    if result is None:
+        raise QueueRecoveryRuntimeError("Director finishing publication is incomplete.")
+    return result
+
+
+def _director_resume_finishing(job: dict, project_dir: str, plan: dict) -> dict:
+    """Recover publication before deciding whether pristine finishing must rerun."""
+    completed = _queue_recovery_unit_matches(job, kind="director_delivery", variant=0, index=0,
+                                            project_dir=project_dir, quarantine_invalid=False)
+    pending = _queue_recovery_delivery_pending(job)
+    if completed is not None and completed["unit_id"] == plan["unit_id"]:
+        if pending is not None:
+            if pending.get("unit_id") != completed["unit_id"]:
+                raise QueueRecoveryRuntimeError("Director finishing has a different pending successor.")
+            staged = _queue_recovery_restore_delivery_staged(job, project_dir, pending)
+            adopted = _director_commit_finishing_publication(job, project_dir, staged, plan)
+            if adopted is None:
+                raise QueueRecoveryRuntimeError("Director completed publication is incomplete.")
+            return adopted
+        return _director_finishing_output_map(completed)
+    _director_require_finishing_plan(job, project_dir, plan)
+    if pending is None or pending.get("state") == "staging_native":
+        staged = _director_protect_finishing_native(job, project_dir, plan)
+    else:
+        staged = _queue_recovery_restore_delivery_staged(job, project_dir, pending)
+        if pending.get("publication"):
+            adopted = _director_commit_finishing_publication(job, project_dir, staged, plan)
+            if adopted is not None:
+                return adopted
+            _queue_recovery_reconcile_delivery_publication(job, staged)
+            refreshed = copy.deepcopy(pending)
+            refreshed.pop("publication", None)
+            cursor = dict(job.get("recovery_cursor") or {})
+            cursor["delivery_pending"] = refreshed
+            if _queue_recovery_checkpoint(job, recovery_cursor=cursor,
+                    recovery_state="interrupted", reruns_denoise=False) is not True:
+                raise QueueRecoveryRuntimeError("Director partial publication rollback is unresolved.")
+    _director_process_finishing_from_protected_native(job, project_dir, staged, plan)
+    return _director_publish_finishing_outputs(job, project_dir, staged, plan)
+
+
+def _director_finishing_plan_from_pending(job: dict, pending: dict) -> dict:
+    """Reconstruct saved intent without consuming references or running an effect."""
+    contract = copy.deepcopy(pending.get("director_finishing"))
+    settings = copy.deepcopy(pending.get("settings"))
+    if (not isinstance(contract, dict) or not isinstance(settings, dict)
+            or pending.get("publication_schema") != 2):
+        raise QueueRecoveryRuntimeError("Director finishing intent is incomplete.")
+    identity = {**contract, "optional_finishing": _h3_delivery_finishing_identity(contract.get("optional_finishing"))}
+    proof = settings.get("director_finishing")
+    if (not isinstance(proof, dict) or set(proof) != {"binding", "digest"}
+            or proof["binding"] != identity
+            or not hmac.compare_digest(proof["digest"], _project_reference_private_commitment(identity))):
+        raise QueueRecoveryRuntimeError("Director finishing intent is not authenticated.")
+    dependencies = list(pending.get("dependencies") or [])
+    unit_id = recovery_unit_id(job["id"], "director_delivery", dependencies=dependencies, settings=settings)
+    if pending.get("unit_id") != unit_id:
+        raise QueueRecoveryRuntimeError("Director finishing intent identity changed.")
+    if pending.get("state") == "staging_native":
+        staging = copy.deepcopy(pending.get("staging"))
+    else:
+        sources = pending.get("sources")
+        if not isinstance(sources, list) or len(sources) != len(contract["file_names"]):
+            raise QueueRecoveryRuntimeError("Director finishing source membership changed.")
+        staging = []
+        for index, (name, source) in enumerate(zip(contract["file_names"], sources)):
+            extension = os.path.splitext(name)[1]
+            prefix = f".maestro-delivery-{job['id']}-{unit_id[-12:]}-{index}"
+            staging.append({"original_basename": name, "source": copy.deepcopy(source),
+                "native_basename": prefix + ".native" + extension,
+                "native_sidecar_basename": prefix + ".native.meta.json",
+                "work_basename": prefix + ".work" + extension,
+                "final_basename": f"h3-delivery-{unit_id.rsplit(':', 1)[-1]}-{index}{extension}"})
+    return {"director_finishing": contract, "publication_schema": 2, "settings": settings,
+            "dependencies": dependencies, "unit_id": unit_id, "staging": staging}
+
+
+def _director_finalize_finishing_publication(job: dict, pending: dict, plan: dict) -> bool:
+    """Retry terminal cleanup from saved hashes, including already removed copies."""
+    import stat
+
+    project_dir = os.path.realpath(job["out_dir"])
+    completed = _queue_recovery_unit_matches(job, kind="director_delivery", variant=0, index=0,
+                                            project_dir=project_dir, quarantine_invalid=False)
+    if (job.get("status") != "completed" or completed is None
+            or completed["unit_id"] != plan["unit_id"]
+            or completed["settings"] != plan["settings"]
+            or completed["dependencies"] != plan["dependencies"]
+            or _queue_recovery_delivery_pending(job) != pending):
+        raise QueueRecoveryRuntimeError("Director terminal cleanup has no accepted publication.")
+    outputs = _director_finishing_output_map(completed)
+    if (job.get("output_files") != outputs["finals"]
+            or not set(outputs["files"]) <= set(job.get("artifact_files") or [])):
+        raise QueueRecoveryRuntimeError("Director terminal output map changed.")
+    artifacts = pending.get("artifacts")
+    records = (pending.get("publication") or {}).get("items")
+    staging = plan["staging"]
+    if (not isinstance(artifacts, list) or not isinstance(records, list)
+            or len(artifacts) != len(staging) or len(records) != len(staging)
+            or pending.get("work_basenames") != [entry["work_basename"] for entry in staging]):
+        raise QueueRecoveryRuntimeError("Director cleanup receipt is incomplete.")
+    cleanup = []
+    for entry, descriptor, record, media in zip(staging, artifacts, records,
+            completed["attestation"]["director_delivery"]["binding"]["media"]):
+        private_bytes = json.dumps(record["director_private_sidecar"], indent=2).encode()
+        private_sha = hashlib.sha256(private_bytes).hexdigest()
+        if (descriptor.get("producer_unit_id") != plan["unit_id"]
+                or descriptor.get("basename") != entry["native_basename"]
+                or descriptor.get("sidecar_basename") != entry["native_sidecar_basename"]
+                or descriptor.get("original_basename") != entry["final_basename"]
+                or (descriptor.get("size"), descriptor.get("sha256")) != (
+                    entry["source"]["size"], entry["source"]["sha256"])
+                or record.get("basename") != entry["final_basename"]
+                or (record.get("media_size"), record.get("media_sha256")) != (media["bytes"], media["sha256"])
+                or private_sha != record.get("private_sidecar_sha256")):
+            raise QueueRecoveryRuntimeError("Director cleanup identity changed.")
+        rollback = os.path.splitext(entry["work_basename"])[0] + ".rollback.meta.json"
+        cleanup.extend([(entry["work_basename"], media["bytes"], media["sha256"]),
+            (rollback, len(private_bytes), private_sha),
+            (entry["native_basename"], descriptor["size"], descriptor["sha256"]),
+            (entry["native_sidecar_basename"], descriptor["sidecar_size"], descriptor["sidecar_sha256"])])
+    identity = lambda info: (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns, info.st_nlink)
+    checked = []
+    for name, size, sha in cleanup:
+        if name != os.path.basename(name) or not name.startswith(".maestro-delivery-"):
+            raise QueueRecoveryRuntimeError("Director cleanup path is invalid.")
+        path = os.path.join(project_dir, name)
+        try:
+            before = os.lstat(path)
+        except FileNotFoundError:
+            continue
+        if (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1
+                or _recovery_sha256_file(path) != (size, sha)
+                or identity(os.lstat(path)) != identity(before)):
+            raise QueueRecoveryRuntimeError("Director cleanup preserved a changed temporary file.")
+        checked.append((path, size, sha, identity(before)))
+    # Native metadata follows its media. An interrupted cleanup can therefore
+    # resume with missing copies without weakening receipt-based completion.
+    for path, size, sha, saved in checked:
+        if (identity(os.lstat(path)) != saved or _recovery_sha256_file(path) != (size, sha)
+                or identity(os.lstat(path)) != saved):
+            raise QueueRecoveryRuntimeError("Director cleanup preserved a changed temporary file.")
+        os.remove(path)
+    cursor = dict(job.get("recovery_cursor") or {})
+    cursor.pop("delivery_pending", None)
+    if _queue_recovery_checkpoint(job, recovery_cursor=cursor,
+            recovery_state="terminal", reruns_denoise=False) is not True:
+        raise QueueRecoveryRuntimeError("Director finishing terminal cleanup is unresolved.")
+    job.pop("_h3_delivery_publication", None)
+    job.pop("_h3_delivery_native", None)
+    job.pop("_h3_delivery_cleanup_pending", None)
+    return True
+
+
+def _resume_pending_director_finishing_only(job: dict, *, update_job_fn=None, finish_job_fn=None) -> bool:
+    """Resume only protected finishing, preserving final and component output maps."""
+    pending = _queue_recovery_delivery_pending(job)
+    if pending is None:
+        return False
+    plan = _director_finishing_plan_from_pending(job, pending)
+    if job.get("status") == "completed":
+        return _director_finalize_finishing_publication(job, pending, plan)
+    result = _director_resume_finishing(job, os.path.realpath(job["out_dir"]), plan)
+    replacements = result["replacements"]
+    clips = {key: replacements.get(name, name) for key, name in (job.get("clip_output_files") or {}).items()}
+    if not clips:
+        clips = {str(index): name for index, name in enumerate(result["files"])
+                 if result["roles"][name] == "component"}
+    join = replacements.get(job.get("join_output_file"), job.get("join_output_file"))
+    finisher = finish_job if finish_job_fn is None else finish_job_fn
+    completed = finisher(job, "completed", output_files=result["finals"],
+        artifact_files=list(dict.fromkeys([*(job.get("artifact_files") or []), *result["files"]])),
+        clip_output_files=clips, join_output_file=join,
+        progress=100, phase="", message="Done", error=None)
+    if completed and job.get("status") == "completed" and not is_cancel_requested(job):
+        return _director_finalize_finishing_publication(job, _queue_recovery_delivery_pending(job), plan)
+    _rollback_h3_delivery_publication(job, update_job_fn=update_job_fn)
+    return False
+
+
 def _queue_recovery_delivery_plan(
     job: dict,
     project_dir: str,
@@ -14408,6 +17248,7 @@ def _queue_recovery_delivery_plan(
 def _queue_recovery_checkpoint_delivery_intent(job: dict, plan: dict) -> dict:
     """Persist planned native names and source hashes before the first rename."""
     pending = {
+        **({"director_finishing": copy.deepcopy(plan["director_finishing"])} if "director_finishing" in plan else {}),
         **({"optional_finishing": plan["optional_finishing"]} if "optional_finishing" in plan else {}),
         "dependencies": list(plan.get("dependencies") or []),
         "publication_schema": plan.get("publication_schema", 1),
@@ -14418,13 +17259,15 @@ def _queue_recovery_checkpoint_delivery_intent(job: dict, plan: dict) -> dict:
     }
     cursor = dict(job.get("recovery_cursor") or {})
     cursor["delivery_pending"] = pending
-    _queue_recovery_checkpoint(
+    committed = _queue_recovery_checkpoint(
         job,
         recovery_cursor=cursor,
         recovery_state="interrupted",
         reruns_denoise=False,
         message="Protecting native output for delivery",
     )
+    if "director_finishing" in plan and committed is not True:
+        raise QueueRecoveryRuntimeError("Director finishing intent was not saved.")
     return pending
 
 
@@ -14447,6 +17290,7 @@ def _queue_recovery_checkpoint_delivery_pending(
         item["work_basename"] = os.path.basename(item["work_path"])
         artifacts.append(descriptor)
     pending = {
+        **({"director_finishing": copy.deepcopy(plan["director_finishing"])} if "director_finishing" in plan else {}),
         **({"optional_finishing": plan["optional_finishing"]} if "optional_finishing" in plan else {}),
         "artifacts": artifacts,
         "dependencies": list(plan["dependencies"]),
@@ -14466,7 +17310,7 @@ def _queue_recovery_checkpoint_delivery_pending(
         job, recovery_cursor=cursor, recovery_state="interrupted", reruns_denoise=False,
         message="Protected native output is ready for delivery",
     )
-    if job.get("kind") == "studio_h3_delivery_recovery" and committed is not True:
+    if (job.get("kind") == "studio_h3_delivery_recovery" or "director_finishing" in plan) and committed is not True:
         raise QueueRecoveryRuntimeError("H3 child native checkpoint was rejected.")
     return pending
 
@@ -14987,7 +17831,10 @@ def _redact_local_paths(value):
         return {
             key: _redact_local_paths(nested)
             for key, nested in value.items()
-            if key not in {"owner_session_id", "_maestro_session_id", "_maestro_access_policy", "_studio_lora_parameter_snapshot"}
+            if key not in {"owner_session_id", "_maestro_session_id", "_maestro_access_policy", "_studio_lora_parameter_snapshot", "_director_video_lora_snapshot",
+                            "_director_video_lora_parent_snapshot", "_director_video_lora_child_snapshot", "_director_video_lora_task_plans", "_director_video_lora_task_inventory",
+                            "_director_video_lora_native_plans", "_director_video_lora_preparation_plans", "_director_video_lora_consumption_plans",
+                            "_director_video_lora_task_retention_pending"}
         }
     if isinstance(value, list):
         return [_redact_local_paths(item) for item in value]
@@ -15221,6 +18068,7 @@ def _init_pipeline():
             recovery_validate_child=_director_recovery_validate_child,
             recovery_prepare_h3_scene_rerun=_director_recovery_prepare_h3_scene_rerun,
             runtime_admission=_director_recovery_runtime_admission,
+            video_lora_child_admission=_admit_director_video_lora_child,
         )
         _pipeline_initialized = True
 
@@ -17265,6 +20113,35 @@ def _studio_image_lora_schema_applicable(schema):
     )
 
 
+def _studio_video_lora_execution_binding(params, *, normalize=False):
+    from services.studio_lora_execution import project_studio_video_lora_execution, studio_video_lora_model_applicable
+    model_type = params.get("model_type")
+    model_def = wgp.get_model_def(model_type)
+    if not studio_video_lora_model_applicable(model_type, model_def):
+        raise ValueError("This model does not support plain Studio video LoRA parameters")
+    effective = copy.deepcopy(params)
+    if normalize:
+        effective = copy.deepcopy(wgp.primary_settings)
+        effective.update(copy.deepcopy(params))
+        wgp.fix_settings(model_type, effective, params.get("settings_version", 0))
+        custom, error = wgp.collect_custom_settings_from_inputs(model_def, effective, strict=True)
+        if error is not None:
+            raise ValueError("Invalid custom video settings")
+        effective["custom_settings"] = custom
+    return project_studio_video_lora_execution(
+        effective, model_def=model_def, base_model_type=wgp.get_base_model_type(model_type),
+        aligned_frames=wgp.align_model_frame_count(effective.get("video_length"), model_def),
+        validated=not normalize,
+    )
+
+
+def _validate_studio_video_lora_native(params, binding):
+    if _studio_video_lora_execution_binding(params) != binding.get("video_execution"):
+        raise ValueError("Video LoRA execution settings changed after admission")
+    if params.get("prompt") != binding.get("native_prompt"):
+        raise ValueError("Video LoRA prompt changed after admission")
+
+
 def _resolve_studio_image_lora_parameters(params, *, freeze=False, contexts=None):
     from services.generation_presets import (
         GenerationPresetError, normalize_generation_lora_parameters,
@@ -17277,10 +20154,14 @@ def _resolve_studio_image_lora_parameters(params, *, freeze=False, contexts=None
         return []
     model_type = params.get("model_type")
     model_def = wgp.get_model_def(model_type)
+    is_image = (
+        params.get("generation_mode") == "image"
+        and type(params.get("image_mode")) is int and params["image_mode"] == 1
+        and isinstance(model_def, dict) and model_def.get("image_outputs")
+    )
+    is_video = params.get("generation_mode") == "video"
     if (
-        params.get("generation_mode") != "image"
-        or type(params.get("image_mode")) is not int or params["image_mode"] != 1
-        or not isinstance(model_def, dict) or not model_def.get("image_outputs")
+        not (is_image or is_video)
         or any(params.get(key) for key in (
             "edit_sub_mode", "sfx_mode", "progressive_pipeline",
             "single_stage_pipeline", "reference_pipeline", "enhance_before_generate",
@@ -17290,14 +20171,19 @@ def _resolve_studio_image_lora_parameters(params, *, freeze=False, contexts=None
     ):
         raise HTTPException(
             status_code=400,
-            detail="LoRA parameters currently require generic image generation without prompt enhancement",
+            detail="LoRA parameters require plain Studio image or supported text-to-video generation",
         )
+    if is_video:
+        try:
+            _studio_video_lora_execution_binding(params, normalize=True)
+        except (ValueError, TypeError, KeyError) as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
     prompt_mode = params.get("multi_prompts_gen_type", 0)
     if (
         not isinstance(params.get("prompt"), str)
         or (prompt_mode is not None and (type(prompt_mode) is not int or prompt_mode not in range(5)))
     ):
-        raise HTTPException(status_code=400, detail="Image prompt or prompt split mode is invalid")
+        raise HTTPException(status_code=400, detail="Studio prompt or prompt split mode is invalid")
     active = params.get("activated_loras")
     if (
         not isinstance(active, list) or len(active) > 64
@@ -17336,7 +20222,7 @@ def _studio_image_lora_parameter_binding(params, *, contexts=None):
             raise HTTPException(status_code=409, detail="Selected LoRA source changed")
         sources.append({"id": selection["id"], "path": os.path.realpath(path)})
     # JSON normalization makes the private seal identical after manifest replay.
-    return json.loads(json.dumps({
+    binding = json.loads(json.dumps({
         "version": 1, "model_type": params["model_type"],
         "generation_mode": params["generation_mode"], "image_mode": params["image_mode"],
         "authored_prompt": params.get("prompt", ""),
@@ -17346,6 +20232,13 @@ def _studio_image_lora_parameter_binding(params, *, contexts=None):
         "lora_parameters": params["lora_parameters"],
         "selections": selections, "sources": sources,
     }, allow_nan=False))
+    if params["generation_mode"] == "video":
+        binding["version"] = 2
+        binding["video_execution"] = _studio_video_lora_execution_binding(params, normalize=True)
+        # WanGP interprets templates locally without replacing the prompt in
+        # its returned native packet. Bind that packet's once-expanded input.
+        binding["native_prompt"] = _apply_studio_image_lora_parameters(params, binding)["prompt"]
+    return binding
 
 
 def _seal_studio_image_lora_parameters(params):
@@ -17393,7 +20286,7 @@ def _apply_studio_image_lora_parameters(params, binding):
     ]
     authored = binding["authored_prompt"]
     if not isinstance(authored, str) or result.get("prompt", "") != authored:
-        raise ValueError("Authored image prompt changed after LoRA admission")
+        raise ValueError("Authored Studio prompt changed after LoRA admission")
     if fragments:
         suffix = " ".join(fragments)
         if binding["multi_prompts_gen_type"] == 2:
@@ -17689,6 +20582,8 @@ def _director_image_role_wire_mode(body: dict) -> str:
 
 def _reject_client_director_image_role_internals(body: dict) -> None:
     """Keep role provenance and resolved prompt expansions server-owned."""
+    if {"_director_video_lora_snapshot", "_director_video_lora_parent_snapshot", "_director_video_lora_child_snapshot", "_director_video_lora_task_plans", "_director_video_lora_task_inventory", "_director_video_lora_native_plans", "_director_video_lora_preparation_plans", "_director_video_lora_consumption_plans"}.intersection(body):
+        raise HTTPException(400, "Director video LoRA internals are server-owned")
     if _DIRECTOR_IMAGE_ROLE_INTERNAL_FIELDS.intersection(body):
         raise HTTPException(
             status_code=400,
@@ -17724,10 +20619,31 @@ def _prepare_generation_sidecar_params(source_params: dict):
             ]
     sidecar_params = source_params.copy()
     sidecar_params.pop("_studio_lora_parameter_snapshot", None)
+    for key in {"_director_video_lora_snapshot", "_director_video_lora_parent_snapshot", "_director_video_lora_child_snapshot", "_director_video_lora_task_plans", "_director_video_lora_task_inventory", "_director_video_lora_native_plans", "_director_video_lora_preparation_plans", "_director_video_lora_consumption_plans"}:
+        sidecar_params.pop(key, None)
     sidecar_params.pop("_project_asset_ref_provenance", None)
     sidecar_params.pop("_project_asset_ref_paths", None)
     sidecar_params.pop("_h3_rerun_predecessor_path", None)
     sidecar_params.pop("_h3_rerun_input", None)
+    private_images = source_params.get("_director_custom_style_image_paths")
+    style_paths = {value for value in private_images if isinstance(value, str)} if isinstance(private_images, list) else set()
+    mapping_record = source_params.get("_h3_prompt_mapping_record")
+    if isinstance(mapping_record, dict):
+        for reference in mapping_record.get("reference_manifest") or []:
+            if (isinstance(reference, dict) and reference.get("custom_visual_style")
+                    and isinstance(reference.get("path"), str)):
+                style_paths.add(reference["path"])
+    if style_paths:
+        references = sidecar_params.get("image_refs")
+        if isinstance(references, list):
+            sidecar_params["image_refs"] = [value for value in references
+                                           if not isinstance(value, str) or value not in style_paths]
+        # The private mapping record contains paths. The producer retains
+        # its path-free mapping receipt and exact journal-bound identity.
+        sidecar_params.pop("_h3_prompt_mapping_record", None)
+    for key in ("_director_custom_style_snapshot", "_director_custom_style_video_snapshot",
+                "_director_custom_style_inputs", "_director_custom_style_image_paths"):
+        sidecar_params.pop(key, None)
     # Voice references are reusable only after the user attaches them again.
     # Publish their basenames, never the workspace-local paths used by the job.
     sidecar_params.pop("voice_clone_refs", None)
@@ -18207,10 +21123,381 @@ def _apply_authoritative_generation_prompt(body: dict, prompt: str) -> None:
         _apply_director_image_role_generation(body)
 
 
+def _reject_client_custom_visual_style_state(params):
+    if not isinstance(params, dict):
+        raise HTTPException(400, "Director parameters must be an object")
+    if {"_director_video_lora_snapshot", "_director_video_lora_parent_snapshot", "_director_video_lora_child_snapshot", "_director_video_lora_task_plans", "_director_video_lora_task_inventory", "_director_video_lora_native_plans", "_director_video_lora_preparation_plans", "_director_video_lora_consumption_plans"}.intersection(params):
+        raise HTTPException(400, "Director video LoRA internals are server-owned")
+    if {"_director_custom_style_snapshot", "_director_custom_style_video_snapshot",
+            "_director_custom_style_inputs", "_director_custom_style_image_paths",
+            "custom_visual_style_guidance"}.intersection(params):
+        raise HTTPException(400, "Saved visual style contents are server-owned")
+
+
+def _director_custom_visual_style_bindings(params):
+    from services.director_pipeline import _director_image_role_model
+
+    video = params.get("video_model")
+    if not isinstance(video, str) or not video or video not in wgp.models_def:
+        raise HTTPException(409, "Select an available video model before using a saved visual style")
+    models = {"video": video,
+              "image_creator": _director_image_role_model(params, "creator"),
+              "image_editor": _director_image_role_model(params, "editor")}
+    if any(model not in wgp.models_def for model in models.values()):
+        raise HTTPException(409, "A selected visual style model is unavailable")
+    # Reference capability stays absent until an actual scoped native adapter
+    # is connected. Catalog visibility never authorizes image delivery.
+    return {stage: {"model_type": model, "mode": mode, "capability": None}
+            for stage, model, mode in (
+                ("video", video, "ref2va" if video == "minimax_h3_ref2va" else "video"),
+                ("image_creator", models["image_creator"], "image_generation"),
+                ("image_editor", models["image_editor"], "image_editing"),
+            )}
+
+
+def _director_custom_visual_style_scope(workspace, project_dir, session_id, *, pipeline_id=None):
+    if (not isinstance(workspace, str) or not workspace
+            or not isinstance(project_dir, str) or not project_dir
+            or not isinstance(session_id, str) or not session_id):
+        raise HTTPException(409, "Saved visual style project ownership is unavailable")
+    current_dir = _existing_workspace_dir(workspace)
+    if not current_dir or os.path.realpath(current_dir) != os.path.realpath(project_dir):
+        raise HTTPException(409, "Saved visual style project changed")
+    owner = owner_principal_digest(_session_secret(), session_id)
+    project = _queue_recovery_existing_project_identity(current_dir)
+    if pipeline_id is not None:
+        parent = _director_recovery_parents.get(pipeline_id)
+        if (not isinstance(parent, dict) or parent.get("workspace") != workspace
+                or not hmac.compare_digest(str(parent.get("_recovery_owner_digest") or ""), owner)
+                or not hmac.compare_digest(str(parent.get("_recovery_project_digest") or ""), project)):
+            raise HTTPException(409, "Saved visual style recovery ownership changed")
+    return {"project_id": workspace, "workspace_id": "main",
+            "project_instance": project, "owner_digest": owner}
+
+
+
+def _director_video_lora_scope(params, current_scope):
+    """Require a fresh scope from the existing authorized project resolver.
+
+    The caller must derive this from the current session, physical project
+    incarnation and (on recovery) exact parent. Request fields are not scope.
+    """
+    import re
+    fields = {"project_id", "workspace_id", "project_instance", "owner_digest"}
+    if (type(current_scope) is not dict or set(current_scope) != fields
+            or any(type(value) is not str or not value or len(value) > 256
+                   for value in current_scope.values())
+            or current_scope["project_id"] != (params.get("workspace") or "default")
+            or current_scope["workspace_id"] != "main"
+            or re.fullmatch(r"owner:v1:[0-9a-f]{64}", current_scope["owner_digest"]) is None
+            or re.fullmatch(r"project:v1:[0-9a-f]{64}", current_scope["project_instance"]) is None):
+        raise ValueError("Current Director video LoRA project ownership is unavailable")
+    return dict(current_scope)
+
+
+
+
+
+def _resolve_director_video_lora_parameters(params, *, freeze=False, contexts=None):
+    from services.generation_presets import (
+        GenerationPresetError, normalize_generation_lora_parameters,
+    )
+    loras = params.get("video_loras", {})
+    if not isinstance(loras, dict):
+        raise HTTPException(400, "Invalid Director video LoRA selection")
+    try:
+        wire = normalize_generation_lora_parameters(loras.get("lora_parameters", {}))
+    except GenerationPresetError as error:
+        raise HTTPException(400, "Invalid Director video LoRA parameters") from error
+    active = loras.get("activated_loras", [])
+    if (
+        not isinstance(active, list) or len(active) > 64
+        or any(not isinstance(name, str) for name in active)
+        or len(set(active)) != len(active) or not set(wire).issubset(active)
+        or not isinstance(loras.get("loras_multipliers", ""), str)
+    ):
+        raise HTTPException(400, "Director LoRA parameters must name active catalog files")
+    if not active:
+        return []
+    model_type = params.get("video_model")
+    model_def = wgp.get_model_def(model_type)
+    if not isinstance(model_def, dict) or model_def.get("image_outputs") or model_def.get("audio_only"):
+        raise HTTPException(409, "Selected Director video model is unavailable")
+    selections = []
+    for filename in active:
+        try:
+            path = wgp.resolve_lora_path(model_type, filename)
+            schema = _project_reference_lora_parameter_schema(model_type, path)
+        except ValueError as error:
+            # Match the shared resolver's historical strength-only behavior
+            # for an ordinary malformed sidecar. Parameter requests fail closed.
+            if filename in wire:
+                raise HTTPException(409, "Director video LoRA schema is unavailable") from error
+            schema = None
+        except (OSError, TypeError) as error:
+            raise HTTPException(409, "Director video LoRA schema is unavailable") from error
+        if filename not in wire:
+            if schema is not None and schema.get("schema_source") == "server_known_contract":
+                raise HTTPException(400, "Server-known LoRA requires its published parameters")
+            continue
+        if not _studio_image_lora_schema_applicable(schema):
+            raise HTTPException(409, "This LoRA parameter contract requires a Reference or Director image role")
+        # A scalar is required by the shared schema resolver. The complete
+        # authored strength schedule is retained separately in the binding.
+        selections.append({"id": filename, "multiplier": 1.0, "scope": "generation", **wire[filename]})
+    return _project_reference_resolve_additional_loras(
+        selections, generation_model=model_type, editor_model=None,
+        operation_roles={"generation": (), "editing": ()},
+        freeze=freeze, commitment_contexts=contexts,
+    )
+
+
+def _director_video_lora_parameter_binding(params, *, current_scope, contexts=None):
+    scope = _director_video_lora_scope(params, current_scope)
+    selections = _resolve_director_video_lora_parameters(params, freeze=True, contexts=contexts)
+    loras = params.get("video_loras") or {}
+    model_type = params.get("video_model")
+    model_def = wgp.get_model_def(model_type)
+    sources = []
+    for filename in loras.get("activated_loras", []):
+        path = wgp.resolve_lora_path(model_type, filename)
+        if not isinstance(path, str) or os.path.islink(path) or not os.path.isfile(path):
+            raise HTTPException(409, "Selected Director video LoRA source changed")
+        sources.append({"id": filename, "path": os.path.realpath(path),
+                        "sha256": _project_reference_sha256_file(path)})
+    return json.loads(json.dumps({
+        "version": 3,
+        "scope": scope,
+        "video_model": model_type,
+        "workspace": params.get("workspace", ""),
+        "pipeline_type": params.get("pipeline_type", "music_video"),
+        "seamless": params.get("seamless", True),
+        "activated_loras": loras.get("activated_loras"),
+        "loras_multipliers": loras.get("loras_multipliers", ""),
+        "lora_parameters": loras.get("lora_parameters", {}),
+        "model_contract": {key: model_def.get(key) for key in (
+            "architecture", "t2v_class", "i2v_class", "sliding_window",
+            "guidance_max_phases", "lock_guidance_phases", "multiple_submodels",
+        )},
+        "selections": selections,
+        "sources": sources,
+    }, allow_nan=False))
+
+
+def _seal_director_video_lora_parameters(params, *, current_scope):
+    if "_director_video_lora_snapshot" in params:
+        _validate_director_video_lora_parameters(params, current_scope=current_scope)
+        return
+    # Validate even empty supplied values, and inspect every active catalog
+    # selection for a required server-known contract before deciding no seal
+    # is needed. This cheap pass never hashes a weight file.
+    if not _resolve_director_video_lora_parameters(params):
+        return
+    binding = _director_video_lora_parameter_binding(params, current_scope=current_scope)
+    params["_director_video_lora_snapshot"] = {
+        "binding": binding,
+        "digest": _project_reference_private_commitment(binding),
+    }
+
+
+def _validate_director_video_lora_parameters(params, *, current_scope):
+    snapshot = params.get("_director_video_lora_snapshot")
+    if not isinstance(snapshot, dict) or set(snapshot) != {"binding", "digest"}:
+        raise ValueError("Director video LoRA admission snapshot is missing")
+    binding = snapshot["binding"]
+    if (
+        not isinstance(binding, dict) or not isinstance(snapshot["digest"], str)
+        or not hmac.compare_digest(snapshot["digest"], _project_reference_private_commitment(binding))
+    ):
+        raise ValueError("Director video LoRA admission snapshot changed")
+    contexts = {
+        selection["id"]: selection["parameter_commitment_context"]
+        for selection in binding["selections"]
+    }
+    current = _director_video_lora_parameter_binding(params, current_scope=current_scope, contexts=contexts)
+    if current != binding:
+        raise ValueError("Selected Director LoRA parameters or source changed; refresh and submit again")
+    return binding
+
+
+def _admit_director_generation_parameters(request, params, workspace, project_dir, *, retain_images=False):
+    # The original style admission owns its selector validation and image-copy
+    # cleanup. Bind LoRAs before making retained media copies.
+    if not isinstance(params, dict):
+        raise HTTPException(400, "Director parameters must be an object")
+    if {"_director_video_lora_snapshot", "_director_video_lora_parent_snapshot", "_director_video_lora_child_snapshot", "_director_video_lora_task_plans", "_director_video_lora_task_inventory", "_director_video_lora_native_plans", "_director_video_lora_preparation_plans", "_director_video_lora_consumption_plans"}.intersection(params):
+        raise HTTPException(400, "Director video LoRA internals are server-owned")
+    if params.get("workspace") not in (None, "", workspace):
+        raise HTTPException(400, "Director LoRA project does not match")
+    frozen = _admit_director_custom_visual_style(
+        request, params, workspace, project_dir, retain_images=False,
+    )
+    frozen["workspace"] = workspace
+    selections = _resolve_director_video_lora_parameters(frozen)
+    scope = None
+    if selections:
+        _require_project_access(request, workspace, existing_only=True, permission="project.generate")
+        scope = _director_custom_visual_style_scope(
+            workspace, project_dir, request.state.maestro_session_id,
+        )
+        frozen["_maestro_session_id"] = request.state.maestro_session_id
+        _seal_director_video_lora_parameters(frozen, current_scope=scope)
+    if retain_images and frozen.get("_director_custom_style_snapshot") is not None:
+        scope = scope or _director_custom_visual_style_scope(
+            workspace, project_dir, request.state.maestro_session_id,
+        )
+        frozen = _retain_director_custom_style_images(
+            request, frozen, workspace, project_dir, scope,
+        )
+    return frozen
+
+
+def _validate_director_video_lora_recovery(params, *, workspace, project_dir, pipeline_id):
+    # Recovery never mints a missing admission. Ordinary strength-only parents
+    # keep their existing path, including the shared server-known-contract gate.
+    selections = _resolve_director_video_lora_parameters(params)
+    if selections or "_director_video_lora_snapshot" in params:
+        scope = _director_custom_visual_style_scope(
+            workspace, project_dir or _existing_workspace_dir(workspace),
+            params.get("_maestro_session_id"), pipeline_id=pipeline_id,
+        )
+        return _validate_director_video_lora_parameters(params, current_scope=scope)
+    return None
+
+
+def _director_retained_style_inputs(params):
+    """Read an exact server-owned parent or child binding, never a path list alone."""
+    from services.director_pipeline import (
+        _director_custom_style_video_snapshot, _validate_director_custom_style_inputs,
+    )
+
+    if "_director_custom_style_snapshot" in params:
+        projection = _director_custom_style_video_snapshot(params)
+    else:
+        projection = params.get("_director_custom_style_video_snapshot")
+    envelope = projection.get("retained_inputs") if isinstance(projection, dict) else None
+    if envelope is None:
+        if "_director_custom_style_inputs" in params or params.get("_director_custom_style_image_paths"):
+            raise QueueRecoveryRuntimeError("Saved visual style inputs have no frozen binding.")
+        return None
+    if (set(projection) != {"version", "parent_snapshot_digest", "video_snapshot", "retained_inputs"}
+            or type(projection["version"]) is not int or projection["version"] != 1):
+        raise QueueRecoveryRuntimeError("Saved visual style input binding changed.")
+    try:
+        envelope = _validate_director_custom_style_inputs(envelope,
+            parent_digest=projection["parent_snapshot_digest"], video_snapshot=projection["video_snapshot"])
+    except (ValueError, TypeError, KeyError) as error:
+        raise QueueRecoveryRuntimeError("Saved visual style input binding changed.") from error
+    if params.get("_director_custom_style_image_paths") != [item["path"] for item in envelope["inputs"]]:
+        raise QueueRecoveryRuntimeError("Saved visual style input paths changed.")
+    return envelope
+
+
+def _retain_director_custom_style_images(request, frozen, workspace, project_dir, scope):
+    """Retain fresh selections under the admission's existing project guard."""
+    from services.custom_visual_styles import digest
+    from services.director_style_input_snapshot import (
+        snapshot_style_image, cleanup_uncommitted_style_image_snapshot,
+    )
+    from services.director_pipeline import _validate_director_custom_style_inputs
+
+    parent = frozen.get("_director_custom_style_snapshot")
+    stage = (parent or {}).get("stages", {}).get("video")
+    if not isinstance(stage, dict) or not stage.get("references"):
+        return frozen
+    store = _project_asset_store()
+    retention_id = uuid.uuid4().hex
+    inputs, sources = [], []
+    try:
+        with store.publication_guard():
+            source_root = str(store._workspace_dir(workspace, "main") / "media")
+            for index, reference in enumerate(stage["references"]):
+                selection = reference["selection"]
+                source = _resolve_custom_visual_style_reference(request, workspace, "main", selection)
+                expected = {key: copy.deepcopy(reference[key])
+                            for key in ("selection", "sha256", "terms", "access_policy")}
+                if source != expected:
+                    raise ValueError("Selected visual style source changed")
+                variant = store.get_variant(workspace, "main", selection["asset_id"], selection["variant_id"])
+                output = variant["outputs"][selection["output_index"]]
+                path = store.resolve_output_path(workspace, "main", output["relative_path"])
+                inputs.append(snapshot_style_image(project_dir, retention_id=retention_id,
+                    source_path=path, source_root=source_root, expected_size=os.stat(path).st_size,
+                    expected_sha256=reference["sha256"], owner_digest=scope["owner_digest"],
+                    project_digest=scope["project_instance"], style_snapshot_digest=stage["digest"],
+                    field=f"_director_custom_style_image_paths:{index}"))
+                sources.append(source)
+        envelope = {"version": 1, "retention_id": retention_id,
+                    "parent_snapshot_digest": parent["digest"], "video_snapshot_digest": stage["digest"],
+                    "scope_digest": parent["scope_digest"], "inputs": inputs, "sources": sources}
+        envelope["digest"] = digest(envelope)
+        frozen["_director_custom_style_inputs"] = _validate_director_custom_style_inputs(
+            envelope, parent_digest=parent["digest"], video_snapshot=stage,
+            scope_digest=parent["scope_digest"])
+        frozen["_director_custom_style_image_paths"] = [item["path"] for item in inputs]
+        return frozen
+
+    except BaseException:
+        for descriptor in inputs:
+            cleanup_uncommitted_style_image_snapshot(descriptor, project_directory=project_dir,
+                retention_id=retention_id, owner_digest=scope["owner_digest"],
+                project_digest=scope["project_instance"], style_snapshot_digest=stage["digest"],
+                field=descriptor["field"])
+        raise
+
+def _admit_director_custom_visual_style(request, params, workspace, project_dir, *, retain_images=False):
+    from services.custom_visual_styles import CustomVisualStyleLibrary
+    from services.custom_visual_style_pipeline import SELECTOR, admit_selection
+    from services.project_assets import ProjectAssetNotFoundError
+
+    _reject_client_custom_visual_style_state(params)
+    if params.get(SELECTOR) is None:
+        return copy.deepcopy(params)
+    if "use_director_v2" in params and params["use_director_v2"] is not True:
+        raise HTTPException(409, "Saved visual styles require Director v2 planning")
+    _require_project_access(request, workspace, existing_only=True, permission="project.generate")
+    frozen = copy.deepcopy(params)
+    frozen["workspace"] = workspace
+    _resolve_director_image_role_request(request, frozen)
+    scope = _director_custom_visual_style_scope(
+        workspace, project_dir, request.state.maestro_session_id,
+    )
+    try:
+        frozen = admit_selection(
+            CustomVisualStyleLibrary(_project_asset_store()), frozen,
+            current_scope=scope, stage_bindings=_director_custom_visual_style_bindings(frozen),
+            resolve_reference=lambda stage, project, subworkspace, selection:
+                _resolve_custom_visual_style_reference(request, project, subworkspace, selection),
+        )
+    except (ValueError, PermissionError, ProjectAssetNotFoundError) as error:
+        raise _project_asset_error(error) from error
+    frozen["_maestro_session_id"] = request.state.maestro_session_id
+    if retain_images:
+        frozen = _retain_director_custom_style_images(request, frozen, workspace, project_dir, scope)
+    return frozen
+
+
+def _discard_director_style_admission(params, project_dir):
+    """Remove only this admission's exact copies before publication begins."""
+    from services.director_style_input_snapshot import cleanup_uncommitted_style_image_snapshot
+
+    retained = _director_retained_style_inputs(params)
+    if retained is None:
+        return
+    for descriptor in retained["inputs"]:
+        cleanup_uncommitted_style_image_snapshot(descriptor, project_directory=project_dir,
+            retention_id=retained["retention_id"], owner_digest=descriptor["owner_principal"],
+            project_digest=descriptor["project_instance"],
+            style_snapshot_digest=retained["video_snapshot_digest"], field=descriptor["field"])
+
+
 def _director_recovery_runtime_admission(
     params: dict,
     *,
     source_remote: bool = False,
+    workspace: str | None = None,
+    project_dir: str | None = None,
+    pipeline_id: str | None = None,
 ) -> None:
     """Apply the same model/LoRA gates to startup and direct service recovery."""
     requested_models = [
@@ -18225,6 +21512,29 @@ def _director_recovery_runtime_admission(
         "DirectorRecoveryState", (), {"maestro_remote": bool(source_remote)},
     )()
     _resolve_director_image_role_request(request, params)
+    _validate_director_video_lora_recovery(params, workspace=workspace, project_dir=project_dir, pipeline_id=pipeline_id)
+    from services.custom_visual_style_pipeline import SELECTOR, SNAPSHOT, recover_selection
+    if params.get(SELECTOR) is not None or SNAPSHOT in params:
+        if "use_director_v2" in params and params["use_director_v2"] is not True:
+            raise HTTPException(409, "Saved visual styles require Director v2 planning")
+        current_project_dir = project_dir or _existing_workspace_dir(workspace)
+        scope = _director_custom_visual_style_scope(
+            workspace, current_project_dir,
+            params.get("_maestro_session_id"), pipeline_id=pipeline_id,
+        )
+        recover_selection(params, current_scope=scope,
+                          stage_bindings=_director_custom_visual_style_bindings(params))
+        retained = _director_retained_style_inputs(params)
+        if retained is not None:
+            from services.custom_visual_styles import digest
+            from services.director_style_input_snapshot import validate_style_image_snapshot
+            if retained["scope_digest"] != digest(scope) or not all(
+                    validate_style_image_snapshot(descriptor, project_directory=current_project_dir,
+                        retention_id=retained["retention_id"], owner_digest=scope["owner_digest"],
+                        project_digest=scope["project_instance"],
+                        style_snapshot_digest=retained["video_snapshot_digest"], field=descriptor["field"])
+                    for descriptor in retained["inputs"]):
+                raise HTTPException(409, "Saved visual style image changed; review this request")
 
 
 _KREA_JOB_ROLE_KEY = "_krea_principal_role"
@@ -19415,13 +22725,25 @@ def _plan_h3_adaptive_models(
     fl2va_model = _h3_preferred_fl2va_model(body)
     adaptive = body.get("h3_adaptive_conditioning", True) is not False
     native_boundaries = body.get("h3_native_boundary_conditioning") is True
-    legacy_semantic_refs = bool(body.get("image_refs")) or any(
+    planned_style_refs = False
+    style_projection = body.get("_director_custom_style_video_snapshot")
+    if style_projection is not None:
+        from services.custom_visual_styles import validate_snapshot
+
+        if not isinstance(style_projection, dict):
+            raise QueueRecoveryRuntimeError("Saved visual style binding is unavailable.")
+        frozen_style = validate_snapshot(style_projection.get("video_snapshot"))
+        if any(ref["delivery"] == "planned" for ref in frozen_style["references"]):
+            if _director_retained_style_inputs(body) is None:
+                raise QueueRecoveryRuntimeError("Saved visual style images have no retained input binding.")
+            planned_style_refs = True
+    legacy_semantic_refs = planned_style_refs or bool(body.get("image_refs")) or any(
         body.get(key) for key in ("video_guide", "video_guide2", "video_guide3")
     ) or any(letter in str(body.get("audio_prompt_type") or "") for letter in "ABCK")
     if native_boundaries:
         from services.h3_boundary_policy import has_semantic_references
 
-        has_semantic_refs = has_semantic_references(body)
+        has_semantic_refs = planned_style_refs or has_semantic_references(body)
     else:
         has_semantic_refs = legacy_semantic_refs
     if not adaptive:
@@ -21266,7 +24588,12 @@ def list_loras_details(model_type: str):
                     parameter_schema,
                 )
                 info["parameter_schema_status"] = "ready"
+                from services.studio_lora_execution import studio_video_lora_model_applicable
                 info["parameter_execution"] = {
+                    "studio_video_generation": bool(
+                        studio_video_lora_model_applicable(model_type, md)
+                        and _studio_image_lora_schema_applicable(parameter_schema)
+                    ),
                     "studio_image_generation": bool(
                         md.get("image_outputs")
                         and (parameter_schema["parameters"] or parameter_schema["trigger_fragments"])
@@ -25653,10 +28980,13 @@ def _resource_release_activity() -> dict:
     from services import director_pipeline as director
 
     jobs = sorted(
-        (str(job_id), str(job.get("status") or ""))
+        (str(job_id), "stopping" if job.get("_generation_slot_owned")
+         and job.get("status") not in _RESOURCE_RELEASE_ACTIVE_STATUSES
+         else str(job.get("status") or ""))
         for job_id, job in list(_jobs.items())
         if isinstance(job, Mapping)
-        and job.get("status") in _RESOURCE_RELEASE_ACTIVE_STATUSES
+        and (job.get("status") in _RESOURCE_RELEASE_ACTIVE_STATUSES
+             or job.get("_generation_slot_owned"))
     )
     pipelines = sorted(
         (str(pid), str(pipeline.get("status") or ""))
@@ -25706,7 +29036,7 @@ def _resource_release_activity() -> dict:
     ).hexdigest()
     return {
         "activity_token": token,
-        "running": sum(status == "running" for _, status in jobs),
+        "running": sum(status in {"running", "stopping"} for _, status in jobs),
         "queued": sum(
             status in {"queued", "waiting_for_plan_approval"}
             for _, status in jobs
@@ -29437,6 +32767,25 @@ def _require_project_asset_media_access(
     return asset
 
 
+def _guard_project_asset_style_mutation(project, workspace, *, asset_id=None, body=None):
+    """Keep generic writes outside the server-owned style/CAS namespace."""
+    from contextlib import contextmanager
+    from services.custom_visual_style_api import guard_generic_asset_mutation
+
+    @contextmanager
+    def guarded():
+        # Blender status already takes this lock before the shared asset lock.
+        # Keep that order while holding the style check through publication.
+        with _blender_candidate_status_lock:
+            store = _project_asset_store()
+            with store.publication_guard():
+                current = store.get_asset(project, workspace, asset_id) if asset_id else None
+                guard_generic_asset_mutation(current, body)
+                yield
+
+    return guarded()
+
+
 def _project_reference_private_authored_snapshot(variant: dict) -> dict:
     """Validate one durable private snapshot without exposing it publicly."""
     if not isinstance(variant, dict) or variant.get("variant_type") != "reference_pack":
@@ -29742,6 +33091,43 @@ def _editor_require_current_source(request: Request, project: str, asset: dict) 
         raise HTTPException(status_code=409, detail="Editor source changed; reopen the video") from error
     if not hmac.compare_digest(str(asset.get("output_revision") or ""), current):
         raise HTTPException(status_code=409, detail="Editor source changed; reopen the video")
+
+
+@api.get("/api/v1/projects/{project}/editor/projects")
+def get_output_editor_projects(project: str, request: Request):
+    """Discover saved drafts whose retained assets are readable in this session."""
+    from services.editor_projects import EditorProjectError, list_editor_projects, load_editor_project
+    with _reserve_workspace_operations(project):
+        _require_project_access(request, project, existing_only=True, permission="project.read")
+        result = []
+        for summary in list_editor_projects(_editor_save_root(), project):
+            try:
+                saved = load_editor_project(_editor_save_root(), project, summary["id"])
+                for asset in saved.get("assets", {}).values():
+                    _editor_require_current_source(request, project, asset)
+            except (HTTPException, FileNotFoundError, EditorProjectError, OSError, ValueError):
+                # A deleted, stale, private or unreadable source is not a new
+                # disclosure path through draft metadata.
+                continue
+            result.append(summary)
+    return {"projects": result}
+
+
+@api.get("/api/v1/projects/{project}/editor/projects/{editor_id}")
+def get_output_editor_project(project: str, editor_id: str, request: Request):
+    """Retrieve a saved timeline without creating or resetting a draft."""
+    from services.editor_projects import EditorProjectError, load_editor_project
+    with _reserve_workspace_operations(project):
+        _require_project_access(request, project, existing_only=True, permission="project.read")
+        try:
+            saved = load_editor_project(_editor_save_root(), project, editor_id)
+        except FileNotFoundError:
+            raise HTTPException(status_code=404, detail="Editor draft not found") from None
+        except (EditorProjectError, OSError, ValueError):
+            raise HTTPException(status_code=503, detail="Editor draft is unavailable") from None
+        for asset in saved.get("assets", {}).values():
+            _editor_require_current_source(request, project, asset)
+    return {"project": saved}
 
 
 @api.post("/api/v1/projects/{project}/editor/projects")
@@ -30449,6 +33835,114 @@ async def export_output_editor_project(project: str, editor_id: str, request: Re
     return {"job_id": job_id, "status": "queued"}
 
 
+
+def _resolve_custom_visual_style_reference(request, project, workspace, selection, *, pin_current=False):
+    """Resolve one kept image and its current source proof in project scope."""
+    from copy import deepcopy
+    from services.character_sheet_anchor import (
+        _stable_file_sha256, verify_reference_pack_anchor_proof,
+    )
+    from services.custom_visual_styles import StyleConflict, normalize_definition
+    from services.model_terms import model_terms_statuses
+
+    normalize_definition({"version": 1, "direction": "Reference selection",
+                          "borrow_scope": ["palette"], "references": [selection]})
+    _require_project_access(request, project, existing_only=True, permission="project.read")
+    if workspace != "main":
+        raise ValueError("invalid style workspace")
+    store = _project_asset_store()
+    with store.publication_guard():
+        asset = _require_project_asset_media_access(
+            project, workspace, selection["asset_id"], request.state.maestro_session_id,
+            variant_id=selection["variant_id"],
+        )
+        variant = next(item for item in asset["variants"] if item["id"] == selection["variant_id"])
+        if variant.get("status") != "kept":
+            raise HTTPException(409, "Keep this reference before using it in a visual style")
+        outputs = variant.get("outputs") or []
+        index = selection["output_index"]
+        if index >= len(outputs) or not isinstance(outputs[index], dict):
+            raise HTTPException(404, "Visual reference not found")
+        output = outputs[index]
+        if not str(output.get("media_type") or "").casefold().startswith("image/"):
+            raise ValueError("visual style references must be images")
+        relative = output.get("relative_path")
+        if not isinstance(relative, str):
+            raise ValueError("invalid visual reference")
+        path = Path(store.resolve_output_path(project, workspace, relative))
+        source_sha256 = _stable_file_sha256(
+            store, project, workspace, asset["id"], variant["id"], relative, path,
+        )
+        if not pin_current and not hmac.compare_digest(source_sha256, selection["expected_sha256"]):
+            raise StyleConflict("Visual reference changed")
+        metadata = output.get("metadata") if isinstance(output.get("metadata"), dict) else {}
+        pack = metadata.get("reference_pack")
+        proof = pack.get("anchor_provenance") if isinstance(pack, dict) else None
+        terms = {"status": "not_recorded", "source_model": None, "accepted": None}
+        if proof is not None:
+            if not isinstance(proof, dict) or not verify_reference_pack_anchor_proof(
+                _character_sheet_anchor_key(), proof,
+                expected_binding={"project_id": project, "workspace_id": workspace,
+                                  "asset_id": asset["id"], "variant_id": variant["id"],
+                                  "output_index": index, "basename": path.name,
+                                  "source_model_id": proof.get("source_model_id"),
+                                  "source_sha256": source_sha256, "job_id": proof.get("job_id")},
+            ):
+                raise StyleConflict("Visual reference source proof changed")
+            model = proof["source_model_id"]
+            if model not in wgp.models_def:
+                raise StyleConflict("Visual reference source model terms are unavailable")
+            _require_model_recipe_terms([model])
+            records = model_terms_statuses(wgp.server_config.get("services", {}), model, wgp.models_def)
+            terms = {"status": "verified", "source_model": model, "accepted": True,
+                     "requirements": records}
+        pinned_selection = deepcopy(selection)
+        pinned_selection["expected_sha256"] = source_sha256
+        return {"selection": pinned_selection, "sha256": source_sha256,
+                "terms": terms, "access_policy": {
+                    "authorized": True, "project_id": project, "workspace_id": workspace,
+                    **public_output_policy(metadata),
+                }}
+
+
+def _resolve_current_custom_visual_style_reference(request, project, workspace, selection):
+    """Server-only picker boundary; saving and execution still require exact pins."""
+    if not isinstance(selection, dict) or set(selection) != {"asset_id", "variant_id", "output_index"}:
+        raise ValueError("invalid visual reference selector")
+    return _resolve_custom_visual_style_reference(
+        request, project, workspace, {**selection, "expected_sha256": "0" * 64},
+        pin_current=True,
+    )
+
+
+def _custom_visual_style_project_instance(project, workspace):
+    if workspace != "main":
+        raise ValueError("invalid style workspace")
+    return _queue_recovery_existing_project_identity(
+        _existing_workspace_dir(project),
+    )
+
+
+def _build_custom_visual_style_router():
+    from services.custom_visual_styles import CustomVisualStyleLibrary
+    from services.custom_visual_style_api import build_router
+
+    class LibraryProxy:
+        def __getattr__(self, name):
+            # The route registration does not create storage or import models.
+            return getattr(CustomVisualStyleLibrary(_project_asset_store()), name)
+
+    return build_router(
+        LibraryProxy(), require_project_access=_require_project_access,
+        reserve_workspace_operations=_reserve_workspace_operations,
+        resolve_reference=_resolve_custom_visual_style_reference,
+        resolve_current_reference=_resolve_current_custom_visual_style_reference,
+        project_instance=_custom_visual_style_project_instance,
+    )
+
+
+api.include_router(_build_custom_visual_style_router())
+
 @api.get("/api/v1/projects/{project}/assets")
 def list_project_assets(
     project: str,
@@ -30477,18 +33971,19 @@ async def create_project_asset(project: str, request: Request):
     body = await request.json()
     _begin_workspace_operation(project_id)
     try:
-        return _project_asset_store().create_asset(
-            project_id,
-            workspace_id,
-            name=body.get("name", ""),
-            asset_type=body.get("asset_type", "character"),
-            description=body.get("description", ""),
-            tags=body.get("tags"),
-            provenance=_project_asset_provenance(
-                body.get("provenance"), default="typed",
-            ),
-            metadata=body.get("metadata"),
-        )
+        with _guard_project_asset_style_mutation(project_id, workspace_id, asset_id=None, body=body):
+            return _project_asset_store().create_asset(
+                project_id,
+                workspace_id,
+                name=body.get("name", ""),
+                asset_type=body.get("asset_type", "character"),
+                description=body.get("description", ""),
+                tags=body.get("tags"),
+                provenance=_project_asset_provenance(
+                    body.get("provenance"), default="typed",
+                ),
+                metadata=body.get("metadata"),
+            )
     except Exception as error:
         raise _project_asset_error(error) from error
     finally:
@@ -30498,20 +33993,22 @@ async def create_project_asset(project: str, request: Request):
 @api.patch("/api/v1/projects/{project}/assets/{asset_id}")
 async def update_project_asset(project: str, asset_id: str, request: Request):
     project_id, workspace_id = _asset_scope(request, project)
+    body = await request.json()
     _begin_workspace_operation(project_id)
     try:
-        _require_project_asset_media_access(
-            project_id, workspace_id, asset_id, request.state.maestro_session_id,
-        )
-        updated = _project_asset_store().update_asset(
-            project_id, workspace_id, asset_id, await request.json(),
-        )
-        authorized = _public_authorized_project_assets(
-            [updated], request.state.maestro_session_id,
-        )
-        if not authorized:
-            raise HTTPException(status_code=404, detail="Reference asset not found")
-        return authorized[0]
+        with _guard_project_asset_style_mutation(project_id, workspace_id, asset_id=asset_id, body=body):
+            _require_project_asset_media_access(
+                project_id, workspace_id, asset_id, request.state.maestro_session_id,
+            )
+            updated = _project_asset_store().update_asset(
+                project_id, workspace_id, asset_id, body,
+            )
+            authorized = _public_authorized_project_assets(
+                [updated], request.state.maestro_session_id,
+            )
+            if not authorized:
+                raise HTTPException(status_code=404, detail="Reference asset not found")
+            return authorized[0]
     except Exception as error:
         raise _project_asset_error(error) from error
     finally:
@@ -30523,12 +34020,13 @@ def delete_project_asset(project: str, asset_id: str, request: Request):
     project_id, workspace_id = _asset_scope(request, project)
     _begin_workspace_operation(project_id)
     try:
-        _require_project_asset_media_access(
-            project_id, workspace_id, asset_id, request.state.maestro_session_id,
-        )
-        if not _project_asset_store().delete_asset(project_id, workspace_id, asset_id):
-            raise HTTPException(status_code=404, detail="Reference asset not found")
-        return {"deleted": True}
+        with _guard_project_asset_style_mutation(project_id, workspace_id, asset_id=asset_id, body=None):
+            _require_project_asset_media_access(
+                project_id, workspace_id, asset_id, request.state.maestro_session_id,
+            )
+            if not _project_asset_store().delete_asset(project_id, workspace_id, asset_id):
+                raise HTTPException(status_code=404, detail="Reference asset not found")
+            return {"deleted": True}
     except HTTPException:
         raise
     except Exception as error:
@@ -30543,53 +34041,54 @@ async def add_project_asset_variant(project: str, asset_id: str, request: Reques
     body = await request.json()
     source_workspace = str(body.get("source_workspace") or project)
     with _reserve_workspace_operations(project_id, source_workspace):
-        _require_project_asset_media_access(
-            project_id, workspace_id, asset_id, request.state.maestro_session_id,
-        )
-        _require_project_access(
-            request,
-            source_workspace,
-            permission="project.read",
-        )
-        outputs = []
-        for raw in body.get("outputs") or []:
-            if isinstance(raw, str):
-                filename = raw
-                label = ""
-            elif isinstance(raw, dict):
-                filename = str(raw.get("path") or raw.get("filename") or "")
-                label = str(raw.get("label") or "")
-            else:
-                continue
-            path = _resolve_authorized_request_media(
-                request, filename, source_workspace,
+        with _guard_project_asset_style_mutation(project_id, workspace_id, asset_id=asset_id, body=body):
+            _require_project_asset_media_access(
+                project_id, workspace_id, asset_id, request.state.maestro_session_id,
             )
-            if not path:
-                raise HTTPException(status_code=404, detail=f"Output not found: {filename}")
-            inherited = _inherit_media_access_policy(
-                [path], source_workspace, request.state.maestro_session_id,
+            _require_project_access(
+                request,
+                source_workspace,
+                permission="project.read",
             )
-            outputs.append({
-                "source_path": path,
-                "label": label,
-                "metadata": inherited,
-            })
-        try:
-            return _project_asset_store().add_variant(
-                project_id,
-                workspace_id,
-                asset_id,
-                variant_type=body.get("variant_type", "reference"),
-                label=body.get("label", "Reference"),
-                outputs=outputs,
-                provenance=_project_asset_provenance(
-                    body.get("provenance"), default="imported",
-                ),
-                status=body.get("status", "candidate"),
-                metadata=body.get("metadata"),
-            )
-        except Exception as error:
-            raise _project_asset_error(error) from error
+            outputs = []
+            for raw in body.get("outputs") or []:
+                if isinstance(raw, str):
+                    filename = raw
+                    label = ""
+                elif isinstance(raw, dict):
+                    filename = str(raw.get("path") or raw.get("filename") or "")
+                    label = str(raw.get("label") or "")
+                else:
+                    continue
+                path = _resolve_authorized_request_media(
+                    request, filename, source_workspace,
+                )
+                if not path:
+                    raise HTTPException(status_code=404, detail=f"Output not found: {filename}")
+                inherited = _inherit_media_access_policy(
+                    [path], source_workspace, request.state.maestro_session_id,
+                )
+                outputs.append({
+                    "source_path": path,
+                    "label": label,
+                    "metadata": inherited,
+                })
+            try:
+                return _project_asset_store().add_variant(
+                    project_id,
+                    workspace_id,
+                    asset_id,
+                    variant_type=body.get("variant_type", "reference"),
+                    label=body.get("label", "Reference"),
+                    outputs=outputs,
+                    provenance=_project_asset_provenance(
+                        body.get("provenance"), default="imported",
+                    ),
+                    status=body.get("status", "candidate"),
+                    metadata=body.get("metadata"),
+                )
+            except Exception as error:
+                raise _project_asset_error(error) from error
 
 
 @api.patch("/api/v1/projects/{project}/assets/{asset_id}/variants/{variant_id}")
@@ -30600,32 +34099,33 @@ async def set_project_asset_variant_status(
     body = await request.json()
     _begin_workspace_operation(project_id)
     try:
-        _require_project_asset_media_access(
-            project_id, workspace_id, asset_id,
-            request.state.maestro_session_id, variant_id=variant_id,
-        )
-        status = str(body.get("status") or "candidate")
-        blender_result = _set_blender_candidate_status(
-            project_id,
-            workspace_id,
-            asset_id,
-            variant_id,
-            status,
-            out_dir=_existing_workspace_dir(project_id),
-            session_id=request.state.maestro_session_id,
-        )
-        if blender_result is not None:
-            return blender_result
-        updated = _project_asset_store().set_variant_status(
-            project_id, workspace_id, asset_id, variant_id,
-            status,
-        )
-        authorized = _public_authorized_project_assets(
-            [{"variants": [updated]}], request.state.maestro_session_id,
-        )
-        if not authorized or not authorized[0].get("variants"):
-            raise HTTPException(status_code=404, detail="Reference variant not found")
-        return authorized[0]["variants"][0]
+        with _guard_project_asset_style_mutation(project_id, workspace_id, asset_id=asset_id, body=body):
+            _require_project_asset_media_access(
+                project_id, workspace_id, asset_id,
+                request.state.maestro_session_id, variant_id=variant_id,
+            )
+            status = str(body.get("status") or "candidate")
+            blender_result = _set_blender_candidate_status(
+                project_id,
+                workspace_id,
+                asset_id,
+                variant_id,
+                status,
+                out_dir=_existing_workspace_dir(project_id),
+                session_id=request.state.maestro_session_id,
+            )
+            if blender_result is not None:
+                return blender_result
+            updated = _project_asset_store().set_variant_status(
+                project_id, workspace_id, asset_id, variant_id,
+                status,
+            )
+            authorized = _public_authorized_project_assets(
+                [{"variants": [updated]}], request.state.maestro_session_id,
+            )
+            if not authorized or not authorized[0].get("variants"):
+                raise HTTPException(status_code=404, detail="Reference variant not found")
+            return authorized[0]["variants"][0]
     except Exception as error:
         raise _project_asset_error(error) from error
     finally:
@@ -30640,13 +34140,14 @@ def delete_project_asset_variant(
     project_id, workspace_id = _asset_scope(request, project)
     _begin_workspace_operation(project_id)
     try:
-        _require_project_asset_media_access(
-            project_id, workspace_id, asset_id,
-            request.state.maestro_session_id, variant_id=variant_id,
-        )
-        deleted = _project_asset_store().delete_variant(
-            project_id, workspace_id, asset_id, variant_id,
-        )
+        with _guard_project_asset_style_mutation(project_id, workspace_id, asset_id=asset_id, body=None):
+            _require_project_asset_media_access(
+                project_id, workspace_id, asset_id,
+                request.state.maestro_session_id, variant_id=variant_id,
+            )
+            deleted = _project_asset_store().delete_variant(
+                project_id, workspace_id, asset_id, variant_id,
+            )
     except Exception as error:
         raise _project_asset_error(error) from error
     finally:
@@ -36286,8 +39787,9 @@ async def blender_director_plan(request: Request):
     body = await request.json()
     if not isinstance(body, dict):
         raise HTTPException(status_code=400, detail="Request body must be an object")
-    workspace = str(body.get("workspace") or _get_active_workspace())
-    project_root = _require_project_access(request, workspace)
+    _promote_external_llm_request(request)
+    workspace = _request_project_workspace(request, body.get("workspace"))
+    project_root = _require_project_access(request, workspace, permission="project.generate")
     prompt = str(body.get("prompt") or "").strip()
     if not prompt or len(prompt) > 10_000:
         raise HTTPException(status_code=400, detail="prompt must be 1-10000 characters")
@@ -36314,8 +39816,8 @@ async def blender_director_plan(request: Request):
     # Fail before any model load or provider work when the hosted bridge is
     # not fully installed, attested, and reachable.
     _require_blender_ready()
-    _ensure_llm_loaded()
     from services import llm_service
+    from services.llm_operations import run_blocking_shielded
     system_prompt = (
         "You are Director's bounded Blender blocking planner. Return JSON only. "
         "Use primitives cube/sphere/cylinder/cone/torus/plane, no Python, no paths, "
@@ -36333,8 +39835,11 @@ async def blender_director_plan(request: Request):
         "frames including the beginning and end. Every animated name must exist."
     )
     try:
-        raw = await asyncio.to_thread(
-            _run_configured_llm_operation,
+        selection = await run_blocking_shielded(_resolve_direct_llm_selection, request)
+        raw = await run_blocking_shielded(
+            _run_authorized_llm_with_selection,
+            request,
+            selection,
             llm_service.generate,
             prompt=f"Scene request:\n{prompt}\nStyle: {str(body.get('style') or 'cinematic blocking')}",
             system_prompt=system_prompt,
@@ -36370,7 +39875,6 @@ async def blender_director_plan(request: Request):
         raise
     except Exception as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
-    services = wgp.server_config.get("services", {})
     return {
         "workspace": workspace,
         "director_prompt": prompt,
@@ -36382,7 +39886,7 @@ async def blender_director_plan(request: Request):
         "duration_seconds": duration,
         "frame_count": frame_count,
         "fps": fps,
-        "llm_model": services.get("llm_model_id", _DEFAULT_LLM_REPO),
+        "llm_model": selection.get("model_id", _DEFAULT_LLM_REPO),
         "confirmation_required": False,
         "review_strategy": "Director analyzes 2-8 temporally separated frames together, revises if needed, then renders the full-rate reference",
     }
@@ -36413,6 +39917,8 @@ async def blender_render_preview(request: Request):
     project_root = _require_project_access(
         request, workspace, permission="project.generate",
     )
+    from services.custom_visual_style_api import guard_generic_asset_mutation
+    guard_generic_asset_mutation(body=body)
     try:
         policy = output_policy_from_request(
             body,
@@ -44690,6 +48196,7 @@ def _public_pipeline_state(state: dict) -> dict:
     from services.director.nsfw_guidance import EXPLICIT_GUIDANCE_SNAPSHOT_KEY
     from services.director_pipeline import scrub_director_public_credentials
     public = scrub_director_public_credentials(copy.deepcopy(state))
+    public.pop("_planning_custody_required", None)
     # Historical raw planner logs predate request-scoped streaming. Keep the
     # file untouched for provenance, but never publish its prompt, thinking,
     # or response content. New Director checkpoints write this field as null.
@@ -44703,6 +48210,12 @@ def _public_pipeline_state(state: dict) -> dict:
             snapshot.pop(internal_key, None)
         _strip_director_image_role_internals(snapshot)
         snapshot.pop(EXPLICIT_GUIDANCE_SNAPSHOT_KEY, None)
+        snapshot.pop("_director_custom_style_snapshot", None)
+        for key in {"_director_video_lora_snapshot", "_director_video_lora_parent_snapshot", "_director_video_lora_child_snapshot", "_director_video_lora_task_plans", "_director_video_lora_task_inventory", "_director_video_lora_native_plans", "_director_video_lora_preparation_plans", "_director_video_lora_consumption_plans"}:
+            snapshot.pop(key, None)
+        snapshot.pop("_director_custom_style_video_snapshot", None)
+        snapshot.pop("_director_custom_style_inputs", None)
+        snapshot.pop("_director_custom_style_image_paths", None)
         public["_params_snapshot"] = snapshot
     return _redact_local_paths(_sanitize_director_public_failures(public))
 
@@ -44792,10 +48305,14 @@ def _director_action_failure_response() -> JSONResponse:
 
 
 _DIRECTOR_RECOVERY_STATES = frozenset({
-    "blocked_input_changed", "blocked_remote_reauth", "interrupted",
+    "blocked_input_changed", "blocked_remote_reauth", "blocked_planning_admission", "interrupted",
     "paused", "retrying", "terminal",
 })
 _DIRECTOR_RECOVERY_REASONS = {
+    "blocked_planning_admission": (
+        "planning_authority_required",
+        "This interrupted planning attempt requires fresh execution authority.",
+    ),
     "blocked_input_changed": (
         "input_missing_or_changed",
         "A required Director input is missing or changed",
@@ -45308,6 +48825,7 @@ async def director_preflight(request: Request):
     ))
     return {
         "status": "ready",
+        "hold_planning_supported": True,
         "resolved": {
             "pipeline_type": admission["pipeline_type"],
             "video_model": admission["video_model"],
@@ -45356,6 +48874,7 @@ async def director_queue_add(request: Request, workspace: str = ""):
     if params.get("workspace") and params["workspace"] != selected_workspace:
         raise HTTPException(status_code=400, detail="Director queue project does not match the selected project")
     params["workspace"] = selected_workspace
+    _reject_client_custom_visual_style_state(params)
     request_id = body.get("request_id")
     try:
         base = _director_queue_base(request, selected_workspace)
@@ -45372,7 +48891,13 @@ async def director_queue_add(request: Request, workspace: str = ""):
                     raise DirectorQueueAdmissionConflict("The original project is no longer available. Check the queue before submitting a new project.") from exc
                 if not hmac.compare_digest(expected_instance, current_instance):
                     raise DirectorQueueAdmissionConflict("This saved submission belongs to an earlier project and cannot be retried here.")
-            result = enqueue_director_pipeline(base, params, request_id=request_id)
+            result = enqueue_director_pipeline(
+                base, params, request_id=request_id,
+                admit_params=lambda frozen: _admit_director_generation_parameters(
+                    request, frozen, selected_workspace, base, retain_images=True,
+                ),
+                discard_admission=lambda frozen: _discard_director_style_admission(frozen, base),
+            )
             result["project_instance"] = _queue_recovery_existing_project_identity(base)
             return result
 
@@ -45453,13 +48978,41 @@ async def director_queue_update(request: Request, entry_id: str, workspace: str 
     params = body.get("params") if isinstance(body, dict) else None
     if not isinstance(params, dict):
         raise HTTPException(status_code=400, detail="Director queue params are required")
+    selected_workspace = _request_project_workspace(request, workspace)
+    if params.get("workspace") and params["workspace"] != selected_workspace:
+        raise HTTPException(400, "Director queue project does not match the selected project")
+    params["workspace"] = selected_workspace
+    _reject_client_custom_visual_style_state(params)
+    base = _director_queue_base(request, selected_workspace)
     try:
-        return await upload_usage.to_thread(
+        reservation = _reserve_workspace_operations(selected_workspace)
+        reservation.__enter__()
+        work = upload_usage.to_thread(
             update_director_queue_entry,
-            _director_queue_base(request, workspace),
+            base,
             entry_id,
             params,
+            admit_params=lambda frozen: _admit_director_generation_parameters(
+                request, frozen, selected_workspace, base, retain_images=True,
+            ),
+            discard_admission=lambda frozen: _discard_director_style_admission(frozen, base),
         )
+        try:
+            task = upload_usage.create_task(work)
+        except BaseException:
+            work.close()
+            reservation.__exit__(None, None, None)
+            raise
+
+        def drained(done):
+            try:
+                if not done.cancelled():
+                    done.exception()
+            finally:
+                reservation.__exit__(None, None, None)
+
+        task.add_done_callback(drained)
+        return await asyncio.shield(task)
     except PipelineBusyError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
@@ -45494,6 +49047,14 @@ async def director_pipeline_start(request: Request):
     from services.director.nsfw_guidance import EXPLICIT_GUIDANCE_SNAPSHOT_KEY
     from services.director_pipeline import start_pipeline
     body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Director request must be an object")
+    if "hold_planning" in body and type(body["hold_planning"]) is not bool:
+        raise HTTPException(status_code=400, detail="Planning hold must be true or false")
+    if body.get("hold_planning") is True and (
+        body.get("prepared_clip_plans") or body.get("prepared_planned_clips")
+    ):
+        raise HTTPException(status_code=400, detail="A held story must be planned before using prepared clips")
     _credit_prepare_director_pipeline(body)
     # This private recovery bit is server-owned. start_pipeline recomputes it
     # from the authoritative consent/provider policy and literal request flag.
@@ -45501,6 +49062,10 @@ async def director_pipeline_start(request: Request):
     try:
         _reject_client_h3_internal_state(body)
         _reject_client_director_image_role_internals(body)
+        if {"_director_custom_style_snapshot", "_director_custom_style_video_snapshot",
+                "_director_custom_style_inputs", "_director_custom_style_image_paths",
+                "custom_visual_style_guidance"}.intersection(body):
+            _reject_client_custom_visual_style_state(body)
         body["_director_component_errors"] = True
         workspace = _authorize_director_media_inputs(request, body)
         body["workspace"] = workspace
@@ -45546,7 +49111,15 @@ async def director_pipeline_start(request: Request):
     body["_maestro_session_id"] = request.state.maestro_session_id
     _begin_workspace_operation(workspace)
     try:
-        pid = start_pipeline(body)
+        if body.get("custom_visual_style_selection") is not None or "video_loras" in body:
+            body = _admit_director_generation_parameters(
+                request, body, workspace, _existing_workspace_dir(workspace), retain_images=True,
+            )
+        if body.get("_director_custom_style_inputs") is not None:
+            pid = start_pipeline(body, discard_admission=lambda frozen:
+                _discard_director_style_admission(frozen, _existing_workspace_dir(workspace)))
+        else:
+            pid = start_pipeline(body)
     finally:
         _end_workspace_operation(workspace)
     return {"pipeline_id": pid}
@@ -45563,6 +49136,7 @@ def director_pipeline_status(request: Request, pid: str):
         "_recovery", "_recovery_parent", "_recovery_owner_digest",
         "_recovery_project_digest", "_recovery_block_reason",
         "_llm_log", "_llm_passes",
+        "_planning_custody_required",
     ):
         p.pop(internal, None)
     p.update(_public_director_recovery_metadata(p))
@@ -45573,7 +49147,7 @@ def director_pipeline_status(request: Request, pid: str):
 async def director_pipeline_continue(pid: str, request: Request):
     """Resume a paused pipeline, optionally with updated clip plans."""
     _init_pipeline()
-    from services.director_pipeline import continue_pipeline
+    from services.director_pipeline import continue_pipeline, _director_llm_selection
     pipeline = _require_live_pipeline(request, pid)
     if pipeline.get("status") == "blocked":
         raise HTTPException(
@@ -45581,7 +49155,31 @@ async def director_pipeline_continue(pid: str, request: Request):
             detail="Director recovery is blocked and requires manual repair.",
         )
     body = await request.json() if request.headers.get("content-length", "0") != "0" else {}
-    ok = continue_pipeline(pid, body or None)
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Director continuation must be an object")
+    if pipeline.get("pause_reason") == "before_planning" and body:
+        raise HTTPException(status_code=400, detail="Start the held story without replacing its saved request")
+    if "hold_video" in body and (
+        type(body["hold_video"]) is not bool or pipeline.get("pause_reason") != "review_images"
+    ):
+        raise HTTPException(status_code=400, detail="Choose a video queue hold after image review")
+    planning_admission = None
+    if pipeline.get("pause_reason") == "before_planning":
+        from services.native_acceptance_reservation import reservation
+        if reservation.target is not None:
+            # Resolve the actual recovery parent and live parameter object;
+            # public snapshots and client-supplied authority are insufficient.
+            from services import director_pipeline as pipeline_service
+            with pipeline_service._pipeline_lock:
+                live = pipeline_service._pipelines.get(pid)
+                parent = _director_recovery_parents.get(pid)
+                if not live or not isinstance(parent, dict):
+                    raise HTTPException(status_code=409, detail="Director planning parent is unavailable")
+                params = live.get("params") or {}
+                planning_admission = reservation.bind_planning(
+                    pid, parent, params, _director_llm_selection(params),
+                )
+    ok = continue_pipeline(pid, body or None, planning_admission=planning_admission)
     if not ok:
         raise HTTPException(status_code=400, detail="Pipeline is not paused")
     return {"status": "resumed"}
@@ -46145,6 +49743,15 @@ async def director_v2_plan(request: Request):
         ) from error
     from services.director.nsfw_guidance import EXPLICIT_GUIDANCE_SNAPSHOT_KEY
     body.pop(EXPLICIT_GUIDANCE_SNAPSHOT_KEY, None)
+    from services.director_video_followup import (
+        validate_existing_image_prompts,
+        with_existing_image_prompt_context,
+        preserve_existing_image_prompts,
+    )
+    try:
+        existing_image_prompts = validate_existing_image_prompts(body)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail="Invalid Director video follow-up") from error
     worker_mode = bool(getattr(
         request.state, "maestro_director_preview_worker", False,
     ))
@@ -46192,6 +49799,10 @@ async def director_v2_plan(request: Request):
             )
         body["workspace"] = workspace
         _reject_client_director_image_role_internals(body)
+        if {"_director_custom_style_snapshot", "_director_custom_style_video_snapshot",
+                "_director_custom_style_inputs", "_director_custom_style_image_paths",
+                "custom_visual_style_guidance"}.intersection(body):
+            _reject_client_custom_visual_style_state(body)
         # Bound caller-controlled compatible list shapes before media
         # authorization performs any path or filesystem work.
         _director_preview_media_paths(body)
@@ -46285,6 +49896,17 @@ async def director_v2_plan(request: Request):
                         raise LlmRequestCancelled(
                             "Director preview project changed",
                         )
+                    def freeze_style():
+                        with _reserve_workspace_operations(workspace):
+                            return _admit_director_custom_visual_style(
+                                detached_request, worker_body, workspace,
+                                _existing_workspace_dir(workspace),
+                            )
+                    frozen_worker_body = (
+                        await run_blocking_shielded(freeze_style)
+                        if worker_body.get("custom_visual_style_selection") is not None
+                        else copy.deepcopy(worker_body)
+                    )
                     await run_blocking_shielded(
                         _revalidate_prompt_enhancement_images,
                         media_paths,
@@ -46308,7 +49930,7 @@ async def director_v2_plan(request: Request):
                         snapshot_prefix="maestro-director-preview-",
                     )
                     materialized_body = _director_preview_materialized_body(
-                        worker_body, media_paths, materialized_paths,
+                        frozen_worker_body, media_paths, materialized_paths,
                     )
                     detached_request = _ScopedDirectorPreviewRequest(
                         detached_authority,
@@ -46401,6 +50023,8 @@ async def director_v2_plan(request: Request):
             if key in body:
                 planner_kwargs_base[key] = body[key]
         planner_kwargs_base["h3_style_workflow_present"] = workflow is not None
+        from services.director_pipeline import _director_custom_visual_style_guidance
+        planner_kwargs_base["custom_visual_style_guidance"] = _director_custom_visual_style_guidance(body)
         video_model = body.get("video_model", "")
         image_model = (
             body.get("image_editor_model")
@@ -46427,13 +50051,13 @@ async def director_v2_plan(request: Request):
             )
             director = DirectorOrchestrator(
                 llm_generate=_with_llm_route_progress(
-                    llm_service.generate,
+                    with_existing_image_prompt_context(llm_service.generate, existing_image_prompts),
                     route_progress,
                     route_response_assist,
                     operation_cancellation,
                 ),
                 llm_generate_streaming=_with_llm_route_progress(
-                    llm_service.generate_streaming,
+                    with_existing_image_prompt_context(llm_service.generate_streaming, existing_image_prompts),
                     route_progress,
                     route_response_assist,
                     operation_cancellation,
@@ -46467,6 +50091,11 @@ async def director_v2_plan(request: Request):
                     "pass_limit": director_pass_limit,
                 })
             plan = director.plan(skill_type, **planner_kwargs)
+            if existing_image_prompts is not None:
+                if len(plan.shots) != len(existing_image_prompts):
+                    raise ValueError("Director video follow-up scene count changed")
+                for shot, image_prompt in zip(plan.shots, existing_image_prompts):
+                    shot.image_prompt = image_prompt
             if operation_cancellation is not None:
                 operation_cancellation.checkpoint()
             if callable(route_progress):
@@ -46486,6 +50115,8 @@ async def director_v2_plan(request: Request):
             if operation_cancellation is not None:
                 operation_cancellation.checkpoint()
             clip_plans = director.plan_to_clip_plans(rendered)
+            if existing_image_prompts is not None:
+                clip_plans = preserve_existing_image_prompts(clip_plans, existing_image_prompts)
             if operation_cancellation is not None:
                 operation_cancellation.checkpoint()
             if polish_mode == "third_pass" and clip_plans:
@@ -46507,6 +50138,8 @@ async def director_v2_plan(request: Request):
                     video_loras=video_loras_activated,
                     image_loras=image_loras_activated,
                     characters=planner_kwargs.get("characters", []) or [],
+                    custom_visual_style_guidance=planner_kwargs.get("custom_visual_style_guidance", ""),
+                    polish_image_prompts=existing_image_prompts is None,
                     response_assist=route_response_assist,
                     progress_callback=route_progress,
                     cancel_handle=operation_cancellation,
@@ -51855,6 +55488,10 @@ async def generate(request: Request):
     body = await request.json()
     if not isinstance(body, dict):
         raise HTTPException(status_code=422, detail="Generation settings must be an object")
+    if {"_director_custom_style_snapshot", "_director_custom_style_video_snapshot",
+            "_director_custom_style_inputs", "_director_custom_style_image_paths",
+            "custom_visual_style_guidance"}.intersection(body):
+        raise HTTPException(status_code=400, detail="Saved visual style contents are server-owned")
     if "_studio_lora_parameter_snapshot" in body:
         raise HTTPException(status_code=400, detail="LoRA parameter admission state is server-owned")
     if "generation_request_id" in body:
@@ -51937,6 +55574,7 @@ async def generate(request: Request):
         if "lora_parameters" in body:
             _resolve_studio_image_lora_parameters({
                 **body, "enhance_before_generate": enhance_before_generate,
+                "project_asset_refs": raw_project_asset_refs,
             })
         project_asset_ref_descriptors = (
             _normalize_project_asset_ref_descriptors(raw_project_asset_refs)
@@ -66174,6 +69812,13 @@ def _rollback_h3_delivery_publication(job: dict, *, update_job_fn=None) -> None:
 
 
 def _finalize_h3_delivery_publication(job: dict) -> bool:
+    publication = job.get("_h3_delivery_publication")
+    if isinstance(publication, dict) and publication.get("director_finishing") is True:
+        pending = _queue_recovery_delivery_pending(job)
+        if not isinstance(pending, dict) or "director_finishing" not in pending:
+            raise QueueRecoveryRuntimeError("Director terminal cleanup intent is unresolved.")
+        return _director_finalize_finishing_publication(job, pending,
+            _director_finishing_plan_from_pending(job, pending))
     publication = job.pop("_h3_delivery_publication", None)
     if not isinstance(publication, dict):
         return True
@@ -66561,6 +70206,9 @@ def _resume_pending_h3_delivery_only(
     pending = _queue_recovery_delivery_pending(job)
     if pending is None:
         return False
+    if "director_finishing" in pending:
+        return _resume_pending_director_finishing_only(
+            job, update_job_fn=update_job_fn, finish_job_fn=finish_job_fn)
     out_dir = os.path.realpath(str(job.get("out_dir") or ""))
     settings = dict(pending.get("settings") or {})
     dependencies = list(pending.get("dependencies") or [])
@@ -71627,6 +75275,7 @@ def _run_generation(
     h3_delivery_request = False
     h3_integrity_passed = False
     cumulative_dispatch = None
+    director_finishing_result = None
 
     def _defer_h3_final_publication(target: Mapping[str, Any]) -> bool:
         params = target.get("params")
@@ -71819,8 +75468,17 @@ def _run_generation(
     h3_reference_file_tokens = []
 
     studio_lora_binding = None
+    director_lora_snapshot = None
     studio_params = job.get("params") or {}
-    if studio_params.get("lora_parameters") or "_studio_lora_parameter_snapshot" in studio_params:
+    if "_director_video_lora_child_snapshot" in studio_params:
+        try:
+            director_lora_snapshot = _validate_director_video_lora_child_job(job)
+        except Exception:
+            finish_job(job, "failed",
+                error="Selected Director LoRA parameters or source changed; refresh and submit again.",
+                message="Director LoRA parameter validation failed")
+            return False
+    elif studio_params.get("lora_parameters") or "_studio_lora_parameter_snapshot" in studio_params:
         try:
             studio_lora_binding = _validate_studio_image_lora_parameters(studio_params)
         except Exception:
@@ -72024,6 +75682,10 @@ def _run_generation(
 
             # Build task manifest from user params
             raw_params = job["params"].copy()
+            for private_key in ("_director_video_lora_task_plans", "_director_video_lora_task_inventory",
+                    "_director_video_lora_native_plans", "_director_video_lora_preparation_plans", "_director_video_lora_consumption_plans",
+                    "_director_video_lora_parent_snapshot", "_director_video_lora_child_snapshot"):
+                raw_params.pop(private_key, None)
             if studio_lora_binding is not None:
                 raw_params = _apply_studio_image_lora_parameters(raw_params, studio_lora_binding)
             else:
@@ -72194,7 +75856,8 @@ def _run_generation(
                 except Exception:
                     pass
             if trusted_h3_plan:
-                job["params"] = raw_params.copy()
+                if director_lora_snapshot is None:
+                    job["params"] = raw_params.copy()
                 job["window_total"] = int(
                     trusted_h3_plan.get("clip_count") or 0
                 )
@@ -73177,6 +76840,27 @@ def _run_generation(
                 cumulative_plan=h3_cumulative_plan,
             )
 
+            # Keep admitted semantics in task-owned server state, outside the
+            # client task parameters. Append paths once, before WGP creates
+            # the immutable PIL baseline used by the prompt mapper.
+            h3_task_style_handoffs: dict[str, dict] = {}
+            style_projection = (job.get("params") or {}).get("_director_custom_style_video_snapshot")
+            if style_projection is not None:
+                from services.custom_visual_styles import validate_snapshot
+
+                style_body = validate_snapshot(style_projection.get("video_snapshot"))
+                if (any(ref["delivery"] == "planned" for ref in style_body["references"])
+                        and any((item.get("params") or {}).get("model_type") == "minimax_h3_ref2va"
+                                for item in manifest) and h3_mapping_plan is None):
+                    raise QueueRecoveryRuntimeError("Saved visual style references require H3 prompt mapping.")
+                for manifest_task in manifest:
+                    prepared = _prepare_h3_task_custom_style(job, manifest_task,
+                        h3_mapping_descriptors or [], h3_mapping_project_dir)
+                    if prepared is not None:
+                        manifest_task["params"] = prepared["raw_inputs"]
+                        prepared.pop("style_pixels", None)
+                        h3_task_style_handoffs[str(manifest_task.get("id"))] = prepared
+
             # WanGP's manifest parser materializes authorized image/video
             # paths into PIL/tensor objects. Freeze the producer metadata
             # before that boundary so later sidecar publication never tries
@@ -73286,6 +76970,7 @@ def _run_generation(
             join_output_file = None
             producer_artifact_roles: dict[str, str] = {}
             postprocessing_outcomes: dict[str, list[dict[str, str]]] = {}
+            director_assembly_tasks: dict[int, dict] = {}
 
             def _record_postprocessing_outcome(
                 filename: str, step: str, outcome: str, *, method: str = "",
@@ -73481,7 +77166,7 @@ def _run_generation(
                             )
                             if no_transition:
                                 return True
-                            ordinary_units_to_reseal[ordinary_unit["unit_id"]] = ordinary_unit
+                            ordinary_units_to_reseal[ordinary_unit["unit_id"]] = copy.deepcopy(ordinary_unit)
                             return False
                         if (
                             kind not in {"h3_segment", "h3_concat", "h3_scene"}
@@ -73780,7 +77465,7 @@ def _run_generation(
                         settings = recovery_unit.get("settings")
                         if isinstance(settings, dict):
                             file_sidecar["producer_unit_settings"] = dict(settings)
-                        if unit_kind == "h3_scene":
+                        if isinstance(recovery_unit.get("attestation"), dict):
                             file_sidecar["producer_unit_attestation"] = copy.deepcopy(recovery_unit["attestation"])
                         continuation = recovery_unit.get("continuation")
                         if isinstance(continuation, dict):
@@ -73822,6 +77507,11 @@ def _run_generation(
                         expected = expected_ordinary_artifacts[file_sidecar["producer_unit_id"]][fname]
                         file_sidecar["producer_media_size"] = expected["size"]
                         file_sidecar["producer_media_sha256"] = expected["sha256"]
+                        retained_unit = ordinary_units_to_reseal[file_sidecar["producer_unit_id"]]
+                        if (retained_unit.get("settings") or {}).get("director_lora_consumption") is not None:
+                            retained_unit["attestation"] = _director_native_delivery_attestation(job,
+                                retained_unit, list(expected_ordinary_artifacts[retained_unit["unit_id"]].values()))
+                            file_sidecar["producer_unit_attestation"] = copy.deepcopy(retained_unit["attestation"])
                         if producer_role:
                             file_sidecar["producer_artifact_class"] = producer_role
                             file_sidecar["artifact_class"] = "temporary" if native_source else producer_role
@@ -73975,6 +77665,11 @@ def _run_generation(
                             expected = expected_ordinary_artifacts[meta["producer_unit_id"]][name]
                             size, digest = expected["size"], expected["sha256"]
                             meta.update(producer_media_size=size, producer_media_sha256=digest)
+                            retained_unit = ordinary_units_to_reseal[meta["producer_unit_id"]]
+                            if (retained_unit.get("settings") or {}).get("director_lora_consumption") is not None:
+                                retained_unit["attestation"] = _director_native_delivery_attestation(job,
+                                    retained_unit, list(expected_ordinary_artifacts[retained_unit["unit_id"]].values()))
+                                meta["producer_unit_attestation"] = copy.deepcopy(retained_unit["attestation"])
                             serialized_meta = json.dumps(meta, indent=2).replace("\n", os.linesep).encode("utf-8")
                             _atomic_write_json(meta_path, meta)
                             expected_ordinary_artifacts[meta["producer_unit_id"]][name].update({
@@ -74190,6 +77885,8 @@ def _run_generation(
                 with _sample_campaign_transition_lock:
                     if not sample_safe_unit_current(abort_state):
                         raise InterruptedError("H3 concat preempted")
+                    concat_attestation = _director_h3_output_attestation(
+                        job, unit_id, [output_name], out_dir, concat_safety_stats)
                     _write_output_sidecars(
                         [output_name],
                         native_source=h3_delivery_native_source,
@@ -74202,6 +77899,7 @@ def _run_generation(
                                 "settings": dict(settings),
                                 "unit_id": unit_id,
                                 "variant": variant,
+                                "attestation": concat_attestation,
                             },
                         },
                         task_params=_snapshot_h3_recovery_task_params(
@@ -74222,9 +77920,7 @@ def _run_generation(
                         artifact_names=[output_name],
                         dependencies=dependencies,
                         settings=settings,
-                        attestation={
-                            "h3_audio_true_peak": dict(concat_safety_stats),
-                        },
+                        attestation=concat_attestation,
                     )
                     if not unit:
                         raise InterruptedError("H3 concat checkpoint rejected")
@@ -74238,6 +77934,125 @@ def _run_generation(
                     if path not in gen["file_list"]:
                         gen["file_list"].append(path)
                     return unit
+
+            def _assemble_director_native_groups():
+                nonlocal join_output_file
+                if director_lora_snapshot is None or h3_cumulative_plan is not None:
+                    return
+                groups = {}
+                for task_index, task in enumerate(queue):
+                    info = (task.get("params") or {}).get("multi_clip_info")
+                    if (not isinstance(info, dict) or info.get("automatic_h3_longform")
+                            or info.get("defer_concat")
+                            or (info.get("total") == 1 and info.get("source_prefix") is None)):
+                        continue
+                    groups.setdefault(info["group_id"], []).append(task_index)
+
+                def require_current():
+                    if is_cancel_requested(job) or not sample_safe_unit_current(abort_state):
+                        raise InterruptedError("Director assembly was cancelled or preempted")
+
+                for group_id, task_indices in groups.items():
+                    last_index = max(task_indices, key=lambda index: queue[index]["params"]["multi_clip_info"]["index"])
+                    actual = director_assembly_tasks[last_index]
+                    controls = actual["params"]
+                    info = controls["multi_clip_info"]
+                    recipes = job["params"]["_director_video_lora_task_plans"]
+                    repeats = len(recipes[str(last_index)]["binding"]["repeat_seeds"])
+                    for repeat_index in range(repeats):
+                        require_current()
+                        spec = _director_concat_spec(job, group_id, repeat_index, out_dir)
+                        binding = spec["settings"]["director_concat"]["binding"]
+                        if {row["task_index"] for row in binding["members"]} != set(task_indices):
+                            raise QueueRecoveryRuntimeError("Director assembly task membership changed.")
+                        unit = _queue_recovery_unit_matches(job, kind="director_concat",
+                            variant=spec["variant"], index=repeat_index, project_dir=out_dir,
+                            quarantine_invalid=False)
+                        if unit is None:
+                            # A rejected retained derived seal never permits its
+                            # delivered bytes to be overwritten by raw concat.
+                            if any(row.get("kind") == "director_concat" and row.get("variant") == spec["variant"]
+                                   and row.get("index") == repeat_index for row in _queue_recovery_units(job)):
+                                raise QueueRecoveryRuntimeError("Director derived delivery is unresolved.")
+                            from services.director_video_lora_execution import validated_task_binding
+
+                            def validate_inputs():
+                                current = validated_task_binding(actual["task"], controls,
+                                    attachment_keys=wgp.ATTACHMENT_KEYS)["params"]
+                                if _project_reference_private_commitment(current) != binding["assembly_controls_digest"]:
+                                    raise QueueRecoveryRuntimeError("Director assembly inputs changed.")
+
+                            source_prefix = info.get("source_prefix")
+                            audio = (None if source_prefix is not None else controls.get("audio_source")
+                                if info.get("preserve_generated_audio") else controls.get("audio_guide") or controls.get("audio_source"))
+                            output_name = (f"director_{job_id}_g{hashlib.sha256(group_id.encode()).hexdigest()[:12]}"
+                                f"_r{repeat_index}_multiclip{os.path.splitext(binding['members'][-1]['basename'])[1]}")
+                            if (os.path.lexists(os.path.join(out_dir, output_name))
+                                    or os.path.lexists(os.path.join(out_dir, os.path.splitext(output_name)[0] + ".meta.json"))):
+                                raise QueueRecoveryRuntimeError("Director assembly orphan requires authenticated recovery.")
+                            safety = {}
+
+                            def concatenate(paths, staging_path):
+                                require_current()
+                                validate_inputs()
+                                if wgp.concatenate_multi_clip_videos(paths, staging_path, audio,
+                                        audio_start_sec=info.get("audio_start_sec", 0),
+                                        clip_start_frames=[row["discard_prefix_frames"] for row in binding["members"]],
+                                        source_prefix=source_prefix,
+                                        abort_callback=lambda: is_cancel_requested(job) or not sample_safe_unit_current(abort_state)) is not True:
+                                    return False
+                                stats = wgp.enforce_h3_final_audio_safety(staging_path,
+                                    wgp.get_base_model_type(controls["model_type"]))
+                                if stats is not None:
+                                    safety.update(stats)
+                                require_current()
+                                validate_inputs()
+                                if _director_concat_spec(job, group_id, repeat_index, out_dir) != spec:
+                                    raise QueueRecoveryRuntimeError("Director assembly parents changed.")
+                                return True
+
+                            replay_concat_to_stable_output(out_dir,
+                                component_basenames=[row["basename"] for row in binding["members"]],
+                                output_basename=output_name, concatenate=concatenate, replace_existing=False)
+                            size, digest = _recovery_sha256_file(os.path.join(out_dir, output_name))
+                            output_binding = {"version": 1,
+                                "spec_digest": spec["settings"]["director_concat"]["digest"],
+                                "media": [{"basename": output_name, "bytes": size, "sha256": digest}]}
+                            attestation = {"director_concat_output": {"binding": output_binding,
+                                "digest": _project_reference_private_commitment(output_binding)}}
+                            if safety:
+                                attestation["h3_audio_true_peak"] = dict(safety)
+                            unit_id = recovery_unit_id(job_id, "director_concat", **spec)
+                            sidecar_params = dict(queue[last_index]["params"])
+                            sidecar_params.update(prompt=info.get("global_prompt") or "\n".join(
+                                recipes[str(row["task_index"])]["binding"]["task"]["params"].get("prompt", "")
+                                for row in binding["members"]),
+                                video_length=sum(row["published_frames"] for row in binding["members"])
+                                    + int((source_prefix or {}).get("retained_frames", 0) or 0),
+                                multi_prompts_gen_type=3)
+                            if source_prefix is not None or info.get("preserve_generated_audio"):
+                                sidecar_params.pop("audio_guide", None)
+                            if safety:
+                                sidecar_params["h3_audio_true_peak"] = dict(safety)
+                            with _sample_campaign_transition_lock:
+                                require_current()
+                                _write_output_sidecars([output_name], private_native_parent=defer_output_publication,
+                                    recovery_units={output_name: {"kind": "director_concat", "unit_id": unit_id,
+                                        **spec, "attestation": attestation}}, task_params=sidecar_params)
+                                unit = _queue_recovery_checkpoint_unit(job, kind="director_concat",
+                                    project_dir=out_dir, artifact_names=[output_name], attestation=attestation, **spec)
+                                if not unit:
+                                    raise QueueRecoveryRuntimeError("Director assembly checkpoint was not acknowledged.")
+                        for artifact in unit["artifacts"]:
+                            name = artifact["basename"]
+                            path = os.path.join(out_dir, name)
+                            producer_artifact_roles[name] = "final"
+                            gen.setdefault("artifact_roles", {})[path] = "final"
+                            if path not in gen["file_list"]:
+                                gen["file_list"].append(path)
+                            if path not in gen.setdefault("artifact_list", []):
+                                gen["artifact_list"].append(path)
+                            join_output_file = name
 
             def _cumulative_abort_check():
                 if is_cancel_requested(job) or not sample_safe_unit_current(abort_state):
@@ -74313,6 +78128,9 @@ def _run_generation(
                 )
                 for task in queue
             )
+
+            if director_lora_snapshot is not None:
+                _retain_director_video_lora_task_inventory(job, director_lora_snapshot, queue)
 
             for task_idx, task in enumerate(queue):
                 # The previous synchronous child no longer reads its inputs.
@@ -74439,14 +78257,18 @@ def _run_generation(
                     if os.environ.get("MAESTRO_H3_CUMULATIVE_EXPERIMENTAL") != "1":
                         raise QueueRecoveryRuntimeError("Private H3 cumulative generation is disabled.")
                 mapping_receipt = None
+                style_handoff = h3_task_style_handoffs.get(str(task.get("id")))
                 if h3_scene_repair is not None:
                     _director_h3_scene_repair_handoff(job, task, out_dir)
                 if h3_mapping_plan is not None:
                     task, task_sidecar_params = _bind_h3_task_prompt_mapping(
                         job, task, task_sidecar_params,
                         h3_mapping_initial_images.pop(str(task.get("id"))),
-                        h3_mapping_plan, h3_mapping_descriptors,
+                        h3_mapping_plan, (style_handoff["descriptors"] if style_handoff is not None
+                                          else h3_mapping_descriptors),
                         h3_mapping_project_dir,
+                        semantic_manifest=(style_handoff["semantic_manifest"] if style_handoff is not None else None),
+                        descriptor_bindings=(style_handoff["descriptor_bindings"] if style_handoff is not None else None),
                     )
                     reference_token = task.pop("_h3_reference_files", None)
                     if reference_token is not None:
@@ -74456,10 +78278,20 @@ def _run_generation(
                     recovery_clip_info = task_params.get("multi_clip_info")
                     mapping_receipt = task_sidecar_params["_h3_prompt_mapping_receipt"]
                     for prior in _queue_recovery_units(job):
-                        if prior.get("kind") == "ordinary_repeat" and prior.get("state") == "completed":
+                        if (prior.get("kind") == "ordinary_repeat" and prior.get("state") == "completed"
+                                and (director_lora_snapshot is None or prior.get("variant") == task_idx)):
                             if (prior.get("settings") or {}).get("prompt_mapping") != mapping_receipt:
                                 raise QueueRecoveryRuntimeError("Recovered H3 output prompt mapping changed.")
                 repeat_mapping_settings = {"prompt_mapping": mapping_receipt} if mapping_receipt is not None else {}
+                if director_lora_snapshot is not None:
+                    _restore_director_video_lora_task_id(
+                        job, task, director_lora_snapshot, task_idx,
+                    )
+                style_observation = _h3_task_style_observation(
+                    task, task_sidecar_params, style_handoff, gen,
+                    wgp.get_model_def(task_params.get("model_type")) or {},
+                    cumulative=h3_cumulative_plan is not None,
+                ) if style_handoff is not None else None
                 if (
                     isinstance(recovery_clip_info, dict)
                     and recovery_clip_info.get("automatic_h3_longform")
@@ -74483,6 +78315,21 @@ def _run_generation(
                         index=recovery_segment,
                         project_dir=out_dir,
                     )
+                    if director_lora_snapshot is not None:
+                        retained = (job.get("params") or {}).get("_director_video_lora_consumption_plans", {}).get(str(task_idx))
+                        if recovered_segment is None and retained is not None:
+                            # An acknowledged native receipt cannot authorize
+                            # denoising again merely because publication failed.
+                            raise QueueRecoveryRuntimeError("Director H3 consumed output needs producer recovery.")
+                        if recovered_segment is not None:
+                            recipe = job["params"]["_director_video_lora_task_plans"][str(task_idx)]
+                            proof = recovered_segment["settings"]["director_lora_consumption"]["binding"]
+                            if (proof["task_index"] != task_idx or proof["repeat_index"] != 0
+                                    or _director_h3_task_coordinate(job, task_idx, recipe)
+                                        != (recovery_variant, recovery_segment)
+                                    or _director_video_lora_task_topology(task_params, task_idx)
+                                        != _director_video_lora_task_topology(recipe["binding"]["task"]["params"], task_idx)):
+                                raise QueueRecoveryRuntimeError("Director H3 recovered task correspondence changed.")
                     if recovered_segment is not None and mapping_receipt is not None and (
                         (recovered_segment.get("settings") or {}).get("prompt_mapping") != mapping_receipt
                     ):
@@ -74688,15 +78535,69 @@ def _run_generation(
                 gen["prompts_max"] = total_tasks
 
                 params = validated_params.copy()
+                director_task_recipe = None
+                director_native_consumer = None
+                native_invocation_fence = threading.Event()
+                if director_lora_snapshot is not None:
+                    director_task_recipe = _retain_director_video_lora_task(
+                        job, task, validated_params, director_lora_snapshot, task_idx,
+                    )
+                    director_assembly_tasks[task_idx] = {"task": task,
+                        "params": {key: validated_params.get(key)
+                            for key in ("model_type", "audio_source", "audio_guide", "multi_clip_info")}}
+                    director_native_consumer = _build_director_video_lora_consumer(
+                        job, director_lora_snapshot, task_idx, director_task_recipe,
+                    )
                 recovery_clip = params.get("multi_clip_info")
                 recovery_h3_segment = bool(
                     isinstance(recovery_clip, dict)
                     and (recovery_clip.get("automatic_h3_longform") or h3_cumulative_plan is not None)
                 )
+                director_repeat_prefix = []
+                director_recovered_units = []
+                if director_native_consumer is not None and not recovery_h3_segment:
+                    def _validate_director_repeat_prefix():
+                        nonlocal director_repeat_prefix, director_recovered_units
+                        director_repeat_prefix, director_recovered_units = _director_completed_repeat_prefix(
+                            job, task_index=task_idx, task_recipe=director_task_recipe,
+                            project_dir=out_dir)
+                        return director_repeat_prefix
+                    director_native_consumer.restore_completed_prefix(
+                        validate_completed=_validate_director_repeat_prefix)
+                    params["repeat_start_offset"] = len(director_repeat_prefix)
+                    if any((unit.get("attestation") or {}).get("director_lora_delivery")
+                           for unit in director_recovered_units):
+                        # Delivered bytes remain retained, but their finishing
+                        # transaction must resume before any pass can repeat.
+                        raise QueueRecoveryRuntimeError("Director delivered finishing recovery is not installed.")
+                    for unit in director_recovered_units:
+                        terminals, roles = _director_recovered_repeat_media(job, task_idx, unit)
+                        for artifact in unit["artifacts"]:
+                            name = artifact["basename"]
+                            path = os.path.join(out_dir, name)
+                            producer_artifact_roles[name] = roles[name]
+                            gen.setdefault("artifact_roles", {})[path] = roles[name]
+                            if path not in gen.setdefault("artifact_list", []):
+                                gen["artifact_list"].append(path)
+                            if name in terminals and path not in gen["file_list"]:
+                                gen["file_list"].append(path)
+                        if isinstance(recovery_clip, dict):
+                            videos = [name for name in terminals if os.path.splitext(name)[1].lower()
+                                      in {".mp4", ".webm", ".mkv", ".mov"}]
+                            if len(videos) != 1:
+                                raise QueueRecoveryRuntimeError("Director recovered clip identity is unresolved.")
+                            clip_output_files[recovery_clip["index"]] = videos[0]
+                    if len(director_repeat_prefix) == len(director_task_recipe["binding"]["repeat_seeds"]):
+                        # No native call, model-load observation or scheduler
+                        # boundary is synthesized for a recovered task.
+                        completed += 1
+                        print(f"  Task {task_no} recovered from verified native repeats")
+                        continue
                 recovery_native_output = bool(
                     job.get("_recovery_manifest_pointer")
                     and (
                         recovery_h3_segment
+                        or director_native_consumer is not None
                         or (not is_multiclip and not defer_output_publication)
                     )
                 )
@@ -74731,8 +78632,82 @@ def _run_generation(
                 ))
                 repeat_final_files: set[str] = set()
 
+                def _retain_director_repeat_output(repeat_index, media_paths, *, terminal_paths):
+                    if director_native_consumer is None:
+                        raise QueueRecoveryRuntimeError("Director repeat producer is unavailable.")
+                    entries = job["params"]["_director_video_lora_preparation_plans"][str(task_idx)]["binding"]["entries"]
+                    windows = sum(key.startswith(f"{repeat_index}:window:") for key in entries)
+                    receipt = director_native_consumer.completed_repeat(
+                        repeat_index, expected_windows=windows)
+                    return _retain_director_produced_repeat(
+                        receipt, media_paths, terminal_paths=terminal_paths)
+
+                def _retain_director_produced_repeat(receipt, media_paths, *, terminal_paths):
+                    # Both local and isolated consumers return the same real
+                    # activation receipt. Authentication, media membership,
+                    # promotion and publication remain with the server below.
+                    if director_native_consumer is None or recovery_staging_dir is None:
+                        raise QueueRecoveryRuntimeError("Director repeat producer is unavailable.")
+                    if native_invocation_fence.is_set():
+                        raise InterruptedError("Director native invocation stopped")
+                    if (type(receipt) is not dict or type(receipt.get("binding")) is not dict
+                            or type(receipt["binding"].get("repeat_index")) is not int
+                            or receipt["binding"]["repeat_index"] < 0):
+                        raise QueueRecoveryRuntimeError("Director repeat receipt is invalid.")
+                    repeat_index = receipt["binding"]["repeat_index"]
+                    entries = job["params"]["_director_video_lora_preparation_plans"][str(task_idx)]["binding"]["entries"]
+                    windows = sum(key.startswith(f"{repeat_index}:window:") for key in entries)
+                    terminal_names = {os.path.basename(path) for path in terminal_paths}
+                    output_roles = {}
+                    for path in media_paths:
+                        name = os.path.basename(path)
+                        declared = (gen.get("artifact_roles") or {}).get(path)
+                        output_roles[name] = (
+                            "component" if name in terminal_names and (recovery_h3_segment or is_multiclip or defer_output_publication)
+                            else "final" if name in terminal_names
+                            else declared if declared in _RECOVERY_ARTIFACT_ROLES else "window")
+                    _retain_director_video_lora_consumption(
+                        job, director_lora_snapshot, task_idx, director_task_recipe, receipt, media_paths,
+                        terminal_paths=terminal_paths, output_roles=output_roles)
+                    if not recovery_h3_segment:
+                        staged = _queue_recovery_staged_media_paths(media_paths, recovery_staging_dir)
+                        names = sorted(staged)
+                        if not names or set(names) != {os.path.basename(path) for path in media_paths}:
+                            raise QueueRecoveryRuntimeError("Director repeat staging membership changed.")
+                        for name, path in staged.items():
+                            producer_artifact_roles[name] = output_roles[name]
+                            gen.setdefault("artifact_roles", {})[path] = output_roles[name]
+                        settings = _h3_style_observed_settings(
+                            repeat_mapping_settings, style_observation, repeat_index,
+                            expected_windows=windows, job=job, task=task)
+                        settings = _director_native_producer_settings(
+                            job, task_index=task_idx, repeat_index=repeat_index,
+                            kind="ordinary_repeat", variant=task_idx, index=repeat_index,
+                            artifact_names=names, settings=settings)
+                        unit_id = recovery_unit_id(job_id, "ordinary_repeat", variant=task_idx,
+                                                   index=repeat_index, settings=settings)
+                        units = {name: {"kind": "ordinary_repeat", "variant": task_idx,
+                            "index": repeat_index, "unit_id": unit_id, "settings": settings} for name in names}
+                        with _sample_campaign_transition_lock:
+                            if native_invocation_fence.is_set() or not sample_safe_unit_current(abort_state):
+                                return False
+                            _write_output_sidecars(names, recovery_units=units, media_paths=staged,
+                                task_params=task_sidecar_params,
+                                private_native_parent=is_multiclip or defer_output_publication)
+                            _queue_recovery_promote_staged_outputs(gen, out_dir, staged)
+                            if not _queue_recovery_checkpoint_unit(job, kind="ordinary_repeat",
+                                    variant=task_idx, index=repeat_index, project_dir=out_dir,
+                                    artifact_names=names, settings=settings):
+                                return False
+                        return {path: os.path.join(out_dir, name) for name, path in staged.items()}
+                    # H3 components use their existing segment callback next;
+                    # it carries the same commitment with its dependency graph.
+                    return True
+
                 def _publish_and_yield_after_repeat_output():
                     nonlocal repeat_file_cursor, repeat_audio_cursor
+                    if native_invocation_fence.is_set():
+                        return False
                     try:
                         completed_repeats = max(
                             0, int(gen.get("repeat_no") or 0),
@@ -74791,19 +78766,33 @@ def _run_generation(
                         )
                     if new_artifacts:
                         repeat_final_files.update(final_files)
+                        published_repeat_settings = _h3_style_observed_settings(
+                            repeat_mapping_settings, style_observation,
+                            max(0, completed_repeats - 1),
+                            expected_windows=gen.get("total_windows"),
+                            job=job, task=task,
+                        ) if any(name.lower().endswith((".mp4", ".webm", ".mov", ".mkv"))
+                                 for name in final_files) else dict(repeat_mapping_settings)
+                        repeat_variant = task_idx if director_native_consumer is not None else 0
+                        if director_native_consumer is not None:
+                            published_repeat_settings = _director_native_producer_settings(
+                                job, task_index=task_idx, repeat_index=max(0, completed_repeats - 1),
+                                kind="ordinary_repeat", variant=repeat_variant,
+                                index=max(0, completed_repeats - 1), artifact_names=new_artifacts,
+                                settings=published_repeat_settings)
                         repeat_unit_id = recovery_unit_id(
                             job_id,
                             "ordinary_repeat",
-                            index=max(0, completed_repeats - 1),
-                            settings=repeat_mapping_settings,
+                            variant=repeat_variant, index=max(0, completed_repeats - 1),
+                            settings=published_repeat_settings,
                         )
                         recovery_units = {
                             filename: {
                                 "index": max(0, completed_repeats - 1),
                                 "kind": "ordinary_repeat",
                                 "unit_id": repeat_unit_id,
-                                "variant": 0,
-                                **({"settings": repeat_mapping_settings} if repeat_mapping_settings else {}),
+                                "variant": repeat_variant,
+                                **({"settings": published_repeat_settings} if published_repeat_settings else {}),
                             }
                             for filename in new_artifacts
                         }
@@ -74811,7 +78800,7 @@ def _run_generation(
                         # exposed on the job; otherwise a remote request could
                         # observe a private output during the sidecar gap.
                         with _sample_campaign_transition_lock:
-                            if not sample_safe_unit_current(abort_state):
+                            if native_invocation_fence.is_set() or not sample_safe_unit_current(abort_state):
                                 return False
                             _write_output_sidecars(
                                 new_artifacts,
@@ -74851,12 +78840,12 @@ def _run_generation(
                             if not _queue_recovery_checkpoint_unit(
                                 job,
                                 kind="ordinary_repeat",
-                                variant=0,
+                                variant=repeat_variant,
                                 index=repeat_index,
                                 project_dir=out_dir,
                                 artifact_names=new_artifacts,
                                 ordinary_repeat_offset=completed_repeats,
-                                settings=repeat_mapping_settings,
+                                settings=published_repeat_settings,
                             ):
                                 job["recovery_cursor"] = prior_cursor
                                 return False
@@ -74915,6 +78904,15 @@ def _run_generation(
                         completed_repeats = current_total = 0
                     if completed_repeats >= current_total:
                         return True
+
+                    # The private lease reservation admits this one frozen
+                    # native task. A count edit cannot expand that workload or
+                    # delegate model authority to an RPC publication thread.
+                    from services.native_acceptance_reservation import reservation
+                    if reservation.target is not None and director_native_consumer is not None:
+                        director_native_consumer.require_repeat_count(current_total)
+                        if generation_slot_should_park_after_output(job):
+                            raise QueueRecoveryRuntimeError("The reserved Director invocation cannot yield to another job.")
 
                     update_job(
                         job,
@@ -74992,6 +78990,8 @@ def _run_generation(
                     rendered_path, callback_clip_info,
                 ):
                     """Seal/promote each H3 component as soon as WGP writes it."""
+                    if native_invocation_fence.is_set():
+                        raise InterruptedError("Director native invocation stopped")
                     if (
                         not recovery_h3_segment
                         or not isinstance(callback_clip_info, dict)
@@ -75044,6 +79044,17 @@ def _run_generation(
                         callback_clip_info,
                     )
                     segment_settings.update(predecessor_evidence)
+                    segment_settings = _h3_style_observed_settings(
+                        segment_settings, style_observation,
+                        gen.get("repeat_no", 0) - 1,
+                        expected_windows=gen.get("total_windows"),
+                        job=job, task=task,
+                    )
+                    if director_native_consumer is not None:
+                        segment_settings = _director_native_producer_settings(
+                            job, task_index=task_idx, repeat_index=gen.get("repeat_no", 0) - 1,
+                            kind="h3_segment", variant=variant, index=segment_index,
+                            artifact_names=[name], settings=segment_settings)
                     unit_id = recovery_unit_id(
                         job_id, "h3_segment", variant=variant,
                         index=segment_index, dependencies=dependencies,
@@ -75051,7 +79062,7 @@ def _run_generation(
                     )
                     producer_artifact_roles[name] = "component"
                     with _sample_campaign_transition_lock:
-                        if not sample_safe_unit_current(abort_state):
+                        if native_invocation_fence.is_set() or not sample_safe_unit_current(abort_state):
                             raise InterruptedError("H3 segment preempted")
                         if not update_job(
                             job,
@@ -75104,7 +79115,7 @@ def _run_generation(
                         _publish_and_yield_after_repeat_output
                     )
                     cursor = job.get("recovery_cursor")
-                    if isinstance(cursor, dict):
+                    if director_native_consumer is None and isinstance(cursor, dict):
                         try:
                             params["repeat_start_offset"] = max(
                                 0, int(cursor.get("ordinary_repeat_offset", 0) or 0),
@@ -75189,6 +79200,8 @@ def _run_generation(
                         call_started = time.perf_counter()
                         profile_observation = None
                         decode_observation = None
+                        style_observer_installed = False
+                        style_observer_prior_key = "_h3_reference_observer" in gen
                         try:
                             with acceptance.worker(worker_admission):
                                 expected_args = set(inspect.signature(wgp.generate_video).parameters.keys())
@@ -75240,8 +79253,65 @@ def _run_generation(
                                 }
                                 def invoke_native_generation():
                                     admitted_params = job.get("params") or {}
+                                    if director_lora_snapshot is not None:
+                                        # These worker-owned objects bind the
+                                        # actual load/windows to retained task
+                                        # consumption and durable output seals.
+                                        filtered_params["_maestro_director_lora_guard"] = director_native_consumer
+                                        filtered_params["_maestro_director_repeat_output"] = _retain_director_repeat_output
                                     if admitted_params.get("lora_parameters") or "_studio_lora_parameter_snapshot" in admitted_params:
-                                        _validate_studio_image_lora_parameters(admitted_params)
+                                        lora_binding = _validate_studio_image_lora_parameters(admitted_params)
+                                        if lora_binding["generation_mode"] == "video":
+                                            _validate_studio_video_lora_native(filtered_params, lora_binding)
+                                    if director_native_consumer is not None and acceptance.target is not None:
+                                        from services import native_acceptance_reservation as native_admission
+                                        from services.director_native_generation import run_native_generation
+                                        from services.director_native_process import NativeProcessError, reap_owned_after_failure
+                                        from services.job_lifecycle import _lifecycle_lock
+
+                                        required_worker_sources = {
+                                            "app/services/director_native_generation.py",
+                                            "app/services/director_native_process.py",
+                                            "app/services/director_video_lora_execution.py",
+                                        }
+                                        if not required_worker_sources.issubset(native_admission._PLAN["source_pins"]):
+                                            raise QueueRecoveryRuntimeError("Director child execution is absent from the frozen native binding.")
+
+                                        def native_authority_current():
+                                            if not acceptance.dispatch_ready():
+                                                return False
+                                            with native_slot._guard, acceptance._lock:
+                                                return acceptance._worker_valid(worker_admission)
+
+                                        try:
+                                            return run_native_generation(
+                                                wgp, task, filtered_params,
+                                                identity={"job_id": job_id,
+                                                    "execution_attempt": job.get("execution_attempt"),
+                                                    "task_index": task_idx,
+                                                    "child_digest": director_lora_snapshot["digest"],
+                                                    "task_digest": director_task_recipe["digest"]},
+                                                consumer=director_native_consumer, send_cmd=send_cmd,
+                                                plugin_data=plugin_data,
+                                                retain_repeat=_retain_director_produced_repeat,
+                                                after_repeat=filtered_params.get("after_repeat_output"),
+                                                validate_authority=native_authority_current,
+                                                cancelled=lambda: bool(gen.get("abort") or is_cancel_requested(job)),
+                                                state_lock=_lifecycle_lock,
+                                                requested_outputs=lambda: job.get("requested_outputs", filtered_params.get("repeat_generation", 1)),
+                                                invocation_fence=native_invocation_fence,
+                                            )
+                                        except NativeProcessError as error:
+                                            if getattr(error, "process", None) is not None:
+                                                # A failed bounded drain retains this
+                                                # scheduler's slots and callback
+                                                # lifetime. Never expose exit or let
+                                                # the queue launch a successor early.
+                                                gen["abort"] = True
+                                                update_job(job, message="Stopping generation…", phase="Stopping generation")
+                                                while not reap_owned_after_failure(error):
+                                                    time.sleep(1)
+                                            raise
                                     return wgp.generate_video(
                                         task,
                                         send_cmd,
@@ -75249,12 +79319,20 @@ def _run_generation(
                                         **filtered_params,
                                     )
 
+                                if style_observation is not None:
+                                    if gen.get("_h3_reference_observer") is None:
+                                        gen["_h3_reference_observer"] = style_observation
+                                        style_observer_installed = True
+                                    else:
+                                        style_observation.fail("reference_observer_already_owned")
                                 _run_generation_task_with_llm_exclusion(
                                     call_model,
                                     send_cmd,
                                     invoke_native_generation,
                                 )
                         except Exception as e:
+                            if style_observation is not None:
+                                style_observation.fail("native_generation_failed")
                             print(f"\n  [ERROR] {e}")
                             traceback.print_exc()
                             if getattr(e, "code", None) == (
@@ -75270,6 +79348,12 @@ def _run_generation(
                                 ],
                             )
                         finally:
+                            if (style_observer_installed
+                                    and gen.get("_h3_reference_observer") is style_observation):
+                                if style_observer_prior_key:
+                                    gen["_h3_reference_observer"] = None
+                                else:
+                                    gen.pop("_h3_reference_observer", None)
                             if decode_observation is not None:
                                 try:
                                     decode_observation.finalize()
@@ -76113,6 +80197,22 @@ def _run_generation(
                             clip_info,
                         )
                         h3_segment_settings.update(predecessor_evidence)
+                        sealed_segment_unit = _queue_recovery_unit_matches(
+                            job, kind="h3_segment", variant=h3_variant,
+                            index=h3_segment, project_dir=out_dir,
+                        )
+                        if sealed_segment_unit is not None:
+                            # The synchronous pre-concat checkpoint may have
+                            # already sealed this producer. Preserve its exact
+                            # encoding receipt and unit identity for AV state.
+                            h3_segment_settings = dict(sealed_segment_unit.get("settings") or {})
+                        else:
+                            h3_segment_settings = _h3_style_observed_settings(
+                                h3_segment_settings, style_observation,
+                                gen.get("repeat_no", 0) - 1,
+                                expected_windows=gen.get("total_windows"),
+                                job=job, task=task,
+                            )
                         h3_segment_unit_id = recovery_unit_id(
                             job_id, "h3_segment", variant=h3_variant,
                             index=h3_segment, dependencies=h3_dependencies,
@@ -76140,13 +80240,6 @@ def _run_generation(
                                     metadata=h3_continuation,
                                 )
                             )
-                        sealed_segment_unit = _queue_recovery_unit_matches(
-                            job,
-                            kind="h3_segment",
-                            variant=h3_variant,
-                            index=h3_segment,
-                            project_dir=out_dir,
-                        )
                         if not segment_names and sealed_segment_unit is None:
                             raise _h3_checkpoint_error("H3 segment produced no verified component.")
                         if segment_names and sealed_segment_unit is None:
@@ -76339,6 +80432,11 @@ def _run_generation(
                             with _sample_campaign_transition_lock:
                                 if not sample_safe_unit_current(abort_state):
                                     return False
+                                concat_attestation = _director_h3_output_attestation(
+                                    job, concat_unit_id, concat_names, out_dir, concat_safety_stats,
+                                    media_paths=task_staged_media)
+                                for concat_unit in concat_units.values():
+                                    concat_unit["attestation"] = concat_attestation
                                 _write_output_sidecars(
                                     concat_names,
                                     native_source=h3_delivery_native_source,
@@ -76370,11 +80468,7 @@ def _run_generation(
                                     artifact_names=concat_names,
                                     dependencies=concat_dependencies,
                                     settings=concat_settings,
-                                    attestation={
-                                        "h3_audio_true_peak": dict(
-                                            concat_safety_stats
-                                        ),
-                                    },
+                                    attestation=concat_attestation,
                                 ):
                                     return False
                                 if not update_job(
@@ -76427,6 +80521,9 @@ def _run_generation(
                                     cancelled = True
                                     break
                             _record_eta_inactive_time(inactive_started)
+
+            if completed == total_tasks and not cancelled and not skipped:
+                _assemble_director_native_groups()
 
             elapsed = time.time() - start_time
             print(f"\n{'='*50}")
@@ -76495,7 +80592,7 @@ def _run_generation(
                             None
                             if defer_output_publication
                             else []
-                            if h3_delivery_request
+                            if h3_delivery_request or director_lora_snapshot is not None
                             else verified_h3_final_files
                             if automatic_h3_longform or h3_cumulative_plan is not None
                             else None
@@ -76512,7 +80609,7 @@ def _run_generation(
                         and not all(
                             name in (
                                 job.get("artifact_files") or []
-                                if _defer_h3_final_publication(job)
+                                if _defer_h3_final_publication(job) or director_lora_snapshot is not None
                                 else published_outputs
                             ) for name in new_files
                         )
@@ -76948,6 +81045,8 @@ def _run_generation(
                 director_postprocess_files = None
                 if success and director_final_video_postprocess:
                     director_postprocess_files = (
+                        _director_h3_scene_repair_outputs(job, out_dir, new_files)
+                        if h3_scene_repair is not None and director_lora_snapshot is not None else
                         _authoritative_h3_postprocess_outputs(
                             new_files,
                             producer_artifact_roles,
@@ -76962,7 +81061,31 @@ def _run_generation(
                         )
                         finish_job(job, "failed", error=message, message=message)
                         return False
-                if success and pp_spatial_upsampling:
+                if success and director_lora_snapshot is not None and not defer_output_publication:
+                    finishing_finals = (_director_h3_scene_repair_outputs(job, out_dir, new_files)
+                        if h3_scene_repair is not None else _authoritative_h3_postprocess_outputs(
+                        new_files, producer_artifact_roles,
+                        is_multiclip=is_multiclip, join_output_file=join_output_file))
+                    finishing_plan = _director_finishing_plan(job, out_dir, new_files, finishing_finals)
+                    director_finishing_result = _director_resume_finishing(job, out_dir, finishing_plan)
+                    replacements = director_finishing_result["replacements"]
+                    clip_output_files = {key: replacements.get(name, name)
+                        for key, name in clip_output_files.items()}
+                    join_output_file = replacements.get(join_output_file, join_output_file)
+                    scene_output_files = {key: replacements.get(name, name)
+                        for key, name in (job.get("h3_scene_output_files") or {}).items()}
+                    new_files = director_finishing_result["files"]
+                    producer_artifact_roles.update(director_finishing_result["roles"])
+                    director_postprocess_files = director_finishing_result["finals"]
+                    h3_delivery_transaction_owned = True
+                    with _sample_campaign_transition_lock:
+                        if not sample_safe_unit_current(abort_state) or not update_job(job,
+                                output_files=director_finishing_result["finals"],
+                                artifact_files=list(dict.fromkeys([*(job.get("artifact_files") or []), *new_files])),
+                                clip_output_files=clip_output_files, join_output_file=join_output_file,
+                                h3_scene_output_files=scene_output_files):
+                            raise InterruptedError("Director finishing publication was cancelled or preempted")
+                if success and pp_spatial_upsampling and director_finishing_result is None:
                     postprocess_files = (
                         _authoritative_h3_postprocess_outputs(
                             new_files,
@@ -77155,7 +81278,7 @@ def _run_generation(
                             return False
 
                 # Post-generation dynamic audio normalization (smooths speaker volume transitions)
-                if success and raw_params.get("tts_dynaudnorm"):
+                if success and raw_params.get("tts_dynaudnorm") and director_finishing_result is None:
                     audio_exts = {".wav", ".mp3", ".flac", ".ogg"}
                     for fname in new_files:
                         ext = os.path.splitext(fname)[1].lower()
@@ -77202,7 +81325,7 @@ def _run_generation(
                 # Refresh sidecars after post-processing/renames. Internal
                 # shot clips are deleted after shot-aware edit assembly and
                 # therefore must never be published as gallery artifacts.
-                if not defer_output_publication and not h3_delivery_request:
+                if not defer_output_publication and not h3_delivery_request and director_finishing_result is None:
                     _write_output_sidecars(new_files)
 
             h3_integrity_failed = False
@@ -77217,7 +81340,7 @@ def _run_generation(
                     published = record_job_outputs(job, scene_results, final_output_files=scene_results)
                     if published != scene_results:
                         raise QueueRecoveryRuntimeError("Repaired scene publication was rejected.")
-            if h3_scene_repair is None and not defer_output_publication and requested_model in _H3_LONG_STUDIO_MODELS and not h3_delivery_request:
+            if h3_scene_repair is None and not defer_output_publication and requested_model in _H3_LONG_STUDIO_MODELS and not h3_delivery_request and director_finishing_result is None:
                 h3_expected = {}
                 h3_final_names = []
                 for name in new_files:
@@ -77438,6 +81561,11 @@ def _run_generation(
                 job,
                 "completed" if success else "failed",
                 **({
+                    "output_files": director_finishing_result["finals"],
+                    "artifact_files": list(dict.fromkeys([*(job.get("artifact_files") or []), *director_finishing_result["files"]])),
+                    "clip_output_files": clip_output_files,
+                    "join_output_file": join_output_file,
+                } if director_finishing_result is not None else {
                     "output_files": _h3_verified_published_outputs(
                         job, out_dir, rejected_names,
                     ),
@@ -77461,14 +81589,15 @@ def _run_generation(
             if job.get("_h3_delivery_publication"):
                 if published and job.get("status") == "completed" and not is_cancel_requested(job):
                     _finalize_h3_delivery_publication(job)
-                    cursor = dict(job.get("recovery_cursor") or {})
-                    cursor.pop("delivery_pending", None)
-                    _queue_recovery_checkpoint(
-                        job,
-                        recovery_cursor=cursor,
-                        recovery_state="terminal",
-                        reruns_denoise=False,
-                    )
+                    if director_finishing_result is None:
+                        cursor = dict(job.get("recovery_cursor") or {})
+                        cursor.pop("delivery_pending", None)
+                        _queue_recovery_checkpoint(
+                            job,
+                            recovery_cursor=cursor,
+                            recovery_state="terminal",
+                            reruns_denoise=False,
+                        )
                 else:
                     _rollback_h3_delivery_publication(
                         job, update_job_fn=update_job,
@@ -83276,7 +87405,7 @@ async def revoke_output_share(request: Request):
     return {"revoked": revoked}
 
 
-@api.get("/api/v1/output-shares/{token}/media", include_in_schema=False)
+@api.get("/api/v1/output-shares/{token}/media")
 def serve_output_share_media(token: str):
     record = _output_share_manager().resolve(token)
     if record is None:
@@ -84862,6 +88991,58 @@ def serve_upload(request: Request, filename: str):
         if resolved == filepath:
             return share_delete_file_response(resolved)
     raise HTTPException(status_code=404, detail="Upload not found")
+
+
+# ============================================================================
+# Public Continuum API discovery and contract
+# ============================================================================
+
+@api.get("/api/v1/api/documentation/{document}")
+def continuum_api_documentation(document: str):
+    """Read the maintained API guide, coverage map or operation reference."""
+    from pathlib import Path
+    from fastapi.responses import Response
+    names = {"guide": "README.md", "coverage": "coverage.md", "operations": "operations.md"}
+    if document not in names:
+        raise HTTPException(status_code=404, detail="Choose guide, coverage or operations")
+    source = Path(__file__).resolve().parent.parent / "docs" / "api" / names[document]
+    if not source.is_file():
+        raise HTTPException(status_code=503, detail="API documentation is being prepared; read /openapi.json")
+    text = source.read_text(encoding="utf-8")
+    for filename, target in (("README.md", "guide"), ("coverage.md", "coverage"), ("operations.md", "operations")):
+        text = text.replace("](" + filename + ")", "](/api/v1/api/documentation/" + target + ")")
+    text = text.replace("](openapi.json)", "](/openapi.json)")
+    return Response(text, media_type="text/markdown; charset=utf-8")
+
+@api.get("/api/v1/api/discovery")
+def continuum_api_discovery(request: Request):
+    """Discover operations and actual access; this grants no execution authority."""
+    from continuum_api.contract import public_operation_index
+    return {
+        "api": "Maestro Continuum HTTP", "version": "1.0.0",
+        "openapi_url": "/openapi.json", "documentation": "/api/v1/api/documentation/guide",
+        "coverage": "/api/v1/api/documentation/coverage",
+        "access": get_access_context(request),
+        "models": list_models(request),
+        "operations": public_operation_index(api.openapi()),
+        "catalog": {"models": "/api/v1/models", "inputs_and_settings": "/api/v1/model-options/{model_type}",
+                    "defaults": "/api/v1/defaults/{model_type}", "projects": "/api/v1/workspaces",
+                    "model_terms": "/api/v1/host-terms", "llm_models": "/api/v1/llm/models"},
+        "capability_states": {
+            "supported": "A production operation exists; it is not a claim that its model is installed or qualified.",
+            "installed": "Catalog is_downloaded reports local assets. Terms and runtime qualification are separate.",
+            "ready": "Read the capability's current availability, terms and preparation result. Installation alone is insufficient.",
+            "experimental": "A capability is explicitly experimental or has pending acceptance; inspect its catalog and status.",
+            "unavailable": "The current catalog, access, terms, readiness or admission refuses this operation; follow its reason.",
+        },
+        "execution": {"gpu_authority": "Existing GPU coordination remains required for actual model work.",
+                      "timeouts": "A client timeout never cancels the server operation. Reconcile its exact returned or caller identity.",
+                      "identity_types": ["generation_job", "director_pipeline", "preparation", "llm_operation", "queue_entry", "yue2_take", "training_job"]},
+    }
+
+
+from continuum_api.contract import install_contract as _install_continuum_contract
+_install_continuum_contract(api)
 
 
 # ============================================================================

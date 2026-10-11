@@ -367,6 +367,13 @@ function describeResourceExecution(
   if (!descriptor) return null
 
   if (descriptor.intent === 'generation') {
+    if (descriptor.state === 'resources_releasing') {
+      return {
+        label: descriptor.execution === 'cpu' ? 'Stopping CPU processing' : 'Stopping generation',
+        title: 'The job has ended, but its worker is still closing. Wait for it to finish before freeing model memory.',
+        tone: 'transition',
+      }
+    }
     if (descriptor.execution === 'cpu') {
       const label = descriptor.state === 'queued'
         ? 'CPU processing queued'

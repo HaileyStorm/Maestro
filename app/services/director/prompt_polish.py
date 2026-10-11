@@ -18,6 +18,7 @@ from services.llm_cancellation import (
     LlmCancellationHandle,
     LlmRequestCancelled,
 )
+from .planners.base import append_custom_visual_style_guidance
 
 _ENHANCE_DIR = os.path.join(os.path.dirname(__file__), "..", "llm_guides", "enhance")
 _DIALECT_DIR = os.path.join(os.path.dirname(__file__), "..", "llm_guides", "dialect")
@@ -1085,6 +1086,7 @@ def polish_prompts_third_pass(
     progress_callback: Optional[Callable[[dict], None]] = None,
     is_active: Optional[Callable[[], bool]] = None,
     cancel_handle: Optional[LlmCancellationHandle] = None,
+    custom_visual_style_guidance: str = "",
 ) -> list[dict]:
     """Post-process clip plans through the enhance LLM pipeline (third pass).
 
@@ -1117,6 +1119,7 @@ def polish_prompts_third_pass(
         clip_plans with polished prompts (modified in-place).
     """
     from services import llm_service
+    append_custom_visual_style_guidance("", custom_visual_style_guidance)
 
     if polish_video_prompts is None:
         polish_video_prompts = should_polish_director_video_prompts(
@@ -1972,10 +1975,16 @@ def polish_prompts_third_pass(
         # polish LLM saw "Blaine → strong man in black" in the system
         # prompt and inserted "Blaine" into output that had no name.
         def _build_video_system_for(text: str) -> str:
-            return _video_system_base + _build_filtered_char_block(text, shot_name_to_desc)
+            return append_custom_visual_style_guidance(
+                _video_system_base + _build_filtered_char_block(text, shot_name_to_desc),
+                custom_visual_style_guidance,
+            )
 
         def _build_image_system_for(text: str) -> str:
-            return _image_system_base + _build_filtered_char_block(text, shot_name_to_desc)
+            return append_custom_visual_style_guidance(
+                _image_system_base + _build_filtered_char_block(text, shot_name_to_desc),
+                custom_visual_style_guidance,
+            )
 
         wps = plan.get("window_prompts", [])
         has_windows = bool(wps and len(wps) > 1)

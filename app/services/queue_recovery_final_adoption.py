@@ -36,8 +36,8 @@ _QUARANTINE_PREFIX = re.compile(r"^[0-9a-f]{32}-(.+)$")
 _JOB_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$")
 _UNIT_ID = re.compile(r"^unit:v1:[0-9a-f]{64}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
-_FINAL_KINDS = {"h3_concat", "h3_delivery", "ordinary_repeat"}
-_UNIT_KINDS = _FINAL_KINDS | {"h3_segment"}
+_FINAL_KINDS = {"h3_concat", "h3_delivery", "ordinary_repeat", "director_delivery"}
+_UNIT_KINDS = _FINAL_KINDS | {"h3_segment", "h3_scene", "director_concat"}
 _thread_lock = threading.RLock()
 
 
@@ -354,9 +354,13 @@ def _candidate(
     names: set[str],
     *,
     workspace: str,
+    published_sidecar: bool = False,
+    media_source: tuple[Path, str, bool] | None = None,
+    director_required: bool = False,
 ) -> dict[str, Any] | None:
     match = _QUARANTINE_PREFIX.fullmatch(sidecar_name)
-    if match is None or not match.group(1).endswith(".meta.json"):
+    original_sidecar = sidecar_name if published_sidecar else (match.group(1) if match else "")
+    if _direct_name(original_sidecar) is None or not original_sidecar.endswith(".meta.json"):
         return None
     sidecar_bytes, sidecar_info = _read_exact(
         quarantine / sidecar_name,
@@ -372,7 +376,7 @@ def _candidate(
     if output is None:
         return None
     expected_sidecar = os.path.splitext(output)[0] + ".meta.json"
-    if match.group(1) != expected_sidecar:
+    if original_sidecar != expected_sidecar:
         return None
     media_matches = sorted(
         name for name in names
@@ -381,11 +385,18 @@ def _candidate(
             and parsed.group(1) == output
         )
     )
-    if len(media_matches) != 1:
-        return None
-    media_name = media_matches[0]
+    if media_source is None:
+        if len(media_matches) != 1:
+            return None
+        media_directory, media_name, published_media = quarantine, media_matches[0], False
+    else:
+        media_directory, media_name, published_media = media_source
+        media_match = _QUARANTINE_PREFIX.fullmatch(media_name)
+        original_media = media_name if published_media else (media_match.group(1) if media_match else "")
+        if _direct_name(media_name) is None or original_media != output:
+            return None
     try:
-        media_size, media_sha = sha256_file(quarantine / media_name)
+        media_size, media_sha = sha256_file(media_directory / media_name)
     except QueueRecoveryRuntimeError:
         return None
     job_id = meta.get("job_id")
@@ -401,10 +412,16 @@ def _candidate(
         settings = {}
     artifacts = meta.get("producer_unit_artifact_names")
     continuation = meta.get("producer_unit_continuation")
+    attestation = meta.get("producer_unit_attestation")
+    director = (director_required or kind in {"director_concat", "director_delivery"}
+        or (isinstance(settings, dict) and "director_lora_consumption" in settings)
+        or (isinstance(attestation, dict) and any(key in attestation for key in
+            ("director_h3_concat_output", "director_h3_scene_output"))))
     position = _declared_position(meta)
-    if position is None and kind == "ordinary_repeat":
+    if position is None and (kind == "ordinary_repeat" or director):
         position = (1, 0)
-    expected_role = "component" if kind == "h3_segment" else "final"
+    expected_role = meta.get("producer_artifact_class") if director else (
+        "component" if kind in {"h3_segment", "h3_scene"} else "final")
     # ``private`` is a Gallery-preview choice, not an authorization boundary.
     # Both boolean values are valid producer evidence; workspace confinement,
     # project-local quarantine, and the sealed artifact graph provide the
@@ -432,6 +449,7 @@ def _candidate(
         or meta.get("workspace") != workspace
         or meta.get("artifact_class") != expected_role
         or meta.get("producer_artifact_class") != expected_role
+        or (director and expected_role not in {"final", "component", "window", "temporary"})
         or position is None
         or meta.get("producer_media_size") != media_size
         or meta.get("producer_media_sha256") != media_sha
@@ -439,7 +457,10 @@ def _candidate(
         return None
     continuation_sha = ""
     if continuation is not None:
-        if (
+        if director and isinstance(continuation, dict) and continuation.get("mode") == "prompt_only":
+            if set(continuation) != {"dependency", "mode"} or continuation["dependency"] != unit_id:
+                return None
+        elif (
             not isinstance(continuation, dict)
             or continuation.get("dependency") != unit_id
             or _direct_name(continuation.get("basename")) is None
@@ -450,7 +471,8 @@ def _candidate(
             or _SHA256.fullmatch(continuation["sha256"]) is None
         ):
             return None
-        continuation_sha = continuation["sha256"]
+        else:
+            continuation_sha = continuation["sha256"]
     try:
         expected_id = recovery_unit_id(
             job_id,
@@ -478,10 +500,15 @@ def _candidate(
         "output_index": position[1],
         "output_total": position[0],
         "settings": settings,
+        "attestation": attestation,
+        "director": director,
+        "role": expected_role,
         "sidecar_sha256": hashlib.sha256(sidecar_bytes).hexdigest(),
         "sidecar_size": int(sidecar_info.st_size),
         "source_media": media_name,
         "source_sidecar": sidecar_name,
+        "source_media_published": published_media,
+        "source_sidecar_published": published_sidecar,
         "private": meta.get("private"),
         "continuation": continuation,
         "unit_id": unit_id,
@@ -521,6 +548,82 @@ def _discover(quarantine: Path, *, workspace: str) -> tuple[list[dict], int]:
         else:
             candidates.append(candidate)
     return candidates, rejected
+
+
+def _discover_director_members(root: Path, quarantine: Path, *, workspace: str,
+                               director_job_classifier=None) -> list[dict]:
+    """Read complete producer pairs across both roots; never stage or mutate."""
+    locations: dict[str, list[tuple[Path, str, bool]]] = {}
+    for directory, published in ((quarantine, False), (root, True)):
+        try:
+            names = os.listdir(directory)
+        except OSError:
+            raise QueueRecoveryRuntimeError("Director recovery members could not be listed.") from None
+        if len(names) > 20_000:
+            raise QueueRecoveryRuntimeError("Director recovery member scan limit exceeded.")
+        for name in names:
+            parsed = _QUARANTINE_PREFIX.fullmatch(name)
+            original = name if published else (parsed.group(1) if parsed else "")
+            if _direct_name(original) is not None:
+                locations.setdefault(original, []).append((directory, name, published))
+    jobs = set()
+    classified = {}
+    for original, entries in locations.items():
+        if not original.endswith(".meta.json"):
+            continue
+        for directory, name, published in entries:
+            try:
+                payload, _info = _read_exact(directory / name, maximum_bytes=MAX_MANIFEST_BYTES)
+                meta = json.loads(payload.decode("utf-8"))
+                if not isinstance(meta, dict):
+                    continue
+                if published and not any(not entry[2] for entry in
+                        locations.get(_direct_name(meta.get("output_filename")), [])):
+                    continue
+                job_id = meta.get("job_id")
+                if type(job_id) is not str or _JOB_ID.fullmatch(job_id) is None:
+                    continue
+                if job_id not in classified:
+                    classified[job_id] = (director_job_classifier(job_id)
+                        if callable(director_job_classifier) else job_id.startswith("director-"))
+                settings = meta.get("producer_unit_settings")
+                attestation = meta.get("producer_unit_attestation")
+                if (classified[job_id] or meta.get("producer_unit_kind") in {"director_concat", "director_delivery"}
+                        or (isinstance(settings, dict) and "director_lora_consumption" in settings)
+                        or (isinstance(attestation, dict) and any(key in attestation for key in
+                            ("director_h3_concat_output", "director_h3_scene_output")))):
+                    jobs.add(job_id)
+            except (QueueRecoveryRuntimeError, UnicodeDecodeError, ValueError, TypeError):
+                continue
+    candidates = []
+    for original, sidecars in sorted(locations.items()):
+        if not original.endswith(".meta.json"):
+            continue
+        private_sidecars = [entry for entry in sidecars if not entry[2]]
+        if len(private_sidecars) > 1:
+            continue
+        directory, name, published = (private_sidecars or sidecars)[0]
+        try:
+            payload, _info = _read_exact(directory / name, maximum_bytes=MAX_MANIFEST_BYTES)
+            meta = json.loads(payload.decode("utf-8"))
+            if not isinstance(meta, dict) or meta.get("job_id") not in jobs:
+                continue
+            media = locations.get(_direct_name(meta.get("output_filename")), [])
+            private_media = [entry for entry in media if not entry[2]]
+            if len(private_media) > 1:
+                raise QueueRecoveryRuntimeError("Director recovery media is ambiguous.")
+            if not media:
+                continue
+            candidate = _candidate(directory, name, set(), workspace=workspace,
+                published_sidecar=published, media_source=(private_media or media)[0],
+                director_required=bool(classified.get(meta["job_id"])))
+        except (QueueRecoveryRuntimeError, UnicodeDecodeError, ValueError, TypeError):
+            continue
+        if candidate is not None:
+            candidates.append(candidate)
+    # Root-only jobs are outside this quarantine recovery operation. Include
+    # every member of a triggered Director job, including stripped sidecars.
+    return sorted(candidates, key=lambda item: item["source_sidecar"])
 
 
 def _staging_unit(
@@ -889,6 +992,8 @@ def _valid_units(candidates: list[dict]) -> dict[str, tuple[dict, ...]]:
             or item["settings"] != first["settings"]
             or item["artifact_names"] != first["artifact_names"]
             or item["continuation_sha256"] != first["continuation_sha256"]
+            or item["continuation"] != first["continuation"]
+            or (first.get("director") and item.get("attestation") != first.get("attestation"))
             for item in items
         ):
             continue
@@ -1221,7 +1326,7 @@ def stage_quarantined_h3_segment_for_final_adoption(
         }
 
 
-def _complete_groups(candidates: list[dict]) -> tuple[list[dict], list[dict]]:
+def _complete_groups(candidates: list[dict], *, director_validator=None, director_job_classifier=None) -> tuple[list[dict], list[dict]]:
     valid_units = _valid_units(candidates)
     by_job: dict[str, list[dict]] = {}
     for unit_id, items in valid_units.items():
@@ -1229,7 +1334,29 @@ def _complete_groups(candidates: list[dict]) -> tuple[list[dict], list[dict]]:
             by_job.setdefault(items[0]["job_id"], []).extend(items)
     complete: list[dict] = []
     incomplete: list[dict] = []
+    director_jobs = {item["job_id"] for item in candidates if item.get("director")}
+    for job_id in {item["job_id"] for item in candidates}:
+        requires_proof = (director_job_classifier(job_id) if callable(director_job_classifier)
+                          else job_id.startswith("director-"))
+        if requires_proof:
+            director_jobs.add(job_id)
+    for job_id in sorted(director_jobs):
+        items = [item for item in candidates if item["job_id"] == job_id]
+        proof = director_validator(job_id, items) if callable(director_validator) else None
+        group = {"job_id": job_id, "kind": "director_delivery", "output_total": len(items),
+                 "items": [dict(item, output_index=index) for index, item in enumerate(items)]}
+        if (isinstance(proof, Mapping) and items and len(items) <= 4096
+                and set(proof.get("artifact_files") or []) == {item["dest_media"] for item in items}
+                and len(proof["artifact_files"]) == len(items)
+                and proof.get("output_files")
+                and set(proof["output_files"]) <= set(proof["artifact_files"])):
+            group["final_output_files"] = list(proof["output_files"])
+            complete.append(group)
+        else:
+            incomplete.append(group)
     for job_id, raw_items in sorted(by_job.items()):
+        if job_id in director_jobs:
+            continue
         preferred = "h3_delivery" if any(
             item["kind"] == "h3_delivery" for item in raw_items
         ) else "h3_concat" if any(
@@ -1300,6 +1427,10 @@ def _destination_mode(group: Mapping[str, Any], root: Path) -> str:
         for kind in ("sidecar", "media"):
             destination = root / item[f"dest_{kind}"]
             exists = destination.exists() or destination.is_symlink()
+            if group["kind"] == "director_delivery":
+                item[f"preexisting_{kind}"] = exists
+                if item.get(f"source_{kind}_published") and not exists:
+                    raise QueueRecoveryRuntimeError("Director recovery existing member disappeared.")
             if not exists:
                 continue
             present += 1
@@ -1311,6 +1442,10 @@ def _destination_mode(group: Mapping[str, Any], root: Path) -> str:
                 raise QueueRecoveryRuntimeError(
                     "Final-adoption destination collision blocked the group."
                 )
+    if (group["kind"] == "director_delivery" and present
+            and not (present == expected and all(not item.get(f"source_{kind}_published")
+                for item in group["items"] for kind in ("media", "sidecar")))):
+        return "director_mixed"
     if present == 0:
         return "publish"
     if present == expected:
@@ -1373,6 +1508,34 @@ def _validate_preexisting_plan(
                     raise QueueRecoveryRuntimeError(
                         "Final-adoption exact preexisting evidence is not durable."
                     ) from None
+    if fsync:
+        _fsync_directory(root)
+
+
+def _validate_director_preserved_entries(plan: Mapping[str, Any], root: Path,
+                                        quarantine: Path, *, fsync: bool = False) -> None:
+    """Recheck preserved members without consuming their independent copies."""
+    for item in plan["items"]:
+        for kind in ("media", "sidecar"):
+            if not item[f"preexisting_{kind}"]:
+                continue
+            destination = root / item[f"dest_{kind}"]
+            size, digest = item[f"{kind}_size"], item[f"{kind}_sha256"]
+            if not _entry_hash(destination, size=size, digest=digest):
+                raise QueueRecoveryRuntimeError("Director recovery preserved member changed.")
+            if not item[f"source_{kind}_published"]:
+                source = quarantine / item[f"source_{kind}"]
+                if not _entry_hash(source, size=size, digest=digest):
+                    raise QueueRecoveryRuntimeError("Director recovery independent evidence changed.")
+                a, b = os.lstat(source), os.lstat(destination)
+                if (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino):
+                    raise QueueRecoveryRuntimeError("Director recovery preserved copy is not independent.")
+            if fsync:
+                fd = os.open(destination, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+                try:
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
     if fsync:
         _fsync_directory(root)
 
@@ -1452,6 +1615,12 @@ def _rollback(plan: Mapping[str, Any], root: Path, quarantine: Path) -> None:
             digest = item.get(f"{kind}_sha256")
             if type(size) is not int or type(digest) is not str or _SHA256.fullmatch(digest) is None:
                 blocked = True
+                continue
+            if plan.get("publication_mode") == "director_mixed" and item[f"preexisting_{kind}"]:
+                # This file predates this plan. Even an exact independent
+                # quarantine copy does not authorize deleting or moving it.
+                if not _entry_hash(destination, size=size, digest=digest):
+                    blocked = True
                 continue
             source_exists = source.exists() and not source.is_symlink()
             destination_exists = destination.exists() and not destination.is_symlink()
@@ -1542,7 +1711,11 @@ def _plan_for(
                 "source_media", "source_sidecar", "unit_id",
             )
         })
-    return {
+        if publication_mode == "director_mixed":
+            for kind in ("media", "sidecar"):
+                items[-1][f"preexisting_{kind}"] = candidate[f"preexisting_{kind}"]
+                items[-1][f"source_{kind}_published"] = bool(candidate.get(f"source_{kind}_published"))
+    plan = {
         "schema_version": _SCHEMA,
         "workspace": workspace,
         "job_id": group["job_id"],
@@ -1551,22 +1724,26 @@ def _plan_for(
         "publication_mode": publication_mode,
         "items": items,
     }
+    if group["kind"] == "director_delivery":
+        plan["final_output_files"] = list(group["final_output_files"])
+    return plan
 
 
 def _validate_plan(
     plan: Mapping[str, Any], *, allowed_kinds: set[str] | frozenset[str] = _FINAL_KINDS,
 ) -> None:
     if (
-        set(plan) != {
+        set(plan) != ({
             "schema_version", "workspace", "job_id", "kind",
             "output_total", "publication_mode", "items",
-        }
+        } | ({"final_output_files"} if plan.get("kind") == "director_delivery" else set()))
         or plan.get("schema_version") != _SCHEMA
         or _direct_name(plan.get("workspace")) is None
         or type(plan.get("job_id")) is not str
         or _JOB_ID.fullmatch(plan["job_id"]) is None
         or plan.get("kind") not in allowed_kinds
-        or plan.get("publication_mode") not in {"publish", "preexisting_exact"}
+        or plan.get("publication_mode") not in {"publish", "preexisting_exact", "director_mixed"}
+        or (plan.get("publication_mode") == "director_mixed" and plan.get("kind") != "director_delivery")
         or type(plan.get("output_total")) is not int
         or not 1 <= plan["output_total"] <= 4096
         or not isinstance(plan.get("items"), list)
@@ -1581,6 +1758,10 @@ def _validate_plan(
         "output_index", "sidecar_sha256", "sidecar_size",
         "source_media", "source_sidecar", "unit_id",
     }
+    mixed = plan["publication_mode"] == "director_mixed"
+    if mixed:
+        expected_keys |= {"preexisting_media", "preexisting_sidecar",
+                          "source_media_published", "source_sidecar_published"}
     for item in plan["items"]:
         if not isinstance(item, dict) or set(item) != expected_keys:
             raise QueueRecoveryRuntimeError("Final-adoption immutable plan is invalid.")
@@ -1592,12 +1773,16 @@ def _validate_plan(
             raise QueueRecoveryRuntimeError("Final-adoption immutable plan is invalid.")
         source_media = _QUARANTINE_PREFIX.fullmatch(item["source_media"])
         source_sidecar = _QUARANTINE_PREFIX.fullmatch(item["source_sidecar"])
+        for kind, match in (("media", source_media), ("sidecar", source_sidecar)):
+            published = mixed and item[f"source_{kind}_published"]
+            if (mixed and (type(item[f"source_{kind}_published"]) is not bool
+                           or type(item[f"preexisting_{kind}"]) is not bool)):
+                raise QueueRecoveryRuntimeError("Director final-adoption member scope is invalid.")
+            if ((published and (not item[f"preexisting_{kind}"] or item[f"source_{kind}"] != item[f"dest_{kind}"]))
+                    or (not published and (match is None or match.group(1) != item[f"dest_{kind}"]))):
+                raise QueueRecoveryRuntimeError("Final-adoption immutable source scope is invalid.")
         if (
-            source_media is None
-            or source_sidecar is None
-            or source_media.group(1) != item["dest_media"]
-            or source_sidecar.group(1) != item["dest_sidecar"]
-            or type(item.get("unit_id")) is not str
+            type(item.get("unit_id")) is not str
             or _UNIT_ID.fullmatch(item["unit_id"]) is None
             or type(item.get("output_index")) is not int
             or not 0 <= item["output_index"] < plan["output_total"]
@@ -1620,6 +1805,14 @@ def _validate_plan(
         or len(sources) != plan["output_total"] * 2
     ):
         raise QueueRecoveryRuntimeError("Final-adoption immutable plan is invalid.")
+    if mixed and not any(item[f"preexisting_{kind}"] for item in plan["items"] for kind in ("media", "sidecar")):
+        raise QueueRecoveryRuntimeError("Director final-adoption preserved scope is empty.")
+    if plan["kind"] == "director_delivery":
+        finals = plan["final_output_files"]
+        if (not isinstance(finals, list) or not finals or len(set(finals)) != len(finals)
+                or any(_direct_name(name) is None for name in finals)
+                or not set(finals) <= {item["dest_media"] for item in plan["items"]}):
+            raise QueueRecoveryRuntimeError("Director final-adoption output scope changed.")
 
 
 def _load_private_json(path: Path) -> tuple[dict[str, Any], bytes]:
@@ -1764,7 +1957,9 @@ def _receipt_jobs(
             for item in plan.get("items") or []
             for kind in ("sidecar", "media")
         )
-        total = int(plan.get("output_total", 0) or 0)
+        outputs = (list(plan["final_output_files"]) if plan["kind"] == "director_delivery"
+                   else sorted(str(item["dest_media"]) for item in plan.get("items") or []))
+        total = len(outputs)
         jobs.append({
             "job_id": str(plan.get("job_id") or ""),
             "state": "adopted" if exact else "missing",
@@ -1773,7 +1968,7 @@ def _receipt_jobs(
             "missing": 0 if exact else total,
             "quarantined": 0,
             "output_files": (
-                sorted(str(item["dest_media"]) for item in plan.get("items") or [])
+                outputs
                 if exact else []
             ),
         })
@@ -1985,6 +2180,8 @@ def adopt_quarantined_final_groups(
     *,
     workspace: str,
     _publish_hook: Callable[[str, int], None] | None = None,
+    director_validator: Callable[[str, list[dict]], Mapping[str, Any] | None] | None = None,
+    director_job_classifier: Callable[[str], bool] | None = None,
 ) -> dict[str, Any]:
     """Adopt every complete attested final group without creating a job.
 
@@ -2035,7 +2232,13 @@ def adopt_quarantined_final_groups(
             _discover(quarantine, workspace=workspace)
             if quarantine is not None else ([], 0)
         )
-        complete, incomplete = _complete_groups(candidates)
+        if quarantine is not None:
+            director_members = _discover_director_members(root, quarantine, workspace=workspace,
+                director_job_classifier=director_job_classifier)
+            director_ids = {item["job_id"] for item in director_members}
+            candidates = [item for item in candidates if item["job_id"] not in director_ids] + director_members
+        complete, incomplete = _complete_groups(candidates, director_validator=director_validator,
+            director_job_classifier=director_job_classifier)
         conflicting: list[dict] = []
         for group in complete:
             binding_path = bindings / _binding_name(workspace, group["job_id"])
@@ -2064,6 +2267,7 @@ def adopt_quarantined_final_groups(
                 workspace=workspace,
                 publication_mode=publication_mode,
             )
+            _validate_plan(plan)
             plan_payload = _canonical_json(plan)
             plan_sha = hashlib.sha256(plan_payload).hexdigest()
             plan_path = plans / f"{plan_sha}.json"
@@ -2095,9 +2299,13 @@ def adopt_quarantined_final_groups(
                 _create_only(receipt_path, _canonical_json(receipt))
                 continue
             try:
+                if publication_mode == "director_mixed":
+                    _validate_director_preserved_entries(plan, root, quarantine, fsync=True)
                 operation_index = 0
                 for kind in ("sidecar", "media"):
                     for item in plan["items"]:
+                        if publication_mode == "director_mixed" and item[f"preexisting_{kind}"]:
+                            continue
                         _publish_one(
                             quarantine / item[f"source_{kind}"],
                             root / item[f"dest_{kind}"],
@@ -2113,6 +2321,8 @@ def adopt_quarantined_final_groups(
                         if callable(_publish_hook):
                             _publish_hook(kind, operation_index)
                         operation_index += 1
+                if publication_mode == "director_mixed":
+                    _validate_director_preserved_entries(plan, root, quarantine, fsync=True)
                 receipt = {
                     "schema_version": _SCHEMA,
                     "plan_sha256": plan_sha,

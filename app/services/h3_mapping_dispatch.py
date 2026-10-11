@@ -7,11 +7,12 @@ serializing images or treating a new pathname as access authority.
 from __future__ import annotations
 
 import copy
+import json
 import os
 import re
 
 from services.h3_adaptive_execution import bind_h3_execution_segment
-from services.h3_prompt_mapping import source_prompt_schema
+from services.h3_prompt_mapping import _validated_reference_binding, source_prompt_schema
 from services.h3_reference_binding import build_h3_reference_binding
 from services.h3_reference_inputs import VIDEO_KEYS
 from services.queue_recovery_runtime import QueueRecoveryRuntimeError
@@ -144,12 +145,15 @@ def bind_h3_mapping_task(
     descriptors, validate_descriptor, has_audio, continuation=None,
     continuation_path=None, materialize_image=None,
     materialize_files=None, cleanup_files=None,
+    semantic_manifest=None,
 ):
     """Return task and serializable sidecar copies after a complete transaction.
 
     ``continuation`` must already have been verified by the caller, including
     its predecessor dependency and exact content digest. The descriptor
     validator is still called for its projected reference input.
+    ``semantic_manifest`` is an optional server-admitted baseline manifest;
+    late continuation inputs retain their independently verified binding.
     """
     params = task.get("params")
     if not isinstance(params, dict) or not isinstance(source_snapshot, dict):
@@ -233,6 +237,20 @@ def bind_h3_mapping_task(
         raw, descriptors=selected_descriptors,
         validate_descriptor=validate_descriptor, has_audio=has_audio,
     )
+    if semantic_manifest is not None:
+        try:
+            semantic = _validated_reference_binding(semantic_manifest)
+            baseline = [item for item in references if item["source_key"] != late_field]
+            if len(semantic) != len(baseline):
+                raise ValueError("semantic reference count changed")
+            semantic_keys = {"role", "image_intent", "audio_intent", "custom_visual_style"}
+            for actual, admitted in zip(baseline, semantic):
+                identity = {key: value for key, value in admitted.items() if key not in semantic_keys}
+                if json.dumps(identity, sort_keys=True, allow_nan=False) != json.dumps(actual, sort_keys=True, allow_nan=False):
+                    raise ValueError("semantic reference source changed")
+                actual.update(copy.deepcopy({key: admitted[key] for key in semantic_keys if key in admitted}))
+        except (ValueError, TypeError) as exc:
+            raise QueueRecoveryRuntimeError("H3 admitted semantic reference binding changed.") from exc
     image_bindings = [item for item in references if item["type"] == "image"]
     if image_bindings and not callable(materialize_image):
         raise QueueRecoveryRuntimeError("H3 mapping needs content-pinned reference images.")

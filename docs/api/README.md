@@ -1,0 +1,437 @@
+# Maestro Continuum API
+
+Continuum's HTTP API uses the same project authorization, admissions, queues,
+model execution and output publication as the shipped app. It is distinct from
+the **WanGP in-process Python API** in [`app/docs/API.md`](../../app/docs/API.md).
+Do not start WanGP or import `wgp.py` to use this HTTP API.
+
+Use the current Maestro URL shown by Pinokio. Ports change after restarts.
+Localhost, authorized LAN access and the configured Cloudflare share use the
+same `/api/v1` paths. `/health` and `/ready` report service health, not model
+readiness or a GPU grant.
+
+The running `/openapi.json` is the request
+and response contract. `/docs` offers a filterable interactive viewer with
+collapsed feature groups and operation IDs. Filter by a feature such as
+`editor`, expand an operation and use **Try it out**. Same-origin browser
+requests use your existing signed-in session; never paste session cookies into
+the **Authorize** dialog. Owner confirmation, terms and project permissions
+still apply. Start with
+`GET /api/v1/api/discovery`: it returns actual access, the filtered model
+catalog, operation identities, boundaries and capability discovery links.
+The [feature coverage map](coverage.md) explains compositions and human
+boundaries. The [operation reference](operations.md) contains generated IDs.
+The [exported OpenAPI](openapi.json) is an offline snapshot; current server
+discovery remains authoritative.
+
+## Setup and first discovery
+
+Run the shipped app through Pinokio **Start**. Install the Python client from
+this checkout using your normal virtual environment:
+
+```bash
+uv pip install ./sdk/python
+uv pip install './sdk/python[mcp]' # only when using the MCP bridge
+```
+
+No package installation starts a model. New model assets follow the configured
+model storage location; the API does not select a new cache root.
+
+Python:
+
+```python
+import os
+from maestro_continuum import MaestroClient
+
+with MaestroClient(os.environ["MAESTRO_URL"],
+                   cookie_file=os.environ.get("MAESTRO_COOKIE_FILE")) as maestro:
+    discovery = maestro.discover()
+    print(discovery["access"])
+    print(maestro.request("GET", "/api/v1/workspaces"))
+    for operation_id, operation in maestro.operations(feature="editor").items():
+        print(operation_id, operation["method"], operation["path"])
+```
+
+curl, keeping its signed session in an operator-owned cookie jar:
+
+```bash
+umask 077
+export MAESTRO_URL='http://127.0.0.1:CURRENT_PORT'
+export MAESTRO_ORIGIN="$MAESTRO_URL" # exact scheme/host/port, with no path or trailing slash
+curl --fail-with-body -c maestro-discovery.cookies -b maestro-discovery.cookies \
+  "$MAESTRO_URL/api/v1/api/discovery"
+curl --fail-with-body -b maestro-discovery.cookies \
+  "$MAESTRO_URL/api/v1/models"
+```
+
+Replace `CURRENT_PORT` with the actual configured port. Keep cookie jars out of
+repositories, prompts, MCP tool arguments and logs. Do not copy browser profiles
+or cookies to create an AI session.
+
+The TypeScript client is [`sdk/typescript`](../../sdk/typescript). Build it from
+the repository root:
+
+```bash
+npm --prefix sdk/typescript install
+npm --prefix sdk/typescript run build
+```
+
+From the repository root, this runnable Node example uses the
+compiled TypeScript client to discover the server's actual anonymous access:
+
+```bash
+node --input-type=module <<'JS'
+import { MaestroClient } from './sdk/typescript/dist/index.js'
+const maestro = new MaestroClient(process.env.MAESTRO_URL)
+console.log(JSON.stringify(await maestro.discover(), null, 2))
+console.log(await maestro.request('GET', '/api/v1/workspaces'))
+JS
+```
+
+Node's built-in `fetch` does not persist session cookies. For signed-in Node
+usage, supply a `fetch` adapter backed by your operator-managed cookie jar;
+an empty project list from this example does not prove private projects are
+absent. Python and curl can directly use the private jar created by the login
+helper below. In a same-origin browser application, import the TypeScript SDK
+through that application's bundler; the browser keeps its existing session:
+
+```typescript
+import { MaestroClient } from './sdk/typescript/dist/index.js'
+
+const maestro = new MaestroClient(window.location.origin)
+console.log(await maestro.discover())
+console.log(await maestro.request('GET', '/api/v1/workspaces'))
+const operations = await maestro.operations()
+const editorRead = Object.values(operations).find(op =>
+  op.method === 'GET' && op.path === '/api/v1/projects/{project}/editor/projects')!
+console.log(await maestro.call(editorRead.operationId, { path: { project: 'my-project' } }))
+```
+
+## Authentication, project access and locality
+
+Read `/api/v1/access-context`, `/api/v1/account/context` and `/api/v1/workspaces`.
+The signed `maestro_session` identifies a session; it does not bypass project
+access. When account enforcement is enabled, the existing
+`maestro_account_session` and project membership additionally apply. When it is
+disabled, the existing local compatibility policy applies. This interface never
+activates accounts or creates API keys.
+
+For a separate authorized client session, the human can use the existing
+account login flow. The installed human-only helper prompts in an interactive
+terminal and saves a new private cookie jar without overwriting an existing one:
+
+```bash
+mkdir -m 700 -p "$HOME/.config/maestro"
+maestro-continuum-login --url "$MAESTRO_URL" \
+  --cookie-file "$HOME/.config/maestro/continuum.cookies"
+export MAESTRO_COOKIE_FILE="$HOME/.config/maestro/continuum.cookies"
+```
+
+The human types credentials directly into that terminal; the helper never
+accepts passwords from command arguments, pipes, environment or MCP. Use a new
+filename for a later login and retire sessions through the existing account UI.
+For Python, pass `cookie_file=os.environ["MAESTRO_COOKIE_FILE"]` to `MaestroClient`.
+curl uses `-b "$MAESTRO_COOKIE_FILE"`; MCP reads the same operator-selected path.
+This login helper does not provide recent owner reauthentication or model consent.
+
+To use your own operator credential mechanism, obtain `POST /api/v1/account/nonce` with
+`{"purpose":"login"}`, then `POST /api/v1/account/login` with `username`,
+`password`, the returned `nonce`, and optional `device_label`. Both requests
+use the same session and exact app `Origin`; successful login sets the account
+cookie. Account bootstrap, registration, password/recovery operations and
+reauthentication remain human operations with their existing restrictions.
+Supply credentials through the operator's credential mechanism, never an AI
+prompt or an MCP argument. A failed or unavailable login is not permission to
+enable accounts or weaken access.
+
+Mutation requests send `Origin: <exact configured app origin>`. While remote
+sharing is enabled, mutations require an approved Origin or Referer even from
+ordinary HTTP clients. Account mutations always require the exact origin.
+Browsers set these headers themselves; they cannot be overridden by JavaScript.
+The Python client and Node client adapter use the configured origin. CORS is
+not authentication. Do not forge forwarded headers or tunnel identity.
+
+Use explicit `workspace` or the `{project}` path parameter. Avoid relying on the
+host's mutable active project. Legacy Cloudflare access requires a protected,
+unlocked named project and does not expose the default project. Account mode
+uses membership and operation permissions such as `project.read`,
+`project.mutate`, `project.generate` and `project.membership.manage`.
+
+Local, LAN and Cloudflare are transport distinctions. Actual owner controls
+depend on access-context's route allowlist and recent reauthentication, not a
+guess based on the hostname. Configuration, filesystem scans/imports, account
+administration, recovery authority and confirmed resource release preserve their
+specific local/owner boundaries. The SDK can represent their public HTTP
+contracts; the MCP bridge excludes credential and internal authority operations.
+Use the indicated owner UI when confirmation is required.
+
+## Models, settings, terms and readiness
+
+For the selected model, read `/api/v1/models`,
+`/api/v1/model-options/{model_type}` and `/api/v1/defaults/{model_type}`.
+Use returned IDs and settings; do not hard-code a model from an example.
+`supported_operations`, input capabilities and Director compatibility describe
+support. `is_downloaded` describes installed assets. `verified`, experimental
+capability flags, `availability_status`, manual-checkpoint verification,
+`required_host_terms` and capability-specific status/preparation describe
+different prerequisites. An `available` legal/install policy is not a promise
+that the runtime can execute a model now. Unknown readiness stays unknown.
+
+Read `/api/v1/host-terms?workspace=...` for applicable acceptance state. The human
+must review/accept the current terms through the existing flow. The API and MCP
+do not accept terms on the human's behalf. Curated download uses
+`POST /api/v1/models/{model_type}/download` with the required project and terms;
+observe `/api/v1/models/downloads/status`. Downloading is distinct from loading,
+preparing and generating. Manual checkpoints and custom acquisition retain their
+local owner workflow.
+
+Before actual model work, obtain the installed GPU coordinator's fresh,
+exact-workload authority. Catalog entries, idle hardware, a held request and
+`/ready` are not grants. Do not submit internal grant objects through this API.
+Local creative prompts/media follow the existing content-neutral execution
+path; this interface adds no prompt scanning or subject-matter policy layer.
+An explicitly chosen remote provider retains its existing privacy/terms gate.
+
+## Generation, held queues and uncertain submission
+
+Use `POST /api/v1/generate` with an immutable `generation_request_id`, explicit
+workspace, a catalog model ID, prompt and model-specific settings. The public
+`_queue_mode` is `now` or `held`; `held` saves a genuine job without releasing it
+for model work. Preserve the exact submitted JSON before sending it.
+
+```python
+import os, uuid
+from maestro_continuum import MaestroClient, UncertainSubmission
+
+with MaestroClient(os.environ["MAESTRO_URL"],
+                   cookie_file=os.environ.get("MAESTRO_COOKIE_FILE")) as maestro:
+    workspace = "my-project"
+    model = os.environ["MAESTRO_MODEL"]  # selected from this server's catalog
+    request_id = str(uuid.uuid4())
+    defaults = maestro.request("GET", f"/api/v1/defaults/{model}")
+    body = {**defaults, "workspace": workspace, "model_type": model,
+            "prompt": "A ceramic cup beside an open window in afternoon light",
+            "generation_request_id": request_id, "_queue_mode": "held",
+            "enhance_before_generate": False}
+    try:
+        admission = maestro.request("POST", "/api/v1/generate", body=body)
+    except UncertainSubmission:
+        admission = maestro.request("GET", f"/api/v1/generate/submissions/{request_id}",
+                                    query={"workspace": workspace})
+    print(admission)
+```
+
+`admission_state` is `unknown`, `pending` or `accepted`. Accepted responses bind
+the `generation_request_id` to a server `job_id`. Pending/unknown is not proof of
+cancellation or permission to send a new ID. Continue polling the same lookup;
+an ambiguous submission never gets an automatic retry. Exact same-body replay
+is supported by the Studio admission contract; different input under the same
+ID conflicts. Reconcile before replaying, including after a 503 or reconnect.
+
+curl for a **previously prepared** JSON body containing the chosen request ID:
+
+```bash
+curl --fail-with-body -c "$MAESTRO_COOKIE_FILE" -b "$MAESTRO_COOKIE_FILE" \
+  -H "Origin: $MAESTRO_ORIGIN" -H 'Content-Type: application/json' \
+  --data-binary @generation.json "$MAESTRO_URL/api/v1/generate"
+curl --fail-with-body -b "$MAESTRO_COOKIE_FILE" \
+  "$MAESTRO_URL/api/v1/generate/submissions/$REQUEST_ID?workspace=$WORKSPACE"
+```
+
+Read `/api/v1/status/{job_id}` and `/api/v1/queue` for progress, holds, recovery
+and outputs. A held job is released individually by
+`POST /api/v1/queue/{job_id}/resume` only after its execution prerequisites are
+satisfied. `/jobs/queue/start` releases all authorized held jobs: do not use it
+to release an unrelated backlog. `POST /api/v1/cancel/{job_id}` requests
+cancellation; observe terminal status and resource release separately.
+
+H3 plan preview and approval use `/generate/plan` and
+`/generate/{job_id}/plan/approve`. Guides and Bridge use their dedicated authored
+operations with current Gallery revisions. Continue/Extend can be composed from
+authorized uploaded source media and the ordinary generation operation; use the
+model options and the documented continuation fields in the coverage map.
+Specialized Retake/Bridge/tool submissions currently lack Studio's common
+caller-ID receipt. After a lost response, inspect the same session's jobs,
+Queue and outputs and stop for owner reconciliation if acceptance cannot be
+identified. Never infer exactly-once behavior from a generated wrapper.
+
+## Director, Chat, music and recovery
+
+Director preview is a separate LLM operation: submit `/director/v2/plan` with
+its caller request ID, then observe `/llm/operations/director_preview/{id}` and
+`/result`. Its cancellation operation is distinct from canceling a generation
+job. An LLM preparation ID and a Director pipeline ID are also distinct.
+
+For a real story pipeline, `/director/preflight` discovers admissibility;
+`/director/pipeline/start` with `hold_planning:true` saves a genuine parent before
+planning. Prepared clip plans cannot be substituted into this hold. Observe
+`/director/pipeline/{pipeline_id}`. At `pause_reason:"before_planning"`, continue
+with an empty body to release the frozen request after fresh model authority.
+Review pauses permit their documented clip-plan edits; image review can set
+`hold_video:true`. Stop, continue and recovered resume are separate actions.
+Do not assume a restart resumes an unreleased hold.
+An interrupted attempt tied to a private execution reservation reports
+`blocked_planning_admission` after restart. Its owner must resolve the retained
+attempt and obtain fresh authority through the existing recovery path;
+ordinary Continue cannot release it. Clients cannot supply private admission
+markers or reconstruct an expired grant.
+
+For example, save this body as `director-story.json`, using a project you can
+access and model IDs returned by discovery. `short_film_story` is the story
+workflow; `short_film` is not an accepted pipeline type.
+
+```json
+{
+  "workspace": "example-project",
+  "pipeline_type": "short_film_story",
+  "story_description": "A ceramic cup rests beside an open window. A breeze lifts the curtain and morning light moves across the cup. One continuous five-second shot with a quiet ending.",
+  "video_model": "minimax_h3",
+  "image_creator_model": "flux2_klein_9b",
+  "image_editor_model": "flux2_klein_9b",
+  "target_duration": 5,
+  "target_scenes": 1,
+  "fps": 24,
+  "private_output": true,
+  "auto_mode": false,
+  "hold_planning": true,
+  "hold_video": true
+}
+```
+
+```bash
+curl --fail-with-body -b "$MAESTRO_COOKIE_FILE" \
+  -H "Origin: $MAESTRO_ORIGIN" -H 'Content-Type: application/json' \
+  --data-binary @director-story.json "$MAESTRO_URL/api/v1/director/pipeline/start"
+# Save the returned pipeline_id; substitute it below.
+curl --fail-with-body -b "$MAESTRO_COOKIE_FILE" \
+  "$MAESTRO_URL/api/v1/director/pipeline/$PIPELINE_ID"
+```
+
+The initial status is `paused` with `pause_reason:"before_planning"`; no model
+work has begun. After satisfying the selected model's terms/readiness and the
+host's compute authority, POST `{}` to
+`/api/v1/director/pipeline/$PIPELINE_ID/continue` using the same cookie and Origin
+headers. `auto_mode:false` pauses for prompt and image review. `hold_video:true`
+holds video children separately and does not hold planning. Do not resubmit the
+start body on reconnect: inspect the retained pipeline by its ID.
+
+Director queue entry IDs, enqueue request IDs and later pipeline IDs differ.
+Use the queue's exact request/project-incarnation contract and GET operations to
+reconcile. Saved pipeline tags, repairs, reruns and rejoin use `/director/pipelines`
+routes. Repair state is not a generation status. Direct start/rerun operations
+without an admission receipt must not be blindly retried after a timeout.
+
+Director music preparation uses `/director/preparation` and its saved
+`director_request_id`; `/director/generate-music` consumes that request. YuE2
+uses take IDs and its own compose, plan review/continue/cancel, library and audio
+operations. Training has a separate job/request identity. Preserve those IDs
+and the model terms; do not reinterpret a prepared song as a generation job.
+
+Chat uses `/llm/prepare`, `/llm/chat` and `/llm/chat/{request_id}` with frozen
+input and exact session/project identity. Chat attachment uploads are scoped to
+that identity. Browser **Stop** stops waiting; there is no public Chat cancel
+operation. Conversation history and lyric/draft transfers remain client state,
+which an external client may maintain itself. A preparation can need human
+terms or model selection before it becomes ready.
+
+On reconnection, use the **same authorized session**, project and saved IDs.
+Read current state; do not assume the active project or process is unchanged.
+Recovery routes retain their existing revision, owner and capability boundaries.
+403/423 indicates missing authority/access; 409 indicates drift/conflict;
+422 indicates invalid input/settings; 503 indicates temporary unavailability.
+The response's `detail` supplies the operation-specific next step. A timeout is
+an observation failure, never cancellation, completion or a fresh-submit grant.
+
+Director runtime preparation can report `error_code: "llm_runtime_unavailable"`
+with `failure_details.stage: "model_load"`. Its public message tells the owner
+to repair the local chat runtime before starting a new Director run. Detailed
+loader diagnostics remain in private server logs. A failed parent is terminal;
+do not blindly Continue or resubmit it. A reserved native attempt cannot
+silently repair, build or download a replacement runtime.
+
+## Editor, assets and output workflows
+
+List drafts with `GET /projects/{project}/editor/projects` and retrieve by
+`/{editor_id}`. Opening from Gallery remains a POST with `output_name` and
+`output_revision`. Save the validated timeline using PUT with
+`expected_revision`; do not silently overwrite a newer draft. Clip/take/audio/
+image operations also carry source and revision identities. Export queues a
+saved revision and returns a job ID; originals remain intact.
+
+Gallery reads, metadata and authorized media downloads use `/outputs`,
+`/outputs/{name}/metadata` and `/file/{name}?workspace=...`. Preserve the current
+revision for operations that require it. Favorites toggle; repeating them is
+not idempotent. Bulk moves/privacy/deletion return per-item outcomes. Component
+cleanup can be deferred; a response is not proof that every linked file vanished.
+
+References and saved visual styles use project-scoped operations. A saved style
+update requires its current revision and selector-based references; do not
+submit internal SHA/authority snapshots as a replacement for resolution.
+Profiles use their stable create IDs and revision contracts. Recipe application
+is a client-side projection into generation settings; remote recipe reads and
+local owner mutations keep their existing boundaries. Blender accepts structured
+scene/animation/inspection/render and composition packages, never arbitrary
+Python, shell commands or unrestricted filesystem paths.
+
+## MCP setup
+
+The general-purpose bridge reads the current HTTP contract and publishes only
+explicitly eligible operations, using the official MCP stdio protocol. It has
+no direct model, shell or filesystem execution route. It does not create a new
+network listener or a new account system.
+
+```json
+{
+  "mcpServers": {
+    "maestro-continuum": {
+      "command": "maestro-continuum-mcp",
+      "args": ["--url", "http://127.0.0.1:CURRENT_PORT"],
+      "env": {"MAESTRO_COOKIE_FILE": "/operator/private/maestro-session.cookies"}
+    }
+  }
+}
+```
+
+The operator supplies a session established through the normal flow. Optional
+`--origin` sets the exact configured origin, and `--read-only` limits tools to
+eligible GET operations. Repeat `--feature` to publish only selected feature
+families, such as `--feature editor --feature gallery`; read the current
+operation metadata for family names. For LAN/Cloudflare use the configured URL and an
+authorized session for that surface; a local cookie is not a cross-host grant.
+Never place passwords, provider keys or GPU authority in the MCP config.
+
+Tools list their real path/query/body schemas, boundaries and replay policy.
+Outputs are structured `{result:...}` or `{error:...}` with `isError`. Binary
+media produces a same-session authorized link. MCP multipart uploads accept up to
+16 MiB of base64 media with a direct-child filename; larger files use the SDK's
+explicit upload API; MCP does not accept arbitrary host filenames. Authentication,
+terms acceptance, owner confirmation and internal recovery authority remain
+outside AI tool arguments. Destructive/idempotent hints are conservative and
+never override runtime permissions. Reconnect to refresh tools after a release.
+
+For Gallery input reuse, `maestro_gallery_to_upload` downloads one exact authorized
+media revision and uploads those retained bytes privately through the existing
+HTTP routes. It accepts `workspace`, `filename`, `revision`, and optional
+`revision_kind` (`listing_revision` by default, or `content_revision`). It returns
+`upload.filename` and does not start generation. Use that filename as the selected
+model's input in the same project. The transfer is limited to 16 MiB and is absent
+in read-only mode. Larger files use the SDK download/upload recipe in the coverage
+map. A lost upload acknowledgement remains uncertain; never repeat the composite
+tool automatically. This helper is a client composition, not a separate HTTP
+engine or access grant.
+
+## Maintenance and evidence
+
+Authored contracts live beside the source-extracted inventory in
+`app/continuum_api`. Update them when a production handler changes. Export the
+running `/openapi.json` to `docs/api/openapi.json`, then run
+`python scripts/generate_continuum_clients.py --schema docs/api/openapi.json`
+to regenerate Python/TypeScript operation references. `--inventory` updates
+source-derived fields without replacing authored contracts. No model loads or
+test suite are part of generation.
+
+`contract_status:authored`, `source_extracted` and `framework_only` distinguish
+semantic review from generated inventory. Coverage and validation gaps are
+listed in the feature map. Full feature parity and execution acceptance are
+separate claims; this API does not claim native model or human quality acceptance
+from an OpenAPI export, a client build or a route count.

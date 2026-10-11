@@ -1165,12 +1165,16 @@ def _normalize_preset(value: Any) -> dict[str, Any]:
     }
     parameter_selections = normalized["params"].get("lora_parameters") or {}
     if parameter_selections and (
-        mode != "image"
-        or normalized["params"].get("image_mode") != 1
+        profile_version == 3
+        or not (
+            (mode == "image" and normalized["params"].get("image_mode") == 1)
+            or (mode == "video" and normalized["params"].get("image_mode") == 0
+                and normalized["params"].get("multi_prompts_gen_type", 0) in (0, 2))
+        )
         or not set(parameter_selections).issubset(activated_loras)
     ):
         raise GenerationPresetError(
-            "LoRA parameters require active LoRAs in generic image generation",
+            "LoRA parameters require active LoRAs in plain Studio image or text-to-video generation",
         )
     if (
         profile_version in {2, 3}

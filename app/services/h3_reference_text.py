@@ -12,6 +12,7 @@ from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 from models.minimax_h3.reference_manifest import reference_role_text
+from services.h3_custom_style_text import scoped_style_relationship
 
 
 SubjectMatch = tuple[int, str, str]
@@ -71,6 +72,7 @@ def reference_relationships(
         return subject_resolver(_trim_sentence(role))
 
     for reference in references or []:
+        scoped_style = scoped_style_relationship(dict(reference), picture_no + 1)
         kind = str(reference.get("type") or "").strip().lower()
         raw_role = str(reference.get("role") or "").strip()
         rendered_role = reference_role_text(
@@ -80,6 +82,12 @@ def reference_relationships(
 
         if kind == "image":
             picture_no += 1
+            if scoped_style is not None:
+                definition, preservation, detail = scoped_style
+                definitions.append(definition)
+                retention.append(preservation)
+                detail_bindings.append(detail)
+                continue
             label = f"<Picture {picture_no}>"
             intent = str(reference.get("image_intent") or "").strip().lower()
 

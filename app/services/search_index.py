@@ -192,7 +192,7 @@ def _modern_producer_role(meta: Mapping[str, object]) -> Optional[str]:
     if fixed is not None:
         return fixed
     declared = meta.get("producer_artifact_class")
-    if kind == "ordinary_repeat" and declared in ARTIFACT_CLASSES:
+    if kind in {"ordinary_repeat", "director_concat", "director_delivery"} and declared in ARTIFACT_CLASSES:
         return str(declared)
     # A producer-unit marker proves this is modern evidence, but an unknown or
     # incomplete role does not prove finality. Keep it visible as a component.
@@ -209,6 +209,94 @@ def _is_sliding_window(meta: Mapping[str, object]) -> bool:
     except (TypeError, ValueError):
         return False
     return window > 0 and total > window
+
+
+def _director_superseded_native_names(entries: list[dict]) -> set[str]:
+    """Display native parents under components after a complete delivery set.
+
+    This is a sidecar relationship for listing, not recovery or deletion
+    authority. Keep original metadata and producer receipts unchanged.
+    """
+    by_name = {str(entry.get("name") or ""): entry for entry in entries}
+    superseded: set[str] = set()
+    inspected = set()
+    for entry in entries:
+        meta = entry.get("meta")
+        if not isinstance(meta, Mapping) or meta.get("producer_unit_kind") != "director_delivery":
+            continue
+        try:
+            job_id, unit_id = meta["job_id"], meta["producer_unit_id"]
+            if (not isinstance(job_id, str) or not job_id or not isinstance(unit_id, str)
+                    or re.fullmatch(r"unit:v1:[0-9a-f]{64}", unit_id) is None
+                    or (job_id, unit_id) in inspected):
+                continue
+            inspected.add((job_id, unit_id))
+            names = meta["producer_unit_artifact_names"]
+            settings = meta["producer_unit_settings"]
+            targets = settings["director_finishing"]["binding"]["targets"]
+            hashes = settings["native_hashes"]
+            dependencies = meta["producer_unit_dependencies"]
+            binding = meta["producer_unit_attestation"]["director_delivery"]["binding"]
+            media = binding["media"]
+            if (not isinstance(names, list) or not names or len(names) > 4096
+                    or any(not isinstance(name, str) or name != os.path.basename(name) for name in names)
+                    or len(set(names)) != len(names) or not set(names) <= set(by_name)
+                    or binding["unit_id"] != unit_id
+                    or not isinstance(media, list) or len(media) != len(names)
+                    or {row["basename"] for row in media} != set(names)
+                    or not isinstance(targets, list) or not isinstance(hashes, list)
+                    or not isinstance(dependencies, list) or not targets
+                    or len(targets) != len(hashes) or len(targets) != len(dependencies)
+                    or len(targets) != len(media)
+                    or any(not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None
+                           for value in hashes)):
+                continue
+            complete = True
+            for row, target in zip(media, targets):
+                delivered = by_name[row["basename"]]
+                child = delivered.get("meta")
+                if (not isinstance(child, Mapping) or row["role"] not in ARTIFACT_CLASSES
+                        or row["role"] != target["role"]
+                        or type(row["bytes"]) is not int or row["bytes"] < 1
+                        or not isinstance(row["sha256"], str)
+                        or re.fullmatch(r"[0-9a-f]{64}", row["sha256"]) is None
+                        or child.get("producer_media_size") != row["bytes"]
+                        or child.get("producer_media_sha256") != row["sha256"]
+                        or delivered.get("size", row["bytes"]) != row["bytes"]
+                        or child.get("producer_artifact_class") != row["role"]
+                        or child.get("artifact_class") != row["role"]
+                        or any(child.get(key) != meta.get(key) for key in (
+                            "job_id", "producer_unit_id", "producer_unit_kind",
+                            "producer_unit_artifact_names", "producer_unit_settings",
+                            "producer_unit_dependencies", "producer_unit_attestation"))):
+                    complete = False
+                    break
+            if not complete:
+                continue
+            native_names = set()
+            for target, dependency, native_hash in zip(targets, dependencies, hashes):
+                name = target["basename"]
+                if (not isinstance(name, str) or not name or name != os.path.basename(name)
+                        or not isinstance(dependency, str)
+                        or re.fullmatch(r"unit:v1:[0-9a-f]{64}", dependency) is None):
+                    complete = False
+                    break
+                native_entry = by_name.get(name, {})
+                native = native_entry.get("meta")
+                if (not isinstance(native, Mapping) or native.get("job_id") != job_id
+                        or native.get("producer_unit_kind") not in {"ordinary_repeat", "director_concat"}
+                        or native.get("producer_unit_id") != dependency
+                        or native.get("producer_media_sha256") != native_hash
+                        or native_entry.get("size", native.get("producer_media_size")) != native.get("producer_media_size")):
+                    complete = False
+                    break
+                native_names.add(name)
+            if complete:
+                superseded.update(native_names)
+        except (KeyError, TypeError, ValueError, AttributeError):
+            # Malformed or incomplete lineage does not hide an existing Final.
+            continue
+    return superseded
 
 
 def classify_gallery_artifacts(entries: Iterable[Mapping[str, object]]) -> dict[str, str]:
@@ -297,6 +385,9 @@ def classify_gallery_artifacts(entries: Iterable[Mapping[str, object]]) -> dict[
             classes[name] = "component"
         else:
             classes[name] = "final"
+    for name in _director_superseded_native_names(normalized):
+        if classes.get(name) == "final":
+            classes[name] = "component"
     return classes
 
 
@@ -361,6 +452,11 @@ def linked_component_names(
             or artifact_class not in {"component", "window", "temporary"}
             or artifact_lineage(meta) != lineage
         ):
+            continue
+        if (artifact_class == "component" and _modern_producer_role(meta) == "final"
+                and meta.get("producer_unit_kind") in {"ordinary_repeat", "director_concat"}):
+            # A delivery relationship changes display only. It cannot authorize
+            # deleting the retained native producer, even with clip metadata.
             continue
         explicit = meta.get("artifact_class")
         if explicit == artifact_class:

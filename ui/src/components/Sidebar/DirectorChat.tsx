@@ -4,6 +4,7 @@ import { useStore, getFamiliesForMode, getModelsForFamily, isDirectorPipelineAct
 import { downloadModel, estimateH3Performance, fetchDefaults, fetchModelOptions, getDirectorHostActionAccessState, getFileUrl, verifyManualCheckpoint, waitForModelDownloadTerminal } from '../../api/client'
 import type { DirectorFailureComponent, DirectorImageRoleCandidate, DirectorReadinessReason } from '../../api/client'
 import { DirectorImageRoleLoraSelector, DirectorLoraSelector } from '../SettingsDrawer/DirectorLoraSelector'
+import { ProjectVisualStyleField } from '../SettingsDrawer/ProjectVisualStyleField'
 import { DirectorSongSetup } from './DirectorSongSetup'
 import { GenerationProfiles } from './GenerationProfiles'
 import { DirectorShotDeck } from '../DirectorShotDeck'
@@ -542,6 +543,8 @@ export function DirectorChat() {
   const shortFilmNarrative = useStore(s => s.shortFilmNarrative)
   const shortFilmSetNarrative = useStore(s => s.shortFilmSetNarrative)
   const startDirectorPipeline = useStore(s => s.startDirectorPipeline)
+  const continueHeldPipeline = useStore(s => s.continuePipeline)
+  const stopHeldPipeline = useStore(s => s.stopPipeline)
   const pipelineStatus = useStore(s => s.pipelineStatus)
   const pipelinePhase = pipelineStatus?.phase
   const pipelineActive = isDirectorPipelineActive(pipelineStatus)
@@ -1208,6 +1211,21 @@ export function DirectorChat() {
           </SystemBubble>
         )}
 
+        {pipelineStatus?.status === 'paused' && pipelineStatus.pause_reason === 'before_planning' && (
+          <SystemBubble>
+            <p className="text-xs text-text-secondary">Your story is saved. Planning will wait until you start it.</p>
+            <div className="mt-2 flex gap-2">
+              <button type="button" disabled={loading} onClick={() => { void continueHeldPipeline() }}
+                className="rounded bg-accent-blue px-3 py-1.5 text-xs text-white disabled:opacity-40">
+                Start planning
+              </button>
+              <button type="button" disabled={loading} onClick={() => { void stopHeldPipeline() }}
+                className="rounded border border-border px-3 py-1.5 text-xs text-text-secondary disabled:opacity-40">
+                Cancel held story
+              </button>
+            </div>
+          </SystemBubble>
+        )}
         <div ref={messagesEndRef} />
       </div>
 
@@ -1247,6 +1265,15 @@ export function DirectorChat() {
               </div>
             )}
           </div>
+        )}
+        {isStoryPath && step === 'style' && (
+          <button type="button"
+            disabled={!chatInputEnabled || !sceneDescription.trim()}
+            onClick={() => { void startDirectorPipeline('hold_planning') }}
+            title="Save this story without loading a model. Start planning when you are ready."
+            className="rounded border border-border px-3 py-1.5 text-xs text-text-secondary disabled:opacity-40">
+            Plan later
+          </button>
         )}
         <div className="flex items-end gap-2">
           {/* Auto-grows with content (issue #11). The composer bar is the
@@ -3088,6 +3115,7 @@ function StyleForm({
       </fieldset>
 
       <H3StyleWorkflowField effectiveVideoModel={effectiveVideoModel} surface="Director" />
+      <ProjectVisualStyleField />
 
       {/* Speaker Mapping — hidden for story path (no audio = no detected speakers) */}
       {!isStoryPath && speakers.length >= 1 && (
@@ -3173,6 +3201,12 @@ function ImagePromptsReview({
   isActive: boolean
   isShortFilm?: boolean
 }) {
+  const pipelineStatus = useStore(s => s.pipelineStatus)
+  const pipelineInProgress = isDirectorPipelineActive(pipelineStatus)
+    || pipelineStatus?.status === 'paused'
+  const reviewingPipelinePrompts = pipelineStatus?.status === 'paused'
+    && pipelineStatus.pause_reason === 'review_prompts'
+  const continuePipeline = useStore(s => s.continuePipeline)
   return (
     <div className="space-y-2">
       <div className="flex items-center justify-between">
@@ -3180,7 +3214,8 @@ function ImagePromptsReview({
         {isActive && (
           <button
             onClick={planPrompts}
-            disabled={loading}
+            disabled={loading || pipelineInProgress}
+            title={pipelineInProgress ? 'Stop the current Director run before regenerating prompts.' : undefined}
             className="text-[10px] text-accent-blue hover:text-accent-blue-hover flex items-center gap-0.5"
           >
             <RotateCcw size={10} /> Regenerate
@@ -3228,8 +3263,14 @@ function ImagePromptsReview({
 
       {isActive && (
         <button
-          onClick={generateStartImages}
-          disabled={loading}
+          onClick={() => {
+            if (reviewingPipelinePrompts) {
+              void continuePipeline({ clip_plans: clipPlans })
+            } else {
+              void generateStartImages()
+            }
+          }}
+          disabled={loading || (pipelineInProgress && !reviewingPipelinePrompts)}
           className="w-full py-2 rounded-lg bg-accent-blue text-white text-xs font-medium hover:bg-accent-blue-hover transition-colors flex items-center justify-center gap-1.5"
         >
           {/* Always available now — directorGenerateStartImages generates an
@@ -3378,13 +3419,19 @@ function VideoPromptsReview({
    *  them to click. */
   isAutoGenerating?: boolean
 }) {
+  const pipelineInProgress = useStore(s => isDirectorPipelineActive(s.pipelineStatus)
+    || s.pipelineStatus?.status === 'paused')
+  const reviewingPipelineImages = useStore(s => s.pipelineStatus?.status === 'paused'
+    && s.pipelineStatus.pause_reason === 'review_images')
+  const continuePipeline = useStore(s => s.continuePipeline)
   return (
     <div className="space-y-2">
       <div className="flex items-center justify-between">
         <label className="text-[11px] text-text-muted uppercase tracking-wider">Video Prompts</label>
         <button
           onClick={planVideoPrompts}
-          disabled={loading}
+          disabled={loading || pipelineInProgress}
+          title={pipelineInProgress ? 'Stop the current Director run before regenerating prompts.' : undefined}
           className="text-[10px] text-accent-blue hover:text-accent-blue-hover flex items-center gap-0.5"
         >
           <RotateCcw size={10} /> Regenerate
@@ -3454,7 +3501,29 @@ function VideoPromptsReview({
                   was already running, confusing the user.
                 * Manual mode after the user clicked Generate — guards
                   against double-submission. */}
-        {isGenerating ? (
+        {reviewingPipelineImages ? (
+          <div className="space-y-1.5">
+            <div className="grid grid-cols-2 gap-1.5">
+              <button
+                type="button"
+                disabled={loading}
+                onClick={() => { void continuePipeline({ clip_plans: clipPlans, hold_video: false }) }}
+                className="mobile-control-target flex items-center justify-center gap-1.5 rounded-lg bg-accent-green py-2.5 text-sm font-semibold text-white hover:bg-accent-green-hover disabled:opacity-60"
+              >
+                <Play size={14} /> Generate video
+              </button>
+              <button
+                type="button"
+                disabled={loading}
+                onClick={() => { void continuePipeline({ clip_plans: clipPlans, hold_video: true }) }}
+                className="mobile-control-target flex items-center justify-center gap-1.5 rounded-lg border border-border py-2.5 text-sm font-medium text-text-secondary hover:bg-bg-hover disabled:opacity-60"
+              >
+                <ListPlus size={14} /> Queue video
+              </button>
+            </div>
+            <p className="text-[11px] text-text-muted">Queued video stays on hold until you start it from Queue.</p>
+          </div>
+        ) : isGenerating ? (
           // Muted disabled state. opacity-60 dims the whole control
           // (including the spinner) so it reads as "not interactive"
           // even against the bright accent backgrounds Golden Hour and

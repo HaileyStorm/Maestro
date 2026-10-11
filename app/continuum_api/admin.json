@@ -1,0 +1,5206 @@
+[
+  {
+    "method": "GET",
+    "path": "/api/v1/research/status",
+    "summary": "Read research progress",
+    "description": "Server-store status including research/implementation activity, readiness, counts, disclosure and a sanitized runtime error.",
+    "responses": {
+      "200": {
+        "description": "Read research progress result.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "research_active": {
+                  "type": "boolean"
+                },
+                "research_phase": {
+                  "type": "string"
+                },
+                "implementation_active": {
+                  "type": "boolean"
+                },
+                "implementation_ready": {
+                  "type": "boolean"
+                },
+                "implementation_chunk_count": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "runtime_error": {
+                  "type": "string",
+                  "nullable": true
+                },
+                "disclosure": {
+                  "type": "string"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    "x-maestro": {
+      "feature": "research",
+      "permissions": [],
+      "boundary": "Direct loopback peer and approved local advertised origins required; Cloudflare/LAN denied. Read-only server-store research status.",
+      "idempotency": "Read-only; repeat to refresh current state.",
+      "operation_kind": "research",
+      "mcp": true,
+      "contract_status": "authored",
+      "source": "app/launch.py:4711",
+      "handler": "research_status"
+    }
+  },
+  {
+    "method": "POST",
+    "path": "/api/v1/research/run",
+    "summary": "Start configured research cycle",
+    "description": "Runs the fixed application-environment research command with force=True. Refuses concurrent research/implementation. May use the configured research provider.",
+    "responses": {
+      "202": {
+        "description": "Start configured research cycle result.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "status": {
+                  "type": "string",
+                  "enum": [
+                    "accepted"
+                  ]
+                },
+                "force": {
+                  "type": "boolean",
+                  "enum": [
+                    true
+                  ]
+                }
+              },
+              "additionalProperties": true,
+              "required": [
+                "status",
+                "force"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "x-maestro": {
+      "feature": "research",
+      "permissions": [],
+      "boundary": "Direct loopback peer and approved local advertised origins are required; Cloudflare/LAN research controls are rejected.  launch of configured external research; it is not an arbitrary command tool.",
+      "idempotency": "Not replay-safe after timeout; inspect research/status. A subsequent request can start another cycle.",
+      "operation_kind": "research",
+      "mcp": false,
+      "contract_status": "authored",
+      "source": "app/launch.py:4719",
+      "handler": "run_research_now"
+    }
+  },
+  {
+    "method": "POST",
+    "path": "/api/v1/research/implementation/nonce",
+    "summary": "Prepare human implementation confirmation",
+    "description": "Issues a short-lived token bound to the current Maestro session; it cannot authorize client-selected paths or findings.",
+    "responses": {
+      "200": {
+        "description": "Prepare human implementation confirmation result.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "nonce": {
+                  "type": "string"
+                },
+                "expires_in_seconds": {
+                  "type": "integer",
+                  "minimum": 1
+                }
+              },
+              "additionalProperties": true,
+              "required": [
+                "nonce",
+                "expires_in_seconds"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "x-maestro": {
+      "feature": "research",
+      "permissions": [],
+      "boundary": "Direct loopback peer and approved local advertised origins are required; Cloudflare/LAN research controls are rejected.  confirmation for a code-changing implementation action.",
+      "idempotency": "Each call mints a new expiring nonce; never use a token from another session.",
+      "operation_kind": "research",
+      "mcp": false,
+      "contract_status": "authored",
+      "source": "app/launch.py:4730",
+      "handler": "issue_research_implementation_nonce"
+    }
+  },
+  {
+    "method": "POST",
+    "path": "/api/v1/research/implementation/run",
+    "summary": "Run confirmed research implementation",
+    "description": "Consumes nonce before every check, including busy/readiness failure. Server selects stored eligible findings and implementation inputs; force bypasses only the readiness count threshold.",
+    "responses": {
+      "202": {
+        "description": "Run confirmed research implementation result.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "status": {
+                  "type": "string",
+                  "enum": [
+                    "accepted"
+                  ]
+                },
+                "force": {
+                  "type": "boolean"
+                }
+              },
+              "additionalProperties": true,
+              "required": [
+                "status",
+                "force"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "x-maestro": {
+      "feature": "research",
+      "permissions": [],
+      "boundary": "Direct loopback peer and approved local advertised origins are required; Cloudflare/LAN research controls are rejected. -confirmed source implementation, not an MCP code execution capability.",
+      "idempotency": "Nonce is one-shot even on rejection. Observe research/status after uncertainty; do not replay the consumed confirmation.",
+      "operation_kind": "research",
+      "mcp": false,
+      "contract_status": "authored",
+      "source": "app/launch.py:4740",
+      "handler": "run_research_implementation"
+    },
+    "requestBody": {
+      "required": true,
+      "content": {
+        "application/json": {
+          "schema": {
+            "type": "object",
+            "properties": {
+              "nonce": {
+                "type": "string",
+                "minLength": 1
+              },
+              "force": {
+                "type": "boolean",
+                "default": false
+              }
+            },
+            "additionalProperties": true,
+            "required": [
+              "nonce"
+            ]
+          },
+          "example": {
+            "nonce": "<session-issued nonce>",
+            "force": false
+          }
+        }
+      }
+    }
+  },
+  {
+    "method": "GET",
+    "path": "/api/v1/model-visibility",
+    "summary": "Read selector visibility",
+    "description": "Persisted host selector whitelist; configured=False means no valid persisted whitelist.",
+    "responses": {
+      "200": {
+        "description": "Read selector visibility result.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "configured": {
+                  "type": "boolean"
+                },
+                "enabled_models": {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "maxLength": 200
+                  }
+                },
+                "defaults_version": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              },
+              "additionalProperties": true,
+              "required": [
+                "configured",
+                "enabled_models",
+                "defaults_version"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "x-maestro": {
+      "feature": "models",
+      "permissions": [],
+      "boundary": "Read-only snapshot; it neither grants compute authority nor changes project access.",
+      "idempotency": "Read-only; repeat to refresh current state.",
+      "operation_kind": "models",
+      "mcp": true,
+      "contract_status": "authored",
+      "source": "app/launch.py:18851",
+      "handler": "get_model_visibility"
+    }
+  },
+  {
+    "method": "PUT",
+    "path": "/api/v1/model-visibility",
+    "summary": "Save selector visibility",
+    "description": "Strips whitespace and deduplicates nonempty IDs; maximum 5000 normalized IDs, each at most 200 characters. Newly enabled H3 recipes require current legal access. defaults_version is integer-coerced and negative values clamp to zero; stored legacy identifiers remain readable.",
+    "responses": {
+      "200": {
+        "description": "Save selector visibility result.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "configured": {
+                  "type": "boolean"
+                },
+                "enabled_models": {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "maxLength": 200
+                  }
+                },
+                "defaults_version": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              },
+              "additionalProperties": true,
+              "required": [
+                "configured",
+                "enabled_models",
+                "defaults_version"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "x-maestro": {
+      "feature": "models",
+      "permissions": [],
+      "boundary": "Host-wide visibility mutation; local control or the production recently reauthenticated owner.remote_parity exception is required.",
+      "idempotency": "State replacement; read model-visibility after an uncertain persistence result.",
+      "operation_kind": "models",
+      "mcp": false,
+      "contract_status": "authored",
+      "source": "app/launch.py:18858",
+      "handler": "update_model_visibility"
+    },
+    "requestBody": {
+      "required": true,
+      "content": {
+        "application/json": {
+          "schema": {
+            "type": "object",
+            "properties": {
+              "enabled_models": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "maxLength": 200
+                },
+                "maxItems": 5000
+              },
+              "defaults_version": {
+                "type": "integer",
+                "minimum": 0,
+                "default": 0
+              }
+            },
+            "additionalProperties": true,
+            "required": [
+              "enabled_models"
+            ]
+          },
+          "example": {
+            "enabled_models": [
+              "t2v"
+            ],
+            "defaults_version": 1
+          }
+        }
+      }
+    }
+  },
+  {
+    "method": "GET",
+    "path": "/api/v1/resolutions",
+    "summary": "List general resolution presets",
+    "description": "Returns label/value pairs; model-options supplies any model-specific canvas/alignment restrictions.",
+    "responses": {
+      "200": {
+        "description": "List general resolution presets result.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "resolutions": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "label": {
+                        "type": "string"
+                      },
+                      "value": {
+                        "type": "string"
+                      }
+                    },
+                    "additionalProperties": true,
+                    "required": [
+                      "label",
+                      "value"
+                    ]
+                  }
+                }
+              },
+              "additionalProperties": true,
+              "required": [
+                "resolutions"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "x-maestro": {
+      "feature": "models",
+      "permissions": [],
+      "boundary": "Read-only snapshot; it neither grants compute authority nor changes project access.",
+      "idempotency": "Read-only; repeat to refresh current state.",
+      "operation_kind": "models",
+      "mcp": true,
+      "contract_status": "authored",
+      "source": "app/launch.py:19157",
+      "handler": "list_resolutions"
+    }
+  },
+  {
+    "method": "GET",
+    "path": "/api/v1/loras/preview/{filename}",
+    "summary": "Read downloaded LoRA preview",
+    "description": "Only a basename not starting with a dot is accepted. Searches configured local LoRA preview directories; returns MP4 or image bytes, or 404.",
+    "responses": {
+      "200": {
+        "description": "Read downloaded LoRA preview result.",
+        "content": {
+          "video/mp4": {
+            "schema": {
+              "type": "string",
+              "format": "binary"
+            }
+          },
+          "image/png": {
+            "schema": {
+              "type": "string",
+              "format": "binary"
+            }
+          }
+        }
+      }
+    },
+    "x-maestro": {
+      "feature": "models",
+      "permissions": [],
+      "boundary": "Read-only snapshot; it neither grants compute authority nor changes project access.",
+      "idempotency": "Read-only; repeat to refresh current state.",
+      "operation_kind": "models",
+      "mcp": true,
+      "contract_status": "authored",
+      "source": "app/launch.py:19246",
+      "handler": "serve_lora_preview"
+    },
+    "parameters": [
+      {
+        "name": "filename",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    ]
+  },
+  {
+    "method": "GET",
+    "path": "/api/v1/civitai/base-models",
+    "summary": "List CivitAI browser filters",
+    "description": "Server-supported browser filter labels; no network/model execution.",
+    "responses": {
+      "200": {
+        "description": "List CivitAI browser filters result.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "filters": {
+                  "type": "array",
+                  "items": {}
+                }
+              },
+              "additionalProperties": true,
+              "required": [
+                "filters"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "x-maestro": {
+      "feature": "model_import",
+      "permissions": [],
+      "boundary": "Existing signed session and origin guards apply; this host-control prefix is unavailable through Cloudflare. LAN access remains subject to production origin/account guards. Read-only snapshot; it neither grants compute authority nor changes project access.",
+      "idempotency": "Read-only; repeat to refresh current state.",
+      "operation_kind": "model_import",
+      "mcp": true,
+      "contract_status": "authored",
+      "source": "app/launch.py:25945",
+      "handler": "civitai_base_models"
+    }
+  },
+  {
+    "method": "GET",
+    "path": "/api/v1/civitai/checkpoint-architectures",
+    "summary": "Discover compatible checkpoint pipelines",
+    "description": "Lists installed verified pipeline definitions for a CivitAI base label; supported describes the pipeline definition, not accepted native execution.",
+    "responses": {
+      "200": {
+        "description": "Discover compatible checkpoint pipelines result.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "architectures": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "architecture": {
+                        "type": "string"
+                      },
+                      "label": {
+                        "type": "string"
+                      }
+                    },
+                    "additionalProperties": true
+                  }
+                },
+                "suggested_architecture": {
+                  "type": "string",
+                  "nullable": true
+                },
+                "supported": {
+                  "type": "boolean"
+                },
+                "unsupported_reason": {
+                  "type": "string",
+                  "nullable": true
+                }
+              },
+              "additionalProperties": true,
+              "required": [
+                "architectures",
+                "supported"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "x-maestro": {
+      "feature": "model_import",
+      "permissions": [],
+      "boundary": "Existing signed session and origin guards apply; this host-control prefix is unavailable through Cloudflare. LAN access remains subject to production origin/account guards. Read-only snapshot; it neither grants compute authority nor changes project access.",
+      "idempotency": "Read-only; repeat to refresh current state.",
+      "operation_kind": "model_import",
+      "mcp": true,
+      "contract_status": "authored",
+      "source": "app/launch.py:25951",
+      "handler": "civitai_checkpoint_architectures"
+    },
+    "parameters": [
+      {
+        "name": "base_model",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "string",
+          "default": ""
+        },
+        "description": ""
+      }
+    ]
+  },
+  {
+    "method": "GET",
+    "path": "/api/v1/checkpoints/installed",
+    "summary": "List imported checkpoints",
+    "description": "Current on-disk imported checkpoints with cached update manifest and preview information.",
+    "responses": {
+      "200": {
+        "description": "List imported checkpoints result.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "checkpoints": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "model_type": {
+                        "type": "string"
+                      },
+                      "filename": {
+                        "type": "string"
+                      },
+                      "name": {
+                        "type": "string"
+                      },
+                      "civitai_model_id": {
+                        "type": "integer"
+                      },
+                      "current_version_id": {
+                        "type": "integer",
+                        "nullable": true
+                      },
+                      "update_status": {
+                        "type": "string",
+                        "enum": [
+                          "unknown",
+                          "current",
+                          "available",
+                          "removed"
+                        ]
+                      },
+                      "latest_version_id": {
+                        "type": "integer",
+                        "nullable": true
+                      },
+                      "latest_published_at": {
+                        "type": "string",
+                        "nullable": true
+                      },
+                      "latest_changelog": {
+                        "type": "string",
+                        "nullable": true
+                      },
+                      "preview_url": {
+                        "type": "string",
+                        "nullable": true
+                      }
+                    },
+                    "additionalProperties": true
+                  }
+                },
+                "manifest_last_check_at": {
+                  "type": "string",
+                  "nullable": true
+                }
+              },
+              "additionalProperties": true,
+              "required": [
+                "checkpoints",
+                "manifest_last_check_at"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "x-maestro": {
+      "feature": "model_import",
+      "permissions": [],
+      "boundary": "Existing signed session and origin guards apply; this host-control prefix is unavailable through Cloudflare. LAN access remains subject to production origin/account guards. Read-only snapshot; it neither grants compute authority nor changes project access.",
+      "idempotency": "Read-only; repeat to refresh current state.",
+      "operation_kind": "model_import",
+      "mcp": true,
+      "contract_status": "authored",
+      "source": "app/launch.py:25995",
+      "handler": "checkpoints_installed"
+    }
+  },
+  {
+    "method": "POST",
+    "path": "/api/v1/checkpoints/check-updates",
+    "summary": "Check imported checkpoint updates",
+    "description": "Queries CivitAI for each imported checkpoint and updates its cached manifest. Previous entry survives transient network failure. force is a query parameter, not a JSON body.",
+    "responses": {
+      "200": {
+        "description": "Check imported checkpoint updates result.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "checked": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "updates_available": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "errors": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "skipped": {
+                  "type": "boolean"
+                },
+                "last_full_check_at": {
+                  "type": "string",
+                  "nullable": true
+                }
+              },
+              "additionalProperties": true,
+              "required": [
+                "checked",
+                "updates_available",
+                "errors",
+                "skipped"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "x-maestro": {
+      "feature": "model_import",
+      "permissions": [],
+      "boundary": "Existing signed session and origin guards apply; this host-control prefix is unavailable through Cloudflare. LAN access remains subject to production origin/account guards. Public CivitAI metadata lookup using server-owned configuration; no inference or paid dispatch.",
+      "idempotency": "Normally skips a full check within 24 hours. force=True repeats the metadata queries and manifest update.",
+      "operation_kind": "model_import",
+      "mcp": true,
+      "contract_status": "authored",
+      "source": "app/launch.py:26013",
+      "handler": "checkpoints_check_updates"
+    },
+    "parameters": [
+      {
+        "name": "force",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "boolean",
+          "default": false
+        },
+        "description": ""
+      }
+    ]
+  },
+  {
+    "method": "GET",
+    "path": "/api/v1/civitai/search",
+    "summary": "Search CivitAI catalog",
+    "description": "Public CivitAI metadata lookup using only server-owned credentials. Successful responses use a bounded 15-minute cache. Result data remains the third-party catalog shape.",
+    "responses": {
+      "200": {
+        "description": "Search CivitAI catalog result.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "items": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "id": {
+                        "type": "integer"
+                      },
+                      "name": {
+                        "type": "string"
+                      },
+                      "type": {
+                        "type": "string"
+                      },
+                      "modelVersions": {
+                        "type": "array",
+                        "items": {
+                          "type": "object",
+                          "properties": {},
+                          "additionalProperties": true
+                        }
+                      }
+                    },
+                    "additionalProperties": true
+                  }
+                },
+                "metadata": {
+                  "type": "object",
+                  "properties": {},
+                  "additionalProperties": true
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    "x-maestro": {
+      "feature": "model_import",
+      "permissions": [],
+      "boundary": "Existing signed session and origin guards apply; this host-control prefix is unavailable through Cloudflare. LAN access remains subject to production origin/account guards. Read-only external catalog search; no credential input or download.",
+      "idempotency": "Read-only; repeat to refresh current state.",
+      "operation_kind": "model_import",
+      "mcp": true,
+      "contract_status": "authored",
+      "source": "app/launch.py:26088",
+      "handler": "civitai_search"
+    },
+    "parameters": [
+      {
+        "name": "query",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "string",
+          "default": ""
+        },
+        "description": ""
+      },
+      {
+        "name": "sort",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "string",
+          "default": "Highest Rated"
+        },
+        "description": ""
+      },
+      {
+        "name": "period",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "string",
+          "default": "AllTime"
+        },
+        "description": ""
+      },
+      {
+        "name": "nsfw",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "boolean",
+          "default": false
+        },
+        "description": ""
+      },
+      {
+        "name": "types",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "string",
+          "default": "LORA"
+        },
+        "description": ""
+      },
+      {
+        "name": "baseModels",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "string",
+          "default": ""
+        },
+        "description": ""
+      },
+      {
+        "name": "limit",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "integer",
+          "default": 20
+        },
+        "description": ""
+      },
+      {
+        "name": "cursor",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "string",
+          "default": ""
+        },
+        "description": ""
+      }
+    ]
+  },
+  {
+    "method": "GET",
+    "path": "/api/v1/civitai/model/{model_id}",
+    "summary": "Read CivitAI model metadata",
+    "description": "Fetches one numeric CivitAI model ID and enriches versions with locally supported architecture information; cached successful metadata is not model execution proof.",
+    "responses": {
+      "200": {
+        "description": "Read CivitAI model metadata result.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "integer"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "type": {
+                  "type": "string"
+                },
+                "description": {
+                  "type": "string"
+                },
+                "modelVersions": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": true
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    "x-maestro": {
+      "feature": "model_import",
+      "permissions": [],
+      "boundary": "Existing signed session and origin guards apply; this host-control prefix is unavailable through Cloudflare. LAN access remains subject to production origin/account guards. Read-only external metadata using server-owned credentials.",
+      "idempotency": "Read-only; repeat to refresh current state.",
+      "operation_kind": "model_import",
+      "mcp": true,
+      "contract_status": "authored",
+      "source": "app/launch.py:26166",
+      "handler": "civitai_model_detail"
+    },
+    "parameters": [
+      {
+        "name": "model_id",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "integer"
+        }
+      }
+    ]
+  },
+  {
+    "method": "POST",
+    "path": "/api/v1/civitai/download",
+    "summary": "Import CivitAI weight file",
+    "description": "Accepts only permitted CivitAI/CDN URLs and confined filename/directory components. Checkpoints need a compatible installed pipeline; Quad creator resources require accepted current creator terms before any write. Background import can enrich metadata and guides.",
+    "responses": {
+      "200": {
+        "description": "Import CivitAI weight file result.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "download_id": {
+                  "type": "string"
+                },
+                "status": {
+                  "type": "string",
+                  "enum": [
+                    "downloading"
+                  ]
+                }
+              },
+              "additionalProperties": true,
+              "required": [
+                "download_id",
+                "status"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "x-maestro": {
+      "feature": "model_import",
+      "permissions": [],
+      "boundary": "Existing signed session and origin guards apply; this host-control prefix is unavailable through Cloudflare. LAN access remains subject to production origin/account guards. Human-selected external executable model import and disk placement; stored credentials remain server-owned.",
+      "idempotency": "No request key/coalescing guarantee. Observe civitai/downloads by returned download_id; never blindly repeat an uncertain import.",
+      "operation_kind": "model_import",
+      "mcp": false,
+      "contract_status": "authored",
+      "source": "app/launch.py:26232",
+      "handler": "civitai_download"
+    },
+    "requestBody": {
+      "required": true,
+      "content": {
+        "application/json": {
+          "schema": {
+            "type": "object",
+            "properties": {
+              "download_url": {
+                "type": "string",
+                "format": "uri"
+              },
+              "filename": {
+                "type": "string",
+                "default": "model.safetensors",
+                "description": "Plain filename; checkpoint imports permit only .safetensors or .sft."
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "lora",
+                  "checkpoint"
+                ],
+                "default": "lora"
+              },
+              "target_arch": {
+                "type": "string",
+                "default": ""
+              },
+              "target_architecture": {
+                "type": "string",
+                "default": "",
+                "description": "Required compatible installed pipeline for checkpoint imports."
+              },
+              "target_dir_name": {
+                "type": "string",
+                "default": "",
+                "description": "Plain directory component, not a host path."
+              },
+              "auto_quantize": {
+                "type": "boolean",
+                "default": false
+              },
+              "model_id": {
+                "type": "integer",
+                "nullable": true
+              },
+              "version_id": {
+                "type": "integer",
+                "nullable": true
+              },
+              "model_name": {
+                "type": "string",
+                "default": ""
+              },
+              "trained_words": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "images": {
+                "type": "array",
+                "items": {}
+              },
+              "description": {
+                "type": "string",
+                "default": ""
+              },
+              "version_description": {
+                "type": "string",
+                "default": ""
+              },
+              "base_model": {
+                "type": "string",
+                "default": ""
+              },
+              "example_prompts": {
+                "type": "array",
+                "items": {}
+              },
+              "tags": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "nsfw": {
+                "type": "boolean",
+                "default": false
+              },
+              "published_at": {
+                "type": "string",
+                "nullable": true
+              }
+            },
+            "additionalProperties": true,
+            "required": [
+              "download_url"
+            ]
+          },
+          "example": {
+            "download_url": "https://civitai.com/api/download/models/123",
+            "filename": "example.safetensors",
+            "kind": "lora",
+            "target_dir_name": "wan"
+          }
+        }
+      }
+    }
+  },
+  {
+    "method": "GET",
+    "path": "/api/v1/civitai/downloads",
+    "summary": "Observe imports",
+    "description": "Active and recent serialized download records; errors/status are observations, not acceptance or cancellation.",
+    "responses": {
+      "200": {
+        "description": "Observe imports result.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "downloads": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "id": {
+                        "type": "string"
+                      },
+                      "filename": {
+                        "type": "string"
+                      },
+                      "status": {
+                        "type": "string"
+                      },
+                      "progress": {
+                        "type": "integer"
+                      },
+                      "bytes_downloaded": {
+                        "type": "integer"
+                      },
+                      "bytes_total": {
+                        "type": "integer"
+                      },
+                      "error": {
+                        "type": "string",
+                        "nullable": true
+                      },
+                      "started_at": {
+                        "type": "number"
+                      },
+                      "completed_at": {
+                        "type": "number"
+                      },
+                      "model_type": {
+                        "type": "string",
+                        "nullable": true
+                      },
+                      "warnings": {
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      }
+                    },
+                    "additionalProperties": true,
+                    "required": [
+                      "id",
+                      "filename",
+                      "status",
+                      "progress",
+                      "bytes_downloaded",
+                      "bytes_total",
+                      "error",
+                      "started_at",
+                      "completed_at",
+                      "model_type",
+                      "warnings"
+                    ]
+                  }
+                }
+              },
+              "additionalProperties": true,
+              "required": [
+                "downloads"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "x-maestro": {
+      "feature": "model_import",
+      "permissions": [],
+      "boundary": "Existing signed session and origin guards apply; this host-control prefix is unavailable through Cloudflare. LAN access remains subject to production origin/account guards. Read-only snapshot; it neither grants compute authority nor changes project access.",
+      "idempotency": "Read-only; repeat to refresh current state.",
+      "operation_kind": "model_import",
+      "mcp": true,
+      "contract_status": "authored",
+      "source": "app/launch.py:26684",
+      "handler": "civitai_downloads_status"
+    }
+  },
+  {
+    "method": "POST",
+    "path": "/api/v1/huggingface/import-lora",
+    "summary": "Import LoRA URL",
+    "description": "Historical route accepts Hugging Face repository URLs and CivitAI model/version/download URLs. Selects a SafeTensor file, creates confined sidecars and starts a background import; target_dir is a plain component.",
+    "responses": {
+      "200": {
+        "description": "Import LoRA URL result.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "status": {
+                  "type": "string"
+                },
+                "download_id": {
+                  "type": "string"
+                },
+                "filename": {
+                  "type": "string"
+                },
+                "target_dir": {
+                  "type": "string"
+                },
+                "repo_id": {
+                  "type": "string"
+                },
+                "base_model": {
+                  "type": "string"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    "x-maestro": {
+      "feature": "model_import",
+      "permissions": [],
+      "boundary": "Existing signed session and origin guards apply; this host-control prefix is unavailable through Cloudflare. LAN access remains subject to production origin/account guards. Human-selected external model import and filesystem placement; not arbitrary URL/host path execution.",
+      "idempotency": "No replay identity. Observe civitai/downloads; a timeout does not cancel or justify a second import.",
+      "operation_kind": "model_import",
+      "mcp": false,
+      "contract_status": "authored",
+      "source": "app/launch.py:26875",
+      "handler": "hf_import_lora"
+    },
+    "requestBody": {
+      "required": true,
+      "content": {
+        "application/json": {
+          "schema": {
+            "type": "object",
+            "properties": {
+              "url": {
+                "type": "string",
+                "format": "uri",
+                "minLength": 1
+              },
+              "target_dir": {
+                "type": "string",
+                "default": ""
+              },
+              "filename": {
+                "type": "string",
+                "default": ""
+              }
+            },
+            "additionalProperties": true,
+            "required": [
+              "url"
+            ]
+          },
+          "example": {
+            "url": "https://huggingface.co/example/lora-repository",
+            "filename": "example.safetensors"
+          }
+        }
+      }
+    }
+  },
+  {
+    "method": "POST",
+    "path": "/api/v1/checkpoints/{model_type}/generate-guide",
+    "summary": "Generate checkpoint prompting guide",
+    "description": "Requires existing CivitAI-imported finetune provenance; reads sidecar and optional source pointers, uses configured guide LLM, writes enhance_guide_text into that definition. Optional malformed/absent body falls back to stored provenance.",
+    "responses": {
+      "200": {
+        "description": "Generate checkpoint prompting guide result.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "guide": {
+                  "type": "string"
+                },
+                "source_urls": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              },
+              "additionalProperties": true,
+              "required": [
+                "guide",
+                "source_urls"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "x-maestro": {
+      "feature": "model_import",
+      "permissions": [],
+      "boundary": "Existing signed session and origin guards apply; this host-control prefix is unavailable through Cloudflare. LAN access remains subject to production origin/account guards. Human-controlled catalog write and configured LLM/source enrichment; provider and compute preparation retain their own authorization.",
+      "idempotency": "Regenerates/replaces the inline guide; read the returned guide before deciding to repeat.",
+      "operation_kind": "model_import",
+      "mcp": false,
+      "contract_status": "authored",
+      "source": "app/launch.py:27770",
+      "handler": "generate_checkpoint_guide"
+    },
+    "requestBody": {
+      "required": false,
+      "content": {
+        "application/json": {
+          "schema": {
+            "type": "object",
+            "properties": {
+              "source_url": {
+                "type": "string",
+                "format": "uri"
+              },
+              "source_urls": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "format": "uri"
+                }
+              }
+            },
+            "additionalProperties": true
+          },
+          "example": {
+            "source_urls": [
+              "https://huggingface.co/example/model"
+            ]
+          }
+        }
+      }
+    },
+    "parameters": [
+      {
+        "name": "model_type",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string"
+        }
+      }
+    ]
+  },
+  {
+    "method": "GET",
+    "path": "/api/v1/model-options/{model_type}",
+    "summary": "Read model capability controls",
+    "description": "Current catalog/default-derived UI contract. False/absent capability does not authorize a control; current execution and terms gates remain authoritative. Additional model-specific choices/settings are extensible.",
+    "responses": {
+      "200": {
+        "description": "Read model capability controls result.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "model_type": {
+                  "type": "string"
+                },
+                "architecture": {
+                  "type": "string"
+                },
+                "guidance_max_phases": {
+                  "type": "integer"
+                },
+                "lock_guidance_phases": {
+                  "type": "boolean"
+                },
+                "sliding_window": {
+                  "type": "boolean"
+                },
+                "image_outputs": {
+                  "type": "boolean"
+                },
+                "audio_only": {
+                  "type": "boolean"
+                },
+                "returns_audio": {
+                  "type": "boolean"
+                },
+                "i2v_class": {
+                  "type": "boolean"
+                },
+                "t2v_class": {
+                  "type": "boolean"
+                },
+                "fps": {
+                  "type": "number"
+                },
+                "frames_minimum": {
+                  "type": "integer"
+                },
+                "frames_steps": {
+                  "type": "integer"
+                },
+                "frames_maximum": {
+                  "type": "integer",
+                  "nullable": true
+                },
+                "frame_alignment_modulus": {
+                  "type": "integer"
+                },
+                "frame_alignment_remainder": {
+                  "type": "integer"
+                },
+                "frame_alignment_mode": {
+                  "type": "string"
+                },
+                "resolutions": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "label": {
+                        "type": "string"
+                      },
+                      "value": {
+                        "type": "string"
+                      }
+                    },
+                    "additionalProperties": true
+                  },
+                  "nullable": true
+                },
+                "guide_preprocessing": {
+                  "type": "object",
+                  "properties": {},
+                  "additionalProperties": true,
+                  "nullable": true
+                },
+                "guide_custom_choices": {
+                  "type": "object",
+                  "properties": {},
+                  "additionalProperties": true,
+                  "nullable": true
+                },
+                "image_ref_choices": {
+                  "type": "object",
+                  "properties": {},
+                  "additionalProperties": true,
+                  "nullable": true
+                },
+                "audio_prompt_type_sources": {
+                  "type": "object",
+                  "properties": {},
+                  "additionalProperties": true,
+                  "nullable": true
+                },
+                "sample_solvers": {
+                  "type": "array",
+                  "items": {
+                    "type": "array",
+                    "items": {}
+                  },
+                  "nullable": true
+                },
+                "sliding_window_defaults": {
+                  "type": "object",
+                  "properties": {},
+                  "additionalProperties": true,
+                  "nullable": true
+                },
+                "custom_settings_def": {
+                  "type": "object",
+                  "properties": {},
+                  "additionalProperties": true,
+                  "nullable": true
+                },
+                "semantic_reference_limits": {
+                  "type": "object",
+                  "properties": {},
+                  "additionalProperties": true,
+                  "nullable": true
+                },
+                "max_image_refs": {
+                  "type": "integer",
+                  "nullable": true
+                },
+                "reference_image_max_count": {
+                  "type": "integer",
+                  "nullable": true
+                },
+                "reference_video_max_count": {
+                  "type": "integer",
+                  "nullable": true
+                },
+                "reference_audio_max_count": {
+                  "type": "integer",
+                  "nullable": true
+                },
+                "mixed_reference_max_count": {
+                  "type": "integer",
+                  "nullable": true
+                },
+                "default_num_inference_steps": {
+                  "type": "integer",
+                  "nullable": true
+                },
+                "default_guidance_scale": {
+                  "type": "number",
+                  "nullable": true
+                },
+                "default_video_length": {
+                  "type": "integer",
+                  "nullable": true
+                },
+                "default_sliding_window_size": {
+                  "type": "integer",
+                  "nullable": true
+                },
+                "ltx25_video_vae_choices": {
+                  "description": "Current model-defined choices; preserve catalog shape, including null/array forms."
+                },
+                "ltx25_video_vae_default": {
+                  "type": "string"
+                },
+                "h3_native_boundary_conditioning": {
+                  "type": "boolean"
+                },
+                "h3_cumulative_append": {
+                  "type": "boolean"
+                },
+                "supports_end_frame": {
+                  "type": "boolean"
+                }
+              },
+              "additionalProperties": true,
+              "required": [
+                "model_type"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "x-maestro": {
+      "feature": "models",
+      "permissions": [],
+      "boundary": "Remote-visible model restriction applies. Catalog controls do not establish native, quality or GPU qualification.",
+      "idempotency": "Read-only; repeat to refresh current state.",
+      "operation_kind": "models",
+      "mcp": true,
+      "contract_status": "authored",
+      "source": "app/launch.py:28175",
+      "handler": "get_model_options"
+    },
+    "parameters": [
+      {
+        "name": "model_type",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string"
+        }
+      }
+    ]
+  },
+  {
+    "method": "GET",
+    "path": "/api/v1/system-config",
+    "summary": "Read host performance configuration",
+    "description": "Reads system settings, available attention modes and linked read-only model roots; no credentials or acceptance proof.",
+    "responses": {
+      "200": {
+        "description": "Read host performance configuration result.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "attention_mode": {
+                  "type": "string"
+                },
+                "transformer_quantization": {
+                  "type": "string"
+                },
+                "vae_config": {
+                  "type": "integer"
+                },
+                "compile": {
+                  "type": "string"
+                },
+                "video_profile": {
+                  "type": "number"
+                },
+                "image_profile": {
+                  "type": "number"
+                },
+                "audio_profile": {
+                  "type": "number"
+                },
+                "video_output_codec": {
+                  "type": "string"
+                },
+                "image_output_codec": {
+                  "type": "string"
+                },
+                "enhancer_enabled": {
+                  "type": "integer"
+                },
+                "prompt_enhancer_quantization": {
+                  "type": "string"
+                },
+                "vram_safety_coefficient": {
+                  "type": "number"
+                },
+                "model_folders": {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "description": "Existing external directory; primary and internal roots are rejected."
+                  }
+                },
+                "app_version": {
+                  "type": "string"
+                },
+                "attention_modes_available": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    "x-maestro": {
+      "feature": "settings",
+      "permissions": [],
+      "boundary": "Existing signed session and origin guards apply; this host-control prefix is unavailable through Cloudflare. LAN access remains subject to production origin/account guards. Read-only snapshot; it neither grants compute authority nor changes project access. Host paths and machine-specific configuration; human configuration UI read, not an MCP credential/filesystem projection.",
+      "idempotency": "Read-only; repeat to refresh current state.",
+      "operation_kind": "settings",
+      "mcp": false,
+      "contract_status": "authored",
+      "source": "app/launch.py:28526",
+      "handler": "get_system_config"
+    }
+  },
+  {
+    "method": "PUT",
+    "path": "/api/v1/system-config",
+    "summary": "Update host performance settings",
+    "description": "Partial update of recognized fields. model_folders is validated first, retains the primary download root and maps to linked read-only roots; raw checkpoints_paths is ignored. Unknown fields are ignored; a body with no recognized fields fails. Handler does not impose a universal model-independent value range.",
+    "responses": {
+      "200": {
+        "description": "Update host performance settings result.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "status": {
+                  "type": "string",
+                  "enum": [
+                    "ok"
+                  ]
+                },
+                "updated": {
+                  "type": "object",
+                  "properties": {},
+                  "additionalProperties": true
+                }
+              },
+              "additionalProperties": true,
+              "required": [
+                "status",
+                "updated"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "x-maestro": {
+      "feature": "settings",
+      "permissions": [],
+      "boundary": "Existing signed session and origin guards apply; this host-control prefix is unavailable through Cloudflare. LAN access remains subject to production origin/account guards. Human host-performance and arbitrary-directory configuration; can restamp queued residency. No new compute lease is granted.",
+      "idempotency": "Read system-config after any failure: live settings can change before persistence reports an error. Do not blindly retry.",
+      "operation_kind": "settings",
+      "mcp": false,
+      "contract_status": "authored",
+      "source": "app/launch.py:28606",
+      "handler": "update_system_config"
+    },
+    "requestBody": {
+      "required": true,
+      "content": {
+        "application/json": {
+          "schema": {
+            "type": "object",
+            "properties": {
+              "attention_mode": {
+                "type": "string"
+              },
+              "transformer_quantization": {
+                "type": "string"
+              },
+              "vae_config": {
+                "type": "integer"
+              },
+              "compile": {
+                "type": "string"
+              },
+              "video_profile": {
+                "type": "number"
+              },
+              "image_profile": {
+                "type": "number"
+              },
+              "audio_profile": {
+                "type": "number"
+              },
+              "video_output_codec": {
+                "type": "string"
+              },
+              "image_output_codec": {
+                "type": "string"
+              },
+              "enhancer_enabled": {
+                "type": "integer"
+              },
+              "prompt_enhancer_quantization": {
+                "type": "string"
+              },
+              "vram_safety_coefficient": {
+                "type": "number"
+              },
+              "model_folders": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "description": "Existing external directory; primary and internal roots are rejected."
+                }
+              }
+            },
+            "additionalProperties": true
+          },
+          "example": {
+            "video_profile": 4.5
+          }
+        }
+      }
+    }
+  },
+  {
+    "method": "GET",
+    "path": "/api/v1/model-folders/scan",
+    "summary": "Discover sibling model folders",
+    "description": "Scans sibling Pinokio installs for external app/ckpts directories. Size is top-level-only, not recursive; no caller-supplied scan root.",
+    "responses": {
+      "200": {
+        "description": "Discover sibling model folders result.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "candidates": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "app": {
+                        "type": "string"
+                      },
+                      "path": {
+                        "type": "string"
+                      },
+                      "files": {
+                        "type": "integer"
+                      },
+                      "folders": {
+                        "type": "integer"
+                      },
+                      "size_gb": {
+                        "type": "number"
+                      },
+                      "linked": {
+                        "type": "boolean"
+                      }
+                    },
+                    "additionalProperties": true
+                  }
+                }
+              },
+              "additionalProperties": true,
+              "required": [
+                "candidates"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "x-maestro": {
+      "feature": "settings",
+      "permissions": [],
+      "boundary": "Existing signed session and origin guards apply; this host-control prefix is unavailable through Cloudflare. LAN access remains subject to production origin/account guards. Read-only host discovery with authorized local filesystem metadata. Sibling-install absolute paths are host filesystem metadata; keep this discovery in local configuration UI.",
+      "idempotency": "Read-only; repeat to refresh current state.",
+      "operation_kind": "settings",
+      "mcp": false,
+      "contract_status": "authored",
+      "source": "app/launch.py:28662",
+      "handler": "scan_model_folders"
+    }
+  },
+  {
+    "method": "GET",
+    "path": "/api/v1/downloads/active",
+    "summary": "Read download progress",
+    "description": "Best-effort tracked downloads include elapsed stall information; empty does not prove that no upstream download is running.",
+    "responses": {
+      "200": {
+        "description": "Read download progress result.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "downloads": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": true
+                  }
+                }
+              },
+              "additionalProperties": true,
+              "required": [
+                "downloads"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "x-maestro": {
+      "feature": "settings",
+      "permissions": [],
+      "boundary": "Existing signed session and origin guards apply; this host-control prefix is unavailable through Cloudflare. LAN access remains subject to production origin/account guards. Read-only snapshot; it neither grants compute authority nor changes project access.",
+      "idempotency": "Read-only; repeat to refresh current state.",
+      "operation_kind": "settings",
+      "mcp": true,
+      "contract_status": "authored",
+      "source": "app/launch.py:28732",
+      "handler": "get_active_downloads"
+    }
+  },
+  {
+    "method": "GET",
+    "path": "/api/v1/system-detect",
+    "summary": "Read hardware recommendation",
+    "description": "Returns detected hardware, recommended display/performance fields and automatic-tuning status, including CPU/no-GPU cases.",
+    "responses": {
+      "200": {
+        "description": "Read hardware recommendation result.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "hardware": {
+                  "type": "object",
+                  "properties": {},
+                  "additionalProperties": true
+                },
+                "recommended": {
+                  "type": "object",
+                  "properties": {},
+                  "additionalProperties": true
+                },
+                "auto_enabled": {
+                  "type": "boolean"
+                }
+              },
+              "additionalProperties": true,
+              "required": [
+                "hardware",
+                "recommended",
+                "auto_enabled"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "x-maestro": {
+      "feature": "settings",
+      "permissions": [],
+      "boundary": "Existing signed session and origin guards apply; this host-control prefix is unavailable through Cloudflare. LAN access remains subject to production origin/account guards. Hardware metadata probes; no model inference or compute authority.",
+      "idempotency": "Read-only; repeat to refresh current state.",
+      "operation_kind": "settings",
+      "mcp": true,
+      "contract_status": "authored",
+      "source": "app/launch.py:28751",
+      "handler": "get_system_detect"
+    }
+  },
+  {
+    "method": "POST",
+    "path": "/api/v1/system-detect/apply",
+    "summary": "Apply recommended host settings",
+    "description": "Redetects hardware, writes only recognized recommendation keys, enables auto_performance and restamps queued residency. Profile changes apply on next load.",
+    "responses": {
+      "200": {
+        "description": "Apply recommended host settings result.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "status": {
+                  "type": "string"
+                },
+                "hardware": {
+                  "type": "object",
+                  "properties": {},
+                  "additionalProperties": true
+                },
+                "applied": {
+                  "type": "object",
+                  "properties": {},
+                  "additionalProperties": true
+                },
+                "label": {
+                  "type": "string"
+                },
+                "reason": {
+                  "type": "string"
+                },
+                "profile_changed": {
+                  "type": "boolean"
+                }
+              },
+              "additionalProperties": true,
+              "required": [
+                "status",
+                "hardware",
+                "applied",
+                "profile_changed"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "x-maestro": {
+      "feature": "settings",
+      "permissions": [],
+      "boundary": "Existing signed session and origin guards apply; this host-control prefix is unavailable through Cloudflare. LAN access remains subject to production origin/account guards. Human host-wide performance mutation, not native qualification.",
+      "idempotency": "Recomputes recommendations; inspect system-config/system-detect after an uncertain write.",
+      "operation_kind": "settings",
+      "mcp": false,
+      "contract_status": "authored",
+      "source": "app/launch.py:28772",
+      "handler": "apply_system_detect"
+    }
+  },
+  {
+    "method": "GET",
+    "path": "/api/v1/system-stats",
+    "summary": "Read live host telemetry",
+    "description": "Best-effort CPU/RAM/NVML readings and currently resident generation model. A loaded flag is observation, not a GPU authorization.",
+    "responses": {
+      "200": {
+        "description": "Read live host telemetry result.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "cpu": {
+                  "type": "object",
+                  "properties": {
+                    "percent": {
+                      "type": "number"
+                    }
+                  },
+                  "additionalProperties": true
+                },
+                "ram": {
+                  "type": "object",
+                  "properties": {
+                    "percent": {
+                      "type": "number"
+                    },
+                    "used_gb": {
+                      "type": "number"
+                    },
+                    "total_gb": {
+                      "type": "number"
+                    }
+                  },
+                  "additionalProperties": true
+                },
+                "gpu": {
+                  "type": "object",
+                  "properties": {
+                    "available": {
+                      "type": "boolean"
+                    },
+                    "percent": {
+                      "type": "number"
+                    },
+                    "compute_percent": {
+                      "type": "number"
+                    },
+                    "vram_used_gb": {
+                      "type": "number"
+                    },
+                    "vram_total_gb": {
+                      "type": "number"
+                    },
+                    "vram_percent": {
+                      "type": "number"
+                    }
+                  },
+                  "additionalProperties": true
+                },
+                "model": {
+                  "type": "object",
+                  "properties": {
+                    "name": {
+                      "type": "string",
+                      "nullable": true
+                    },
+                    "model_type": {
+                      "type": "string",
+                      "nullable": true
+                    },
+                    "loaded": {
+                      "type": "boolean"
+                    }
+                  },
+                  "additionalProperties": true
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    "x-maestro": {
+      "feature": "settings",
+      "permissions": [],
+      "boundary": "Existing signed session and origin guards apply; this host-control prefix is unavailable through Cloudflare. LAN access remains subject to production origin/account guards. Read-only snapshot; it neither grants compute authority nor changes project access.",
+      "idempotency": "Read-only; repeat to refresh current state.",
+      "operation_kind": "settings",
+      "mcp": true,
+      "contract_status": "authored",
+      "source": "app/launch.py:28839",
+      "handler": "get_system_stats_live"
+    }
+  },
+  {
+    "method": "GET",
+    "path": "/api/v1/system/preflight",
+    "summary": "Read startup environment checks",
+    "description": "Checks ffmpeg, CUDA availability/import and output-drive free space. Warnings are diagnostics, not a hard generation gate or native acceptance.",
+    "responses": {
+      "200": {
+        "description": "Read startup environment checks result.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "ok": {
+                  "type": "boolean"
+                },
+                "checks": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "id": {
+                        "type": "string"
+                      },
+                      "level": {
+                        "type": "string",
+                        "enum": [
+                          "error",
+                          "warn"
+                        ]
+                      },
+                      "message": {
+                        "type": "string"
+                      }
+                    },
+                    "additionalProperties": true,
+                    "required": [
+                      "id",
+                      "level",
+                      "message"
+                    ]
+                  }
+                }
+              },
+              "additionalProperties": true,
+              "required": [
+                "ok",
+                "checks"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "x-maestro": {
+      "feature": "settings",
+      "permissions": [],
+      "boundary": "Existing signed session and origin guards apply; this host-control prefix is unavailable through Cloudflare. LAN access remains subject to production origin/account guards. Metadata/environment checks only; native generation still requires its existing lease and admission.",
+      "idempotency": "Read-only; repeat to refresh current state.",
+      "operation_kind": "settings",
+      "mcp": true,
+      "contract_status": "authored",
+      "source": "app/launch.py:29517",
+      "handler": "system_preflight"
+    }
+  },
+  {
+    "method": "GET",
+    "path": "/api/v1/services-config",
+    "summary": "Read masked service configuration",
+    "description": "Local response includes masked keys/set flags and host options. Remote response is deliberately limited to model/provider IDs, mature-guidance/voice visibility and remote_read_only; it omits host/provider details.",
+    "responses": {
+      "200": {
+        "description": "Read masked service configuration result.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "llm_model_id": {
+                  "type": "string"
+                },
+                "llm_device": {
+                  "type": "string"
+                },
+                "llm_provider": {
+                  "type": "string",
+                  "enum": [
+                    "local",
+                    "remote",
+                    "openai",
+                    "anthropic"
+                  ]
+                },
+                "llm_remote_url": {
+                  "type": "string"
+                },
+                "enhance_llm_model_id": {
+                  "type": "string"
+                },
+                "enhance_llm_device": {
+                  "type": "string"
+                },
+                "director_prompt_polish": {
+                  "type": "string"
+                },
+                "flashvsr_mode": {
+                  "type": "integer"
+                },
+                "flashvsr_topk_ratio": {
+                  "type": "number"
+                },
+                "flashvsr_backend": {
+                  "type": "string"
+                },
+                "use_director_v2": {
+                  "type": "boolean"
+                },
+                "nsfw_mode": {
+                  "type": "boolean"
+                },
+                "voice_reference_enabled": {
+                  "type": "boolean"
+                },
+                "ltx_progressive_pipeline": {
+                  "type": "boolean"
+                },
+                "show_experimental": {
+                  "type": "boolean"
+                },
+                "auto_performance": {
+                  "type": "boolean"
+                },
+                "storage_allow_linked_removal": {
+                  "type": "boolean"
+                },
+                "director_multishot_lora_mode": {
+                  "type": "boolean"
+                },
+                "llm_selection_revision": {
+                  "type": "string"
+                },
+                "remote_read_only": {
+                  "type": "boolean"
+                },
+                "google_api_key": {
+                  "type": "string",
+                  "description": "Masked server-owned key, never the stored credential."
+                },
+                "google_api_key_set": {
+                  "type": "boolean"
+                },
+                "llm_remote_api_key": {
+                  "type": "string",
+                  "description": "Masked server-owned key, never the stored credential."
+                },
+                "llm_remote_api_key_set": {
+                  "type": "boolean"
+                },
+                "openai_api_key": {
+                  "type": "string",
+                  "description": "Masked server-owned key, never the stored credential."
+                },
+                "openai_api_key_set": {
+                  "type": "boolean"
+                },
+                "anthropic_api_key": {
+                  "type": "string",
+                  "description": "Masked server-owned key, never the stored credential."
+                },
+                "anthropic_api_key_set": {
+                  "type": "boolean"
+                },
+                "civitai_api_key": {
+                  "type": "string",
+                  "description": "Masked server-owned key, never the stored credential."
+                },
+                "civitai_api_key_set": {
+                  "type": "boolean"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    "x-maestro": {
+      "feature": "settings",
+      "permissions": [],
+      "boundary": "Signed-session read; remote projection is restricted by production locality policy. No unmasked credentials are returned. Masked credential fragments/provider endpoint and private host selection settings; use llm/models and llm/status for safe MCP discovery.",
+      "idempotency": "Read-only; repeat to refresh current state.",
+      "operation_kind": "settings",
+      "mcp": false,
+      "contract_status": "authored",
+      "source": "app/launch.py:29633",
+      "handler": "get_services_config"
+    }
+  },
+  {
+    "method": "PUT",
+    "path": "/api/v1/services-config",
+    "summary": "Configure providers and host services",
+    "description": "Partial recognized-key update. Unknown fields are ignored; current selection revision is server-minted. Public providers disable mature guidance; enabling local mature guidance requires exact current host notice. Does not inspect creative content or accept a client-created consent record.",
+    "responses": {
+      "200": {
+        "description": "Configure providers and host services result.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "status": {
+                  "type": "string"
+                },
+                "updated": {
+                  "type": "object",
+                  "properties": {},
+                  "additionalProperties": true
+                }
+              },
+              "additionalProperties": true,
+              "required": [
+                "status",
+                "updated"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "x-maestro": {
+      "feature": "settings",
+      "permissions": [],
+      "boundary": "Machine-wide human provider/credential/configuration action; unavailable through Cloudflare. Never send API keys through MCP or accept terms automatically.",
+      "idempotency": "Read masked services-config after uncertainty; do not echo returned masked values as new credentials.",
+      "operation_kind": "settings",
+      "mcp": false,
+      "contract_status": "authored",
+      "source": "app/launch.py:31264",
+      "handler": "update_services_config"
+    },
+    "requestBody": {
+      "required": true,
+      "content": {
+        "application/json": {
+          "schema": {
+            "type": "object",
+            "properties": {
+              "llm_model_id": {
+                "type": "string"
+              },
+              "llm_device": {
+                "type": "string"
+              },
+              "llm_provider": {
+                "type": "string",
+                "enum": [
+                  "local",
+                  "remote",
+                  "openai",
+                  "anthropic"
+                ]
+              },
+              "llm_remote_url": {
+                "type": "string"
+              },
+              "enhance_llm_model_id": {
+                "type": "string"
+              },
+              "enhance_llm_device": {
+                "type": "string"
+              },
+              "director_prompt_polish": {
+                "type": "string"
+              },
+              "flashvsr_mode": {
+                "type": "integer"
+              },
+              "flashvsr_topk_ratio": {
+                "type": "number"
+              },
+              "flashvsr_backend": {
+                "type": "string"
+              },
+              "use_director_v2": {
+                "type": "boolean"
+              },
+              "nsfw_mode": {
+                "type": "boolean"
+              },
+              "voice_reference_enabled": {
+                "type": "boolean"
+              },
+              "ltx_progressive_pipeline": {
+                "type": "boolean"
+              },
+              "show_experimental": {
+                "type": "boolean"
+              },
+              "auto_performance": {
+                "type": "boolean"
+              },
+              "storage_allow_linked_removal": {
+                "type": "boolean"
+              },
+              "director_multishot_lora_mode": {
+                "type": "boolean"
+              },
+              "google_api_key": {
+                "type": "string",
+                "writeOnly": true,
+                "description": "Human-supplied credential; *** and the existing masked display form are ignored."
+              },
+              "llm_remote_api_key": {
+                "type": "string",
+                "writeOnly": true,
+                "description": "Human-supplied credential; *** and the existing masked display form are ignored."
+              },
+              "openai_api_key": {
+                "type": "string",
+                "writeOnly": true,
+                "description": "Human-supplied credential; *** and the existing masked display form are ignored."
+              },
+              "anthropic_api_key": {
+                "type": "string",
+                "writeOnly": true,
+                "description": "Human-supplied credential; *** and the existing masked display form are ignored."
+              },
+              "civitai_api_key": {
+                "type": "string",
+                "writeOnly": true,
+                "description": "Human-supplied credential; *** and the existing masked display form are ignored."
+              }
+            },
+            "additionalProperties": true
+          },
+          "example": {
+            "voice_reference_enabled": true
+          }
+        }
+      }
+    }
+  },
+  {
+    "method": "GET",
+    "path": "/api/v1/host-terms",
+    "summary": "Read current host notices",
+    "description": "Returns notice versions/current acceptance after authorizing an existing project; does not create the project.",
+    "responses": {
+      "200": {
+        "description": "Read current host notices result.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "terms": {
+                  "type": "object",
+                  "properties": {},
+                  "additionalProperties": true
+                }
+              },
+              "additionalProperties": true,
+              "required": [
+                "terms"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "x-maestro": {
+      "feature": "terms",
+      "permissions": [
+        "project.read"
+      ],
+      "boundary": "Existing project access is required even for local default project; no host-control capability is granted.",
+      "idempotency": "Read-only; repeat to refresh current state.",
+      "operation_kind": "terms",
+      "mcp": true,
+      "contract_status": "authored",
+      "source": "app/launch.py:29754",
+      "handler": "get_host_terms"
+    },
+    "parameters": [
+      {
+        "name": "workspace",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "string",
+          "default": ""
+        },
+        "description": ""
+      }
+    ]
+  },
+  {
+    "method": "POST",
+    "path": "/api/v1/host-terms/accept",
+    "summary": "Accept displayed host notice",
+    "description": "Persists only the exact current named notice/version; stale version is 409. Any currently authorized existing-project user may confirm, including a password-unlocked remote session. Stores no accepting identity and grants no project/machine capability.",
+    "responses": {
+      "200": {
+        "description": "Accept displayed host notice result.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "status": {
+                  "type": "string"
+                },
+                "terms": {
+                  "type": "object",
+                  "properties": {},
+                  "additionalProperties": true
+                }
+              },
+              "additionalProperties": true,
+              "required": [
+                "status",
+                "terms"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "x-maestro": {
+      "feature": "terms",
+      "permissions": [
+        "project.mutate"
+      ],
+      "boundary": "Explicit human notice acceptance; never infer acceptance from an API agent or prior model availability.",
+      "idempotency": "Same current notice/version is a state update; refresh versions after conflict.",
+      "operation_kind": "terms",
+      "mcp": false,
+      "contract_status": "authored",
+      "source": "app/launch.py:29766",
+      "handler": "accept_host_terms"
+    },
+    "requestBody": {
+      "required": true,
+      "content": {
+        "application/json": {
+          "schema": {
+            "type": "object",
+            "properties": {
+              "workspace": {
+                "type": "string"
+              },
+              "term": {
+                "type": "string",
+                "minLength": 1
+              },
+              "version": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "additionalProperties": true,
+            "required": [
+              "term",
+              "version"
+            ]
+          },
+          "example": {
+            "term": "<term returned by host-terms>",
+            "version": "<current displayed version>"
+          }
+        }
+      }
+    }
+  },
+  {
+    "method": "GET",
+    "path": "/api/v1/h3/legal-access",
+    "summary": "Read owner H3 declaration",
+    "description": "Manual owner-declared physical operating country and pinned license decision. Network location is not used and written-authorization exceptions are unsupported.",
+    "responses": {
+      "200": {
+        "description": "Read owner H3 declaration result.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "territory_code": {
+                  "type": "string",
+                  "nullable": true
+                },
+                "license_revision": {
+                  "type": "string"
+                },
+                "license_sha256": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{64}$"
+                },
+                "license_url": {
+                  "type": "string",
+                  "format": "uri"
+                },
+                "location_source": {
+                  "type": "string"
+                },
+                "network_location_used": {
+                  "type": "boolean"
+                },
+                "written_authorization_supported": {
+                  "type": "boolean"
+                },
+                "availability_status": {
+                  "type": "string"
+                },
+                "execution_allowed": {
+                  "type": "boolean"
+                },
+                "declared": {
+                  "type": "boolean"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    "x-maestro": {
+      "feature": "terms",
+      "permissions": [
+        "owner.admin"
+      ],
+      "boundary": "Requires owner.admin and recent password reauthentication for this protected host policy read; direct local or permitted owner remote parity.",
+      "idempotency": "Read-only; repeat to refresh current state.",
+      "operation_kind": "terms",
+      "mcp": true,
+      "contract_status": "authored",
+      "source": "app/launch.py:30002",
+      "handler": "get_h3_legal_access"
+    }
+  },
+  {
+    "method": "PUT",
+    "path": "/api/v1/h3/legal-access",
+    "summary": "Record H3 operating declaration",
+    "description": "Exact fields only; license revision/hash must match the current displayed document, owner_attested must be true and territory must be a valid supported manual declaration.",
+    "responses": {
+      "200": {
+        "description": "Record H3 operating declaration result.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "territory_code": {
+                  "type": "string",
+                  "nullable": true
+                },
+                "license_revision": {
+                  "type": "string"
+                },
+                "license_sha256": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{64}$"
+                },
+                "license_url": {
+                  "type": "string",
+                  "format": "uri"
+                },
+                "location_source": {
+                  "type": "string"
+                },
+                "network_location_used": {
+                  "type": "boolean"
+                },
+                "written_authorization_supported": {
+                  "type": "boolean"
+                },
+                "availability_status": {
+                  "type": "string"
+                },
+                "execution_allowed": {
+                  "type": "boolean"
+                },
+                "declared": {
+                  "type": "boolean"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    "x-maestro": {
+      "feature": "terms",
+      "permissions": [
+        "owner.admin"
+      ],
+      "boundary": "Human physical-location/license declaration requires recently reauthenticated owner; no network inference or automatic legal attestation.",
+      "idempotency": "Refresh the current owner policy after any uncertain update; changed license requires fresh human review.",
+      "operation_kind": "terms",
+      "mcp": false,
+      "contract_status": "authored",
+      "source": "app/launch.py:30021",
+      "handler": "update_h3_legal_access"
+    },
+    "requestBody": {
+      "required": true,
+      "content": {
+        "application/json": {
+          "schema": {
+            "type": "object",
+            "properties": {
+              "territory_code": {
+                "type": "string",
+                "minLength": 2,
+                "maxLength": 2,
+                "pattern": "^[A-Z]{2}$",
+                "description": "Recognized ISO alpha-2 code; declaration does not override excluded-country execution policy."
+              },
+              "owner_attested": {
+                "type": "boolean",
+                "enum": [
+                  true
+                ]
+              },
+              "license_revision": {
+                "type": "string"
+              },
+              "license_sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "territory_code",
+              "owner_attested",
+              "license_revision",
+              "license_sha256"
+            ]
+          },
+          "example": {
+            "territory_code": "<physical operating country>",
+            "owner_attested": true,
+            "license_revision": "<current displayed revision>",
+            "license_sha256": "<current displayed SHA256>"
+          }
+        }
+      }
+    }
+  },
+  {
+    "method": "GET",
+    "path": "/api/v1/krea/owner-policy",
+    "summary": "Read Krea owner policy",
+    "description": "Current actor-aware manual-review and role-scope declaration; server does not classify creative content.",
+    "responses": {
+      "200": {
+        "description": "Read Krea owner policy result.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "schema_version": {
+                  "type": "integer",
+                  "enum": [
+                    3
+                  ]
+                },
+                "declaration": {
+                  "type": "string"
+                },
+                "license_version": {
+                  "type": "string",
+                  "enum": [
+                    "v1"
+                  ]
+                },
+                "license_date": {
+                  "type": "string",
+                  "enum": [
+                    "2026-06-22"
+                  ]
+                },
+                "owner_attested": {
+                  "type": "boolean",
+                  "enum": [
+                    true
+                  ]
+                },
+                "manual_review_accepted": {
+                  "type": "boolean",
+                  "enum": [
+                    true
+                  ]
+                },
+                "local_content_stays_local": {
+                  "type": "boolean",
+                  "enum": [
+                    true
+                  ]
+                },
+                "attribution_accepted": {
+                  "type": "boolean",
+                  "enum": [
+                    true
+                  ]
+                },
+                "role_use_scopes": {
+                  "type": "object",
+                  "properties": {
+                    "owner": {
+                      "type": "string",
+                      "enum": [
+                        "noncommercial"
+                      ]
+                    },
+                    "user": {
+                      "type": "string",
+                      "enum": [
+                        "commercial_under_1m"
+                      ]
+                    }
+                  },
+                  "additionalProperties": false,
+                  "required": [
+                    "owner",
+                    "user"
+                  ]
+                },
+                "content_handling": {
+                  "type": "string"
+                },
+                "license_url": {
+                  "type": "string",
+                  "format": "uri"
+                },
+                "acceptable_use_url": {
+                  "type": "string",
+                  "format": "uri"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    "x-maestro": {
+      "feature": "terms",
+      "permissions": [
+        "owner.admin"
+      ],
+      "boundary": "Recently reauthenticated owner.admin is required even for this protected policy read.",
+      "idempotency": "Read-only; repeat to refresh current state.",
+      "operation_kind": "terms",
+      "mcp": true,
+      "contract_status": "authored",
+      "source": "app/launch.py:30057",
+      "handler": "get_krea_owner_policy"
+    }
+  },
+  {
+    "method": "PUT",
+    "path": "/api/v1/krea/owner-policy",
+    "summary": "Confirm Krea manual-review responsibility",
+    "description": "Exact current schema/declaration/license and exact owner/user role_use_scopes mapping required; legacy use_scope rejected. All four acceptance booleans must be true.",
+    "responses": {
+      "200": {
+        "description": "Confirm Krea manual-review responsibility result.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "status": {
+                  "type": "string"
+                },
+                "content_handling": {
+                  "type": "string"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    "x-maestro": {
+      "feature": "terms",
+      "permissions": [
+        "owner.admin"
+      ],
+      "boundary": "Explicit human manual-review/license/attribution declaration by recently reauthenticated owner; cannot be accepted on their behalf.",
+      "idempotency": "Exact current declaration state update; refresh and obtain human review when the document changes.",
+      "operation_kind": "terms",
+      "mcp": false,
+      "contract_status": "authored",
+      "source": "app/launch.py:30077",
+      "handler": "update_krea_owner_policy"
+    },
+    "requestBody": {
+      "required": true,
+      "content": {
+        "application/json": {
+          "schema": {
+            "type": "object",
+            "properties": {
+              "schema_version": {
+                "type": "integer",
+                "enum": [
+                  3
+                ]
+              },
+              "declaration": {
+                "type": "string"
+              },
+              "license_version": {
+                "type": "string",
+                "enum": [
+                  "v1"
+                ]
+              },
+              "license_date": {
+                "type": "string",
+                "enum": [
+                  "2026-06-22"
+                ]
+              },
+              "owner_attested": {
+                "type": "boolean",
+                "enum": [
+                  true
+                ]
+              },
+              "manual_review_accepted": {
+                "type": "boolean",
+                "enum": [
+                  true
+                ]
+              },
+              "local_content_stays_local": {
+                "type": "boolean",
+                "enum": [
+                  true
+                ]
+              },
+              "attribution_accepted": {
+                "type": "boolean",
+                "enum": [
+                  true
+                ]
+              },
+              "role_use_scopes": {
+                "type": "object",
+                "properties": {
+                  "owner": {
+                    "type": "string",
+                    "enum": [
+                      "noncommercial"
+                    ]
+                  },
+                  "user": {
+                    "type": "string",
+                    "enum": [
+                      "commercial_under_1m"
+                    ]
+                  }
+                },
+                "additionalProperties": false,
+                "required": [
+                  "owner",
+                  "user"
+                ]
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "schema_version",
+              "declaration",
+              "license_version",
+              "license_date",
+              "owner_attested",
+              "manual_review_accepted",
+              "local_content_stays_local",
+              "attribution_accepted",
+              "role_use_scopes"
+            ]
+          }
+        }
+      }
+    }
+  },
+  {
+    "method": "GET",
+    "path": "/api/v1/support/catalog",
+    "summary": "Read configured support options",
+    "description": "Public provider states, destinations and supporter-benefit projection; unavailable/locked states are truthful. Does not start payment or activate credits.",
+    "responses": {
+      "200": {
+        "description": "Read configured support options result.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "schema_version": {
+                  "type": "integer"
+                },
+                "providers": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "state": {
+                        "type": "string"
+                      },
+                      "enabled": {
+                        "type": "boolean"
+                      },
+                      "configured": {
+                        "type": "boolean"
+                      },
+                      "support_url": {
+                        "type": "string",
+                        "nullable": true
+                      },
+                      "destinations": {
+                        "type": "array",
+                        "items": {
+                          "type": "object",
+                          "properties": {},
+                          "additionalProperties": true
+                        }
+                      },
+                      "provider_id": {
+                        "type": "string"
+                      },
+                      "display_name": {
+                        "type": "string"
+                      },
+                      "funding_modes": {
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      },
+                      "description": {
+                        "type": "string"
+                      },
+                      "membership_contract": {
+                        "type": "boolean"
+                      },
+                      "support_evidence": {
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": true,
+                        "nullable": true
+                      },
+                      "public_home_url": {
+                        "type": "string",
+                        "nullable": true
+                      }
+                    },
+                    "additionalProperties": true
+                  }
+                },
+                "supporter_benefits": {
+                  "type": "object",
+                  "properties": {},
+                  "additionalProperties": true
+                },
+                "provider_neutral": {
+                  "type": "boolean"
+                },
+                "paid_capacity_enabled": {
+                  "type": "boolean"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    "x-maestro": {
+      "feature": "support",
+      "permissions": [],
+      "boundary": "Read-only snapshot; it neither grants compute authority nor changes project access.",
+      "idempotency": "Read-only; repeat to refresh current state.",
+      "operation_kind": "support",
+      "mcp": true,
+      "contract_status": "authored",
+      "source": "app/launch.py:30917",
+      "handler": "get_support_catalog"
+    }
+  },
+  {
+    "method": "GET",
+    "path": "/api/v1/support/self",
+    "summary": "Read own support state",
+    "description": "Account-scoped supporter entitlement, responsible-use and credit projections. No target account selector.",
+    "responses": {
+      "200": {
+        "description": "Read own support state result.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "schema_version": {
+                  "type": "integer"
+                },
+                "providers": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": true
+                  }
+                },
+                "supporter_benefits": {
+                  "type": "object",
+                  "properties": {},
+                  "additionalProperties": true
+                },
+                "account_support": {
+                  "type": "object",
+                  "properties": {
+                    "recorded": {
+                      "type": "object",
+                      "properties": {},
+                      "additionalProperties": true
+                    },
+                    "benefits": {
+                      "type": "object",
+                      "properties": {},
+                      "additionalProperties": true
+                    },
+                    "owner_test_credits": {
+                      "type": "object",
+                      "properties": {},
+                      "additionalProperties": true
+                    }
+                  },
+                  "additionalProperties": true
+                },
+                "responsible_use": {
+                  "type": "object",
+                  "properties": {
+                    "notice": {
+                      "type": "object",
+                      "properties": {},
+                      "additionalProperties": true
+                    },
+                    "status": {
+                      "type": "object",
+                      "properties": {},
+                      "additionalProperties": true
+                    }
+                  },
+                  "additionalProperties": true
+                }
+              },
+              "additionalProperties": true,
+              "required": [
+                "account_support",
+                "responsible_use"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "x-maestro": {
+      "feature": "support",
+      "permissions": [],
+      "boundary": "Authenticated account session and configured support portal; only its own account projection is returned.",
+      "idempotency": "Read-only; repeat to refresh current state.",
+      "operation_kind": "support",
+      "mcp": true,
+      "contract_status": "authored",
+      "source": "app/launch.py:30925",
+      "handler": "get_account_support"
+    }
+  },
+  {
+    "method": "POST",
+    "path": "/api/v1/support/webhooks/buy-me-a-coffee",
+    "summary": "Receive signed support event",
+    "description": "Consumes exact raw webhook bytes and provider signature headers; server secret, association and replay integrity are authoritative. No agent may forge an event to grant entitlements.",
+    "responses": {
+      "200": {
+        "description": "Receive signed support event result.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "status": {
+                  "type": "string",
+                  "enum": [
+                    "accepted"
+                  ]
+                },
+                "duplicate": {
+                  "type": "boolean"
+                }
+              },
+              "additionalProperties": true,
+              "required": [
+                "status",
+                "duplicate"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "x-maestro": {
+      "feature": "support",
+      "permissions": [],
+      "boundary": "Provider ingestion endpoint enabled only by configured webhook runtime; signature and ledger integrity required, not ordinary user/MCP mutation.",
+      "idempotency": "Exact signed duplicate returns duplicate=True; integrity conflicts fail closed.",
+      "operation_kind": "support",
+      "mcp": false,
+      "contract_status": "authored",
+      "source": "app/launch.py:30936",
+      "handler": "receive_buy_me_a_coffee_webhook"
+    },
+    "requestBody": {
+      "required": true,
+      "content": {
+        "application/json": {
+          "schema": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": true,
+            "description": "Buy Me a Coffee signed provider event. Preserve exact raw bytes; provider-specific fields are validated by the configured adapter, not a user-editable support action."
+          }
+        }
+      }
+    },
+    "parameters": [
+      {
+        "name": "x-signature-sha256",
+        "in": "header",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "pattern": "^[0-9a-fA-F]{64}$"
+        },
+        "description": "HMAC-SHA256 over the exact raw request bytes, supplied by the configured provider."
+      }
+    ]
+  },
+  {
+    "method": "GET",
+    "path": "/api/v1/support/admin/accounts/{account_id}",
+    "summary": "Read owner support administration",
+    "description": "Returns the target account support/ledger projection under owner administration; unavailable until account/support activation permits it.",
+    "responses": {
+      "200": {
+        "description": "Read owner support administration result.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {},
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    "x-maestro": {
+      "feature": "support_admin",
+      "permissions": [],
+      "boundary": "Personal financial/admin data requires owner authority and production recent-confirmation checks; not a public or delegated MCP account lookup.",
+      "idempotency": "Read-only; repeat to refresh current state.",
+      "operation_kind": "support_admin",
+      "mcp": false,
+      "contract_status": "authored",
+      "source": "app/launch.py:31006",
+      "handler": "get_admin_account_support"
+    },
+    "parameters": [
+      {
+        "name": "account_id",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{32}$"
+        }
+      }
+    ]
+  },
+  {
+    "method": "POST",
+    "path": "/api/v1/support/admin/accounts/{account_id}/fulfillment",
+    "summary": "Record owner fulfillment transition",
+    "description": "Exact fields only. Item is a registered fulfillment name; proof_reference is null or an opaque key. State transition is ledger-backed and does not dispatch paid work.",
+    "responses": {
+      "200": {
+        "description": "Record owner fulfillment transition result.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {},
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    "x-maestro": {
+      "feature": "support_admin",
+      "permissions": [],
+      "boundary": "Human owner administrative ledger action; authenticated portal owner and recent confirmation required.",
+      "idempotency": "Exact opaque idempotency_key maps to one ledger event; preserve it on reconciliation, changed content is not a new retry.",
+      "operation_kind": "support_admin",
+      "mcp": false,
+      "contract_status": "authored",
+      "source": "app/launch.py:31021",
+      "handler": "transition_admin_account_fulfillment"
+    },
+    "requestBody": {
+      "required": true,
+      "content": {
+        "application/json": {
+          "schema": {
+            "type": "object",
+            "properties": {
+              "target_event_id": {
+                "type": "string"
+              },
+              "item": {
+                "type": "string",
+                "pattern": "^[a-z][a-z0-9_]{1,63}$"
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "pending",
+                  "in_progress",
+                  "fulfilled",
+                  "declined",
+                  "reversed"
+                ]
+              },
+              "idempotency_key": {
+                "type": "string",
+                "pattern": "^key_[0-9a-f]{64}$"
+              },
+              "proof_reference": {
+                "type": "string",
+                "pattern": "^key_[0-9a-f]{64}$",
+                "nullable": true
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "target_event_id",
+              "item",
+              "status",
+              "idempotency_key",
+              "proof_reference"
+            ]
+          }
+        }
+      }
+    },
+    "parameters": [
+      {
+        "name": "account_id",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{32}$"
+        }
+      }
+    ]
+  },
+  {
+    "method": "POST",
+    "path": "/api/v1/support/admin/accounts/{account_id}/contributions",
+    "summary": "Record manual support contribution",
+    "description": "Exact fields only. Positive amount required for contribution/start/renew/refund/chargeback; cancel uses zero and target_event_id. Renew/cancel/refund/chargeback need target event. Source/kind combinations are restricted by ledger, not inferred payment authority.",
+    "responses": {
+      "200": {
+        "description": "Record manual support contribution result.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {},
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    "x-maestro": {
+      "feature": "support_admin",
+      "permissions": [],
+      "boundary": "Human owner manual financial record, not payment/credit fabrication or paid dispatch. Existing portal owner/recent-confirmation checks apply.",
+      "idempotency": "Preserve exact idempotency_key and target event; ledger deduplicates corresponding source event.",
+      "operation_kind": "support_admin",
+      "mcp": false,
+      "contract_status": "authored",
+      "source": "app/launch.py:31055",
+      "handler": "record_admin_account_contribution"
+    },
+    "requestBody": {
+      "required": true,
+      "content": {
+        "application/json": {
+          "schema": {
+            "type": "object",
+            "properties": {
+              "source": {
+                "type": "string",
+                "enum": [
+                  "threadspan",
+                  "buy_me_a_coffee",
+                  "patreon",
+                  "direct_compute_sponsorship"
+                ]
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "one_time_contribution",
+                  "recurring_started",
+                  "recurring_renewed",
+                  "recurring_canceled",
+                  "refund",
+                  "chargeback"
+                ]
+              },
+              "amount_minor": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 10000000000
+              },
+              "currency": {
+                "type": "string",
+                "pattern": "^[A-Z]{3}$"
+              },
+              "target_event_id": {
+                "type": "string",
+                "nullable": true
+              },
+              "idempotency_key": {
+                "type": "string",
+                "pattern": "^key_[0-9a-f]{64}$"
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "source",
+              "kind",
+              "amount_minor",
+              "currency",
+              "target_event_id",
+              "idempotency_key"
+            ]
+          }
+        }
+      }
+    },
+    "parameters": [
+      {
+        "name": "account_id",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{32}$"
+        }
+      }
+    ]
+  },
+  {
+    "method": "PUT",
+    "path": "/api/v1/access-context/share-url",
+    "summary": "Register launcher share origin",
+    "description": "Accepts verified current Quick Tunnel or workers.dev origin only. No paths; quick_tunnel_url must be a trycloudflare.com origin. Stable redirect additionally requires stable_verified true.",
+    "responses": {
+      "200": {
+        "description": "Register launcher share origin result.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "status": {
+                  "type": "string"
+                },
+                "share_url": {
+                  "type": "string",
+                  "format": "uri"
+                }
+              },
+              "additionalProperties": true,
+              "required": [
+                "status",
+                "share_url"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "x-maestro": {
+      "feature": "access",
+      "permissions": [],
+      "boundary": "Loopback-only trusted Pinokio launcher registration after its authenticated update/health verification. Client-supplied verification flags are not a public sharing authority.",
+      "idempotency": "Replaces runtime registration; verify current access-context after failure. Does not persist or create a tunnel.",
+      "operation_kind": "access",
+      "mcp": false,
+      "contract_status": "authored",
+      "source": "app/launch.py:31226",
+      "handler": "register_runtime_share_url"
+    },
+    "requestBody": {
+      "required": true,
+      "content": {
+        "application/json": {
+          "schema": {
+            "type": "object",
+            "properties": {
+              "share_url": {
+                "type": "string",
+                "format": "uri"
+              },
+              "quick_tunnel_url": {
+                "type": "string",
+                "format": "uri"
+              },
+              "stable_verified": {
+                "type": "boolean",
+                "default": false
+              }
+            },
+            "additionalProperties": true,
+            "required": [
+              "share_url",
+              "quick_tunnel_url"
+            ]
+          },
+          "example": {
+            "share_url": "https://example.trycloudflare.com",
+            "quick_tunnel_url": "https://example.trycloudflare.com",
+            "stable_verified": false
+          }
+        }
+      }
+    }
+  },
+  {
+    "method": "POST",
+    "path": "/api/v1/projects/{project}/assets/{asset_id}/character-sheet/quad",
+    "summary": "Queue fixed character-sheet canvas",
+    "description": "Existing character in main workspace with an authorized kept anchor. Uses fixed installed Quad FLUX recipe/LoRA and accepted creator terms. Seed is retained with request scope; no arbitrary model/settings override.",
+    "responses": {
+      "200": {
+        "description": "Queue fixed character-sheet canvas result.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "job_id": {
+                  "type": "string"
+                },
+                "status": {
+                  "type": "string",
+                  "enum": [
+                    "queued"
+                  ]
+                },
+                "asset": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "string"
+                    },
+                    "asset_type": {
+                      "type": "string",
+                      "enum": [
+                        "character"
+                      ]
+                    },
+                    "pending": {
+                      "type": "boolean"
+                    }
+                  },
+                  "additionalProperties": true
+                }
+              },
+              "additionalProperties": true,
+              "required": [
+                "job_id",
+                "status",
+                "asset"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "x-maestro": {
+      "feature": "character_sheet",
+      "permissions": [
+        "project.generate"
+      ],
+      "boundary": "Existing project authorization and current session are required. Media must resolve inside authorized project/upload roots; host paths cannot confer authority. Main workspace, current project incarnation and exact installed resource/terms gates apply; enqueue does not authorize a monitor GPU dispatch.",
+      "idempotency": "Stable request_id binds exact owner/project/anchor/resources/seed. Reconcile same ID after uncertainty; changed payload conflicts, never issue another ID to bypass pending admission.",
+      "operation_kind": "character_sheet",
+      "mcp": true,
+      "contract_status": "authored",
+      "source": "app/launch.py:35434",
+      "handler": "generate_character_sheet_quad"
+    },
+    "requestBody": {
+      "required": true,
+      "content": {
+        "application/json": {
+          "schema": {
+            "type": "object",
+            "properties": {
+              "request_id": {
+                "type": "string",
+                "minLength": 8,
+                "maxLength": 128,
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9._~-]{7,127}$"
+              },
+              "anchor_variant_id": {
+                "type": "string"
+              },
+              "anchor_output_id": {
+                "type": "string"
+              },
+              "seed": {
+                "type": "integer",
+                "default": 0,
+                "minimum": 0,
+                "maximum": 9223372036854775807
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "request_id",
+              "anchor_variant_id",
+              "anchor_output_id"
+            ]
+          },
+          "example": {
+            "request_id": "character-sheet-001",
+            "anchor_variant_id": "<kept variant>",
+            "anchor_output_id": "<kept output>",
+            "seed": 0
+          }
+        }
+      }
+    },
+    "parameters": [
+      {
+        "name": "project",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string"
+        }
+      },
+      {
+        "name": "asset_id",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string"
+        }
+      }
+    ]
+  },
+  {
+    "method": "GET",
+    "path": "/api/v1/storage/duplicates",
+    "summary": "Inspect configured duplicate storage",
+    "description": "Size and bounded byte comparisons identify reclaim candidates. Same physical link is excluded; differing content is conflict. No scan result authorizes deletion.",
+    "responses": {
+      "200": {
+        "description": "Inspect configured duplicate storage result.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "duplicates": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "kind": {
+                        "type": "string"
+                      },
+                      "filename": {
+                        "type": "string"
+                      },
+                      "rel_path": {
+                        "type": "string"
+                      },
+                      "primary_path": {
+                        "type": "string"
+                      },
+                      "size_bytes": {
+                        "type": "integer",
+                        "minimum": 0
+                      },
+                      "linked_path": {
+                        "type": "string"
+                      },
+                      "linked_size_bytes": {
+                        "type": "integer",
+                        "minimum": 0
+                      },
+                      "linked_install": {
+                        "type": "string"
+                      }
+                    },
+                    "additionalProperties": true
+                  }
+                },
+                "conflicts": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "kind": {
+                        "type": "string"
+                      },
+                      "filename": {
+                        "type": "string"
+                      },
+                      "rel_path": {
+                        "type": "string"
+                      },
+                      "primary_path": {
+                        "type": "string"
+                      },
+                      "size_bytes": {
+                        "type": "integer",
+                        "minimum": 0
+                      },
+                      "linked_path": {
+                        "type": "string"
+                      },
+                      "linked_size_bytes": {
+                        "type": "integer",
+                        "minimum": 0
+                      },
+                      "linked_install": {
+                        "type": "string"
+                      }
+                    },
+                    "additionalProperties": true
+                  }
+                },
+                "shared_via_link": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "total_reclaimable_bytes": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              },
+              "additionalProperties": true,
+              "required": [
+                "duplicates",
+                "conflicts",
+                "shared_via_link",
+                "total_reclaimable_bytes"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "x-maestro": {
+      "feature": "storage",
+      "permissions": [],
+      "boundary": "Existing signed session and origin guards apply; this host-control prefix is unavailable through Cloudflare. LAN access remains subject to production origin/account guards. Read-only configured-root inventory; paths are authorized host metadata. Exposes absolute configured storage/linked-install paths; local human storage inventory, not cross-project MCP file discovery.",
+      "idempotency": "Read-only; repeat to refresh current state.",
+      "operation_kind": "storage",
+      "mcp": false,
+      "contract_status": "authored",
+      "source": "app/launch.py:40597",
+      "handler": "storage_duplicates"
+    }
+  },
+  {
+    "method": "POST",
+    "path": "/api/v1/storage/duplicates/reclaim",
+    "summary": "Reclaim primary duplicate",
+    "description": "Revalidates confinement, separate surviving linked copy, size/content and physical identity; refuses linked target/only copy. safe_delete may defer locked-file removal.",
+    "responses": {
+      "200": {
+        "description": "Reclaim primary duplicate result.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "status": {
+                  "type": "string"
+                },
+                "freed_bytes": {
+                  "type": "integer"
+                },
+                "deferred": {
+                  "type": "boolean"
+                },
+                "surviving_copy": {
+                  "type": "string"
+                }
+              },
+              "additionalProperties": true,
+              "required": [
+                "status",
+                "freed_bytes",
+                "deferred",
+                "surviving_copy"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "x-maestro": {
+      "feature": "storage",
+      "permissions": [],
+      "boundary": "Existing signed session and origin guards apply; this host-control prefix is unavailable through Cloudflare. LAN access remains subject to production origin/account guards. Explicit human exact-file destructive maintenance; no age-based cleanup or ownership inference.",
+      "idempotency": "Not replay-safe. Refresh inventory after uncertain deletion/recycling; missing file is not permission to delete another.",
+      "operation_kind": "storage",
+      "mcp": false,
+      "contract_status": "authored",
+      "source": "app/launch.py:40664",
+      "handler": "storage_reclaim"
+    },
+    "requestBody": {
+      "required": true,
+      "content": {
+        "application/json": {
+          "schema": {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "additionalProperties": true,
+            "required": [
+              "path"
+            ]
+          },
+          "example": {
+            "path": "<exact path from current storage/duplicates>"
+          }
+        }
+      }
+    }
+  },
+  {
+    "method": "POST",
+    "path": "/api/v1/storage/duplicates/remove-linked",
+    "summary": "Recycle opted-in linked duplicate",
+    "description": "Requires storage_allow_linked_removal opt-in, target inside configured linked root and independent identical primary copy. Only recycling is permitted; no direct-delete fallback.",
+    "responses": {
+      "200": {
+        "description": "Recycle opted-in linked duplicate result.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "status": {
+                  "type": "string"
+                },
+                "freed_bytes": {
+                  "type": "integer"
+                },
+                "recycled": {
+                  "type": "boolean"
+                },
+                "surviving_copy": {
+                  "type": "string"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    "x-maestro": {
+      "feature": "storage",
+      "permissions": [],
+      "boundary": "Existing signed session and origin guards apply; this host-control prefix is unavailable through Cloudflare. LAN access remains subject to production origin/account guards. Explicit human exact-file destructive maintenance; no age-based cleanup or ownership inference.",
+      "idempotency": "Not replay-safe. Refresh inventory after uncertain deletion/recycling; missing file is not permission to delete another.",
+      "operation_kind": "storage",
+      "mcp": false,
+      "contract_status": "authored",
+      "source": "app/launch.py:40726",
+      "handler": "storage_remove_linked"
+    },
+    "requestBody": {
+      "required": true,
+      "content": {
+        "application/json": {
+          "schema": {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "additionalProperties": true,
+            "required": [
+              "path"
+            ]
+          },
+          "example": {
+            "path": "<exact path from current storage/duplicates>"
+          }
+        }
+      }
+    }
+  },
+  {
+    "method": "GET",
+    "path": "/api/v1/storage/usage",
+    "summary": "Read observed model usage",
+    "description": "Aggregates generation sidecars and current on-disk weights. Missing usage is unknown history, not proof a model is unused. Shared weights overlap per-model sizes; models_total_bytes is globally deduplicated.",
+    "responses": {
+      "200": {
+        "description": "Read observed model usage result.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "models": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "model_type": {
+                        "type": "string"
+                      },
+                      "name": {
+                        "type": "string"
+                      },
+                      "size_bytes": {
+                        "type": "integer"
+                      },
+                      "primary_bytes": {
+                        "type": "integer"
+                      },
+                      "alias_of": {
+                        "type": "string",
+                        "nullable": true
+                      },
+                      "use_count": {
+                        "type": "integer"
+                      },
+                      "last_used": {
+                        "type": "number",
+                        "nullable": true
+                      }
+                    },
+                    "additionalProperties": true
+                  }
+                },
+                "models_total_bytes": {
+                  "type": "integer"
+                },
+                "loras": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "filename": {
+                        "type": "string"
+                      },
+                      "directory": {
+                        "type": "string"
+                      },
+                      "linked": {
+                        "type": "boolean"
+                      },
+                      "size_bytes": {
+                        "type": "integer"
+                      },
+                      "use_count": {
+                        "type": "integer"
+                      },
+                      "last_used": {
+                        "type": "number",
+                        "nullable": true
+                      }
+                    },
+                    "additionalProperties": true
+                  }
+                },
+                "workspaces": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "name": {
+                        "type": "string"
+                      },
+                      "file_count": {
+                        "type": "integer"
+                      },
+                      "size_bytes": {
+                        "type": "integer"
+                      }
+                    },
+                    "additionalProperties": true
+                  }
+                },
+                "scanned_sidecars": {
+                  "type": "integer"
+                }
+              },
+              "additionalProperties": true,
+              "required": [
+                "models",
+                "models_total_bytes",
+                "loras",
+                "workspaces",
+                "scanned_sidecars"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "x-maestro": {
+      "feature": "storage",
+      "permissions": [],
+      "boundary": "Existing signed session and origin guards apply; this host-control prefix is unavailable through Cloudflare. LAN access remains subject to production origin/account guards. Read-only authorized host storage analytics, not an automatic eviction or move policy. Host-wide workspace/usage inventory is not project-scoped; keep personal storage administration in local UI.",
+      "idempotency": "Read-only; repeat to refresh current state.",
+      "operation_kind": "storage",
+      "mcp": false,
+      "contract_status": "authored",
+      "source": "app/launch.py:40782",
+      "handler": "storage_usage"
+    }
+  },
+  {
+    "method": "GET",
+    "path": "/api/v1/llm/status",
+    "summary": "Read truthful LLM readiness",
+    "description": "Reports loaded only when underlying runtime is actually ready. A subprocess still starting reports loading; normalized speed metrics may be present.",
+    "responses": {
+      "200": {
+        "description": "Read truthful LLM readiness result.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "loaded": {
+                  "type": "boolean"
+                },
+                "loading": {
+                  "type": "boolean"
+                },
+                "model_id": {
+                  "type": "string",
+                  "nullable": true
+                },
+                "device": {
+                  "type": "string",
+                  "nullable": true
+                },
+                "backend": {
+                  "type": "string",
+                  "nullable": true
+                },
+                "vision_available": {
+                  "type": "boolean"
+                },
+                "provider": {
+                  "type": "string"
+                },
+                "requested_device": {
+                  "type": "string",
+                  "nullable": true
+                },
+                "runtime": {
+                  "type": "object",
+                  "properties": {
+                    "backend": {
+                      "type": "string",
+                      "nullable": true
+                    },
+                    "build": {
+                      "type": "string"
+                    },
+                    "devices": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": true
+                      }
+                    },
+                    "effective_profile": {
+                      "type": "object",
+                      "properties": {},
+                      "additionalProperties": true
+                    },
+                    "timings": {
+                      "type": "object",
+                      "properties": {},
+                      "additionalProperties": true
+                    },
+                    "speed": {
+                      "type": "object",
+                      "properties": {
+                        "prompt_tokens_per_second": {
+                          "type": "number",
+                          "nullable": true
+                        },
+                        "generation_tokens_per_second": {
+                          "type": "number",
+                          "nullable": true
+                        },
+                        "source": {
+                          "type": "string"
+                        },
+                        "confidence": {
+                          "type": "string"
+                        },
+                        "reason": {
+                          "type": "string"
+                        },
+                        "sample_count": {
+                          "type": "integer"
+                        },
+                        "backend": {
+                          "type": "string"
+                        }
+                      },
+                      "additionalProperties": true
+                    },
+                    "fallback_reason": {
+                      "type": "string",
+                      "nullable": true
+                    },
+                    "control": {
+                      "type": "object",
+                      "properties": {},
+                      "additionalProperties": true
+                    }
+                  },
+                  "additionalProperties": true
+                },
+                "download": {
+                  "type": "object",
+                  "properties": {},
+                  "additionalProperties": true,
+                  "nullable": true
+                },
+                "loading_phase": {
+                  "type": "string",
+                  "nullable": true
+                },
+                "loading_model_id": {
+                  "type": "string",
+                  "nullable": true
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    "x-maestro": {
+      "feature": "llm",
+      "permissions": [],
+      "boundary": "Read-only snapshot; it neither grants compute authority nor changes project access.",
+      "idempotency": "Read-only; repeat to refresh current state.",
+      "operation_kind": "llm",
+      "mcp": true,
+      "contract_status": "authored",
+      "source": "app/launch.py:40935",
+      "handler": "llm_status"
+    }
+  },
+  {
+    "method": "POST",
+    "path": "/api/v1/llm/load",
+    "summary": "Load configured LLM selection",
+    "description": "Optional body overrides configured model/device/provider/remote URL. Provider credentials are server-owned; raw GGUF path/file overrides cannot be supplied. Uses authorized shared preparation and redacted failure.",
+    "responses": {
+      "200": {
+        "description": "Load configured LLM selection result.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "status": {
+                  "type": "string"
+                },
+                "loaded": {
+                  "type": "boolean"
+                },
+                "loading": {
+                  "type": "boolean"
+                },
+                "model_id": {
+                  "type": "string",
+                  "nullable": true
+                },
+                "device": {
+                  "type": "string",
+                  "nullable": true
+                },
+                "backend": {
+                  "type": "string",
+                  "nullable": true
+                },
+                "vision_available": {
+                  "type": "boolean"
+                },
+                "provider": {
+                  "type": "string"
+                },
+                "requested_device": {
+                  "type": "string",
+                  "nullable": true
+                },
+                "runtime": {
+                  "type": "object",
+                  "properties": {
+                    "backend": {
+                      "type": "string",
+                      "nullable": true
+                    },
+                    "build": {
+                      "type": "string"
+                    },
+                    "devices": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": true
+                      }
+                    },
+                    "effective_profile": {
+                      "type": "object",
+                      "properties": {},
+                      "additionalProperties": true
+                    },
+                    "timings": {
+                      "type": "object",
+                      "properties": {},
+                      "additionalProperties": true
+                    },
+                    "speed": {
+                      "type": "object",
+                      "properties": {
+                        "prompt_tokens_per_second": {
+                          "type": "number",
+                          "nullable": true
+                        },
+                        "generation_tokens_per_second": {
+                          "type": "number",
+                          "nullable": true
+                        },
+                        "source": {
+                          "type": "string"
+                        },
+                        "confidence": {
+                          "type": "string"
+                        },
+                        "reason": {
+                          "type": "string"
+                        },
+                        "sample_count": {
+                          "type": "integer"
+                        },
+                        "backend": {
+                          "type": "string"
+                        }
+                      },
+                      "additionalProperties": true
+                    },
+                    "fallback_reason": {
+                      "type": "string",
+                      "nullable": true
+                    },
+                    "control": {
+                      "type": "object",
+                      "properties": {},
+                      "additionalProperties": true
+                    }
+                  },
+                  "additionalProperties": true
+                },
+                "download": {
+                  "type": "object",
+                  "properties": {},
+                  "additionalProperties": true,
+                  "nullable": true
+                },
+                "loading_phase": {
+                  "type": "string",
+                  "nullable": true
+                },
+                "loading_model_id": {
+                  "type": "string",
+                  "nullable": true
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    "x-maestro": {
+      "feature": "llm",
+      "permissions": [],
+      "boundary": "Human machine-wide model/provider load. Local authority or recently reauthenticated owner.remote_parity required; it can consume compute and never substitutes for GPU lease qualification.",
+      "idempotency": "No operation ID; inspect llm/status after uncertainty. Prefer existing project-scoped llm/prepare for tracked preparation.",
+      "operation_kind": "llm",
+      "mcp": false,
+      "contract_status": "authored",
+      "source": "app/launch.py:41021",
+      "handler": "llm_load"
+    },
+    "requestBody": {
+      "required": false,
+      "content": {
+        "application/json": {
+          "schema": {
+            "type": "object",
+            "properties": {
+              "model_id": {
+                "type": "string"
+              },
+              "device": {
+                "type": "string"
+              },
+              "provider": {
+                "type": "string",
+                "enum": [
+                  "local",
+                  "remote",
+                  "openai",
+                  "anthropic"
+                ]
+              },
+              "remote_url": {
+                "type": "string"
+              }
+            },
+            "additionalProperties": true
+          },
+          "example": {
+            "provider": "local",
+            "model_id": "<available catalog ID>",
+            "device": "cpu"
+          }
+        }
+      }
+    }
+  },
+  {
+    "method": "POST",
+    "path": "/api/v1/llm/unload",
+    "summary": "Release LLM memory",
+    "description": "Serializes generation/native lane and classifies current device under the lock before unloading. No provider configuration or credential changes.",
+    "responses": {
+      "200": {
+        "description": "Release LLM memory result.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "status": {
+                  "type": "string",
+                  "enum": [
+                    "ok"
+                  ]
+                }
+              },
+              "additionalProperties": true,
+              "required": [
+                "status"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "x-maestro": {
+      "feature": "llm",
+      "permissions": [],
+      "boundary": "Machine-wide release permitted by local control or recently reauthenticated owner.remote_parity; not arbitrary other-task cancellation.",
+      "idempotency": "No client ID; read llm/status to verify unload before repeating.",
+      "operation_kind": "llm",
+      "mcp": true,
+      "contract_status": "authored",
+      "source": "app/launch.py:41067",
+      "handler": "llm_unload"
+    }
+  },
+  {
+    "method": "GET",
+    "path": "/api/v1/llm/models",
+    "summary": "Discover safe LLM catalog",
+    "description": "Server-owned prompting guides and authorized model entries. External users get curated local/opaque linked-file selections; workspace requests include current opaque project_instance. Configured provider catalog discovery can use server credentials.",
+    "responses": {
+      "200": {
+        "description": "Discover safe LLM catalog result.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "models": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "id": {
+                        "type": "string"
+                      },
+                      "provider": {
+                        "type": "string"
+                      },
+                      "vision_capable": {
+                        "type": "boolean"
+                      },
+                      "label": {
+                        "type": "string"
+                      },
+                      "size_hint": {
+                        "type": "string"
+                      }
+                    },
+                    "additionalProperties": true
+                  }
+                },
+                "guides": {
+                  "type": "object",
+                  "properties": {},
+                  "additionalProperties": true
+                },
+                "project_instance": {
+                  "type": "string"
+                }
+              },
+              "additionalProperties": true,
+              "required": [
+                "models",
+                "guides"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "x-maestro": {
+      "feature": "llm",
+      "permissions": [],
+      "boundary": "Signed-session safe catalog; optional workspace requires existing project access. No raw host path or credential grants.",
+      "idempotency": "Read-only; repeat to refresh current state.",
+      "operation_kind": "llm",
+      "mcp": true,
+      "contract_status": "authored",
+      "source": "app/launch.py:42126",
+      "handler": "list_llm_models"
+    },
+    "parameters": [
+      {
+        "name": "provider",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "string",
+          "default": ""
+        },
+        "description": ""
+      },
+      {
+        "name": "workspace",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "string",
+          "default": ""
+        },
+        "description": ""
+      }
+    ]
+  },
+  {
+    "method": "POST",
+    "path": "/api/v1/llm/generate",
+    "summary": "Generate project text",
+    "description": "Uses configured authorized LLM selection; does not inspect or classify creative subject matter. External requests follow production local-equivalent safe selection and existing project access.",
+    "responses": {
+      "200": {
+        "description": "Generate project text result.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "text": {
+                  "type": "string"
+                }
+              },
+              "additionalProperties": true,
+              "required": [
+                "text"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "x-maestro": {
+      "feature": "llm",
+      "permissions": [
+        "project.generate"
+      ],
+      "boundary": "Existing project authorization and current session are required. Media must resolve inside authorized project/upload roots; host paths cannot confer authority. Configured provider/locality/privacy and shared compute preparation remain authoritative.",
+      "idempotency": "Synchronous text call has no durable request identity contract. Do not resubmit on a transport timeout without reconciling ongoing work.",
+      "operation_kind": "llm",
+      "mcp": true,
+      "contract_status": "authored",
+      "source": "app/launch.py:44029",
+      "handler": "llm_generate"
+    },
+    "requestBody": {
+      "required": true,
+      "content": {
+        "application/json": {
+          "schema": {
+            "type": "object",
+            "properties": {
+              "workspace": {
+                "type": "string"
+              },
+              "prompt": {
+                "type": "string",
+                "minLength": 1
+              },
+              "system_prompt": {
+                "type": "string",
+                "default": ""
+              },
+              "max_new_tokens": {
+                "type": "integer",
+                "default": 256
+              },
+              "temperature": {
+                "type": "number",
+                "default": 0.7
+              },
+              "top_p": {
+                "type": "number",
+                "default": 0.9
+              },
+              "seed": {
+                "type": "integer",
+                "nullable": true
+              },
+              "explicit_output": {
+                "type": "boolean",
+                "default": false,
+                "description": "Selects the configured response-assist behavior for generated text; does not classify the authored prompt."
+              }
+            },
+            "additionalProperties": true,
+            "required": [
+              "prompt"
+            ]
+          },
+          "example": {
+            "workspace": "<existing project>",
+            "prompt": "Write a scene description.",
+            "max_new_tokens": 256
+          }
+        }
+      }
+    }
+  },
+  {
+    "method": "POST",
+    "path": "/api/v1/llm/enhance-prompt",
+    "summary": "Enhance or explicitly compose prompt",
+    "description": "Without request_id returns original/enhanced synchronously. With UUID request_id requires matching project_instance and returns 202 operation status; reuse exact scope/input ID to observe. Authorized images are at most four, 32MiB each/64MiB combined. engine=h3_rewriter requires request_id/project_instance, exact supported H3 model, rewrite_mode image cardinality (0/1/1/2), integer duration 4..15 and configured local rewriter; returns comparisons, never automatic Apply.",
+    "responses": {
+      "200": {
+        "description": "Enhance or explicitly compose prompt result.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "original": {
+                  "type": "string"
+                },
+                "enhanced": {
+                  "type": "string"
+                },
+                "request_id": {
+                  "type": "string"
+                },
+                "status": {
+                  "type": "string"
+                },
+                "h3_rewrite_preview": {
+                  "type": "object",
+                  "properties": {},
+                  "additionalProperties": true
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "202": {
+        "description": "Admitted recoverable Enhance/H3 Compose operation; observe same request_id.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "request_id": {
+                  "type": "string"
+                },
+                "status": {
+                  "type": "string"
+                }
+              },
+              "additionalProperties": true,
+              "required": [
+                "request_id",
+                "status"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "x-maestro": {
+      "feature": "llm",
+      "permissions": [
+        "project.generate"
+      ],
+      "boundary": "Existing project authorization and current session are required. Media must resolve inside authorized project/upload roots; host paths cannot confer authority. Selection/privacy/terms and queued compute authority are server-owned; explicit_output only requests already-consented local response guidance.",
+      "idempotency": "Recoverable UUID calls bind owner/project/session and exact input/runtime/images; mismatch is409. Poll llm/operations/enhance/{request_id}; timeout never cancels. Calls without ID have no durable replay guarantee.",
+      "operation_kind": "llm",
+      "mcp": true,
+      "contract_status": "authored",
+      "source": "app/launch.py:45863",
+      "handler": "llm_enhance_prompt"
+    },
+    "requestBody": {
+      "required": true,
+      "content": {
+        "application/json": {
+          "schema": {
+            "type": "object",
+            "properties": {
+              "workspace": {
+                "type": "string"
+              },
+              "prompt": {
+                "type": "string",
+                "minLength": 1
+              },
+              "request_id": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "project_instance": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              },
+              "image_path": {
+                "type": "string"
+              },
+              "image_paths": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 4
+              },
+              "engine": {
+                "type": "string",
+                "enum": [
+                  "h3_rewriter"
+                ]
+              },
+              "rewrite_mode": {
+                "type": "string",
+                "enum": [
+                  "t2va",
+                  "i2va",
+                  "l2va",
+                  "fl2va"
+                ]
+              },
+              "model_type": {
+                "type": "string",
+                "default": ""
+              },
+              "mode": {
+                "type": "string",
+                "default": "video"
+              },
+              "activated_loras": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "preserve_global_timeline": {
+                "type": "boolean"
+              },
+              "window_count": {
+                "type": "integer"
+              },
+              "h3_style_workflow_present": {
+                "type": "boolean"
+              },
+              "max_new_tokens": {
+                "type": "integer",
+                "default": 512
+              },
+              "temperature": {
+                "type": "number",
+                "default": 0.6
+              },
+              "duration_seconds": {
+                "type": "number"
+              },
+              "window_size_seconds": {
+                "type": "number"
+              },
+              "visual_style": {
+                "type": "string"
+              },
+              "tts_enhance_mode": {
+                "type": "string"
+              },
+              "tts_voice_count": {
+                "type": "integer",
+                "default": 2
+              },
+              "private_output": {
+                "type": "boolean",
+                "default": false
+              },
+              "explicit_output": {
+                "type": "boolean",
+                "default": false
+              }
+            },
+            "additionalProperties": true,
+            "required": [
+              "prompt"
+            ]
+          },
+          "example": {
+            "workspace": "<existing project>",
+            "prompt": "Describe the shot with camera movement.",
+            "model_type": "t2v",
+            "mode": "video"
+          }
+        }
+      }
+    }
+  },
+  {
+    "method": "POST",
+    "path": "/api/v1/llm/operations/enhance/{request_id}/h3-apply",
+    "summary": "Choose stored H3 prompt candidate",
+    "description": "Only a completed authenticated runtime-backed comparison in this session/project may be selected. Exact retained request/preview commitments must match; returns chosen text and never dispatches generation.",
+    "responses": {
+      "200": {
+        "description": "Choose stored H3 prompt candidate result.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "enhanced": {
+                  "type": "string"
+                },
+                "request_commitment": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{64}$"
+                },
+                "preview_commitment": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{64}$"
+                },
+                "selected_kind": {
+                  "type": "string",
+                  "enum": [
+                    "deterministic",
+                    "base",
+                    "adapted"
+                  ]
+                }
+              },
+              "additionalProperties": true,
+              "required": [
+                "enhanced",
+                "request_commitment",
+                "preview_commitment",
+                "selected_kind"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "x-maestro": {
+      "feature": "llm",
+      "permissions": [
+        "project.generate"
+      ],
+      "boundary": "Existing project authorization and current session are required. Media must resolve inside authorized project/upload roots; host paths cannot confer authority. Explicit user choice from stored candidates; no new prompt/model execution.",
+      "idempotency": "Exact retained candidate selection is deterministic; stale scope/commitment conflicts. Read existing comparison rather than inventing proofs.",
+      "operation_kind": "llm",
+      "mcp": true,
+      "contract_status": "authored",
+      "source": "app/launch.py:45825",
+      "handler": "llm_h3_prompt_rewriter_apply"
+    },
+    "requestBody": {
+      "required": true,
+      "content": {
+        "application/json": {
+          "schema": {
+            "type": "object",
+            "properties": {
+              "workspace": {
+                "type": "string"
+              },
+              "project_instance": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              },
+              "request_commitment": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              },
+              "preview_commitment": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              },
+              "selected_kind": {
+                "type": "string",
+                "enum": [
+                  "deterministic",
+                  "base",
+                  "adapted"
+                ]
+              }
+            },
+            "additionalProperties": true,
+            "required": [
+              "project_instance",
+              "request_commitment",
+              "preview_commitment",
+              "selected_kind"
+            ]
+          }
+        }
+      }
+    },
+    "parameters": [
+      {
+        "name": "request_id",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "format": "uuid"
+        }
+      }
+    ]
+  },
+  {
+    "method": "POST",
+    "path": "/api/v1/llm/describe-image",
+    "summary": "Describe authorized image",
+    "description": "Resolves existing authorized media and server-selected vision model; optional creative instruction is unchanged. Response assistance is derived server-side from consent/selection.",
+    "responses": {
+      "200": {
+        "description": "Describe authorized image result.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "description": {
+                  "type": "string"
+                }
+              },
+              "additionalProperties": true,
+              "required": [
+                "description"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "x-maestro": {
+      "feature": "llm",
+      "permissions": [
+        "project.generate"
+      ],
+      "boundary": "Existing project authorization and current session are required. Media must resolve inside authorized project/upload roots; host paths cannot confer authority. Vision model/locality/provider privacy and shared compute gates apply.",
+      "idempotency": "Synchronous description has no durable replay identity; a timeout does not cancel model work.",
+      "operation_kind": "llm",
+      "mcp": true,
+      "contract_status": "authored",
+      "source": "app/launch.py:46670",
+      "handler": "llm_describe_image"
+    },
+    "requestBody": {
+      "required": true,
+      "content": {
+        "application/json": {
+          "schema": {
+            "type": "object",
+            "properties": {
+              "workspace": {
+                "type": "string"
+              },
+              "image_path": {
+                "type": "string",
+                "minLength": 1
+              },
+              "prompt": {
+                "type": "string",
+                "default": "Describe this image in detail."
+              },
+              "max_new_tokens": {
+                "type": "integer",
+                "default": 256
+              },
+              "explicit_output": {
+                "type": "boolean",
+                "default": false
+              }
+            },
+            "additionalProperties": true,
+            "required": [
+              "image_path"
+            ]
+          },
+          "example": {
+            "workspace": "<existing project>",
+            "image_path": "<authorized upload/media reference>",
+            "prompt": "Describe the image."
+          }
+        }
+      }
+    }
+  },
+  {
+    "method": "GET",
+    "path": "/api/v1/h3/benchmark",
+    "summary": "Read recorded H3 measurements",
+    "description": "Local cache measurements are separated from non-comparable published claims. This route never runs or qualifies a benchmark.",
+    "responses": {
+      "200": {
+        "description": "Read recorded H3 measurements result.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "schema_version": {
+                  "type": "integer"
+                },
+                "quick_task": {
+                  "type": "object",
+                  "properties": {},
+                  "additionalProperties": true
+                },
+                "normalization": {
+                  "type": "string"
+                },
+                "records": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": true
+                  }
+                },
+                "published_external": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": true
+                  }
+                }
+              },
+              "additionalProperties": true,
+              "required": [
+                "schema_version",
+                "quick_task",
+                "normalization",
+                "records",
+                "published_external"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "x-maestro": {
+      "feature": "h3_evaluation",
+      "permissions": [],
+      "boundary": "Local-only: all maestro_remote requests are refused, including external LAN classifications. No native acceptance authority.",
+      "idempotency": "Read-only; repeat to refresh current state.",
+      "operation_kind": "h3_evaluation",
+      "mcp": true,
+      "contract_status": "authored",
+      "source": "app/launch.py:51988",
+      "handler": "h3_benchmark_report"
+    }
+  },
+  {
+    "method": "POST",
+    "path": "/api/v1/h3/evaluation/preflight",
+    "summary": "Build offline H3 evaluation manifest",
+    "description": "Pure deterministic manifest/report; no model execution or measured metrics. Explicit resolved seed required, native24fps, legal canvas, frame grid17*n+5 and model-specific bounds, >=2 sampling steps. Experimental video/encoder profiles require opt-in and exact model match. Scaffold Beta3 profiles need a sampler_candidate the current HTTP allowlist does not accept, so that profile cannot be completed through this route.",
+    "responses": {
+      "200": {
+        "description": "Build offline H3 evaluation manifest result.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "manifest": {
+                  "type": "object",
+                  "properties": {},
+                  "additionalProperties": true
+                },
+                "report": {
+                  "type": "object",
+                  "properties": {},
+                  "additionalProperties": true
+                }
+              },
+              "additionalProperties": true,
+              "required": [
+                "manifest",
+                "report"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "x-maestro": {
+      "feature": "h3_evaluation",
+      "permissions": [
+        "project.mutate"
+      ],
+      "boundary": "Existing project access and H3 legal decision required; project_id is derived by the server. Offline preflight is not GPU dispatch or qualification.",
+      "idempotency": "Same explicit fields produce deterministic manifest/report; default job_id differs on a new call. No execution is submitted.",
+      "operation_kind": "h3_evaluation",
+      "mcp": true,
+      "contract_status": "authored",
+      "source": "app/launch.py:51997",
+      "handler": "h3_evaluation_preflight"
+    },
+    "requestBody": {
+      "required": true,
+      "content": {
+        "application/json": {
+          "schema": {
+            "type": "object",
+            "properties": {
+              "workspace": {
+                "type": "string"
+              },
+              "job_id": {
+                "type": "string",
+                "description": "Optional lineage label; defaults to a server-minted manual ID."
+              },
+              "model_type": {
+                "type": "string"
+              },
+              "resolved_seed": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 4294967295
+              },
+              "prompt": {
+                "type": "string",
+                "minLength": 1
+              },
+              "frame_count": {
+                "type": "integer",
+                "default": 124,
+                "description": "Native17*n+5 grid within selected official H3 model limits."
+              },
+              "resolution": {
+                "type": "string",
+                "default": "864x480",
+                "enum": [
+                  "1344x768",
+                  "768x1344",
+                  "1024x768",
+                  "768x1024",
+                  "768x768",
+                  "1152x640",
+                  "640x1152",
+                  "960x544",
+                  "544x960",
+                  "864x480",
+                  "480x864",
+                  "640x640",
+                  "608x352",
+                  "352x608"
+                ]
+              },
+              "fps": {
+                "type": "number",
+                "enum": [
+                  24
+                ],
+                "default": 24
+              },
+              "sampling_steps": {
+                "type": "integer",
+                "minimum": 2,
+                "default": 20
+              },
+              "conditioning": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": true,
+                "nullable": true
+              },
+              "output_artifacts": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "explicit": {
+                "type": "boolean",
+                "default": false
+              },
+              "private": {
+                "type": "boolean",
+                "description": "Defaults to explicit when omitted/null.",
+                "nullable": true
+              },
+              "profile_id": {
+                "type": "string",
+                "nullable": true
+              },
+              "encoder_profile_id": {
+                "type": "string",
+                "nullable": true
+              },
+              "allow_experimental": {
+                "type": "boolean",
+                "default": false
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "model_type",
+              "resolved_seed",
+              "prompt"
+            ]
+          },
+          "example": {
+            "workspace": "<existing project>",
+            "model_type": "minimax_h3",
+            "resolved_seed": 42,
+            "prompt": "A continuous camera shot.",
+            "frame_count": 124,
+            "resolution": "864x480",
+            "fps": 24,
+            "sampling_steps": 20
+          }
+        }
+      }
+    }
+  }
+]

@@ -322,6 +322,7 @@ def _reference_context(references: list[dict[str, Any]]) -> tuple[str, str, str]
     """Return relationship, retention, and official task-type summaries."""
 
     from models.minimax_h3.reference_manifest import reference_role_text, validate_reference_manifest
+    from services.h3_custom_style_text import scoped_style_relationship
 
     # Enhancement is useful before the generation manifest is complete. The
     # actual Ref2VA generation path still performs strict file + visual-media
@@ -341,6 +342,11 @@ def _reference_context(references: list[dict[str, Any]]) -> tuple[str, str, str]
         role = reference_role_text(item.get("role") or f"the supplied {kind} reference")
         if kind == "image":
             picture += 1
+            scoped_style = scoped_style_relationship(item, picture)
+            if scoped_style is not None:
+                relationships.append(scoped_style[0])
+                retention.append(scoped_style[1])
+                continue
             intent = item.get("image_intent", "identity")
             if intent == "composition":
                 relationships.append(

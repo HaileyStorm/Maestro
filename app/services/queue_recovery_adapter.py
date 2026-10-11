@@ -28,6 +28,7 @@ from typing import Any
 import uuid
 
 from services.job_lifecycle import (
+    DirectorExecutionManifestConflict,
     PromptEnhancementGpuIntentConflict,
     validated_h3_delivery_recovery_control,
     validated_prompt_enhancement_gpu_intent,
@@ -170,10 +171,11 @@ def editor_retake_return_retained(job: Mapping[str, Any]) -> bool:
 
 
 def director_h3_source_job_ids(jobs: Mapping[str, Mapping[str, Any]]) -> frozenset[str]:
-    """Retain original H3 evidence and unadopted scene repairs for their parent.
+    """Retain original H3 evidence and pending Director repairs for their parent.
 
     Retention preserves evidence; it never grants generation or media reuse.
     Removing the semantic parent releases this relationship automatically.
+    The historical function name remains for existing lifecycle callers.
     """
     retained = set()
     for parent_id, parent in jobs.items():
@@ -182,41 +184,43 @@ def director_h3_source_job_ids(jobs: Mapping[str, Mapping[str, Any]]) -> frozens
         cursor = parent.get("recovery_cursor")
         if not isinstance(cursor, Mapping):
             continue
-        pid, source_id = cursor.get("pipeline_id"), cursor.get("h3_original_video_job_id")
+        pid = cursor.get("pipeline_id")
         if (type(pid) is not str or not pid or parent_id != f"director-parent-{pid}"
-                or parent.get("id") != parent_id or type(source_id) is not str
-                or not source_id.startswith(f"director-{pid}-")):
-            continue
-        source = jobs.get(source_id)
-        if (not isinstance(source, Mapping) or source.get("id") != source_id
-                or source.get("kind") != "director_child"
-                or str(source.get("workspace") or "default") != str(parent.get("workspace") or "default")
+                or parent.get("id") != parent_id
                 or any(type(parent.get(key)) is not str or not parent[key]
-                       or parent[key] != source.get(key) for key in ("owner_principal", "project_instance"))):
+                       for key in ("owner_principal", "project_instance"))):
             continue
-        retained.add(source_id)
-        repairs = cursor.get("h3_pending_scene_repairs")
-        if not isinstance(repairs, list):
-            continue
-        for repair in repairs:
-            if (not isinstance(repair, Mapping) or type(repair.get("index")) is not int
-                    or repair["index"] < 0 or type(repair.get("revision")) is not int
-                    or repair["revision"] < 1 or type(repair.get("job_id")) is not str):
+
+        def same_child(child_id):
+            child = jobs.get(child_id)
+            return (isinstance(child, Mapping) and child.get("id") == child_id
+                    and child.get("kind") == "director_child"
+                    and str(child.get("workspace") or "default") == str(parent.get("workspace") or "default")
+                    and all(parent[key] == child.get(key) for key in ("owner_principal", "project_instance")))
+
+        source_id = cursor.get("h3_original_video_job_id")
+        if (type(source_id) is str and source_id.startswith(f"director-{pid}-")
+                and same_child(source_id)):
+            retained.add(source_id)
+        for field, kind in (("h3_pending_scene_repairs", "video_scene_rerun"),
+                            ("director_pending_clip_repairs", "video_clip_rerun")):
+            repairs = cursor.get(field)
+            if not isinstance(repairs, list):
                 continue
-            repair_id = repair["job_id"]
-            # The latest recovery_unit becomes h3_segment/h3_scene at
-            # completion. Bind the immutable job id to the parent's intent.
-            unit = {"kind": "video_scene_rerun", "variant": repair["revision"], "index": repair["index"]}
-            identity = json.dumps({"parent": pid, "unit": unit, "attempt": 0},
-                                  sort_keys=True, separators=(",", ":"))
-            expected_id = f"director-{pid}-0-{hashlib.sha256(identity.encode('utf-8')).hexdigest()[:24]}"
-            child = jobs.get(repair_id)
-            if (repair_id != expected_id or not isinstance(child, Mapping)
-                    or child.get("id") != repair_id or child.get("kind") != "director_child"
-                    or str(child.get("workspace") or "default") != str(parent.get("workspace") or "default")
-                    or any(parent[key] != child.get(key) for key in ("owner_principal", "project_instance"))):
-                continue
-            retained.add(repair_id)
+            for repair in repairs:
+                if (not isinstance(repair, Mapping) or type(repair.get("index")) is not int
+                        or repair["index"] < 0 or type(repair.get("revision")) is not int
+                        or repair["revision"] < 1 or type(repair.get("job_id")) is not str):
+                    continue
+                repair_id = repair["job_id"]
+                # Native safe-unit checkpoints advance recovery_unit. The
+                # immutable job ID continues to bind the submitted repair.
+                unit = {"kind": kind, "variant": repair["revision"], "index": repair["index"]}
+                identity = json.dumps({"parent": pid, "unit": unit, "attempt": 0},
+                                      sort_keys=True, separators=(",", ":"))
+                expected_id = f"director-{pid}-0-{hashlib.sha256(identity.encode('utf-8')).hexdigest()[:24]}"
+                if repair_id == expected_id and same_child(repair_id):
+                    retained.add(repair_id)
     return frozenset(retained)
 
 
@@ -2135,6 +2139,9 @@ class QueueRecoveryCoordinator:
             fence = getattr(proposal, "prompt_enhancement_gpu_fence", None)
             if fence is not None and fence() is not True:
                 raise PromptEnhancementGpuIntentConflict("GPU intent lifecycle predecessor changed before persistence")
+            manifest_fence = getattr(proposal, "director_execution_manifest_fence", None)
+            if manifest_fence is not None and manifest_fence() is not True:
+                raise DirectorExecutionManifestConflict("Director manifest worker predecessor changed before persistence")
             if retained_tombstones and not changed_ids and clean_global is None:
                 return
             receipt = self.journal.commit_state(
@@ -2229,7 +2236,7 @@ class QueueRecoveryCoordinator:
             if editor_retake_return_retained(snapshot):
                 raise QueueRecoveryAdapterError("Editor Retake return is pending.")
             if job_id in director_h3_source_job_ids(clean_jobs):
-                raise QueueRecoveryAdapterError("Director H3 evidence remains retained by its parent.")
+                raise QueueRecoveryAdapterError("Director evidence remains retained by its parent.")
             clean_global = self._canonical_global_state(
                 self._global_state, tombstones=(job_id,),
             )

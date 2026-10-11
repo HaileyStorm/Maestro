@@ -54,9 +54,18 @@ class _WorkerAdmission:
         self.used = False
 
 
+class _PlanningAdmission:
+    """Private binding to the real durable Director parent, never a child job."""
+    def __init__(self, reservation, pid, parent, params, selection):
+        self.reservation, self.pid, self.parent = reservation, pid, parent
+        self.params, self.selection = params, selection
+        self.thread = None
+        self.generation_lock = None
+
+
 class Reservation:
     def __init__(self, target=None, dispatch_check=None, *, release_action="start-next"):
-        if type(release_action) is not str or release_action not in {"start-next", "resume"}:
+        if type(release_action) is not str or release_action not in {"start-next", "resume", "continue"}:
             raise ValueError("Invalid native acceptance release action")
         self.target = json.loads(json.dumps(target)) if target is not None else None
         if self.target is not None and "running_execution_attempt" in self.target:
@@ -68,6 +77,7 @@ class Reservation:
         self.release_action = release_action
         self._permits = {}
         self._workers = {}
+        self._planning = {}
         self._lock = threading.RLock()
         self._dispatch_check = dispatch_check
 
@@ -83,7 +93,50 @@ class Reservation:
         """Queue admission always uses the frozen pre-start attempt."""
         if self.target is None:
             return True
+        if self.target.get("kind") == "director_planning":
+            return False
         return self._matches_job(job, self.target.get("execution_attempt"))
+
+    def bind_planning(self, pid, parent, params, selection):
+        if self.target is None:
+            return None
+        token = _PlanningAdmission(self, pid, parent, params, selection)
+        if not self._planning_matches(token) or not self.dispatch_ready():
+            raise NativeAcceptanceReserved("Director planning reservation did not verify")
+        return token
+
+    def _planning_matches(self, token):
+        try:
+            return (self.target.get("kind") == "director_planning"
+                and token.pid == self.target["pipeline_id"]
+                and token.parent.get("kind") == "director_pipeline"
+                and job_identity(token.parent) == self.target["identity"]
+                and digest(token.params) == self.target["request_sha256"]
+                and digest(token.selection) == self.target["llm_selection_sha256"]
+                and token.parent.get("status") not in {"completed", "failed", "cancelled"})
+        except (ValueError, TypeError, KeyError, AttributeError):
+            return False
+
+    def admit_planning(self, token, generation_lock):
+        if self.target is None:
+            return
+        if (type(token) is not _PlanningAdmission or token.reservation is not self
+                or not generation_lock.locked() or not self._planning_matches(token)
+                or not self.dispatch_ready()):
+            raise NativeAcceptanceReserved("Director parent admission changed")
+        with self._lock:
+            current = threading.current_thread()
+            if (current in self._planning
+                    or (token.thread is not None and token.thread() is not current)):
+                raise NativeAcceptanceReserved("Director parent admission belongs to another worker")
+            token.thread, token.generation_lock = weakref.ref(current), generation_lock
+            self._planning[current] = token
+
+    def release_planning(self, token):
+        with self._lock:
+            current = threading.current_thread()
+            if self._planning.get(current) is token:
+                del self._planning[current]
 
     def _matches_job(self, job, execution_attempt):
         try:
@@ -183,6 +236,10 @@ class Reservation:
             raise NativeAcceptanceReserved("The native acceptance guardian is not ready")
         current = threading.current_thread()
         with self._lock:
+            planning = self._planning.get(current)
+            if (planning is not None and planning.thread() is current
+                    and planning.generation_lock.locked() and self._planning_matches(planning)):
+                return
             if any(admission[0]() is current and self._parent_valid(admission)
                     for admission in self._permits.values()):
                 return
@@ -200,6 +257,12 @@ class Reservation:
         if self.target is None or method.upper() in {"GET", "HEAD", "OPTIONS"}:
             return True
         target = self.target["identity"]["id"]
+        if self.target.get("kind") == "director_planning":
+            base = f"/api/v1/director/pipeline/{self.target['pipeline_id']}"
+            if (method.upper(), path) == ("POST", base + "/continue"):
+                return self.dispatch_ready()
+            return (method.upper(), path) in {("POST", base + "/stop"),
+                ("PUT", "/api/v1/access-context/share-url")}
         if (method.upper(), path) == ("POST", f"/api/v1/queue/{target}/{self.release_action}"):
             return self.dispatch_ready()
         return (method.upper(), path) in {
@@ -267,16 +330,26 @@ def _load_startup_plan():
             raise ValueError()
         plan = json.loads(raw)
         target = plan["target"]
-        if (plan["schema"] != "maestro/native-acceptance-reservation/v1"
-                or plan["workspace"] != str(root)
-                or not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", target["identity"]["id"])
+        planning = target.get("kind") == "director_planning"
+        if planning:
+            if (set(target) != {"kind", "identity", "pipeline_id", "request_sha256", "llm_selection_sha256"}
+                    or not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", target["pipeline_id"])
+                    or any(not re.fullmatch(r"[0-9a-f]{64}", target[key])
+                        for key in ("request_sha256", "llm_selection_sha256"))
+                    or plan.get("release_action") != "continue"):
+                raise ValueError()
+        elif (target.get("kind", "generation") != "generation"
                 or type(target["execution_attempt"]) is not int or target["execution_attempt"] < 1
                 or type(target["recovery_attempt"]) is not int or target["recovery_attempt"] < 0
                 or ("running_execution_attempt" in target and (
                     type(target["running_execution_attempt"]) is not int
                     or target["running_execution_attempt"] != target["execution_attempt"] + 1))
+                or plan.get("release_action", "start-next") not in {"start-next", "resume"}):
+            raise ValueError()
+        if (plan["schema"] != "maestro/native-acceptance-reservation/v1"
+                or plan["workspace"] != str(root)
+                or not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", target["identity"]["id"])
                 or type(plan.get("release_action", "start-next")) is not str
-                or plan.get("release_action", "start-next") not in {"start-next", "resume"}
                 or not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", plan["agent_id"])
                 or not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", plan["generation"])
                 or not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", plan["guardian_request"])
@@ -284,6 +357,8 @@ def _load_startup_plan():
             raise ValueError()
         required = {"app/services/native_acceptance_reservation.py", "app/services/job_lifecycle.py",
             "app/wgp.py", "app/services/llm_service.py", "app/launch.py"}
+        if planning:
+            required.add("app/services/director_pipeline.py")
         if not required.issubset(plan["source_pins"]):
             raise ValueError()
         for name, source_hash in plan["source_pins"].items():
@@ -446,7 +521,8 @@ def _guardian_ready():
         return False
     receipt = json.loads(raw)
     fresh_at = receipt.get("last_check", receipt.get("ready_at"))
-    if type(fresh_at) not in {int, float} or not 0 <= time.time() - fresh_at < 10:
+    freshness = 2 if _PLAN["target"].get("kind") == "director_planning" else 10
+    if type(fresh_at) not in {int, float} or not 0 <= time.time() - fresh_at < freshness:
         return False
     if (receipt.get("ready") is not True or receipt.get("failure")
             or receipt.get("owned_runtime_stopped") or receipt.get("foreign_dispatch_fenced")

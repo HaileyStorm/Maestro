@@ -1,0 +1,470 @@
+[
+  {
+    "method": "GET",
+    "path": "/api/v1/api/discovery",
+    "summary": "Discover Continuum operations and actual access",
+    "description": "Read the current public contract index and your real session/account/origin capabilities. Read model options and terms separately. Installation and catalog support do not establish execution authority. This endpoint does not load a model or grant GPU ownership.",
+    "responses": {
+      "200": {
+        "description": "Current authorized server state",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "api": {
+                  "type": "string"
+                },
+                "version": {
+                  "type": "string"
+                },
+                "openapi_url": {
+                  "type": "string"
+                },
+                "access": {
+                  "type": "object",
+                  "additionalProperties": true
+                },
+                "operations": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": true
+                  }
+                },
+                "catalog": {
+                  "type": "object",
+                  "additionalProperties": {
+                    "type": "string"
+                  }
+                },
+                "capability_states": {
+                  "type": "object",
+                  "additionalProperties": {
+                    "type": "string"
+                  }
+                },
+                "execution": {
+                  "type": "object",
+                  "additionalProperties": true
+                },
+                "models": {
+                  "type": "object",
+                  "properties": {
+                    "models": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "additionalProperties": true
+                      }
+                    },
+                    "families": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "additionalProperties": true
+                      }
+                    }
+                  },
+                  "required": [
+                    "models",
+                    "families"
+                  ]
+                },
+                "coverage": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "api",
+                "version",
+                "openapi_url",
+                "access",
+                "operations",
+                "catalog",
+                "capability_states",
+                "execution",
+                "models",
+                "coverage"
+              ],
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    "x-maestro": {
+      "feature": "discovery",
+      "operation_kind": "read",
+      "mcp": true,
+      "permissions": [],
+      "boundary": "Current access only; no model load or execution authority.",
+      "idempotency": "Read-only.",
+      "contract_status": "authored"
+    }
+  },
+  {
+    "method": "GET",
+    "path": "/api/v1/projects/{project}/editor/projects",
+    "summary": "List saved Editor timelines",
+    "description": "Read saved non-destructive timelines without reopening or resetting them. Project read authorization and current retained source access apply. Listing omits drafts with deleted, changed or unreadable sources. Retrieve by ID to inspect an actionable source conflict.",
+    "responses": {
+      "200": {
+        "description": "Current authorized server state",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "projects": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "id": {
+                        "type": "string"
+                      },
+                      "name": {
+                        "type": "string"
+                      },
+                      "workspace": {
+                        "type": "string"
+                      },
+                      "duration": {
+                        "type": "number"
+                      },
+                      "asset_count": {
+                        "type": "integer"
+                      },
+                      "created_at": {
+                        "type": "number",
+                        "description": "Unix timestamp in seconds, including fractional seconds."
+                      },
+                      "updated_at": {
+                        "type": "number",
+                        "description": "Unix timestamp in seconds, including fractional seconds."
+                      }
+                    },
+                    "additionalProperties": true
+                  }
+                }
+              },
+              "required": [
+                "projects"
+              ],
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    "x-maestro": {
+      "feature": "editor",
+      "operation_kind": "read",
+      "mcp": true,
+      "permissions": [
+        "project.read"
+      ],
+      "boundary": "Existing project and all retained source authorization; stale drafts are never a private-source disclosure path.",
+      "idempotency": "Read-only.",
+      "contract_status": "authored"
+    }
+  },
+  {
+    "method": "GET",
+    "path": "/api/v1/projects/{project}/editor/projects/{editor_id}",
+    "summary": "Retrieve saved Editor timeline",
+    "description": "Read saved non-destructive timelines without reopening or resetting them. Project read authorization and current retained source access apply. Listing omits drafts with deleted, changed or unreadable sources. Retrieve by ID to inspect an actionable source conflict.",
+    "responses": {
+      "200": {
+        "description": "Current authorized server state",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "project": {
+                  "$ref": "#/components/schemas/EditorTimeline"
+                }
+              },
+              "required": [
+                "project"
+              ],
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    "x-maestro": {
+      "feature": "editor",
+      "operation_kind": "read",
+      "mcp": true,
+      "permissions": [
+        "project.read"
+      ],
+      "boundary": "Existing project and all retained source authorization; stale drafts are never a private-source disclosure path.",
+      "idempotency": "Read-only.",
+      "contract_status": "authored"
+    }
+  },
+  {
+    "method": "GET",
+    "path": "/api/v1/api/documentation/{document}",
+    "summary": "Read maintained Continuum API documentation",
+    "description": "Read the guide, feature coverage map or generated operation reference without repository access. Only these three named documents are served.",
+    "parameters": [
+      {
+        "name": "document",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "enum": [
+            "guide",
+            "coverage",
+            "operations"
+          ]
+        }
+      }
+    ],
+    "responses": {
+      "200": {
+        "description": "Maintained Markdown documentation",
+        "content": {
+          "text/markdown": {
+            "schema": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    "x-maestro": {
+      "feature": "discovery",
+      "permissions": [],
+      "mcp": true,
+      "idempotent": true,
+      "boundary": "Documentation only; no filesystem path parameter or execution authority.",
+      "idempotency": "Read-only; safe to repeat."
+    }
+  },
+  {
+    "method": "GET",
+    "path": "/api/v1/tools/h3-face-refine/source",
+    "summary": "Read authorized face-repair source facts",
+    "description": "Inspect the exact current Gallery source through the existing bounded CPU decoder. Requires face-repair feature availability, project.generate, model visibility and H3 terms/legal access. Reads reauthorize after decoding; this does not load a model or activate face repair. Source length must be 124\u2013345 frames with frame_count % 17 == 5 and supported geometry.",
+    "parameters": [
+      {
+        "name": "workspace",
+        "in": "query",
+        "required": true,
+        "description": "Exact authorized project name.",
+        "schema": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": "^[^/\\\\\\x00-\\x1f]+$"
+        }
+      },
+      {
+        "name": "name",
+        "in": "query",
+        "required": true,
+        "description": "Exact current Gallery output filename.",
+        "schema": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": "^[^/\\\\\\x00-\\x1f]+$"
+        }
+      },
+      {
+        "name": "revision",
+        "in": "query",
+        "required": true,
+        "description": "Current Gallery listing revision; stale sources fail with 409.",
+        "schema": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": "^[^/\\\\\\x00-\\x1f]+$"
+        }
+      }
+    ],
+    "responses": {
+      "200": {
+        "description": "Authorized measured source facts",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "workspace": {
+                  "type": "string"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "revision": {
+                  "type": "string"
+                },
+                "width": {
+                  "type": "integer"
+                },
+                "height": {
+                  "type": "integer"
+                },
+                "frame_count": {
+                  "type": "integer"
+                },
+                "fps": {
+                  "type": "string"
+                },
+                "audio_streams": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "ordinal": {
+                        "type": "integer"
+                      },
+                      "label": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "ordinal",
+                      "label"
+                    ]
+                  }
+                }
+              },
+              "required": [
+                "workspace",
+                "name",
+                "revision",
+                "width",
+                "height",
+                "frame_count",
+                "fps",
+                "audio_streams"
+              ]
+            }
+          }
+        }
+      },
+      "429": {
+        "description": "Two CPU preview readers are busy. Wait using Retry-After; no model work was submitted."
+      },
+      "499": {
+        "description": "The disconnected preview reader was cancelled and its CPU decoder drained."
+      }
+    },
+    "x-maestro": {
+      "feature": "editing.face_refine",
+      "contract_status": "authored",
+      "mcp": true,
+      "boundary": "Feature availability, project.generate, current source revision, legal/terms and private-output authorization apply. No local path or authority inputs.",
+      "idempotency": "Read-only; repeat with the same source revision. Stale sources require a fresh Gallery review.",
+      "idempotent": true,
+      "destructive": false,
+      "open_world": false
+    }
+  },
+  {
+    "method": "GET",
+    "path": "/api/v1/tools/h3-face-refine/frame",
+    "summary": "Read authorized face-repair frame",
+    "description": "Inspect the exact current Gallery source through the existing bounded CPU decoder. Requires face-repair feature availability, project.generate, model visibility and H3 terms/legal access. Reads reauthorize after decoding; this does not load a model or activate face repair. Source length must be 124\u2013345 frames with frame_count % 17 == 5 and supported geometry.",
+    "parameters": [
+      {
+        "name": "workspace",
+        "in": "query",
+        "required": true,
+        "description": "Exact authorized project name.",
+        "schema": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": "^[^/\\\\\\x00-\\x1f]+$"
+        }
+      },
+      {
+        "name": "name",
+        "in": "query",
+        "required": true,
+        "description": "Exact current Gallery output filename.",
+        "schema": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": "^[^/\\\\\\x00-\\x1f]+$"
+        }
+      },
+      {
+        "name": "revision",
+        "in": "query",
+        "required": true,
+        "description": "Current Gallery listing revision; stale sources fail with 409.",
+        "schema": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": "^[^/\\\\\\x00-\\x1f]+$"
+        }
+      },
+      {
+        "name": "frame_index",
+        "in": "query",
+        "required": true,
+        "schema": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 344
+        },
+        "description": "Zero-based frame within this retained source."
+      },
+      {
+        "name": "preview_attempt",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 999999999
+        },
+        "description": "Optional browser retry cache marker; does not identify generation."
+      }
+    ],
+    "responses": {
+      "200": {
+        "description": "Authorized PNG pixels",
+        "content": {
+          "image/png": {
+            "schema": {
+              "type": "string",
+              "format": "binary"
+            }
+          }
+        }
+      },
+      "429": {
+        "description": "Two CPU preview readers are busy. Wait using Retry-After; no model work was submitted."
+      },
+      "499": {
+        "description": "The disconnected preview reader was cancelled and its CPU decoder drained."
+      }
+    },
+    "x-maestro": {
+      "feature": "editing.face_refine",
+      "contract_status": "authored",
+      "mcp": true,
+      "boundary": "Feature availability, project.generate, current source revision, legal/terms and private-output authorization apply. No local path or authority inputs.",
+      "idempotency": "Read-only; repeat with the same source revision. Stale sources require a fresh Gallery review.",
+      "idempotent": true,
+      "destructive": false,
+      "open_world": false
+    }
+  }
+]

@@ -38,11 +38,53 @@ from services.llm_response_assist import (
 )
 
 logger = logging.getLogger(__name__)
+_runtime_probe_diagnostics = threading.local()
+
+
+class RuntimePreparationError(RuntimeError):
+    code = "llm_runtime_unavailable"
+    next_step = "Repair the local chat runtime before starting a new Director run."
+
+    def __init__(self, reason: str):
+        detail = "The local chat runtime is unavailable. " + self.next_step
+        super().__init__(detail)
+        self.reason = reason
+        self.private_diagnostics = dict(
+            getattr(_runtime_probe_diagnostics, "value", {})
+        )
+        self.failure_details = {
+            "code": self.code, "stage": "model_load", "detail": detail,
+            "exception_type": type(self).__name__, "is_oom": False,
+        }
+
+
+def _record_runtime_probe_diagnostic(kind, *, result=None, error=None):
+    def bounded(value, limit):
+        if isinstance(value, bytes):
+            return value[:limit].decode("utf-8", "replace")
+        return str(value or "").encode("utf-8", "replace")[:limit].decode("utf-8", "replace")
+
+    diagnostic = {
+        "classification": "returned_result" if error is None else type(error).__name__,
+        "returncode": result.returncode if result is not None else None,
+        "stdout": bounded(result.stdout if result is not None else getattr(error, "output", None), 512),
+        "stderr": bounded(result.stderr if result is not None else getattr(error, "stderr", None), 4096),
+    }
+    if error is not None:
+        diagnostic["error"] = bounded(error, 1024)
+    values = getattr(_runtime_probe_diagnostics, "value", {})
+    values[kind] = diagnostic
+    _runtime_probe_diagnostics.value = values
+    if error is not None or diagnostic["returncode"] != 0:
+        # These probes contain only runtime metadata; keep loader errors out
+        # of public failure details while retaining them in private logs.
+        logger.warning("llama-server %s probe failed: %s", kind, diagnostic)
 
 
 def _cancellation_checkpoint(
     cancel_handle: Optional[LlmCancellationHandle],
 ) -> None:
+    _owned_runtime_checkpoint()
     if cancel_handle is not None:
         cancel_handle.checkpoint()
 
@@ -68,6 +110,120 @@ def _unregister_cancellable_response(
 _process: Optional[subprocess.Popen] = None
 _lock = threading.RLock()
 _runtime_status_lock = threading.RLock()
+_runtime_owner = None
+_runtime_owner_scope = threading.local()
+
+
+class LocalRuntimeOwner:
+    """Private process custody; cancellation never needs the model lease.
+
+    Only the synchronous owner holding the model lease can bind a resident or
+    newborn process. Abort is absorbing, including before Popen returns. This
+    capability stays in memory and is never accepted from HTTP or serialized.
+    """
+
+    def __init__(self):
+        self.cancelled = threading.Event()
+        self.retired = False
+        self.process = None
+        self.generation = 0
+        self.resources_released = True
+        self._abort_lock = threading.Lock()
+
+    def checkpoint(self):
+        if self.cancelled.is_set():
+            raise LlmRequestCancelled("Director local runtime was stopped")
+
+    def _bind_locked(self, process, generation):
+        global _runtime_owner
+        if _runtime_owner not in (None, self):
+            raise LlmRequestCancelled("Local runtime still belongs to another operation")
+        self.process, self.generation = process, generation
+        self.resources_released = False
+        _runtime_owner = self
+
+    def abort(self, *, retiring=False):
+        global _runtime_phase, _runtime_abort_requested_at
+        global _runtime_last_aborted_attempt, _runtime_last_release
+        with _runtime_status_lock:
+            if not retiring:
+                self.retired = False
+            elif not self.cancelled.is_set():
+                self.retired = True
+            self.cancelled.set()  # Fence publication before signalling or waiting.
+        # Concurrent stop/watchdog/finalizer callers share the same captured
+        # process, but must not extend the shutdown deadline by queueing waits.
+        if not self._abort_lock.acquire(blocking=False):
+            return self.resources_released
+        try:
+            with _runtime_status_lock:
+                process, generation = self.process, self.generation
+                if process is None:
+                    return True  # A later birth binds and immediately aborts.
+                if _runtime_owner is not self or _process is not process or _runtime_generation != generation:
+                    self.resources_released = process.poll() is not None
+                    return self.resources_released
+                _runtime_phase = "abort_requested"
+                _runtime_abort_requested_at = time.time()
+                _runtime_last_aborted_attempt = (generation, _runtime_active_attempt_id, False)
+                _clear_runtime_remaining_evidence_locked("abort_requested")
+            released, escalated = _terminate_process_and_confirm(
+                process, terminate_timeout=2.0, kill_timeout=2.0,
+            )
+            with _runtime_status_lock:
+                self.resources_released = released
+                if _runtime_owner is self and _process is process and _runtime_generation == generation:
+                    if released:
+                        _runtime_last_aborted_attempt = (generation, _runtime_active_attempt_id, True)
+                        _runtime_last_release = {"generation": generation,
+                            "resources_released": True, "released_at": time.time(),
+                            "escalated_to_kill": escalated}
+                        _clear_runtime_state_locked()
+                    else:
+                        _runtime_phase = "release_failed"
+            return released
+        finally:
+            self._abort_lock.release()
+
+    def detach(self):
+        global _runtime_owner
+        with _runtime_status_lock:
+            if _runtime_owner is self and not self.cancelled.is_set():
+                _runtime_owner = None
+
+
+@contextmanager
+def local_runtime_owner(owner):
+    """Bind private Director custody to nested load/inference calls."""
+    if type(owner) is not LocalRuntimeOwner:
+        raise TypeError("Invalid local runtime owner")
+    previous = getattr(_runtime_owner_scope, "owner", None)
+    if previous not in (None, owner):
+        raise LlmRequestCancelled("Local runtime owner changed")
+    _runtime_owner_scope.owner = owner
+    try:
+        owner.checkpoint()
+        yield
+        # A completed private span retires its process before releasing the
+        # GPU lane. Intentional retirement is not a cancelled logical result.
+        if not (owner.retired and owner.resources_released):
+            owner.checkpoint()
+    finally:
+        _runtime_owner_scope.owner = previous
+
+
+def _owned_runtime_checkpoint(process=None, generation=None):
+    owner = getattr(_runtime_owner_scope, "owner", None)
+    if owner is not None:
+        if owner.cancelled.is_set():
+            owner.abort()
+        owner.checkpoint()
+    if process is not None:
+        with _runtime_status_lock:
+            if _process is not process or _runtime_generation != generation:
+                raise LlmRequestCancelled("Local runtime was replaced while loading")
+
+
 _model_id: str = ""
 _device: str = ""
 _server_port: int = 0
@@ -2892,15 +3048,25 @@ def _discover_nvcc() -> Optional[str]:
 
 def _cuda_process_env(
     nvcc_path: Optional[str], runtime_bin_dir: Optional[str] = None,
+    *, env: Optional[dict] = None,
 ) -> dict:
-    """Return an environment that can find a managed CUDA toolkit at runtime."""
-    env = os.environ.copy()
+    """Resolve sibling runtime libraries and any explicitly supplied toolkit."""
+    import sys
+
+    env = os.environ.copy() if env is None else dict(env)
+    runtime_dir = os.path.realpath(runtime_bin_dir or DEFAULT_BIN_DIR)
+    if sys.platform.startswith("linux") and os.path.isdir(runtime_dir):
+        existing = env.get("LD_LIBRARY_PATH", "")
+        paths = existing.split(os.pathsep) if existing else []
+        env["LD_LIBRARY_PATH"] = os.pathsep.join(
+            [runtime_dir] + [path for path in paths if path != runtime_dir]
+        )
     if not nvcc_path:
         return env
     toolkit_root = os.path.dirname(os.path.dirname(os.path.realpath(nvcc_path)))
     bin_dir = os.path.join(toolkit_root, "bin")
     library_dirs = [
-        os.path.realpath(runtime_bin_dir or DEFAULT_BIN_DIR),
+        runtime_dir,
         os.path.join(toolkit_root, "lib"),
         os.path.join(toolkit_root, "lib64"),
         os.path.join(toolkit_root, "targets", "x86_64-linux", "lib"),
@@ -2910,9 +3076,10 @@ def _cuda_process_env(
     # library's rpath-link explicitly for Miniforge's isolated linker.
     env["PATH"] = os.pathsep.join([bin_dir, env.get("PATH", "")])
     existing = env.get("LD_LIBRARY_PATH", "")
+    available = [directory for directory in library_dirs if os.path.isdir(directory)]
     env["LD_LIBRARY_PATH"] = os.pathsep.join(
-        [directory for directory in library_dirs if os.path.isdir(directory)]
-        + ([existing] if existing else [])
+        available + [path for path in (existing.split(os.pathsep) if existing else [])
+                     if path not in available]
     )
     env["CUDACXX"] = os.path.realpath(nvcc_path)
     env["CUDA_HOME"] = toolkit_root
@@ -2970,10 +3137,8 @@ def _cuda_architecture() -> Optional[str]:
 
 def _llama_server_capabilities(exe_path: str, env: Optional[dict] = None) -> dict:
     """Probe the installed executable and report its actual compute backend."""
-    if env is None:
-        build, runnable = _llama_server_probe(exe_path)
-    else:
-        build, runnable = _llama_server_probe(exe_path, env=env)
+    env = _cuda_process_env(None, os.path.dirname(os.path.abspath(exe_path)), env=env)
+    build, runnable = _llama_server_probe(exe_path, env=env)
     devices: list[str] = []
     backend = "unavailable"
     if runnable:
@@ -2986,6 +3151,7 @@ def _llama_server_capabilities(exe_path: str, env: Optional[dict] = None) -> dic
                 [exe_path, "--list-devices"], capture_output=True, text=True,
                 timeout=30, env=env, **kwargs,
             )
+            _record_runtime_probe_diagnostic("devices", result=result)
             output = (result.stdout or "") + "\n" + (result.stderr or "")
             in_device_list = False
             for line in output.splitlines():
@@ -3000,8 +3166,8 @@ def _llama_server_capabilities(exe_path: str, env: Optional[dict] = None) -> dic
                     devices.append(clean[:160])
             if result.returncode == 0 and devices:
                 backend = "cuda"
-        except Exception:
-            pass
+        except Exception as error:
+            _record_runtime_probe_diagnostic("devices", error=error)
     return {
         "build": build,
         "runnable": runnable,
@@ -3145,6 +3311,8 @@ def _llama_server_probe(exe_path: str, env: Optional[dict] = None):
     uses it when a required shared-library link is missing, so treating that
     result as merely "unparseable" leaves a broken runtime installed forever.
     """
+    _runtime_probe_diagnostics.value = {}
+    env = _cuda_process_env(None, os.path.dirname(os.path.abspath(exe_path)), env=env)
     try:
         import subprocess
         import re
@@ -3155,11 +3323,13 @@ def _llama_server_probe(exe_path: str, env: Optional[dict] = None):
             [exe_path, "--version"], capture_output=True, text=True, timeout=20,
             env=env, **kwargs,
         )
+        _record_runtime_probe_diagnostic("version", result=out)
         m = re.search(r"version:\s*(\d+)", (out.stdout or "") + (out.stderr or ""))
         if m:
             return int(m.group(1)), out.returncode == 0
         return None, out.returncode == 0
-    except Exception:
+    except Exception as error:
+        _record_runtime_probe_diagnostic("version", error=error)
         return None, False
 
 
@@ -3379,6 +3549,32 @@ def _ensure_llama_server(bin_dir: str, requested_device: str = "cpu") -> dict:
     is_linux = sys.platform.startswith("linux")
     exe_name = "llama-server.exe" if is_windows else "llama-server"
     exe_path = os.path.join(bin_dir, exe_name)
+
+    from services.native_acceptance_reservation import reservation
+    if reservation.target is not None:
+        # Frozen acceptance assets cannot be repaired, rebuilt or replaced
+        # by lazy model preparation, even when the runtime is unusable.
+        _runtime_probe_diagnostics.value = {}
+        if not os.path.isfile(exe_path):
+            raise RuntimePreparationError("runtime_missing")
+        capabilities = _llama_server_capabilities(
+            exe_path,
+            env=_cuda_process_env(
+                _discover_nvcc() if requested_device == "cuda" else None,
+                bin_dir,
+            ),
+        )
+        if not capabilities["runnable"]:
+            raise RuntimePreparationError("runtime_not_runnable")
+        minimum = LLAMA_SERVER_BUILD if is_linux and requested_device == "cuda" else MIN_LLAMA_BUILD
+        build = capabilities["build"]
+        if build is not None and build < minimum:
+            raise RuntimePreparationError("runtime_build_too_old")
+        if is_linux and requested_device == "cuda" and (
+            capabilities["backend"] != "cuda" or build is None
+        ):
+            raise RuntimePreparationError("runtime_cuda_unavailable")
+        return capabilities
 
     # Linux release assets are CPU-only.  A CUDA request therefore has one
     # reproducible path: build our pinned official source tag with the managed
@@ -3984,6 +4180,7 @@ def load_model(
     global _runtime_abort_requested_at, _runtime_last_release
 
     provider = str(provider or "local").strip().lower()
+    _owned_runtime_checkpoint()
     if provider == "local" and not cpu_coexistence and str(device).lower() == "cuda":
         from services.native_acceptance_reservation import reservation
         reservation.require_model_admission()
@@ -4118,7 +4315,8 @@ def load_model(
         )
         server_exe = _get_server_exe(requested_device)
         runtime_env = _cuda_process_env(
-            _discover_nvcc() if requested_device == "cuda" else None
+            _discover_nvcc() if requested_device == "cuda" else None,
+            os.path.dirname(server_exe),
         )
         probe_runtime = os.path.isfile(server_exe)
         capabilities = (
@@ -4128,6 +4326,9 @@ def load_model(
                 "build": None, "runnable": True, "backend": "cpu", "devices": [],
             }
         )
+        from services.native_acceptance_reservation import reservation
+        if reservation.target is not None and not capabilities["runnable"]:
+            raise RuntimePreparationError("runtime_not_runnable")
         extra_flags = registry_entry.get("extra_flags", [])
         disable_jinja = bool(registry_entry.get("disable_jinja", False))
         profile = _runtime_profile_for(
@@ -4143,6 +4344,11 @@ def load_model(
             _runtime_launch_identity(server_exe, extra_flags, disable_jinja),
         )
         if is_loaded() and _loaded_model_key == load_key and not force_reload:
+            owner = getattr(_runtime_owner_scope, "owner", None)
+            if owner is not None:
+                with _runtime_status_lock:
+                    owner._bind_locked(_process, _runtime_generation)
+                _owned_runtime_checkpoint()
             _activate_request_scope_after_load()
             _reset_idle_timer(load_key)
             return
@@ -4192,6 +4398,7 @@ def load_model(
         )
 
         print(f"[LLM] Starting llama-server on port {server_port}")
+        _owned_runtime_checkpoint()
         process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
@@ -4203,6 +4410,11 @@ def load_model(
             _runtime_generation_counter += 1
             _runtime_generation = _runtime_generation_counter
             _process = process
+            process_generation = _runtime_generation
+            owner = getattr(_runtime_owner_scope, "owner", None)
+            if owner is not None:
+                owner._bind_locked(process, process_generation)
+        _owned_runtime_checkpoint(process, process_generation)
         # Start the sole stdout consumer immediately. Cold loads can emit far
         # more than a pipe buffer before /health becomes ready.
         log_drain_done = _start_log_reader(process)
@@ -4213,9 +4425,10 @@ def load_model(
         load_timeout = max(60, int(file_size_gb * 15))  # ~15s per GB, min 60s
         ready = False
         for i in range(load_timeout):
-            if _process.poll() is not None:
+            _owned_runtime_checkpoint(process, process_generation)
+            if process.poll() is not None:
                 # The background reader is the sole stdout consumer.
-                exit_code = _process.returncode
+                exit_code = process.returncode
                 # A confirmed process exit closes the pipe. Wait for this
                 # process's own reader to observe EOF and publish every
                 # bounded diagnostic chunk, but never wait indefinitely for a
@@ -4228,11 +4441,12 @@ def load_model(
                     f"Content-free diagnostic tail:\n{output}"
                 )
             try:
-                resp = requests.get(f"{_server_url()}/health", timeout=1)
+                resp = requests.get(f"http://127.0.0.1:{server_port}/health", timeout=1)
                 if resp.status_code == 200:
                     data = resp.json() if resp.text else {}
                     status = data.get("status", "ok")
                     if status == "ok":
+                        _owned_runtime_checkpoint(process, process_generation)
                         ready = True
                         break
                     elif status == "loading model":
@@ -4249,7 +4463,13 @@ def load_model(
                 f"Content-free diagnostic tail:\n{server_output}"
             )
 
+        _owned_runtime_checkpoint(process, process_generation)
         with _runtime_status_lock:
+            # Abort and ready publication serialize on this small lock; an
+            # old successful health response cannot resurrect cleared state.
+            if (_process is not process or _runtime_generation != process_generation
+                    or (owner is not None and owner.cancelled.is_set())):
+                raise LlmRequestCancelled("Local runtime stopped before readiness")
             _model_id = repo_id
             _loading_model_id = ""
             _device = profile["backend"]
@@ -4417,7 +4637,7 @@ def _clear_runtime_state_locked() -> None:
     counters and the last confirmed release record deliberately survive.
     """
 
-    global _process, _model_id, _device, _server_port, _vision_available
+    global _process, _model_id, _device, _server_port, _vision_available, _runtime_owner
     global _loaded_model_key, _loading_model_id
     global _provider, _remote_url, _api_key, _requested_device
     global _runtime_backend, _runtime_build, _runtime_devices, _runtime_profile
@@ -4428,6 +4648,7 @@ def _clear_runtime_state_locked() -> None:
     global _runtime_load_finished_at, _runtime_request_started_at
     global _runtime_request_finished_at, _runtime_abort_requested_at
     _process = None
+    _runtime_owner = None
     _model_id = ""
     _device = ""
     _server_port = 0
@@ -4570,6 +4791,9 @@ def _diagnose_llm_request_failure(exc: Exception) -> "RuntimeError":
     frozen Director run — bad GGUF quant, VRAM OOM at load, wrong binary)
     from a transient network blip and includes only content-free diagnostics.
     """
+    owner = getattr(_runtime_owner_scope, "owner", None)
+    if owner is not None and owner.cancelled.is_set():
+        return LlmRequestCancelled("Director local runtime was stopped")
     token = _current_runtime_attempt_token()
     if token is not None:
         with _runtime_status_lock:

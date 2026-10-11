@@ -1608,6 +1608,22 @@ export interface RecordedFinishingHistory {
   omitted_branches?: number
 }
 
+export interface RecordedStyleDelivery {
+  version: 1
+  style_digest: string
+  model_type: string
+  application: 'references_applied' | 'text_only' | 'reference_use_unverified'
+  references: Array<{
+    index: number
+    sha256: string
+    delivery: 'applied' | 'skipped' | 'unverified'
+    reason: string
+    image_ordinal: number | null
+  }>
+  encoding_receipt_sha256: string | null
+  confirmed_windows: number
+}
+
 export interface OutputMetadata {
   source: 'sidecar' | 'embedded' | 'none'
   params: Record<string, unknown> | null
@@ -1619,6 +1635,10 @@ export interface OutputMetadata {
     output?: MeasuredVideoFacts
   }
   postprocessing?: RecordedFinishingHistory
+  producer_unit_settings?: {
+    custom_visual_style_delivery?: RecordedStyleDelivery
+    [key: string]: unknown
+  }
   private?: boolean
   explicit?: boolean
   upload_filenames?: Record<string, string | string[]>
@@ -1962,7 +1982,7 @@ export interface LoraInfo {
   /** Optional public input contract. Private trigger/template expansion stays server-side. */
   parameter_schema?: LoraParameterSchema
   /** Server-declared paths that consume and seal parameter choices. */
-  parameter_execution?: { studio_image_generation: boolean }
+  parameter_execution?: { studio_image_generation: boolean; studio_video_generation?: boolean }
   /** Update status from the cached CivitAI manifest. Populated by
    *  /api/v1/loras/check-updates and surfaced through this endpoint
    *  without an extra round-trip. The UI uses this to render badges. */
@@ -2425,4 +2445,32 @@ export interface PipelineListItem extends DirectorRecoveryMetadata {
   scene_description: string
   workspace: string
   repair_status?: PipelineRepairStatus | null
+}
+
+
+/** Reusable direction is independent of the authored visual medium. */
+export type CustomVisualStyleBorrowScope = 'palette' | 'materials' | 'lighting' | 'camera_motion'
+export interface CustomVisualStyleReference {
+  asset_id: string
+  variant_id: string
+  output_index: number
+  expected_sha256: string
+}
+export interface CustomVisualStyleDefinition {
+  version: 1
+  direction: string
+  borrow_scope: CustomVisualStyleBorrowScope[]
+  references: CustomVisualStyleReference[]
+}
+export interface CustomVisualStyleSelection {
+  asset_id: string
+  revision: string
+}
+export interface ProjectVisualStyle extends CustomVisualStyleSelection {
+  name: string
+  definition: CustomVisualStyleDefinition
+  project_id: string
+  workspace_id: string
+  incarnation: string
+  edit_revision: number
 }
