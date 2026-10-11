@@ -82,6 +82,10 @@ export function safeAccountHttpErrorMessage(
     return retryAfter > 0 ? `${message} Try again in about ${retryAfter} seconds.` : message
   }
   if (code !== 'account_request_failed') return safeAccountErrorMessage(code, retryAfter)
+  if (context === 'account' && status === 503) {
+    const message = 'Account access is temporarily unavailable. Wait for Maestro to be ready, then try again.'
+    return retryAfter > 0 ? `${message} Try again in about ${retryAfter} seconds.` : message
+  }
   if (context !== 'project-migration') return safeAccountErrorMessage(code, retryAfter)
   const message = status === 404
     ? 'Project setup is not available on this Maestro host.'

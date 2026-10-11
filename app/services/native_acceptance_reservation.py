@@ -256,6 +256,14 @@ class Reservation:
     def permits_http_action(self, method, path):
         if self.target is None or method.upper() in {"GET", "HEAD", "OPTIONS"}:
             return True
+        # Model admission must not lock the owner out of their account. These
+        # routes still pass the normal origin, nonce and account checks; they
+        # grant no model admission and no account administration capability.
+        if method.upper() == "POST" and path in {
+            "/api/v1/account/nonce", "/api/v1/account/login",
+            "/api/v1/account/reauth", "/api/v1/account/logout",
+        }:
+            return True
         target = self.target["identity"]["id"]
         if self.target.get("kind") == "director_planning":
             base = f"/api/v1/director/pipeline/{self.target['pipeline_id']}"
