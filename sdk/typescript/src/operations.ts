@@ -83311,17 +83311,133 @@ export const operationReference: readonly OperationReference[] = [
                   "type": "array",
                   "items": {
                     "type": "object",
-                    "properties": {},
-                    "required": [],
-                    "additionalProperties": true
+                    "properties": {
+                      "name": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Direct-child media basename. Use this field as filename in the file read or MCP Gallery transfer; not a filesystem path."
+                      },
+                      "type": {
+                        "type": "string",
+                        "enum": [
+                          "image",
+                          "video",
+                          "audio"
+                        ],
+                        "description": "Gallery media kind inferred from its extension."
+                      },
+                      "mode": {
+                        "anyOf": [
+                          {
+                            "type": "string",
+                            "description": "Retained generation_mode, when present; model-specific values remain extensible."
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ]
+                      },
+                      "edit_sub_mode": {
+                        "description": "Retained model-specific edit submode from output metadata; may be absent/null or a model-specific value."
+                      },
+                      "artifact_class": {
+                        "type": "string",
+                        "description": "Server-classified output role; use artifact_scope to include retained components."
+                      },
+                      "linked_component_count": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Number of currently linked component files for this final output."
+                      },
+                      "favorite": {
+                        "type": "boolean",
+                        "description": "Project favorite state; false in the session Uploads view."
+                      },
+                      "size": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Media file size in bytes."
+                      },
+                      "created_at": {
+                        "type": "number",
+                        "description": "File modification time as Unix seconds, including fractional seconds; used for newest-first listing."
+                      },
+                      "revision": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 128,
+                        "description": "Opaque listing revision binding media plus sidecar identity. Pass unchanged as listing_revision to GET /file/{filename}, or revision to maestro_gallery_to_upload. It is not a sha256 content_revision. Uploads use a different access-sidecar identity and reject revision-bound output reads."
+                      },
+                      "workspace": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "The explicitly selected authorized project, or __uploads__ for session-owned uploads. Active workspace is not changed."
+                      },
+                      "private": {
+                        "type": "boolean",
+                        "description": "Persisted access/privacy flag; it does not grant project access."
+                      },
+                      "explicit": {
+                        "type": "boolean",
+                        "description": "Persisted source/user flag; clients preserve it without adding content inspection."
+                      },
+                      "url": {
+                        "type": "string",
+                        "description": "Relative authorized media URL including project scope. This convenience URL is not revision-pinned; use name/workspace/revision for a stable transfer."
+                      }
+                    },
+                    "required": [
+                      "name",
+                      "type",
+                      "mode",
+                      "edit_sub_mode",
+                      "artifact_class",
+                      "linked_component_count",
+                      "favorite",
+                      "size",
+                      "created_at",
+                      "revision",
+                      "workspace",
+                      "private",
+                      "explicit",
+                      "url"
+                    ],
+                    "additionalProperties": true,
+                    "description": "Public Gallery listing entry. Retain opaque server revision and project scope; never infer source paths or execution authority from this row."
                   }
                 },
                 "total": {
-                  "type": "integer"
+                  "type": "integer",
+                  "minimum": 0,
+                  "description": "Count after all filters and before pagination."
                 }
               },
-              "required": [],
+              "required": [
+                "outputs",
+                "total"
+              ],
               "additionalProperties": true
+            },
+            "example": {
+              "outputs": [
+                {
+                  "name": "scene.png",
+                  "type": "image",
+                  "mode": "image",
+                  "edit_sub_mode": null,
+                  "artifact_class": "final",
+                  "linked_component_count": 0,
+                  "favorite": false,
+                  "size": 350168,
+                  "created_at": 1790196633.5011718,
+                  "revision": "18d80e5a71f0003d-557d8.18d80e5a89cd82fc-7b8",
+                  "workspace": "my-project",
+                  "private": true,
+                  "explicit": false,
+                  "url": "/api/v1/file/scene.png?workspace=my-project"
+                }
+              ],
+              "total": 1
             }
           }
         }
@@ -83479,7 +83595,7 @@ export const operationReference: readonly OperationReference[] = [
       "idempotency": "Read/preview operation; no native generation job is submitted.",
       "operation_kind": "read",
       "mcp": true,
-      "evidence": "Source contract: app/launch.py, ui/src/api/client.ts and the referenced local service validators. Native/device execution has not been exercised by this contract addition.",
+      "evidence": "Production list_outputs field assembly plus actual authenticated Gallery revision-bound MCP file/private-upload journey. No model execution or full native parity is implied.",
       "contract_status": "authored"
     }
   },

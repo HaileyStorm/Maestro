@@ -147,10 +147,18 @@ recovery while all 16 pre-existing queue payloads remained unchanged; it was
 never resubmitted. That actual Editor response also established numeric Unix timestamps;
 the corrected collection and saved-timeline schemas validate those retained
 HTTP bodies. The filterable explorer exposes operation IDs and collapsed groups.
-Separate authenticated SDK/MCP session and bounded MCP upload acceptance still
-need an operator-established client session. The human-only login helper provides
-that path without browser credential extraction. Authenticated
-LAN/Cloudflare feature acceptance, native model execution, subjective quality
+The human-only login helper established a separate private session. Python and
+Node clients authenticated and read the authorized project and Editor collection;
+the official MCP stdio client read that same collection. One authenticated
+`maestro_gallery_to_upload` call then read an exact authorized Gallery image
+revision and created a private session upload (350,168 bytes), returning its
+filename without a path or generation submission. Its exclusive transfer intent
+and receipt were retained; it was not repeated. These observations establish the
+local client/session and bounded upload handoff, without browser credential
+extraction. The Gallery response contract now names the production listing fields
+and explains the difference between listing revisions, content revisions and
+unpinned convenience URLs. Authenticated LAN/Cloudflare feature acceptance,
+native model execution, subjective quality
 and Git publication are not established by these discovery observations.
 Every mapped action has a production operation, documented composition or
 explicit boundary; complete deployed feature parity remains unclaimed while
