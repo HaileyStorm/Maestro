@@ -434,6 +434,13 @@ rerun can create another revision. Read first and never automatically retry.
 Private frozen inputs, process identities and execution authority are not part
 of the public repair record.
 
+The requested resolution is not a guarantee of the encoded canvas: the current
+native image-fitting policy can adopt the starting image's aspect ratio. A real
+H3 rerun requested 1280x720 and produced 704x704 from its square starting image,
+with 124 frames at 24 fps and stereo audio. Inspect the returned media's actual
+dimensions and duration before composing or exporting it; do not infer them
+from the saved request alone.
+
 ```bash
 # Observe a retained clip attempt after a lost rerun response; this starts no work.
 curl --fail-with-body -b "$MAESTRO_COOKIE_FILE" \

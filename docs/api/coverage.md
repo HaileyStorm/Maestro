@@ -212,8 +212,8 @@ authored contracts. The maintained client references were regenerated from that
 fresh live export; the TypeScript client build passed. All 24 retained job
 identities, the saved parent and the environment remained unchanged across the
 coordinated restart. This establishes the public reconciliation contract and
-deployment, not the rerun response's child identifier or native video execution;
-those require a separate fresh model journey and GPU authority.
+deployment. The subsequent native journey below establishes the ordinary video
+rerun response and execution separately.
 Actual model-free preparation then found that an independent H3 clip rerun was
 applying its saved parent's whole-pipeline Seamless compatibility check. The
 correction clears that flag only in the temporary assessment for an ordinary
@@ -223,6 +223,25 @@ bytes. The original builder now prepares the sealed-image request as 124 frames
 at 24 fps, eight steps and the saved rerun's 1280x720 request. Authorized live
 discovery matches its scalar model metadata; nested diagnostic values are
 abbreviated, so this is not full registry equivalence or native execution proof.
+
+One ordinary saved-video rerun subsequently completed through the authenticated
+production HTTP operation under a fresh exact GPU lease. Its HTTP 200 response
+returned the actual child job identifier and output filename. The native H3
+sampler completed eight steps and published one sealed video; the saved clip
+adopted that output while its parent remained cancelled. After the coordinated
+restart, the completed child row retired normally and its saved repair still
+retained the completed identity and output. The maintained Python client read
+that saved clip, found the output in Gallery, and fetched bytes matching its
+producer seal. Media inspection found 124 frames at 24 fps, 5.166667 seconds,
+704x704 HEVC video and stereo AAC audio. The saved request was 1280x720: current
+native image fitting adopted the square reference canvas. This proves ordinary
+rerun execution, adoption and reconnection, not fixed requested dimensions,
+H3 scene/image-reference style qualification or subjective quality. The earlier
+failed attempt stopped before model admission because the private observer
+incorrectly required an ephemeral field in the persisted manifest; its failure
+and terminal request remain historical evidence. No failed POST was replayed.
+The successful runtime drained, its lease became terminal, normal service and
+public restart status were restored, and no routine test suite was run.
 Historical attempt receipts remain
 retained separately rather than becoming routine regression scenarios.
 
