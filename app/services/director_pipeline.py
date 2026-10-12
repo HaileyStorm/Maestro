@@ -177,8 +177,10 @@ _pipeline_repairs: dict[str, dict] = {}
 # short id.
 _pipeline_llm_contexts: dict[str, dict] = {}
 _pipeline_planning_admissions: dict[str, object] = {}
+_pipeline_image_admissions: dict[str, object] = {}
 _pipeline_gpu_parent_guards: dict[str, object] = {}
 _DIRECTOR_PLANNING_CUSTODY_KEY = "_planning_custody_required"
+_DIRECTOR_IMAGE_CUSTODY_KEY = "_image_custody_required"
 _pipeline_llm_tokens: dict[str, object] = {}
 _pipeline_llm_cancel_handles: dict[
     str, tuple[object, LlmCancellationHandle]
@@ -1559,6 +1561,8 @@ def _write_initial_pipeline_state(pid: str, pipeline: dict, *, before_replace=No
         "_params_snapshot": params,
         **({_DIRECTOR_PLANNING_CUSTODY_KEY: True}
            if pipeline.get(_DIRECTOR_PLANNING_CUSTODY_KEY) is True else {}),
+        **({_DIRECTOR_IMAGE_CUSTODY_KEY: True}
+           if pipeline.get(_DIRECTOR_IMAGE_CUSTODY_KEY) is True else {}),
         "recovery": {},
     }
     filepath = os.path.join(out_dir, pipeline_state_filename(pid))
@@ -1709,6 +1713,8 @@ def _save_pipeline_state_locked(pid: str) -> bool:
         "_params_snapshot": params,
         **({_DIRECTOR_PLANNING_CUSTODY_KEY: True}
            if p.get(_DIRECTOR_PLANNING_CUSTODY_KEY) is True else {}),
+        **({_DIRECTOR_IMAGE_CUSTODY_KEY: True}
+           if p.get(_DIRECTOR_IMAGE_CUSTODY_KEY) is True else {}),
         # Director JSON remains the semantic authority.  This bounded block
         # records only scheduling identities and already-verified child
         # artifact descriptors; prompts and request paths stay in the
@@ -4285,6 +4291,7 @@ def _submit_and_wait(
     pipeline_id = params.get("_director_pipeline_id")
     _detached_operation = bool(params.get("_director_detached_operation"))
     _repair_operation_id = params.get("_director_repair_operation_id")
+    image_admission = _require_pipeline_image_custody(pipeline_id) if pipeline_id else None
     params = dict(params)
     recovery_unit = _normalized_child_unit(
         params.pop("_director_recovery_unit", None)
@@ -4453,6 +4460,8 @@ def _submit_and_wait(
     try:
         if recovery_managed:
             private_options = {}
+            if image_admission is not None:
+                private_options["image_admission"] = image_admission
             if h3_scene_rerun_admission is not None:
                 def lease_before_worker(candidate):
                     with _pipeline_lock:
@@ -4917,6 +4926,9 @@ def _pipeline_llm_call(
     *args,
     **kwargs,
 ):
+    from services.native_acceptance_reservation import reservation
+    if reservation.target is not None and reservation.target.get("kind") == "director_images":
+        reservation.require_model_admission(workload="llm")
     # Planning already owns the complete sequence. Later prompt-polish passes
     # need their own custody span instead of relying on a closed planner guard.
     with _pipeline_lock:
@@ -6175,7 +6187,58 @@ def _require_pipeline_planning_custody(pid: str):
         return admission
 
 
-def continue_pipeline(pid: str, updates: Optional[dict] = None, *, planning_admission=None):
+def _director_image_admission_slots(pipeline: dict) -> list[dict]:
+    """The private acceptance lane covers one new anchor and one shot only."""
+    params = pipeline.get("params") or {}
+    plans = pipeline.get("clip_plans") or []
+    if (params.get("auto_mode") is not False or params.get("hold_video") is not True
+            or not shot_images_required(_director_effective_shot_image_policy(params))
+            or len(plans) != 1 or plans[0].get("keyframe_prompts")
+            or any(params.get(key) for key in ("reference_image_path", "character_ref_paths",
+                "location_ref_paths", "generated_reference_image_filename"))
+            or any(pipeline.get("clip_images") or [])):
+        raise ValueError("Director image reservation requires a fresh one-shot image review")
+    return [{"kind": "image_anchor", "variant": 0, "index": 0},
+        {"kind": "image_start", "variant": 0, "index": 0}]
+
+
+def _director_image_admission_settings(params: dict) -> dict:
+    settings = {}
+    for role in ("creator", "editor"):
+        model = _director_image_role_model(params, role)
+        image = _director_image_params(params, model)
+        loras = _director_image_role_loras(params, role)
+        settings[role] = {"model_type": model,
+            "resolution": image.get("resolution", "1280x720"),
+            "num_inference_steps": image.get("num_inference_steps", 8),
+            "guidance_scale": image.get("guidance_scale", 1),
+            "activated_loras": loras.get("activated_loras", []),
+            "loras_multipliers": loras.get("loras_multipliers", "")}
+    return settings
+
+
+def _require_pipeline_image_custody(pid: str):
+    from services.native_acceptance_reservation import _ImageAdmission, reservation
+    # Ordinary detached cancellation waits for the first caller-owned reads;
+    # it must not gain a new pipeline-lock acquisition before registration.
+    snapshot = _pipelines.get(pid) or {}
+    reserved = reservation.target is not None and reservation.target.get("kind") == "director_images"
+    if snapshot.get(_DIRECTOR_IMAGE_CUSTODY_KEY) is not True and not reserved:
+        return None
+    with _pipeline_lock:
+        pipeline = _pipelines.get(pid) or {}
+        if pipeline.get(_DIRECTOR_IMAGE_CUSTODY_KEY) is not True:
+            if reservation.target is not None and reservation.target.get("kind") == "director_images":
+                raise RuntimeError("Director image work requires its live parent admission")
+            return None
+        token = _pipeline_image_admissions.get(pid)
+        if (type(token) is not _ImageAdmission or token.pipeline is not pipeline
+                or reservation.target is None or not reservation._images_matches(token)):
+            raise RuntimeError("Interrupted Director images require their live parent admission")
+        return token
+
+
+def continue_pipeline(pid: str, updates: Optional[dict] = None, *, planning_admission=None, image_admission=None):
     """Resume a paused pipeline, optionally with updated clip_plans."""
     start_recovered = False
     before_planning = False
@@ -6187,7 +6250,14 @@ def continue_pipeline(pid: str, updates: Optional[dict] = None, *, planning_admi
         if updates is not None and not isinstance(updates, dict):
             raise ValueError("Director continuation must be an object")
         before_planning = p.get("pause_reason") == "before_planning"
-        from services.native_acceptance_reservation import _PlanningAdmission, reservation
+        from services.native_acceptance_reservation import _PlanningAdmission, _ImageAdmission, reservation
+        reserved_images = reservation.target is not None and reservation.target.get("kind") == "director_images"
+        if image_admission is not None or reserved_images or p.get(_DIRECTOR_IMAGE_CUSTODY_KEY) is True:
+            if (p.get("pause_reason") != "review_prompts" or updates
+                    or type(image_admission) is not _ImageAdmission
+                    or image_admission is not reservation._images or image_admission.pipeline is not p
+                    or not reservation._images_matches(image_admission) or not reservation.dispatch_ready()):
+                raise ValueError("Director images need their exact retained parent admission")
         if planning_admission is not None and not before_planning:
             raise ValueError("Director planning admission requires the planning hold")
         if before_planning and (reservation.target is not None
@@ -6222,6 +6292,8 @@ def continue_pipeline(pid: str, updates: Optional[dict] = None, *, planning_admi
             "hold_video": p["params"].get("hold_video"),
             "planning_custody_present": _DIRECTOR_PLANNING_CUSTODY_KEY in p,
             "planning_custody": p.get(_DIRECTOR_PLANNING_CUSTODY_KEY),
+            "image_custody_present": _DIRECTOR_IMAGE_CUSTODY_KEY in p,
+            "image_custody": p.get(_DIRECTOR_IMAGE_CUSTODY_KEY),
             "recovery_projection": {
                 key: p[key] for key in (
                     "recovery_state", "recovery_actions", "_recovery_saved_phase",
@@ -6239,6 +6311,9 @@ def continue_pipeline(pid: str, updates: Optional[dict] = None, *, planning_admi
         if planning_admission is not None:
             _pipeline_planning_admissions[pid] = planning_admission
             p[_DIRECTOR_PLANNING_CUSTODY_KEY] = True
+        if image_admission is not None:
+            _pipeline_image_admissions[pid] = image_admission
+            p[_DIRECTOR_IMAGE_CUSTODY_KEY] = True
         p["status"] = "running"
         p["_resume_after_pause"] = p.get("pause_reason")
         p["pause_reason"] = None
@@ -6255,6 +6330,9 @@ def continue_pipeline(pid: str, updates: Optional[dict] = None, *, planning_admi
             if current is p:
                 if _pipeline_planning_admissions.get(pid) is planning_admission:
                     _pipeline_planning_admissions.pop(pid, None)
+                if _pipeline_image_admissions.get(pid) is image_admission:
+                    _pipeline_image_admissions.pop(pid, None)
+                    reservation.abandon_images(image_admission)
                 current.pop("_review_continue_pending", None)
                 if current.get("status") == "running":
                     current["clip_plans"] = rollback["clip_plans"]
@@ -6280,6 +6358,10 @@ def continue_pipeline(pid: str, updates: Optional[dict] = None, *, planning_admi
                         current[_DIRECTOR_PLANNING_CUSTODY_KEY] = rollback["planning_custody"]
                     else:
                         current.pop(_DIRECTOR_PLANNING_CUSTODY_KEY, None)
+                    if rollback["image_custody_present"]:
+                        current[_DIRECTOR_IMAGE_CUSTODY_KEY] = rollback["image_custody"]
+                    else:
+                        current.pop(_DIRECTOR_IMAGE_CUSTODY_KEY, None)
                     for key in (
                         "recovery_state", "recovery_actions", "_recovery_saved_phase",
                     ):
@@ -6408,6 +6490,8 @@ def _resume_pipeline_reserved(
         return False, "Paused pipelines must be continued explicitly."
     if data.get(_DIRECTOR_PLANNING_CUSTODY_KEY) is True:
         return False, "Interrupted planning requires its live parent admission."
+    if data.get(_DIRECTOR_IMAGE_CUSTODY_KEY) is True:
+        return False, "Interrupted images require their live parent admission."
     if not isinstance(data.get("_params_snapshot"), dict):
         return False, (
             "This pipeline was created before resume support and can't be "
@@ -6516,9 +6600,10 @@ def restore_registered_pipeline(
     saved_status = str(data.get("status") or "queued")
     terminal = saved_status in {"completed", "failed", "cancelled"}
     paused = saved_status == "paused"
-    blocked_custody = data.get(_DIRECTOR_PLANNING_CUSTODY_KEY) is True and not terminal
+    blocked_custody = (data.get(_DIRECTOR_PLANNING_CUSTODY_KEY) is True
+        or data.get(_DIRECTOR_IMAGE_CUSTODY_KEY) is True) and not terminal
     if blocked_custody and not blocked_reason:
-        blocked_reason = "Interrupted planning cannot restart without its original admission."
+        blocked_reason = "Interrupted Director work cannot restart without its original admission."
     blocked_manual = bool(blocked_reason) and not terminal
     can_start_worker = not (
         terminal or paused or blocked_remote or blocked_manual
@@ -6643,6 +6728,8 @@ def restore_registered_pipeline(
         "params": params,
         **({_DIRECTOR_PLANNING_CUSTODY_KEY: True}
            if data.get(_DIRECTOR_PLANNING_CUSTODY_KEY) is True else {}),
+        **({_DIRECTOR_IMAGE_CUSTODY_KEY: True}
+           if data.get(_DIRECTOR_IMAGE_CUSTODY_KEY) is True else {}),
         "pause_reason": data.get("pause_reason"),
         "workspace": (
             None if data.get("workspace") in (None, "default")
@@ -7075,6 +7162,10 @@ def _run_pipeline(pid: str, resume: bool = False):
             clip_plans = _pipelines[pid]["clip_plans"]
 
         # ── Phase 2: Generate Start Images ──────────────────────────────
+        image_admission = _require_pipeline_image_custody(pid)
+        if image_admission is not None:
+            from services.native_acceptance_reservation import reservation
+            reservation.activate_images(image_admission, _pipeline_threads.get(pid))
         if requires_shot_images:
             _update_pipeline(pid, phase="generating_images",
                              progress={"current": 0, "total": len(clip_plans), "message": "Generating start images...", "step": 0, "total_steps": 0})
@@ -7220,7 +7311,16 @@ def _run_pipeline(pid: str, resume: bool = False):
         ):
             _update_pipeline(pid, status="paused", pause_reason="review_images",
                              progress={"current": 2, "total": 3, "message": "Review images", "step": 0, "total_steps": 0})
+            if image_admission is not None:
+                if not _recovered_image_slots_complete(pid, pipeline_out_dir, params,
+                        clip_plans, clip_images, clip_keyframes):
+                    raise RuntimeError("Director image review requires sealed children")
+                reservation.finish_images(image_admission)
+                with _pipeline_lock:
+                    _pipelines[pid].pop(_DIRECTOR_IMAGE_CUSTODY_KEY, None)
             _require_pipeline_checkpoint(pid, "image-review-pause")
+            if image_admission is not None:
+                return
             _wait_for_resume(pid)
             if _pipelines[pid]["status"] == "cancelled":
                 return
@@ -7337,6 +7437,10 @@ def _run_pipeline(pid: str, resume: bool = False):
         with _pipeline_lock:
             _pipeline_llm_tokens.pop(pid, None)
             _pipeline_planning_admissions.pop(pid, None)
+            image_admission = _pipeline_image_admissions.pop(pid, None)
+            if image_admission is not None:
+                from services.native_acceptance_reservation import reservation
+                reservation.abandon_images(image_admission)
             _pipeline_llm_cancel_handles.pop(pid, None)
             _pipeline_llm_contexts.pop(pid, None)
             current = _pipeline_threads.get(pid)
@@ -7526,6 +7630,9 @@ def _ensure_llm_loaded(params: dict, cancel_checkpoint=None) -> dict:
 
 
 def _run_planning(pid: str, params: dict, pipeline_type: str):
+    from services.native_acceptance_reservation import reservation
+    if reservation.target is not None and reservation.target.get("kind") == "director_images":
+        reservation.require_model_admission(workload="llm")
     _require_pipeline_planning_custody(pid)
     from services import llm_service
     selection = _director_llm_selection(params)
@@ -8208,7 +8315,14 @@ def _run_image_generation(pid: str, params: dict, clip_plans: list[dict], out_di
                 "pipeline output directory; video generation was not started."
             )
         ref_image_path = anchor_path
-        params["generated_reference_image_filename"] = anchor_file
+        image_admission = _require_pipeline_image_custody(pid)
+        if image_admission is not None:
+            from services.native_acceptance_reservation import reservation
+            sealed = _recovered_child_outputs(pid,
+                {"kind": "image_anchor", "variant": 0, "index": 0}, out_dir)
+            reservation.seal_image_anchor(image_admission, anchor_file, sealed or [])
+        else:
+            params["generated_reference_image_filename"] = anchor_file
         _update_pipeline(
             pid, generated_reference_image_filename=anchor_file,
         )

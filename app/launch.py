@@ -7796,11 +7796,26 @@ def _director_recovery_submit_child(
     h3_scene_rerun_admission: dict | None = None,
     h3_scene_rerun_before_worker=None,
     h3_scene_rerun_worker=None,
+    image_admission=None,
 ) -> dict:
     """Attach to one deterministic child, or durably register it once."""
     # This trusted entry point owns the incoming kind before either fresh
     # registration or immutable-manifest attachment validates child identity.
     job["kind"] = "director_child"
+    from services.native_acceptance_reservation import reservation
+    if reservation.target is not None and reservation.target.get("kind") == "director_images":
+        # Only the retained Director worker can carry this private capability.
+        reservation.validate_image_child(image_admission, job, unit, attempt)
+    if image_admission is not None:
+        if h3_scene_rerun_admission is not None or h3_scene_rerun_before_worker is not None:
+            raise QueueRecoveryRuntimeError("Director image admission cannot authorize a repair.")
+        job["recovery_cursor"] = dict(job.get("recovery_cursor") or {},
+            director_image_custody={"pipeline_id": pid,
+                "request_sha256": reservation.target["request_sha256"]})
+        def enroll_image(candidate):
+            reservation.enroll_image_child(image_admission, candidate, unit, attempt)
+            return True
+        h3_scene_rerun_before_worker = enroll_image
     try:
         from services import director_pipeline as _director_service
 
@@ -7823,6 +7838,8 @@ def _director_recovery_submit_child(
     job_id = str(job.get("id") or "")
     existing = _jobs.get(job_id)
     if existing is not None:
+        if image_admission is not None:
+            raise QueueRecoveryRuntimeError("Reserved Director image child already exists; reconcile without replay.")
         existing_parent = str(
             (existing.get("params") or {}).get("_director_pipeline_id")
             or (existing.get("params") or {}).get("_director_request_id")
@@ -10186,6 +10203,12 @@ def _queue_recovery_materialize_job(
         runtime["recovery_state"] = "terminal"
         return runtime, False
 
+    if runtime.get("kind") == "director_child" and "director_image_custody" in (snapshot.get("recovery_cursor") or {}):
+        runtime.update(queue_held=True, recovery_state="blocked", reruns_denoise=False,
+            _recovery_reason_code="director_image_admission_required",
+            message="Interrupted Director images require their original execution admission")
+        return runtime, False
+
     # Classify from both cursors before normalization discards failed units or
     # old failure envelopes. A negative ordinary classification stays durable.
     ordinary_request = (
@@ -10684,8 +10707,8 @@ def _director_recovery_restore_parent(
         return None
 
     blocked_reason = (
-        "This interrupted planning attempt requires fresh execution authority."
-        if state.get("_planning_custody_required") is True
+        "This interrupted Director attempt requires its original execution authority."
+        if (state.get("_planning_custody_required") is True or state.get("_image_custody_required") is True)
         and str(state.get("status") or "") not in {"completed", "failed", "cancelled"}
         else ""
     )
@@ -11565,6 +11588,8 @@ def _restore_queue_recovery_on_startup(
 
 def _queue_recovery_revalidate_job(job: dict) -> bool:
     """Recheck project marker, manifest, and all inputs for manual resume."""
+    if job.get("kind") == "director_child" and "director_image_custody" in (job.get("recovery_cursor") or {}):
+        return False
     workspace = str(job.get("workspace") or "default")
     try:
         project_dir = _existing_workspace_dir(workspace)
@@ -48203,6 +48228,7 @@ def _public_pipeline_state(state: dict) -> dict:
     from services.director_pipeline import scrub_director_public_credentials
     public = scrub_director_public_credentials(copy.deepcopy(state))
     public.pop("_planning_custody_required", None)
+    public.pop("_image_custody_required", None)
     # Historical raw planner logs predate request-scoped streaming. Keep the
     # file untouched for provenance, but never publish its prompt, thinking,
     # or response content. New Director checkpoints write this field as null.
@@ -49150,6 +49176,7 @@ def director_pipeline_status(request: Request, pid: str):
         "_recovery_saved_phase", "_recovered_without_worker",
         "_llm_log", "_llm_passes",
         "_planning_custody_required",
+        "_image_custody_required",
     ):
         p.pop(internal, None)
     p.update(_public_director_recovery_metadata(p))
@@ -49177,6 +49204,7 @@ async def director_pipeline_continue(pid: str, request: Request):
     ):
         raise HTTPException(status_code=400, detail="Choose a video queue hold after image review")
     planning_admission = None
+    image_admission = None
     if pipeline.get("pause_reason") == "before_planning":
         from services.native_acceptance_reservation import reservation
         if reservation.target is not None:
@@ -49192,7 +49220,22 @@ async def director_pipeline_continue(pid: str, request: Request):
                 planning_admission = reservation.bind_planning(
                     pid, parent, params, _director_llm_selection(params),
                 )
-    ok = continue_pipeline(pid, body or None, planning_admission=planning_admission)
+    elif pipeline.get("pause_reason") == "review_prompts":
+        from services.native_acceptance_reservation import reservation
+        if reservation.target is not None and reservation.target.get("kind") == "director_images":
+            if body:
+                raise HTTPException(status_code=400, detail="Continue with the retained image plan unchanged")
+            from services import director_pipeline as pipeline_service
+            with pipeline_service._pipeline_lock:
+                live = pipeline_service._pipelines.get(pid)
+                parent = _director_recovery_parents.get(pid)
+                if not live or not isinstance(parent, dict):
+                    raise HTTPException(status_code=409, detail="Director image parent is unavailable")
+                image_admission = reservation.bind_images(pid, parent, live,
+                    pipeline_service._director_image_admission_slots(live),
+                    pipeline_service._director_image_admission_settings(live["params"]))
+    ok = continue_pipeline(pid, body or None, planning_admission=planning_admission,
+        image_admission=image_admission)
     if not ok:
         raise HTTPException(status_code=400, detail="Pipeline is not paused")
     return {"status": "resumed"}
@@ -71790,6 +71833,9 @@ def _try_automatic_resource_retry(
     retryable: bool | None = None,
 ) -> bool:
     """Durably re-admit one exact job, or leave unsafe work terminal/held."""
+    cursor = job.get("recovery_cursor")
+    if isinstance(cursor, dict) and "director_image_custody" in cursor:
+        return False
     details = failure_updates.get("failure_details")
     if not isinstance(details, dict):
         return False

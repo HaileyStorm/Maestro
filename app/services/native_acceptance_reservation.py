@@ -63,6 +63,19 @@ class _PlanningAdmission:
         self.generation_lock = None
 
 
+class _ImageAdmission:
+    """One retained image phase; children acquire their own scheduler permits."""
+    def __init__(self, reservation, pid, parent, pipeline, settings):
+        self.reservation, self.pid, self.parent, self.pipeline = reservation, pid, parent, pipeline
+        self.params = pipeline["params"]
+        self.settings = json.loads(json.dumps(settings))
+        self.anchor_original = {key: self.params[key] for key in ("generated_reference_image_filename",) if key in self.params}
+        self.anchor = None
+        self.thread = None
+        self.children = {}
+        self.closed = False
+
+
 class Reservation:
     def __init__(self, target=None, dispatch_check=None, *, release_action="start-next"):
         if type(release_action) is not str or release_action not in {"start-next", "resume", "continue"}:
@@ -78,6 +91,7 @@ class Reservation:
         self._permits = {}
         self._workers = {}
         self._planning = {}
+        self._images = None
         self._lock = threading.RLock()
         self._dispatch_check = dispatch_check
 
@@ -95,7 +109,142 @@ class Reservation:
             return True
         if self.target.get("kind") == "director_planning":
             return False
+        if self.target.get("kind") == "director_images":
+            with self._lock:
+                token = self._images
+                return (token is not None and self._images_matches(token)
+                    and any(self._image_child_matches(job, entry)
+                        for entry in token.children.values()))
         return self._matches_job(job, self.target.get("execution_attempt"))
+
+    def bind_images(self, pid, parent, pipeline, slots, settings):
+        if self.target is None:
+            return None
+        with self._lock:
+            token = _ImageAdmission(self, pid, parent, pipeline, settings)
+            if (self._images is not None or pipeline.get("status") != "paused"
+                    or pipeline.get("pause_reason") != "review_prompts"
+                    or slots != self.target.get("image_slots")
+                    or not self._images_matches(token) or not self.dispatch_ready()):
+                raise NativeAcceptanceReserved("Director image reservation did not verify")
+            self._images = token
+            return token
+
+    def _images_matches(self, token):
+        try:
+            params = dict(token.params)
+            if token.anchor is not None:
+                if params.pop("generated_reference_image_filename", None) != token.anchor:
+                    return False
+                params.update(token.anchor_original)
+            return (not token.closed and self.target.get("kind") == "director_images"
+                and token.reservation is self and token.pid == self.target["pipeline_id"]
+                and token.pipeline.get("params") is token.params
+                and (token.thread is None or token.thread() is not None and token.thread().is_alive())
+                and token.pipeline.get("created_at") == token.parent.get("created_at")
+                and str(token.pipeline.get("workspace") or "default") == str(token.parent.get("workspace") or "default")
+                and token.pipeline.get("status") not in {"completed", "failed", "cancelled", "blocked"}
+                and token.parent.get("kind") == "director_pipeline"
+                and job_identity(token.parent) == self.target["identity"]
+                and digest(params) == self.target["request_sha256"]
+                and digest(token.settings) == self.target["image_settings_sha256"]
+                and digest({"clip_plans": token.pipeline.get("clip_plans"),
+                    "planned_clips": token.pipeline.get("_planned_clips")}) == self.target["plans_sha256"])
+        except (ValueError, TypeError, KeyError, AttributeError):
+            return False
+
+    def activate_images(self, token, worker):
+        with self._lock:
+            if (type(token) is not _ImageAdmission or token is not self._images
+                    or token.thread is not None or worker is not threading.current_thread()
+                    or not self._images_matches(token) or not self.dispatch_ready()):
+                raise NativeAcceptanceReserved("Director image worker admission changed")
+            token.thread = weakref.ref(worker)
+
+    def _require_image_worker(self, token):
+        if (type(token) is not _ImageAdmission or token is not self._images
+                or token.thread is None or token.thread() is not threading.current_thread()
+                or not self._images_matches(token) or not self.dispatch_ready()):
+            raise NativeAcceptanceReserved("Director image parent admission changed")
+
+    def validate_image_child(self, token, job, unit, attempt):
+        with self._lock:
+            self._require_image_worker(token)
+            slot = {key: unit.get(key) for key in ("kind", "variant", "index")}
+            key = digest(slot)
+            params = job.get("params") or {}
+            if (slot not in self.target["image_slots"] or key in token.children
+                    or any(type(slot[name]) is not int for name in ("variant", "index"))
+                    or type(attempt) is not int or attempt != 0
+                    or job.get("kind") != "director_child"
+                    or params.get("generation_mode") != "image"
+                    or params.get("_director_pipeline_id") != token.pid
+                    or str(job.get("workspace") or "default") != str(token.pipeline.get("workspace") or "default")
+                    or os.path.realpath(job.get("out_dir") or "") != os.path.realpath(token.pipeline.get("out_dir") or "")
+                    or params.get("repeat_generation") != 1 or params.get("video_length") != 1):
+                raise NativeAcceptanceReserved("Director image child slot changed")
+            refs = params.get("image_refs") or []
+            if slot["kind"] == "image_anchor":
+                valid_refs = token.anchor is None and not refs
+            else:
+                valid_refs = (token.anchor is not None and refs == [
+                    os.path.realpath(os.path.join(token.pipeline["out_dir"], token.anchor))])
+            role = "creator" if slot["kind"] == "image_anchor" else "editor"
+            if (not valid_refs
+                    or any(params.get(key) != value for key, value in token.settings[role].items())):
+                raise NativeAcceptanceReserved("Director image child request changed")
+            return key, slot
+
+    def enroll_image_child(self, token, job, unit, attempt):
+        with self._lock:
+            key, slot = self.validate_image_child(token, job, unit, attempt)
+            recovery = job.get("recovery_unit") or {}
+            identity = job_identity(job)
+            if (type(job.get("execution_attempt")) is not int or job["execution_attempt"] != 1
+                    or type(job.get("recovery_attempt", 0)) is not int or job.get("recovery_attempt", 0) != 0
+                    or recovery.get("director_kind") != slot["kind"]
+                    or recovery.get("variant") != slot["variant"] or recovery.get("index") != slot["index"]
+                    or recovery.get("attempt") != attempt
+                    or any(identity[key] != self.target["identity"][key] for key in (
+                        "project_instance_sha256", "owner_principal_sha256"))):
+                raise NativeAcceptanceReserved("Director image child provenance changed")
+            token.children[key] = (job, job_identity(job), job["execution_attempt"],
+                job.get("recovery_attempt", 0), digest(job.get("params")))
+
+    def _image_child_matches(self, job, entry):
+        try:
+            return (entry[0] is job and job_identity(job) == entry[1]
+                and type(job.get("execution_attempt")) is int and job["execution_attempt"] == entry[2]
+                and type(job.get("recovery_attempt", 0)) is int and job.get("recovery_attempt", 0) == entry[3]
+                and digest(job.get("params")) == entry[4])
+        except (ValueError, TypeError, KeyError):
+            return False
+
+    def seal_image_anchor(self, token, filename, verified_outputs):
+        with self._lock:
+            self._require_image_worker(token)
+            entry = token.children.get(digest({"kind": "image_anchor", "variant": 0, "index": 0}))
+            if (token.anchor is not None or entry is None or entry[0].get("status") != "completed"
+                    or not self._image_child_matches(entry[0], entry)
+                    or type(filename) is not str or os.path.basename(filename) != filename
+                    or filename not in verified_outputs):
+                raise NativeAcceptanceReserved("Director image anchor is not sealed")
+            token.anchor = filename
+            token.params["generated_reference_image_filename"] = filename
+
+    def finish_images(self, token):
+        with self._lock:
+            self._require_image_worker(token)
+            if (len(token.children) != len(self.target["image_slots"])
+                    or any(entry[0].get("status") != "completed" or not self._image_child_matches(entry[0], entry)
+                        for entry in token.children.values())):
+                raise NativeAcceptanceReserved("Director image children are not complete")
+            token.closed = True
+
+    def abandon_images(self, token):
+        with self._lock:
+            if type(token) is _ImageAdmission and token is self._images:
+                token.closed = True
 
     def bind_planning(self, pid, parent, params, selection):
         if self.target is None:
@@ -229,9 +378,11 @@ class Reservation:
                 if self._workers.get(current) is token:
                     del self._workers[current]
 
-    def require_model_admission(self):
+    def require_model_admission(self, *, workload=None):
         if self.target is None:
             return
+        if workload == "llm" and self.target.get("kind") == "director_images":
+            raise NativeAcceptanceReserved("LLM work is outside the Director image reservation")
         if not self.dispatch_ready():
             raise NativeAcceptanceReserved("The native acceptance guardian is not ready")
         current = threading.current_thread()
@@ -265,10 +416,10 @@ class Reservation:
         }:
             return True
         target = self.target["identity"]["id"]
-        if self.target.get("kind") == "director_planning":
+        if self.target.get("kind") in {"director_planning", "director_images"}:
             base = f"/api/v1/director/pipeline/{self.target['pipeline_id']}"
             if (method.upper(), path) == ("POST", base + "/continue"):
-                return self.dispatch_ready()
+                return (self.target.get("kind") != "director_images" or self._images is None) and self.dispatch_ready()
             return (method.upper(), path) in {("POST", base + "/stop"),
                 ("PUT", "/api/v1/access-context/share-url")}
         if (method.upper(), path) == ("POST", f"/api/v1/queue/{target}/{self.release_action}"):
@@ -339,11 +490,19 @@ def _load_startup_plan():
         plan = json.loads(raw)
         target = plan["target"]
         planning = target.get("kind") == "director_planning"
-        if planning:
-            if (set(target) != {"kind", "identity", "pipeline_id", "request_sha256", "llm_selection_sha256"}
+        images = target.get("kind") == "director_images"
+        if planning or images:
+            required_target = {"kind", "identity", "pipeline_id", "request_sha256"}
+            required_target |= {"plans_sha256", "image_slots", "image_settings_sha256"} if images else {"llm_selection_sha256"}
+            hash_keys = ("request_sha256", "plans_sha256", "image_settings_sha256") if images else (
+                "request_sha256", "llm_selection_sha256")
+            if (set(target) != required_target
                     or not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", target["pipeline_id"])
                     or any(not re.fullmatch(r"[0-9a-f]{64}", target[key])
-                        for key in ("request_sha256", "llm_selection_sha256"))
+                        for key in hash_keys)
+                    or images and target["image_slots"] != [
+                        {"kind": "image_anchor", "variant": 0, "index": 0},
+                        {"kind": "image_start", "variant": 0, "index": 0}]
                     or plan.get("release_action") != "continue"):
                 raise ValueError()
         elif (target.get("kind", "generation") != "generation"
@@ -365,7 +524,7 @@ def _load_startup_plan():
             raise ValueError()
         required = {"app/services/native_acceptance_reservation.py", "app/services/job_lifecycle.py",
             "app/wgp.py", "app/services/llm_service.py", "app/launch.py"}
-        if planning:
+        if planning or images:
             required.add("app/services/director_pipeline.py")
         if not required.issubset(plan["source_pins"]):
             raise ValueError()
@@ -529,7 +688,7 @@ def _guardian_ready():
         return False
     receipt = json.loads(raw)
     fresh_at = receipt.get("last_check", receipt.get("ready_at"))
-    freshness = 2 if _PLAN["target"].get("kind") == "director_planning" else 10
+    freshness = 2 if _PLAN["target"].get("kind") in {"director_planning", "director_images"} else 10
     if type(fresh_at) not in {int, float} or not 0 <= time.time() - fresh_at < freshness:
         return False
     if (receipt.get("ready") is not True or receipt.get("failure")
