@@ -1784,6 +1784,8 @@ from services.job_lifecycle import (
     approve_prepared_job,
     block_generation_recovery,
     block_resource_admission_failure,
+    resource_admission_recovery_allowed,
+    recover_resource_admission_held,
     complete_prompt_enhancement_resource_release,
     complete_preparation,
     configure_credit_lifecycle_callback,
@@ -10561,6 +10563,15 @@ def _queue_recovery_materialize_job(
             "recovery_state": "blocked",
             "message": blocked_reason,
         })
+        return runtime, False
+    if (not remote and snapshot.get("kind") == "studio_generation" and snapshot.get("status") == "queued"
+            and snapshot.get("queue_held") is True and snapshot.get("phase") == "resource_admission_failed"
+            and snapshot.get("recovery_state") == "blocked_preparation"):
+        message = "Resource admission failed; request preserved. Retry recovery when ready"
+        runtime.update(queue_held=True, recovery_state="blocked_preparation", resource_state="blocked",
+                       _recovery_reason_code="resource_admission_failed", reruns_denoise=False,
+                       message=message, error=message)
+        runtime.pop("_recovery_worker_pending", None)
         return runtime, False
     if remote and not project_reference_finalization:
         runtime.update({
@@ -82968,6 +82979,7 @@ _QUEUE_RECOVERY_REASON_TEXT = {
     ),
     "owner_reauthentication_required": "Unlock this project to resume",
     "preparation_must_resubmit": "This preparation must be resubmitted",
+    "resource_admission_failed": "Request preserved; retry recovery to register it while held",
     "project_missing_or_recreated": "The recovery project is missing or was recreated",
     "worker_start_failed": "The recovery worker could not be started",
     "model_terms_required": "Review and accept this model recipe's terms",
@@ -82999,7 +83011,7 @@ _QUEUE_RECOVERY_REASON_TEXT = {
 def _queue_recovery_is_blocked(job: dict) -> bool:
     return str(job.get("recovery_state") or "") in (
         _BLOCKED_QUEUE_RECOVERY_STATES
-    )
+    ) or _held_resource_admission_recovery_allowed(job)
 
 
 def _queue_recovery_attempt(job: dict) -> int:
@@ -83113,6 +83125,35 @@ def _job_owned_by_request(job: dict | None, request: Request) -> bool:
     return False
 
 
+def _held_resource_admission_recovery_allowed(job: dict) -> bool:
+    job_id = job.get("id")
+    if not isinstance(job_id, str) or not job_id:
+        return False
+    live = _jobs.get(job_id)
+    if live is None or job_id in _active_gen_states:
+        return False
+    if job is not live:
+        current = snapshot_job(live)
+        fields = (
+            "id", "created_at", "kind", "workspace", "_recovery_project_digest",
+            "_recovery_owner_digest", "_recovery_manifest_pointer",
+            "status", "phase", "queue_held", "recovery_state", "resource_state",
+            "resource_intent", "resource_execution", "preemption_mode",
+            "execution_attempt", "recovery_attempt", "_recovery_worker_pending",
+            "_queue_restore_sequence", "cancel_requested", "started_at",
+            "_generation_slot_owned", "progress", "step", "overall_progress",
+            "window_progress", "clip_progress", "window_current", "window_step",
+            "clip_current", "output_files", "artifact_files", "clip_output_files",
+            "h3_scene_output_files", "join_output_file", "recovery_cursor",
+        )
+        if any(type(job.get(key)) is not type(current.get(key))
+               or job.get(key) != current.get(key) for key in fields):
+            return False
+    # snapshot_job releases its lifecycle lock before the queue-first predicate.
+    allowed = resource_admission_recovery_allowed(live)
+    return allowed and _jobs.get(job_id) is live and job_id not in _active_gen_states
+
+
 def _queue_recovery_reason_code(job: dict) -> str | None:
     failed = str(job.get("status") or "") == "failed"
     if not _queue_recovery_is_blocked(job) and not failed:
@@ -83120,6 +83161,8 @@ def _queue_recovery_reason_code(job: dict) -> str | None:
     attempt = _queue_recovery_attempt(job)
     if attempt >= MAX_RECOVERY_ATTEMPTS:
         return "attempt_limit_reached"
+    if _held_resource_admission_recovery_allowed(job):
+        return "resource_admission_failed"
     if _queue_recovery_worker(job) is None:
         return "preparation_must_resubmit"
     if _h3_ordinary_oom_hold(job):
@@ -83159,11 +83202,14 @@ def _public_queue_recovery_metadata(job: dict) -> dict:
         "blocked", "blocked_preparation", "blocked_remote_reauth",
     }
     reason = _queue_recovery_reason_code(job)
+    blocked = blocked or _held_resource_admission_recovery_allowed(job)
     attempt = _queue_recovery_attempt(job)
     safe_worker = _queue_recovery_worker(job) is not None
     actions = []
     if attempt < MAX_RECOVERY_ATTEMPTS and safe_worker:
-        if state == "blocked_remote_reauth" and reason == (
+        if reason == "resource_admission_failed" and _held_resource_admission_recovery_allowed(job):
+            actions = ["retry"]
+        elif state == "blocked_remote_reauth" and reason == (
             "owner_reauthentication_required"
         ):
             actions = ["resume"]
@@ -85646,9 +85692,12 @@ def _resume_recovered_job(
             )
         state = str(job.get("recovery_state") or "")
         reason = _queue_recovery_reason_code(job)
+        admission_recovery = (reason == "resource_admission_failed"
+                              and _held_resource_admission_recovery_allowed(job))
         legal_resume = reason == "h3_legal_access_required"
         expected_action = (
             "resume" if state == "blocked_remote_reauth"
+            else "retry" if admission_recovery
             else "resume" if state == "blocked" and legal_resume
             else "retry" if state == "blocked"
             else "retry" if (
@@ -85681,6 +85730,7 @@ def _resume_recovered_job(
                 "model_terms_required",
                 "director_role_admission_required",
                 "generation_failed",
+                "resource_admission_failed",
             }
         )
         if reason not in allowed_reasons:
@@ -85723,6 +85773,17 @@ def _resume_recovered_job(
         # Successful input validation clears its diagnostic reason. Keep the
         # held action available if a later admission or host gate rejects it.
         job["_recovery_reason_code"] = reason
+        if admission_recovery:
+            attempt, may_retry = next_recovery_attempt(job)
+            if not may_retry or not _held_resource_admission_recovery_allowed(job):
+                raise HTTPException(status_code=409, detail="This held request is no longer eligible for admission recovery")
+            if not recover_resource_admission_held(job, recovery_attempt=attempt):
+                raise HTTPException(status_code=409, detail="Resource admission remains blocked; request preserved")
+            return {
+                "job_id": job_id, "status": "queued", "held": True,
+                "recovery_attempt": attempt, "recovery_state": "restored",
+                "reruns_denoise": False,
+            }
         if reason == "h3_ordinary_restart_required" and not (
             job.get("status") == "queued" and job.get("queue_held") is True
             and _h3_ordinary_restart_allowed(job)

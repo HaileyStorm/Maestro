@@ -32,6 +32,7 @@ from services.job_lifecycle import (
     PromptEnhancementGpuIntentConflict,
     validated_h3_delivery_recovery_control,
     validated_prompt_enhancement_gpu_intent,
+    validated_resource_admission_failures,
 )
 from services.queue_recovery import QueueRecoveryJournal, RecoverySnapshot
 from services.editor_projects import EditorProjectError, validate_editor_retake_origin
@@ -93,6 +94,7 @@ _JOB_FIELDS = frozenset({
     "_recovery_worker_pending",
     "credit_queue", "prompt_result_reference", "prompt_result_consumed",
     "editor_retake_origin", "editor_retake_closed",
+    "resource_admission_failures",
 })
 _GLOBAL_FIELDS = frozenset({
     "paused", "pause_after_current", "manual_order_sequence", "queue_order",
@@ -1211,7 +1213,12 @@ def serialize_job(
             "failed_child_status", "failed_child_reason",
         } and value is None:
             continue
-        if key == "_recovery_worker_pending":
+        if key == "resource_admission_failures":
+            try:
+                result[key] = validated_resource_admission_failures(value)
+            except ValueError as error:
+                raise QueueRecoveryAdapterError("Resource admission diagnostics are invalid.") from error
+        elif key == "_recovery_worker_pending":
             if type(value) is not bool:
                 raise QueueRecoveryAdapterError("Pending worker receipt is invalid.")
             result[key] = value
@@ -1671,7 +1678,10 @@ def _validated_recovered_state(
             clean.setdefault("resource_intent", "generation")
             clean["resource_execution"] = "standard"
             clean["preemption_mode"] = "none"
-            clean["resource_state"] = "queued"
+            admission_blocked = (clean.get("kind") == "studio_generation" and clean.get("status") == "queued"
+                and clean.get("queue_held") is True and clean.get("phase") == "resource_admission_failed"
+                and clean.get("recovery_state") == "blocked_preparation" and clean.get("resource_state") == "blocked")
+            clean["resource_state"] = "blocked" if admission_blocked else "queued"
             clean.setdefault("execution_attempt", 1)
             if sample_preemption_requested:
                 if clean["execution_attempt"] >= _MAX_EXECUTION_ATTEMPT:

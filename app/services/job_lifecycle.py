@@ -593,7 +593,10 @@ def restore_scheduler_state(
     global _queue_sequence, _queue_manual_order_sequence
     global _queue_paused, _pause_after_current
     state = state or {}
-    candidates = {str(job.get("id")): job for job in jobs if job.get("id")}
+    candidates = {str(job.get("id")): job for job in jobs if job.get("id")
+        and not (job.get("kind") == "studio_generation" and job.get("status") == "queued"
+                 and job.get("queue_held") is True and job.get("phase") == "resource_admission_failed"
+                 and job.get("recovery_state") == "blocked_preparation")}
     raw_order = state.get("queue_order")
     order = raw_order if isinstance(raw_order, list) else []
     with _queue_condition, _lifecycle_lock:
@@ -3584,8 +3587,119 @@ def approve_prepared_job(
         return True
 
 
+_ADMISSION_SOURCES = {
+    os.path.realpath(os.path.join(os.path.dirname(__file__), name)): name
+    for name in ("job_lifecycle.py", "queue_recovery_adapter.py", "queue_recovery.py",
+                 "native_acceptance_reservation.py")
+}
+_ADMISSION_SOURCES[os.path.realpath(os.path.join(os.path.dirname(__file__), "..", "launch.py"))] = "launch.py"
+
+
+def validated_resource_admission_failures(value: Any) -> list[dict]:
+    if type(value) is not list or not 1 <= len(value) <= 4:
+        raise ValueError("Invalid resource admission diagnostics")
+    for record in value:
+        if (type(record) is not dict or set(record) != {"stage", "exception_class", "frames"}
+                or type(record["stage"]) is not str or record["stage"] not in {"queue_acquisition", "queue_register"}
+                or type(record["exception_class"]) is not str
+                or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", record["exception_class"]) is None
+                or type(record["frames"]) is not list or len(record["frames"]) > 8):
+            raise ValueError("Invalid resource admission diagnostics")
+        for frame in record["frames"]:
+            if (type(frame) is not dict or set(frame) != {"source", "function", "line"}
+                    or type(frame["source"]) is not str or frame["source"] not in _ADMISSION_SOURCES.values()
+                    or type(frame["function"]) is not str
+                    or re.fullmatch(r"(?:[A-Za-z_][A-Za-z0-9_]{0,79}|<lambda>|<genexpr>|<listcomp>)", frame["function"]) is None
+                    or type(frame["line"]) is not int or not 1 <= frame["line"] <= 1_000_000):
+                raise ValueError("Invalid resource admission diagnostics")
+    return deepcopy(value)
+
+
+def _resource_admission_diagnostic(error: Exception, stage: str) -> dict:
+    name = type(error).__name__
+    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", name) is None:
+        name = "UnknownError"
+    frames = []
+    trace = error.__traceback__
+    remaining = 128
+    while trace is not None and remaining:
+        code = trace.tb_frame.f_code
+        source = _ADMISSION_SOURCES.get(os.path.realpath(code.co_filename))
+        if source is not None and re.fullmatch(r"(?:[A-Za-z_][A-Za-z0-9_]{0,79}|<lambda>|<genexpr>|<listcomp>)", code.co_name):
+            frames.append({"source": source, "function": code.co_name, "line": trace.tb_lineno})
+        trace = trace.tb_next
+        remaining -= 1
+    return validated_resource_admission_failures([{
+        "stage": stage, "exception_class": name, "frames": frames[-8:],
+    }])[0]
+
+
+def resource_admission_recovery_allowed(job: Mapping[str, Any]) -> bool:
+    """Recognize only a never-started ordinary Studio admission failure."""
+    with _queue_condition, _lifecycle_lock:
+        cursor = job.get("recovery_cursor") or {}
+        waiter = _queue_waiters.get(id(job))
+        restored_waiter = (job.get("recovery_state") == "restored"
+            and job.get("resource_state") == "queued"
+            and job.get("_recovery_worker_pending") is True
+            and type(job.get("_queue_restore_sequence")) is int and job["_queue_restore_sequence"] > 0
+            and waiter is not None and waiter[1] is job
+            and waiter[0] == job["_queue_restore_sequence"])
+        blocked = (job.get("recovery_state") == "blocked_preparation"
+            and job.get("resource_state") == "blocked" and waiter is None)
+        return (job.get("kind") == "studio_generation"
+            and job.get("status") == "queued" and job.get("queue_held") is True
+            and job.get("phase") == "resource_admission_failed"
+            and (blocked or restored_waiter)
+            and job.get("resource_intent") == RESOURCE_INTENT_GENERATION
+            and job.get("resource_execution") == RESOURCE_EXECUTION_STANDARD
+            and job.get("preemption_mode") == PREEMPTION_MODE_NONE
+            and type(job.get("execution_attempt")) is int and job["execution_attempt"] == 1
+            and not is_cancel_requested(job) and not job.get("started_at")
+            and not job.get("_generation_slot_owned")
+            and str(job.get("id") or "") not in _registrations
+            and all(not job.get(key) for key in (
+                "progress", "step", "overall_progress", "window_progress", "clip_progress",
+                "window_current", "window_step", "clip_current",
+                "output_files", "artifact_files", "clip_output_files", "h3_scene_output_files",
+                "join_output_file"))
+            and isinstance(cursor, Mapping) and not cursor.get("completed_units"))
+
+
+def recover_resource_admission_held(job: MutableMapping[str, Any], *, recovery_attempt: int) -> bool:
+    """Re-register sealed, owner-revalidated work without releasing its hold."""
+    with _queue_condition, _lifecycle_lock:
+        if (type(recovery_attempt) is not int or recovery_attempt < 1
+                or type(job.get("recovery_attempt", 0)) is not int
+                or recovery_attempt != job.get("recovery_attempt", 0) + 1
+                or not resource_admission_recovery_allowed(job)):
+            return False
+        candidate = _copy_job_for_transition(job)
+        candidate.update(queue_held=True, recovery_state="restored", resource_state="queued",
+                         phase="queued", message="Request recovered and held; start when ready",
+                         error=None, reruns_denoise=False, recovery_attempt=recovery_attempt,
+                         _recovery_reason_code="", _recovery_worker_pending=True)
+        try:
+            _persist_prospective_unlocked("resource_admission_recovered", jobs=(candidate,),
+                                         global_state=_global_state_unlocked(replacements={id(job): candidate}))
+        except Exception as error:
+            block_resource_admission_failure(job, admission_error=error, stage="queue_register")
+            return False
+        if not resource_admission_recovery_allowed(job):
+            return False
+        _publish_job_unlocked(job, candidate)
+        try:
+            _register_generation_waiter_unlocked(job)
+        except Exception as error:
+            block_resource_admission_failure(job, admission_error=error, stage="queue_register")
+            return False
+        _queue_condition.notify_all()
+        return True
+
+
 def block_resource_admission_failure(
-    job: MutableMapping[str, Any],
+    job: MutableMapping[str, Any], *, admission_error: Exception | None = None,
+    stage: str = "queue_acquisition",
 ) -> bool:
     """Fail closed when durable resource admission cannot start a worker.
 
@@ -3603,7 +3717,9 @@ def block_resource_admission_failure(
         message = (
             "Prompt enhancement failed"
             if is_prompt_enhancement
-            else "Resource admission failed; resubmit this request"
+            else "Resource admission failed; request preserved. Retry recovery when ready"
+            if candidate.get("kind") == "studio_generation"
+            else "Resource admission failed; request preserved"
         )
         candidate.update({
             "status": "failed" if is_prompt_enhancement else "queued",
@@ -3612,11 +3728,14 @@ def block_resource_admission_failure(
                 "terminal" if is_prompt_enhancement else "blocked_preparation"
             ),
             "reruns_denoise": False,
-            "_recovery_reason_code": "preparation_must_resubmit",
+            "_recovery_reason_code": ("preparation_must_resubmit" if is_prompt_enhancement else "resource_admission_failed"),
             "phase": "failed" if is_prompt_enhancement else "resource_admission_failed",
             "message": message,
             "error": message,
         })
+        if admission_error is not None:
+            history = validated_resource_admission_failures(candidate["resource_admission_failures"]) if candidate.get("resource_admission_failures") else []
+            candidate["resource_admission_failures"] = (history + [_resource_admission_diagnostic(admission_error, stage)])[-4:]
         if is_prompt_enhancement:
             candidate["finished_at"] = time.time()
         if candidate.get("resource_intent") in _RESOURCE_INTENTS:
@@ -4555,6 +4674,27 @@ def settle_terminal_credit(job: MutableMapping[str, Any]) -> bool:
         return True
 
 
+def _register_generation_waiter_unlocked(job: MutableMapping[str, Any]) -> None:
+    global _queue_sequence
+    waiter_key = id(job)
+    existing = _queue_waiters.get(waiter_key)
+    if existing is not None:
+        job.pop("_queue_restore_sequence", None)
+        return
+    try:
+        restored_sequence = int(job.get("_queue_restore_sequence", 0) or 0)
+    except (TypeError, ValueError):
+        restored_sequence = 0
+    prospective_sequence = max(_queue_sequence + 1, restored_sequence)
+    waiter_sequence = restored_sequence or prospective_sequence
+    global_state = _global_state_unlocked(additions=((waiter_sequence, job),))
+    _persist_prospective_unlocked("queue_register", global_state=global_state)
+    _queue_sequence = prospective_sequence
+    job.pop("_queue_restore_sequence", None)
+    job.setdefault("_queue_enqueued_monotonic", time.monotonic())
+    _queue_waiters[waiter_key] = (waiter_sequence, job)
+
+
 def acquire_generation_slot(
     generation_lock: threading.Lock,
     job: MutableMapping[str, Any],
@@ -4562,31 +4702,10 @@ def acquire_generation_slot(
     poll_interval: float = 0.1,
 ) -> bool:
     """Wait for ordered GPU admission while supporting hold/pause/cancel."""
-    global _queue_sequence
     waiter_key = id(job)
     with _queue_condition:
         with _lifecycle_lock:
-            existing = _queue_waiters.get(waiter_key)
-            if existing is not None:
-                waiter_sequence = existing[0]
-                job.pop("_queue_restore_sequence", None)
-            else:
-                try:
-                    restored_sequence = int(job.get("_queue_restore_sequence", 0) or 0)
-                except (TypeError, ValueError):
-                    restored_sequence = 0
-                prospective_sequence = max(_queue_sequence + 1, restored_sequence)
-                waiter_sequence = restored_sequence or prospective_sequence
-                global_state = _global_state_unlocked(
-                    additions=((waiter_sequence, job),),
-                )
-                _persist_prospective_unlocked(
-                    "queue_register", global_state=global_state,
-                )
-                _queue_sequence = prospective_sequence
-                job.pop("_queue_restore_sequence", None)
-                job.setdefault("_queue_enqueued_monotonic", time.monotonic())
-                _queue_waiters[waiter_key] = (waiter_sequence, job)
+            _register_generation_waiter_unlocked(job)
         try:
             while not is_cancel_requested(job):
                 with _lifecycle_lock:
@@ -4642,10 +4761,10 @@ def acquire_and_start_generation_slot(
         acquired = acquire_generation_slot(
             generation_lock, job, poll_interval=poll_interval,
         )
-    except Exception:
+    except Exception as error:
         if not block_on_persistence_failure:
             raise
-        block_resource_admission_failure(job)
+        block_resource_admission_failure(job, admission_error=error)
         return False
     if not acquired:
         return False
@@ -4865,10 +4984,10 @@ def generation_slot(
         acquired = acquire_generation_slot(
             generation_lock, job, poll_interval=poll_interval,
         )
-    except Exception:
+    except Exception as error:
         if not block_on_persistence_failure:
             raise
-        block_resource_admission_failure(job)
+        block_resource_admission_failure(job, admission_error=error)
         acquired = False
     if acquired:
         with _queue_condition, _lifecycle_lock:

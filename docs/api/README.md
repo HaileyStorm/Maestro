@@ -282,6 +282,20 @@ satisfied. `/jobs/queue/start` releases all authorized held jobs: do not use it
 to release an unrelated backlog. `POST /api/v1/cancel/{job_id}` requests
 cancellation; observe terminal status and resource release separately.
 
+If an accepted, never-started Studio job encounters resource-admission failure,
+keep its original request ID and job ID. Read `recovery_actions`; when it offers
+`retry`, call `POST /api/v1/queue/{job_id}/recovery-retry` once. This narrow
+recovery revalidates the original request and registers the same job while
+held. A successful result has `recovery_state: "restored"`, `held: true` and
+`reruns_denoise: false`; it starts no worker or model work. Release that job
+separately after its execution prerequisites are satisfied. If registration
+remains blocked, the server preserves the request and returns an actionable
+conflict. After an uncertain retry response, inspect the same job and submission
+receipt before doing anything else; do not create another generation request.
+Other advertised retries can start a fresh worker and rerun generation, so
+inspect the returned recovery state and `reruns_denoise` rather than assuming
+every retry is held-only.
+
 The live job list and `/status/{job_id}` are not permanent history. A completed
 job can disappear from them after restart or dismissal. Reconcile its original
 `generation_request_id` through `/generate/submissions/{generation_request_id}`

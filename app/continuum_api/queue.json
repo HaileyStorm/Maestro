@@ -2904,7 +2904,7 @@
     "method": "POST",
     "path": "/api/v1/queue/{job_id}/recovery-retry",
     "summary": "Request an available recovery retry",
-    "description": "Uses only the server-advertised recovery action. Revalidates the sealed request, original owner/project, inputs, model/terms and attempt limit before creating a fresh worker attempt. Resume is for reauthentication/legal-access holds; retry is for eligible failed/blocked work. H3 may require an authorized calibrated replacement plan; ordinary H3 retry can restart the whole clip. Delivery children and paired sample arms use dedicated routes.",
+    "description": "Uses only the server-advertised recovery action. Revalidates the sealed request, original owner/project, inputs and attempt limit. For a never-started, queued and held Studio generation blocked by resource admission, retry preserves the original request/job identity and registers the same job while held; it returns restored, held=true and reruns_denoise=false without starting a worker or loading a model. Release it separately only after execution prerequisites, model terms and GPU authority are satisfied. Other eligible failed/blocked work creates a fresh worker attempt after model/terms admission. Resume is for reauthentication/legal-access holds. H3 may require an authorized calibrated replacement plan; ordinary H3 retry can restart the whole clip. Delivery children and paired sample arms use dedicated routes.",
     "responses": {
       "200": {
         "description": "Authorized result. No execution or acceptance claim beyond the returned state.",
@@ -2927,11 +2927,17 @@
                 },
                 "recovery_state": {
                   "enum": [
-                    "retrying"
+                    "retrying",
+                    "restored"
                   ]
                 },
                 "reruns_denoise": {
                   "type": "boolean"
+                },
+                "held": {
+                  "type": "boolean",
+                  "const": true,
+                  "description": "Present for held-only scheduler registration recovery. No native work is released."
                 }
               },
               "additionalProperties": false,
@@ -2941,7 +2947,44 @@
                 "recovery_attempt",
                 "recovery_state",
                 "reruns_denoise"
+              ],
+              "allOf": [
+                {
+                  "if": {
+                    "properties": {
+                      "recovery_state": {
+                        "const": "restored"
+                      }
+                    },
+                    "required": [
+                      "recovery_state"
+                    ]
+                  },
+                  "then": {
+                    "required": [
+                      "held"
+                    ],
+                    "properties": {
+                      "reruns_denoise": {
+                        "const": false
+                      }
+                    }
+                  }
+                }
               ]
+            },
+            "examples": {
+              "held_registration": {
+                "summary": "Same accepted request restored while held",
+                "value": {
+                  "job_id": "returned-job-id",
+                  "status": "queued",
+                  "held": true,
+                  "recovery_attempt": 1,
+                  "recovery_state": "restored",
+                  "reruns_denoise": false
+                }
+              }
             }
           }
         }
@@ -2953,7 +2996,7 @@
         "project.generate"
       ],
       "boundary": "Existing signed session, project access and exact mutation-origin checks apply. Job controls accept only session-owned jobs; blocked recovery and paired sample jobs require their dedicated actions.",
-      "idempotency": "Each accepted request advances bounded recovery state. No client deduplication key. Poll the original job after an uncertain response and never blindly replay retry.",
+      "idempotency": "No client deduplication key. An accepted retry advances bounded recovery state; held admission recovery preserves the original generation_request_id and job_id. Poll that same job and its submission receipt after an uncertain response. A restored held result requires separate explicit release; never blindly replay retry or resubmit generation.",
       "operation_kind": "generation_job",
       "mcp": true,
       "contract_status": "authored",
