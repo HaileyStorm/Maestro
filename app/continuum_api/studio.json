@@ -9994,7 +9994,7 @@
     "method": "GET",
     "path": "/api/v1/models",
     "summary": "List current models and capabilities",
-    "description": "List current models and capabilities",
+    "description": "Discover visible model identities, declared input/output capabilities, installation policy, recipe operations, terms and Director compatibility. Audio output flags include standalone speech/music. These independent states are not a promise of current runtime or GPU readiness; model-specific settings remain discoverable through model-options and defaults.",
     "responses": {
       "200": {
         "description": "Successful result.",
@@ -10007,8 +10007,259 @@
                   "type": "array",
                   "items": {
                     "type": "object",
-                    "properties": {},
-                    "required": [],
+                    "properties": {
+                      "model_type": {
+                        "type": "string",
+                        "description": "Stable model ID for model-options, defaults, downloads and generation."
+                      },
+                      "name": {
+                        "type": "string",
+                        "description": "Display name."
+                      },
+                      "family": {
+                        "type": "string",
+                        "description": "Catalog family ID."
+                      },
+                      "architecture": {
+                        "type": "string",
+                        "description": "Runtime architecture ID; not proof of installed or ready execution."
+                      },
+                      "description": {
+                        "type": "string",
+                        "description": "Descriptive model metadata; not a runtime readiness verdict.",
+                        "nullable": true
+                      },
+                      "supports_audio": {
+                        "type": "boolean",
+                        "description": "Legacy combined audio flag: accepts audio conditioning or generates audio."
+                      },
+                      "supports_audio_input": {
+                        "type": "boolean",
+                        "description": "The handler accepts audio conditioning. Inspect model-options for accepted forms."
+                      },
+                      "generates_audio": {
+                        "type": "boolean",
+                        "description": "The handler produces audio, including audio-only speech/music or audiovisual output. Does not imply native qualification."
+                      },
+                      "audio_only": {
+                        "type": "boolean",
+                        "description": "The handler produces standalone audio instead of video/image output."
+                      },
+                      "image_outputs": {
+                        "type": "boolean",
+                        "description": "The handler supports image output."
+                      },
+                      "is_i2v": {
+                        "type": "boolean",
+                        "description": "The runtime class exposes image-to-video support."
+                      },
+                      "is_t2v": {
+                        "type": "boolean",
+                        "description": "The runtime class exposes text-to-video support."
+                      },
+                      "supports_end_frame": {
+                        "type": "boolean",
+                        "description": "End-frame conditioning is declared."
+                      },
+                      "supports_ref_images": {
+                        "type": "boolean",
+                        "description": "Reference image choices are declared; inspect model-options."
+                      },
+                      "is_downloaded": {
+                        "type": "boolean",
+                        "description": "Catalog installation check finds required assets. Not a model load or execution readiness result."
+                      },
+                      "downloadable": {
+                        "type": "boolean",
+                        "description": "Curated download policy permits this model. Project authorization and current terms still apply."
+                      },
+                      "manual_installation_ready": {
+                        "type": "boolean",
+                        "description": "A manual installation contract is declared; not proof that its checkpoint is installed."
+                      },
+                      "availability_status": {
+                        "type": "string",
+                        "description": "Current legal/install policy state, e.g. available, manual_installation_required, or location_declaration_required. Extensible; not a GPU/runtime readiness result."
+                      },
+                      "manual_checkpoint_verification_required": {
+                        "type": "boolean",
+                        "description": "A manual checkpoint needs the existing local verification workflow."
+                      },
+                      "manual_checkpoint_verified": {
+                        "type": "boolean",
+                        "description": "Current manual integrity check passed where required; false is also used when no check applies."
+                      },
+                      "supported_operations": {
+                        "type": "array",
+                        "description": "Operations explicitly declared by the capability recipe. An empty list does not disable generic generation; inspect model-options/defaults and the execution guards.",
+                        "items": {
+                          "type": "string"
+                        }
+                      },
+                      "default_for_operations": {
+                        "type": "array",
+                        "description": "Operations for which this recipe declares itself a default.",
+                        "items": {
+                          "type": "string"
+                        }
+                      },
+                      "automatic_routing": {
+                        "type": "boolean",
+                        "description": "Recipe explicitly permits automatic routing; not permission to submit work."
+                      },
+                      "verified": {
+                        "type": "boolean",
+                        "description": "Recipe declares verification. Installation and capability-specific qualification remain separate."
+                      },
+                      "retake_engines": {
+                        "type": "array",
+                        "description": "Declared compatible Retake engines; empty means none.",
+                        "items": {
+                          "type": "string"
+                        }
+                      },
+                      "h3_gallery_av_guides": {
+                        "type": "boolean",
+                        "description": "H3 Gallery audiovisual guide experiment is enabled for this model on this host."
+                      },
+                      "h3_face_refine": {
+                        "type": "boolean",
+                        "description": "Optional H3 face refinement capability; only returned when available."
+                      },
+                      "guidance_max_phases": {
+                        "type": "integer",
+                        "description": "Model-declared number of guidance phases."
+                      },
+                      "fps": {
+                        "type": "number",
+                        "description": "Model-declared default frames per second; not encoded output metadata."
+                      },
+                      "director": {
+                        "type": "object",
+                        "description": "Per-Director-mode compatibility, explanations, audio input/output and reference strategies. Read each mode; audio generation alone does not imply Director video compatibility.",
+                        "additionalProperties": true
+                      },
+                      "required_host_terms": {
+                        "type": "array",
+                        "description": "Current required source/model terms. Read project-scoped host-terms for acceptance; human acceptance remains required.",
+                        "items": {
+                          "type": "object",
+                          "properties": {
+                            "term": {
+                              "type": "string",
+                              "description": "Term ID."
+                            },
+                            "version": {
+                              "type": "integer",
+                              "description": "Required term version.",
+                              "minimum": 1
+                            },
+                            "title": {
+                              "type": "string",
+                              "description": "Human-readable title."
+                            },
+                            "license_url": {
+                              "type": "string",
+                              "description": "Source terms URL."
+                            },
+                            "review_mode": {
+                              "type": "string",
+                              "description": "Human review mode."
+                            },
+                            "notice": {
+                              "type": "string",
+                              "description": "Applicable notice."
+                            }
+                          },
+                          "additionalProperties": true,
+                          "required": [
+                            "term",
+                            "version",
+                            "title",
+                            "license_url",
+                            "review_mode",
+                            "notice"
+                          ]
+                        }
+                      },
+                      "update_status": {
+                        "type": "string",
+                        "description": "Current updater state or pinned/versioned recipe status; not execution readiness."
+                      },
+                      "revenue_eligible": {
+                        "type": "boolean",
+                        "description": "Recipe declaration, null when unspecified.",
+                        "nullable": true
+                      },
+                      "fine_tuning_eligible": {
+                        "type": "boolean",
+                        "description": "Recipe declaration, null when unspecified.",
+                        "nullable": true
+                      },
+                      "derivative_tooling": {
+                        "type": "boolean",
+                        "description": "Recipe declaration, null when unspecified.",
+                        "nullable": true
+                      },
+                      "selector_help": {
+                        "type": "string",
+                        "description": "Optional descriptive model metadata.",
+                        "nullable": true
+                      },
+                      "lora_compatibility_note": {
+                        "type": "string",
+                        "description": "Optional descriptive model metadata.",
+                        "nullable": true
+                      },
+                      "nsfw_only": {
+                        "type": "boolean",
+                        "description": "Retained upstream descriptive metadata; does not gate local content execution."
+                      },
+                      "manual_installation": {
+                        "type": "object",
+                        "description": "Optional confined manual checkpoint manifest with public source, filename, byte/hash pins and local verification guidance.",
+                        "additionalProperties": true
+                      }
+                    },
+                    "required": [
+                      "model_type",
+                      "name",
+                      "family",
+                      "architecture",
+                      "description",
+                      "supports_audio",
+                      "supports_audio_input",
+                      "generates_audio",
+                      "audio_only",
+                      "image_outputs",
+                      "is_i2v",
+                      "is_t2v",
+                      "supports_end_frame",
+                      "supports_ref_images",
+                      "is_downloaded",
+                      "downloadable",
+                      "manual_installation_ready",
+                      "availability_status",
+                      "manual_checkpoint_verification_required",
+                      "manual_checkpoint_verified",
+                      "supported_operations",
+                      "default_for_operations",
+                      "automatic_routing",
+                      "verified",
+                      "retake_engines",
+                      "h3_gallery_av_guides",
+                      "guidance_max_phases",
+                      "fps",
+                      "director",
+                      "required_host_terms",
+                      "update_status",
+                      "revenue_eligible",
+                      "fine_tuning_eligible",
+                      "derivative_tooling",
+                      "selector_help",
+                      "lora_compatibility_note",
+                      "nsfw_only"
+                    ],
                     "additionalProperties": true
                   }
                 },
@@ -10027,12 +10278,19 @@
                         "type": "integer"
                       }
                     },
-                    "required": [],
+                    "required": [
+                      "id",
+                      "label",
+                      "order"
+                    ],
                     "additionalProperties": true
                   }
                 }
               },
-              "required": [],
+              "required": [
+                "models",
+                "families"
+              ],
               "additionalProperties": true
             }
           }

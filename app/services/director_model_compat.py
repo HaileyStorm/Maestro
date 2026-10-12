@@ -347,7 +347,7 @@ def assess_director_model(
         # merged these concepts and is the root cause of incompatible Music
         # Video choices appearing in Director.
         "supports_audio_input": bool(model_def.get("any_audio_prompt")),
-        "generates_audio": bool(model_def.get("returns_audio")),
+        "generates_audio": bool(model_def.get("returns_audio") or model_def.get("audio_only")),
         "supports_voice_reference": voice_reference_mode != "none",
         "voice_reference_mode": voice_reference_mode,
         "video_strategy": strategy,

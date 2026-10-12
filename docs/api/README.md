@@ -200,8 +200,15 @@ Use the indicated owner UI when confirmation is required.
 For the selected model, read `/api/v1/models`,
 `/api/v1/model-options/{model_type}` and `/api/v1/defaults/{model_type}`.
 Use returned IDs and settings; do not hard-code a model from an example.
-`supported_operations`, input capabilities and Director compatibility describe
-support. `is_downloaded` describes installed assets. `verified`, experimental
+`supported_operations` lists operations explicitly declared by a model recipe;
+an empty list means none are declared, not that the generic generation endpoint
+is disabled. Read the model's options and defaults before using that endpoint.
+Input capabilities and Director compatibility describe separate support.
+`generates_audio` includes audio-only speech/music and audiovisual generation;
+`audio_only` distinguishes the former. `supports_audio_input` describes accepted
+audio conditioning, independently of output. These flags describe the handler's
+output/input contract, not successful native qualification.
+`is_downloaded` describes installed assets. `verified`, experimental
 capability flags, `availability_status`, manual-checkpoint verification,
 `required_host_terms` and capability-specific status/preparation describe
 different prerequisites. An `available` legal/install policy is not a promise
