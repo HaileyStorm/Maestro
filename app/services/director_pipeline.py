@@ -7362,9 +7362,27 @@ def _wait_for_gpu(pid: str, poll_interval: float = 2.0):
         if _pipelines.get(pid, {}).get("status") == "cancelled":
             return False
 
-        # Check if any jobs are currently running
-        active_jobs = [j for j in _jobs.values()
-                       if j.get("status") in ("queued", "running")]
+        # Retained held/blocked registrations are not runnable GPU work.
+        # Running jobs remain blockers regardless of later admission flags.
+        from services.job_lifecycle import is_cancel_requested
+        from services.native_acceptance_reservation import reservation
+
+        active_jobs = [
+            j for j in list(_jobs.values())
+            if j.get("status") == "running"
+            or (
+                j.get("status") == "queued"
+                and not j.get("queue_held", False)
+                and j.get("_credit_revalidation_required") is not True
+                and not is_cancel_requested(j)
+                and not str(j.get("recovery_state") or "").startswith("blocked")
+                and not (
+                    j.get("kind") == "director_pipeline"
+                    and j.get("recovery_state") == "terminal"
+                )
+                and reservation.eligible(j)
+            )
+        ]
         if not active_jobs:
             return True
 
