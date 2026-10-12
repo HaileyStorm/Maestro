@@ -803,6 +803,16 @@ def _director_has_visual_references(
     return any(os.path.isfile(path) for path in paths)
 
 
+def _director_scene_description(params: dict) -> str:
+    """Read story-workflow's public alias without changing frozen input."""
+    scene = params.get("scene_description") or ""
+    if not scene and params.get("pipeline_type") in {
+        "short_film_story", "short_film_audio",
+    }:
+        return params.get("story_description") or ""
+    return scene
+
+
 def _director_effective_shot_image_policy(params: dict) -> str:
     """Return a resolved policy, retaining generated images as legacy default."""
     saved = str(params.get("_director_shot_image_policy") or "").strip()
@@ -1520,7 +1530,7 @@ def _write_initial_pipeline_state(pid: str, pipeline: dict, *, before_replace=No
         "pipeline_type": params.get("pipeline_type", "music_video"),
         "shot_image_policy": _director_effective_shot_image_policy(params),
         "shot_image_guidance": params.get("shot_image_guidance", "auto"),
-        "scene_description": params.get("scene_description", ""),
+        "scene_description": _director_scene_description(params),
         "reference_image_path": params.get("reference_image_path"),
         "generated_reference_image_filename": None,
         "character_ref_paths": params.get("character_ref_paths", []),
@@ -1649,7 +1659,7 @@ def _save_pipeline_state_locked(pid: str) -> bool:
         "pipeline_type": params.get("pipeline_type", "music_video"),
         "shot_image_policy": _director_effective_shot_image_policy(params),
         "shot_image_guidance": params.get("shot_image_guidance", "auto"),
-        "scene_description": params.get("scene_description", ""),
+        "scene_description": _director_scene_description(params),
         "reference_image_path": params.get("reference_image_path"),
         # A no-reference run creates its own visual anchor inside the output
         # directory.  Keep the basename separate from the user's input path so
@@ -2493,7 +2503,7 @@ def _director_requests_vocal_performance(params: dict) -> bool:
         return True
     return bool(
         _DIRECTOR_VOCAL_PERFORMANCE_RE.search(
-            str(params.get("scene_description") or "")
+            str(_director_scene_description(params))
         )
     )
 
@@ -5264,7 +5274,9 @@ def _public_director_queue_state(state: dict) -> dict:
         safe_raw = scrub_director_public_credentials(raw)
         entry = {key: value for key, value in safe_raw.items() if key != "params"}
         params = safe_raw.get("params") if isinstance(safe_raw.get("params"), dict) else {}
-        entry.setdefault("scene_description", params.get("scene_description", ""))
+        entry["scene_description"] = (
+            entry.get("scene_description") or _director_scene_description(params)
+        )
         entry.setdefault("pipeline_type", params.get("pipeline_type", "music_video"))
         entry.setdefault("image_model", params.get("image_model", ""))
         entry.setdefault("video_model", params.get("video_model", ""))
@@ -7645,7 +7657,7 @@ def _run_planning_v2(pid: str, params: dict, pipeline_type: str):
     skill_type = skill_map.get(pipeline_type, "music_video")
 
     # Build planner kwargs
-    scene_description = params.get("scene_description", "")
+    scene_description = _director_scene_description(params)
     reference_image_path = params.get("reference_image_path")
     planned_clips = params.get("planned_clips", [])
 
@@ -7807,7 +7819,7 @@ def _run_planning_legacy(pid: str, params: dict, pipeline_type: str):
     """Legacy planning: direct calls to llm_service functions."""
     from services import llm_service
 
-    scene_description = params.get("scene_description", "")
+    scene_description = _director_scene_description(params)
     reference_image_path = params.get("reference_image_path")
     speaker_mappings = params.get("speaker_mappings", [])
     characters = params.get("characters", [])
@@ -8123,7 +8135,7 @@ def _run_image_generation(pid: str, params: dict, clip_plans: list[dict], out_di
     # reference, so every clip's start image keeps a consistent look instead of
     # each being generated independently with no visual through-line.
     if not (ref_image_path and os.path.isfile(ref_image_path)):
-        scene_desc = (params.get("scene_description") or "").strip()
+        scene_desc = _director_scene_description(params).strip()
         first_shot_prompt = (
             clip_plans[0].get("image_prompt", "") if clip_plans else ""
         ).strip()

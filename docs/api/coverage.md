@@ -170,7 +170,13 @@ plan and no error. After natural LLM release, runtime drain, lease withdrawal
 and restoration, the authenticated API returned the same plan and Continue
 action. All 22 unrelated retained queue payloads were preserved. This establishes
 completed planning and review reconnection; subjective plan quality and its
-image/video execution remain unverified. Historical attempt receipts remain
+image/video execution remain unverified. Inspection then found that this
+attempt's `story_description` had not reached the planner, which read only
+`scene_description`: the resulting car scene did not match the submitted cup
+story. The story alias binding is corrected in both planning paths and saved/
+queue projections. The retained mismatched plan is failure evidence, not an
+accepted story result; corrected native story planning remains to be verified.
+Historical attempt receipts remain
 retained separately rather than becoming routine regression scenarios.
 
 Local and stable-share health/readiness passed after the coordinated deployment,

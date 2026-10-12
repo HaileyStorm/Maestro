@@ -338,6 +338,12 @@ with an empty body to release the frozen request after fresh model authority.
 Review pauses permit their documented clip-plan edits; image review can set
 `hold_video:true`. Stop, continue and recovered resume are separate actions.
 Do not assume a restart resumes an unreleased hold.
+For `short_film_story` or `short_film_audio`, supply the authored text as
+`story_description` or the compatible `scene_description`. A nonempty
+`scene_description` takes precedence if both are supplied. Both planning
+backends and saved/queue descriptions use that same text; the original frozen
+request fields remain intact. Review the resulting plan for story fidelity
+before continuing to image or video execution.
 An interrupted attempt tied to a private execution reservation reports
 `blocked_planning_admission` after restart. Its owner must resolve the retained
 attempt and obtain fresh authority through the existing recovery path;

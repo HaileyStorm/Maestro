@@ -56514,10 +56514,12 @@ export const operationReference: readonly OperationReference[] = [
                 }
               },
               "scene_description": {
-                "type": "string"
+                "type": "string",
+                "description": "Scene or story text. A nonempty scene_description takes precedence over story_description."
               },
               "story_description": {
-                "type": "string"
+                "type": "string",
+                "description": "Story text alias for short_film_story and short_film_audio when scene_description is absent or empty. The exact text reaches both planning backends and saved/queue descriptions; frozen submitted fields are not rewritten."
               },
               "visual_style": {
                 "type": "string"
