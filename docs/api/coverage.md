@@ -152,6 +152,10 @@ once under fresh development GPU authority. It completed with one PNG and
 private map copy, and its connected DM edited the copy. This establishes the
 ordinary image submission/status/output/cleanup handoff; it does not establish
 all-model execution, every downstream feature or subjective image quality.
+After another coordinated restart, the same authenticated client reconciled
+the original submission as completed with `retained_job: false` and found the
+same private PNG in project Gallery. The live job status had expired; no
+submission was repeated and no output was regenerated.
 
 Director's real held story admission, recovered Continue, explicit Stop and
 terminal reconnection paths were exercised. Frozen inputs and unrelated retained
@@ -159,9 +163,15 @@ queue payloads survived coordinated restarts. Later bounded attempts reached
 local model preparation and CPU inference but did not complete planning. Runtime
 and observation failures, explicit cancellation and interrupted admission remain
 distinct; a timeout never cancels or authorizes replay. Current recovery errors
-identify the required next action. Completed Director planning and output quality
-remain unverified. Historical attempt receipts remain retained separately rather
-than becoming routine regression scenarios.
+identify the required next action. A later held admission used the Services
+default CUDA device and completed actual local Director planning after one
+Continue under fresh GPU authority. It paused at prompt review with one clip
+plan and no error. After natural LLM release, runtime drain, lease withdrawal
+and restoration, the authenticated API returned the same plan and Continue
+action. All 22 unrelated retained queue payloads were preserved. This establishes
+completed planning and review reconnection; subjective plan quality and its
+image/video execution remain unverified. Historical attempt receipts remain
+retained separately rather than becoming routine regression scenarios.
 
 Local and stable-share health/readiness passed after the coordinated deployment,
 and public Cloudflare API discovery worked in the browser. That remote origin was

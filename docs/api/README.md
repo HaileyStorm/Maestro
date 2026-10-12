@@ -275,6 +275,17 @@ satisfied. `/jobs/queue/start` releases all authorized held jobs: do not use it
 to release an unrelated backlog. `POST /api/v1/cancel/{job_id}` requests
 cancellation; observe terminal status and resource release separately.
 
+The live job list and `/status/{job_id}` are not permanent history. A completed
+job can disappear from them after restart or dismissal. Reconcile its original
+`generation_request_id` through `/generate/submissions/{generation_request_id}`
+with the same session and workspace. An accepted, completed receipt with
+`retained_job: false` still binds the original job; its minimal `job` projection
+can have empty `output_files` and zero `produced_outputs`. Those fields do not
+mean the output was lost. Preserve the output names, revisions and terminal
+cleanup receipt when first observed, and locate retained media through
+`GET /api/v1/outputs` with `workspace` before requesting its authorized file.
+A live status 404 alone is neither cancellation nor permission to regenerate.
+
 For an ordinary **held, unstarted Studio image job**, opt into releasing its
 generation model when its invocation exits. This leaves the immutable generation
 request and its submission ID intact:
