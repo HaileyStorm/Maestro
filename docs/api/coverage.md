@@ -39,6 +39,7 @@ constraints. API availability is separate from native or human acceptance.
 | YuE2 compose, review ABC, generate/continue/cancel takes and retrieve audio | `/yue2/status`, `/library`, `/compose`, `/generations`, `/takes/{take_id}/plan`, `/continue`, `/cancel`, `/audio.{fmt}` | Versioned symbolic settings and retained take IDs; review can pause. Subjective duration/ending/quality acceptance remains human. |
 | YuE2 training library, submission and cancellation | `/yue2/training`, `/training/{job_id}/cancel` | Training identities/inputs/resource requirements differ from generation; no inference lease reuse. |
 | Director preview/planning helpers and model/LoRA preflight | `/director/v2/plan`, `/director/capabilities`, `/director/preflight`, public planning/classification/script routes | Preview LLM operation is not a pipeline. Catalogue compatibility is not native qualification. |
+| Director video LoRA strengths and parameters | `GET /loras/{video_model}/details`; `video_loras` on `/director/pipeline/start` or held `/director/queue` request | Exact catalog filenames and schema digests; generation scope with empty roles. Admission freezes the complete selection. Native model/scheduler support and installed readiness remain separate; see below. |
 | Director start now, save planning for later, review and continue | `/director/pipeline/start` (`hold_planning`), `/pipeline/{pid}`, `/continue`, `/stop`, `/resume` | Hold registers an empty paused pipeline without planning. Continuing may load models. Manual plan/image review and video holds remain real states. |
 | Director queues, editing, reordering, start/pause and removing entries | `/director/queue` and `/queue/{entry_id}`, `/start`, `/pause`, `/reorder` | Request ID plus project-instance scope; held queue is separate from a live pipeline and Studio Queue. |
 | Director saved history, tagging, repair, image/video reruns and rejoin | `/director/pipelines`, `/pipelines/{pid}`, clip tag/rerun routes, `/repair`, `/repair/cancel`, `/rejoin`, DELETE | Read/permission checks bind retained sources and parent identity. Uncertain reruns without a caller receipt must be reconciled from history before another submission. |
@@ -54,6 +55,56 @@ constraints. API availability is separate from native or human acceptance.
 | Storage duplicate scan/reclaim/remove-linked and usage | `/storage/duplicates`, `/reclaim`, `/remove-linked`, `/storage/usage` | Local owner maintenance. Preserve referenced/active/frozen assets; destructive operations are not automatic cleanup authority. |
 | Service/provider configuration, runtime share registration, host terms, legal/owner policies and support/research | Corresponding settings/account/support/research operations in the contract | Human/owner administration or server-to-server webhook as specified; no provider keys, paid dispatch, remote code, content moderation or account activation through general MCP. |
 | Theme, panel sizes, expanded controls, preview playback, drag/drop, clipboard, notifications | Browser/OS presentation and existing local preferences | No meaningful durable backend operation. Clients implement their own presentation; browser privileges are not HTTP permissions. |
+
+## Director video LoRA parameters
+
+Read the selected video model's LoRA details before constructing `video_loras`.
+Use only a returned parameter schema; do not invent a digest, parameter or creator
+activation phrase. The OpenAPI `DirectorVideoLoras` schema describes the wire
+shape, limits and strength syntax. Each parameterized active filename maps to
+`{parameter_schema_digest, parameter_values}`. Resolve required values and
+defaults from that LoRA's current schema. Role-specific Reference or Director
+image parameters belong to their existing image-role operations.
+
+For example, with an authenticated SDK client and an explicitly selected
+`video_model`, `filename`, and scalar `values` matching the discovered schema:
+
+```python
+from urllib.parse import quote
+
+details = maestro.request("GET", f"/api/v1/loras/{quote(video_model, safe='')}/details")
+selected = next(row for row in details["loras"] if row["filename"] == filename)
+schema = selected["parameter_schema"]  # Absence means no published parameter contract.
+video_loras = {
+    "activated_loras": [filename],
+    "loras_multipliers": "0.75",
+    "lora_parameters": {
+        filename: {
+            "parameter_schema_digest": schema["schema_digest"],
+            "parameter_values": values,
+        }
+    },
+}
+# Include video_loras in the documented held Director queue request's params.
+```
+
+Create a new pipeline or held Director request with the selection. Updating a
+held queue entry goes through fresh admission; continuing an admitted pipeline
+does not replace its LoRAs. Preserve the original request identity and reconcile
+it after a lost acknowledgement. Source or schema changes require a new reviewed
+selection rather than a retry with altered bindings.
+
+Native execution is distinct from parameter discovery. Wan has an installed
+schedule callback; ordinary H3 now applies the retained schedule to its actual
+transformer and advances strengths with each native step. Native qualification
+of these parameterized Director paths remains pending. H3 schedules whose
+effective master-step count differs from the retained request (including the
+four-step Turbo preset) do not satisfy this consumer contract. LTX's repeated
+two-stage activations still need a matching consumer implementation. Neither
+catalog visibility nor a ready parameter schema proves those paths usable.
+The `parameter_execution` fields in LoRA details describe Studio operations,
+not Director qualification. Owner-authored parameter sidecars remain local
+configuration; this API does not expose arbitrary host-file editing.
 
 ## Gallery Extend recipe
 

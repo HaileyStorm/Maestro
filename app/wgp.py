@@ -14706,8 +14706,8 @@ def _generate_video_impl(
                         prompt=prompt)
                     _director_lora_activation = _maestro_director_lora_guard.activation_observer(
                         _director_lora_window_token,
-                        transformers=(wan_model.model,) if wan_model.model2 is None
-                        else (wan_model.model, wan_model.model2))
+                        transformers=(trans_lora,) if trans2_lora is None
+                        else (trans_lora, trans2_lora))
                 samples = call_with_lightx2v_cleanup(
                     lightx2v_runtime_requested or pdd_runtime_requested,
                     _unload_generation_loras,

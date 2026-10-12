@@ -2785,6 +2785,28 @@ class MiniMaxH3Model:
             raise RuntimeError(
                 "MiniMax H3 effective video/audio master schedules must have equal lengths"
             )
+        director_lora_activation = _kwargs.get("_maestro_director_lora_activation")
+        if director_lora_activation is not None:
+            # Install the retained schedule on the actual adapter target before
+            # reporting activation. Ordinary H3 keeps its existing load path.
+            from shared.utils.loras_mutipliers import (
+                get_model_switch_steps, update_loras_slists,
+            )
+
+            activation_timesteps = [float(t) for t in timesteps]
+            first_phase, second_phase, _ = get_model_switch_steps(
+                activation_timesteps, _kwargs["guide_phases"], 0,
+                _kwargs["switch_threshold"], _kwargs["switch2_threshold"],
+            )
+
+            def observe_lora_activation(**observation):
+                director_lora_activation(timesteps=activation_timesteps, **observation)
+
+            update_loras_slists(
+                self.transformer, _kwargs["loras_slists"], len(timesteps),
+                phase_switch_step=first_phase, phase_switch_step2=second_phase,
+                activation_observer=observe_lora_activation,
+            )
         report_phase("Preparing H3 denoising schedule")
         row_plan = [
             tuple(
@@ -2810,6 +2832,8 @@ class MiniMaxH3Model:
         def run_transformer_step(
             index, unique_timesteps, timestep_indices, spectrum_phase=None,
         ):
+            if director_lora_activation is not None:
+                offload.set_step_no_for_lora(self.transformer, index)
             if pdd_enabled:
                 pdd_controller.set_step(index)
             transformer_kwargs = dict(

@@ -79,6 +79,47 @@ def enrich_openapi(schema: dict) -> dict:
     timeline["required"] = ["schema_version", "id", "name", "workspace", "revision", "created_at", "updated_at",
                             "canvas", "assets", "tracks", "markers", "export", "exports"]
     schema.setdefault("components", {}).setdefault("schemas", {})["EditorTimeline"] = timeline
+    schema["components"]["schemas"]["DirectorVideoLoras"] = {
+        "type": "object", "additionalProperties": True,
+        "description": (
+            "Director's public video LoRA selection. Read /api/v1/loras/{video_model}/details first. "
+            "Parameter filenames must also be active; copy the current schema digest and obey its "
+            "types, required values and defaults. Generation scope with empty roles is required. "
+            "Admission freezes the selection; continue cannot replace it. Native qualification "
+            "depends on the model and scheduler, independently of schema availability."
+        ),
+        "properties": {
+            "activated_loras": {"type": "array", "maxItems": 64, "uniqueItems": True,
+                "items": {"type": "string"}, "default": [],
+                "description": "Exact filenames from this video model's active LoRA catalog."},
+            "loras_multipliers": {"type": "string", "default": "",
+                "description": "Complete native strength schedule in catalog order; empty uses native defaults. "
+                    "Spaces separate adapters, commas schedule steps and semicolons separate supported phases. "
+                    "The consuming model validates its supported phases."},
+            "lora_parameters": {"type": "object", "maxProperties": 64, "default": {},
+                "description": "At most 65536 UTF-8 bytes after canonical serialization. Keys are active "
+                    "catalog basenames, at most 512 UTF-8 bytes, without slash, backslash or NUL; '.' and '..' are invalid. "
+                    "A server-known parameter contract must be supplied even when using its defaults.",
+                "additionalProperties": {
+                    "type": "object", "additionalProperties": False,
+                    "required": ["parameter_schema_digest", "parameter_values"],
+                    "properties": {
+                        "parameter_schema_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$",
+                            "description": "Exact schema_digest returned by LoRA details, never a client-generated hash."},
+                        "parameter_values": {"type": "object", "maxProperties": 64,
+                            "description": "IDs match [A-Za-z][A-Za-z0-9._:-]{0,63}; values must match the discovered schema. "
+                                "Strings are bounded to 500 UTF-8 bytes. Integers must be safe JavaScript integers; "
+                                "non-integer numbers must be finite with absolute value at most 1e12. No null or nested values.",
+                            "additionalProperties": {"anyOf": [
+                                {"type": "boolean"},
+                                {"type": "integer", "minimum": -9007199254740991, "maximum": 9007199254740991},
+                                {"type": "number", "minimum": -1000000000000, "maximum": 1000000000000},
+                                {"type": "string", "maxLength": 500},
+                            ]}},
+                    },
+                }},
+        },
+    }
     schema["info"].update(
         title="Maestro Continuum HTTP API",
         version="1.0.0",
@@ -116,6 +157,18 @@ def enrich_openapi(schema: dict) -> dict:
                     original.update({(p["in"], p["name"]): p for p in item["parameters"]})
                     operation["parameters"] = list(original.values())
                 operation.setdefault("responses", {}).update(copy.deepcopy(item.get("responses", {})))
+            if path.startswith("/api/v1/director/"):
+                def bind_video_loras(value):
+                    if isinstance(value, dict):
+                        properties = value.get("properties")
+                        if isinstance(properties, dict) and "video_loras" in properties:
+                            properties["video_loras"] = {"$ref": "#/components/schemas/DirectorVideoLoras"}
+                        for nested in value.values():
+                            bind_video_loras(nested)
+                    elif isinstance(value, list):
+                        for nested in value:
+                            bind_video_loras(nested)
+                bind_video_loras(operation.get("requestBody", {}))
             metadata = operation.setdefault("x-maestro", {})
             metadata.setdefault("mcp", False)
             metadata.setdefault("contract_status", "source_extracted" if item else "framework_only")
