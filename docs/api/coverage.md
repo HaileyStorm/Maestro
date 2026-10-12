@@ -198,8 +198,13 @@ reads and exact saved-state, media and sidecar hashes confirmed both outputs.
 Startup had omitted their state-derived retention metadata and retired their
 completed queue rows. The saved producer records and files survived; retired
 rows were not recreated and neither image was replayed. The startup retention
-correction is tracked separately. Subjective image quality, future child-row
-retention and video execution remain distinct acceptance requirements.
+correction is deployed: a subsequent real restart rebuilt both retention
+entries from the unchanged sealed state, and authenticated history remained
+unchanged. All 23 unrelated job identities and saved states survived; eight
+Director cursors gained only their saved pause reason. Because the original
+child rows were already retired, this establishes metadata reconstruction,
+not future native child-row survival. Subjective image quality and video
+execution remain distinct acceptance requirements.
 Historical attempt receipts remain
 retained separately rather than becoming routine regression scenarios.
 
