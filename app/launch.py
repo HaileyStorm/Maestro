@@ -7942,6 +7942,17 @@ def _director_recovery_submit_child(
                     "Director child recovery worker could not start."
                 ) from error
         return existing
+    if image_admission is not None:
+        # This is a new server-authored child. Seal its first attempt before
+        # the journal and private admission enroll it, rather than relying on
+        # the ordinary worker's later default for a missing attempt number.
+        if (type(job.get("execution_attempt", 1)) is not int
+                or job.get("execution_attempt", 1) != 1
+                or type(job.get("recovery_attempt", 0)) is not int
+                or job.get("recovery_attempt", 0) != 0):
+            raise QueueRecoveryRuntimeError("Director image child attempt is not fresh.")
+        job["execution_attempt"] = 1
+        job["recovery_attempt"] = 0
     job["recovery_unit"] = {
         "kind": "director_child_intent",
         "state": "submitted",
