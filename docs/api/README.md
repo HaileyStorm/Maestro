@@ -282,6 +282,18 @@ satisfied. `/jobs/queue/start` releases all authorized held jobs: do not use it
 to release an unrelated backlog. `POST /api/v1/cancel/{job_id}` requests
 cancellation; observe terminal status and resource release separately.
 
+After a service interruption, a job can retain its historical `status: "running"`
+while `recovery_interrupted: true` records the interruption. That flag can also
+remain set while automatic recovery is starting; it does not prove that no
+worker is active. Check Queue and the returned recovery metadata.
+Inspect `recovery_interrupted`, `recovery_blocked`, `recovery_actionable` and
+`recovery_actions` along with status. Python and TypeScript `wait` return blocked
+or actionable recovery snapshots without cancelling or retrying. The interruption flag alone does not end a
+wait during automatic recovery. A wait timeout leaves execution unchanged;
+reconcile the same identifiers and Queue rather than resubmitting. If recovery
+stays unavailable, reconcile with the owner; do not create another generation
+request to bypass recovery.
+
 If an accepted, never-started Studio job encounters resource-admission failure,
 keep its original request ID and job ID. Read `recovery_actions`; when it offers
 `retry`, call `POST /api/v1/queue/{job_id}/recovery-retry` once. This narrow

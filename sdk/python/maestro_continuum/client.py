@@ -156,11 +156,17 @@ class MaestroClient:
         deadline = time.monotonic() + timeout
         while True:
             state = self.call(operation_id, path=path, query=query)
-            if isinstance(state, dict) and state.get("status") in terminal:
+            if isinstance(state, dict) and (
+                state.get("status") in terminal
+                or state.get("recovery_actionable") is True
+                or state.get("recovery_blocked") is True
+            ):
+                # Yield an actionable recovery snapshot without retrying or
+                # cancelling. Interruption alone can mean active auto-recovery.
                 return state
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise MaestroError(None, "Observation timed out; work continues on the server",
+                raise MaestroError(None, "Observation timed out; reconcile server state. No cancellation or retry was requested",
                                    operation=operation_id, uncertain=False)
             time.sleep(min(max(interval, 0.1), remaining))
 

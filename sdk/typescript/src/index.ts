@@ -92,10 +92,12 @@ export class MaestroClient {
     if (!op || op.method !== 'GET') throw new Error('Waiting requires a read-only status operation')
     const deadline = Date.now() + timeoutMs
     while (true) {
-      const state = await this.call(operationId, inputs) as { status?: string }
-      if (['completed', 'failed', 'cancelled', 'blocked', 'paused'].includes(state?.status ?? '')) return state
+      const state = await this.call(operationId, inputs) as { status?: string; recovery_actionable?: boolean; recovery_blocked?: boolean }
+      // Yield actionable recovery without retrying or cancelling. An
+      // interruption flag alone can mean active automatic recovery.
+      if (['completed', 'failed', 'cancelled', 'blocked', 'paused'].includes(state?.status ?? '') || state?.recovery_actionable === true || state?.recovery_blocked === true) return state
       const remaining = deadline - Date.now()
-      if (remaining <= 0) throw new MaestroError(null, 'Observation timed out; work continues on the server', operationId, false)
+      if (remaining <= 0) throw new MaestroError(null, 'Observation timed out; reconcile server state. No cancellation or retry was requested', operationId, false)
       await new Promise(resolve => setTimeout(resolve, Math.min(Math.max(intervalMs, 100), remaining)))
     }
   }
