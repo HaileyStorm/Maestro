@@ -302,6 +302,16 @@ request otherwise returns `409` with a next-step instruction; bulk release
 leaves it held. Clients cannot renew that authority through this API. Ordinary
 jobs retain their existing automatic recovery.
 
+While that original supervised job is queued and held, status and Queue return
+`recovery_requires_gpu_reservation: true` and `recovery_blocked: true`.
+If no other recovery failure takes precedence, `recovery_reason` is
+`gpu_reservation_required`. SDK waits return this blocked snapshot. These fields
+describe the release prerequisite; they do not grant authority or certify that
+a reservation is ready. After the operator installs fresh matching authority,
+release the same job individually through `/queue/{job_id}/resume` or
+`/queue/{job_id}/start-next`. An empty `recovery_actions` list does not prevent
+that ordinary queue release. Preserve the original submission and job IDs.
+
 If an accepted, never-started Studio job encounters resource-admission failure,
 keep its original request ID and job ID. Read `recovery_actions`; when it offers
 `retry`, call `POST /api/v1/queue/{job_id}/recovery-retry` once. This narrow

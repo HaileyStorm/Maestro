@@ -3,7 +3,7 @@
     "method": "GET",
     "path": "/api/v1/status/{job_id}",
     "summary": "Read generation job status",
-    "description": "Session-owned physical job projection with lifecycle, progress, output filenames, resource, queue and recovery fields. H3 prompt text is blanked in polling. Recovery-blocked jobs have null queue position/ETA and expose estimate_after_resume. Resources may still be releasing after terminal cancellation. Private no-store response. completion_policy and completion_cleanup report invocation-scoped generation-model cleanup; terminal generation status alone does not prove release. Configure before admission through PUT /api/v1/jobs/{job_id}/completion-policy.",
+    "description": "Session-owned physical job projection with lifecycle, progress, output filenames, resource, queue and recovery fields. H3 prompt text is blanked in polling. Recovery-blocked jobs have null queue position/ETA and expose estimate_after_resume. Resources may still be releasing after terminal cancellation. Private no-store response. completion_policy and completion_cleanup report invocation-scoped generation-model cleanup; terminal generation status alone does not prove release. Configure before admission through PUT /api/v1/jobs/{job_id}/completion-policy. A queued supervised hold exposes recovery_requires_gpu_reservation=true and recovery_blocked=true; renew exact operator authority and release the original job rather than resubmitting. These flags are not GPU authority.",
     "responses": {
       "200": {
         "description": "Authorized result. No execution or acceptance claim beyond the returned state.",
@@ -490,7 +490,8 @@
                   "type": "boolean"
                 },
                 "recovery_blocked": {
-                  "type": "boolean"
+                  "type": "boolean",
+                  "description": "Recovery cannot proceed without an execution prerequisite or repair; includes a queued supervised hold requiring fresh GPU reservation."
                 },
                 "recovery_attempt": {
                   "type": "integer",
@@ -728,6 +729,10 @@
                     "execution_attempt"
                   ],
                   "additionalProperties": false
+                },
+                "recovery_requires_gpu_reservation": {
+                  "type": "boolean",
+                  "description": "True only for a queued, held job retained from supervised native execution. A fresh matching operator GPU reservation is required before releasing this same job; not a grant/readiness receipt. SDK waits return this recovery-blocked checkpoint. Ordinary held and terminal jobs return false."
                 }
               },
               "additionalProperties": true,
@@ -1381,7 +1386,8 @@
                         "type": "boolean"
                       },
                       "recovery_blocked": {
-                        "type": "boolean"
+                        "type": "boolean",
+                        "description": "Recovery cannot proceed without an execution prerequisite or repair; includes a queued supervised hold requiring fresh GPU reservation."
                       },
                       "recovery_attempt": {
                         "type": "integer",
@@ -1564,6 +1570,10 @@
                           ]
                         },
                         "maxItems": 100
+                      },
+                      "recovery_requires_gpu_reservation": {
+                        "type": "boolean",
+                        "description": "True only for a queued, held job retained from supervised native execution. A fresh matching operator GPU reservation is required before releasing this same job; not a grant/readiness receipt. SDK waits return this recovery-blocked checkpoint. Ordinary held and terminal jobs return false."
                       }
                     },
                     "additionalProperties": true,
@@ -1990,7 +2000,8 @@
                         "type": "boolean"
                       },
                       "recovery_blocked": {
-                        "type": "boolean"
+                        "type": "boolean",
+                        "description": "Recovery cannot proceed without an execution prerequisite or repair; includes a queued supervised hold requiring fresh GPU reservation."
                       },
                       "recovery_attempt": {
                         "type": "integer",
@@ -2084,6 +2095,10 @@
                           "missing_count",
                           "quarantined_count"
                         ]
+                      },
+                      "recovery_requires_gpu_reservation": {
+                        "type": "boolean",
+                        "description": "True only for a queued, held job retained from supervised native execution. A fresh matching operator GPU reservation is required before releasing this same job; not a grant/readiness receipt. SDK waits return this recovery-blocked checkpoint. Ordinary held and terminal jobs return false."
                       }
                     },
                     "additionalProperties": true,

@@ -83303,6 +83303,23 @@ def _public_queue_recovery_metadata(job: dict) -> dict:
         "recovery_actionable": bool(actions),
         "recovery_actions": actions,
     }
+    supervised_hold = (
+        job.get("_native_acceptance_manual_recovery") is True
+        and job.get("status") == "queued" and job.get("queue_held") is True
+    )
+    public["recovery_requires_gpu_reservation"] = supervised_hold
+    if supervised_hold:
+        # This is a prerequisite for releasing the original job, not a new
+        # recovery mutation or evidence that any GPU authority is available.
+        public["recovery_blocked"] = True
+        if not reason:
+            public.update(
+                recovery_reason="gpu_reservation_required",
+                recovery_reason_text=(
+                    "Renew this job's GPU reservation, then release the same "
+                    "held job. Do not submit it again."
+                ),
+            )
     if reason == "h3_ordinary_restart_required":
         eligible = (
             job.get("status") == "queued" and job.get("queue_held") is True
