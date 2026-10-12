@@ -51,6 +51,11 @@ H3_PLAN_MISMATCH_DETAIL: Final[str] = (
 
 PUBLIC_CONTRACT_MESSAGES: Final[frozenset[str]] = frozenset({
     H3_PLAN_MISMATCH_DETAIL,
+    'An audio source is required for this conditioning mode.',
+    'Audio source is required for this conditioning mode. Upload the required voice reference or choose Text only.',
+    'A second audio source is required for this conditioning mode.',
+    'A third audio source is required for this conditioning mode.',
+    'Task validation failed. Check the selected model settings and required inputs.',
     'Dasiwa artifact verification failed',
     'Dasiwa cannot be stacked with another LoRA or accelerator',
     'Dasiwa cannot be stacked with another accelerator',

@@ -1453,7 +1453,36 @@ def _normalize_audio_prompt_type_from_guide(
     return normalized_audio_prompt_type
 
 
-def validate_settings(state, model_type, single_prompt, inputs):
+def missing_audio_source_error(model_def, inputs):
+    """Check selected source slots without opening media or inspecting text."""
+    image_mode = inputs.get("image_mode", 0)
+    if isinstance(image_mode, (int, float)) and image_mode > 0:
+        return None
+    audio_type = inputs.get("audio_prompt_type") or ""
+    if not isinstance(audio_type, str):
+        return None
+    choices = model_def.get("audio_prompt_type_sources") or {}
+    text_only = isinstance(choices, dict) and "" in choices.get("selection", [])
+    first_source_message = (
+        "Audio source is required for this conditioning mode. Upload the required voice reference or choose Text only."
+        if text_only else "An audio source is required for this conditioning mode."
+    )
+    sources = (
+        ("A", "audio_guide", "audio_source_required", first_source_message),
+        ("B", "audio_guide2", "second_audio_source_required",
+         "A second audio source is required for this conditioning mode."),
+        ("C", "audio_guide3", "third_audio_source_required",
+         "A third audio source is required for this conditioning mode."),
+    )
+    for selector, field, code, message in sources:
+        if selector == "A" and model_def.get("auto_null_audio", False):
+            continue
+        if selector in audio_type and not inputs.get(field):
+            return {"code": code, "message": message, "field": field}
+    return None
+
+
+def validate_settings(state, model_type, single_prompt, inputs, *, validation_errors=None):
     def ret():
         return None, None, None, None
 
@@ -1738,28 +1767,19 @@ def validate_settings(state, model_type, single_prompt, inputs):
     if not input_video_strength_visible(model_def, image_prompt_type, video_prompt_type):
         input_video_strength = 1.0
 
-    if "A" in audio_prompt_type:
-        # `auto_null_audio` models (Silent Movie Mode) can be generated
-        # without an explicit audio source — wgp will synthesize a silent
-        # WAV later in this function.
-        if audio_guide == None and not model_def.get("auto_null_audio", False):
-            gr.Info("You must provide an Audio Source")
-            return ret()
-    else:
+    audio_error = missing_audio_source_error(
+        model_def, {**inputs, "audio_prompt_type": audio_prompt_type},
+    )
+    if audio_error is not None:
+        if validation_errors is not None:
+            validation_errors.append(audio_error)
+        gr.Info(audio_error["message"])
+        return ret()
+    if "A" not in audio_prompt_type:
         audio_guide = None
-
-
-    if "B" in audio_prompt_type:
-        if audio_guide2 == None:
-            gr.Info("You must provide a second Audio Source")
-            return ret()
-    else:
+    if "B" not in audio_prompt_type:
         audio_guide2 = None
-    if "C" in audio_prompt_type:
-        if audio_guide3 == None:
-            gr.Info("You must provide a third Audio Source")
-            return ret()
-    else:
+    if "C" not in audio_prompt_type:
         audio_guide3 = None
     if not all_letters(audio_prompt_type, "AB"):
         audio_prompt_type = del_in_sequence(audio_prompt_type, "N")
@@ -16542,10 +16562,13 @@ def validate_task(
     task,
     state,
     *,
+    validation_errors=None,
     _h3_turbo_validation_authorized=False,
     _h3_prompt_template_resolved=False,
 ):
-    """Validate a task's settings. Returns updated params dict or None if invalid."""
+    """Validate settings, optionally reporting fixed per-invocation failure copy."""
+    if validation_errors is not None:
+        validation_errors.clear()
     params = task.get('params', {})
     if "_h3_turbo_validation_authorized" in params:
         print("  [SKIP] Internal H3 validation state is not accepted in task params")
@@ -16569,8 +16592,16 @@ def validate_task(
     inputs['prompt'] = task.get('prompt', '')
     inputs.setdefault('mode', "")
     is_single = inputs.get('multi_prompts_gen_type', 0) in (2,)
-    override_inputs, _, _, _ = validate_settings(state, model_type, single_prompt=is_single, inputs=inputs)
+    override_inputs, _, _, _ = validate_settings(
+        state, model_type, single_prompt=is_single, inputs=inputs,
+        validation_errors=validation_errors,
+    )
     if override_inputs is None:
+        if validation_errors is not None and not validation_errors:
+            validation_errors.append({
+                "code": "task_validation_failed",
+                "message": "Task validation failed. Check the selected model settings and required inputs.",
+            })
         return None
     inputs.update(override_inputs)
     inputs.pop("_h3_prompt_template_resolved", None)

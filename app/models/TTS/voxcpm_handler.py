@@ -55,6 +55,13 @@ def _get_voxcpm2_model_def() -> dict:
         },
         "audio_guide_label": "Voice to clone (optional)",
         "any_audio_prompt": True,
+        "audio_prompt_type_sources": {
+            "selection": ["", "A"],
+            "labels": {"": "Text only", "A": "Voice cloning (1 reference audio)"},
+            "letters_filter": "A",
+            "default": "",
+        },
+        "max_voice_count": 1,
         "alt_prompt": {
             "label": "Voice / emotion instruction",
             "placeholder": "warm, unhurried, slightly amused",
@@ -163,10 +170,14 @@ class family_handler:
         return pipeline, {"voxcpm": pipeline.model}
 
     @staticmethod
+    def fresh_default_settings(base_model_type, model_def):
+        return {"audio_prompt_type": ""}
+
+    @staticmethod
     def update_default_settings(base_model_type, model_def, ui_defaults):
         ui_defaults.update(
             {
-                "audio_prompt_type": "A",
+                "audio_prompt_type": "",
                 "repeat_generation": 1,
                 "video_length": 0,
                 "num_inference_steps": 0,

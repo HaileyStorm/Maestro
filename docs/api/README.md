@@ -344,6 +344,17 @@ caller-ID receipt. After a lost response, inspect the same session's jobs,
 Queue and outputs and stop for owner reconciliation if acceptance cannot be
 identified. Never infer exactly-once behavior from a generated wrapper.
 
+For **VoxCPM text-only narration**, use the ordinary generation workflow with
+`model_type: "voxcpm2"`, `generation_mode: "audio"`, a narration `prompt`,
+`audio_prompt_type: ""` and no `audio_guide`. The empty conditioning value means
+**Text only**; it is intentional. `alt_prompt` can carry voice delivery
+instructions. To use optional voice cloning, select `audio_prompt_type: "A"`
+and supply an authorized uploaded audio reference as `audio_guide`. Choosing
+`"A"` without that reference is an invalid input, not a text-only request.
+Inspect the current model options and readiness before submission; installed
+assets alone do not establish working native inference. A configured duration
+is not a guarantee of exact speech length or voice quality.
+
 ## Director, Chat, music and recovery
 
 Director preview is a separate LLM operation: submit `/director/v2/plan` with

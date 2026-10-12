@@ -19298,6 +19298,11 @@ def get_defaults(model_type: str, request: Request):
     if wgp.get_model_def(model_type) is None:
         raise HTTPException(status_code=404, detail=f"Unknown model: {model_type}")
     defaults = copy.deepcopy(wgp.get_default_settings(model_type))
+    fresh_defaults = getattr(wgp.get_model_handler(model_type), "fresh_default_settings", None)
+    if callable(fresh_defaults):
+        # Fresh discovery can repair an old default without changing saved
+        # settings, profiles, requests, or retained submission identities.
+        defaults.update(fresh_defaults(wgp.get_base_model_type(model_type), wgp.get_model_def(model_type)))
     if str(model_type or "") in globals().get(
         "_H3_LONG_STUDIO_MODELS", frozenset(),
     ):
@@ -55758,6 +55763,7 @@ async def generate(request: Request):
         existing_submission = _studio_submission_lookup(submission_context)
         if existing_submission is not None:
             return _studio_submission_response(submission_context, existing_submission, request, reused=True)
+    audio_error = None
     try:
         if submission_context is not None:
             _reject_client_krea_authority(body)
@@ -55911,6 +55917,10 @@ async def generate(request: Request):
                 # Retain processing flags while restoring a standalone soundtrack's
                 # source selector. Control-video requests keep their explicit mode.
                 body["audio_prompt_type"] = f"A{_audio_prompt_type}"
+
+        audio_error = None if is_sfx else wgp.missing_audio_source_error(_generation_model_def, body)
+        if audio_error is not None:
+            raise HTTPException(status_code=400, detail=audio_error)
 
         # Ordinary longer H3 requests use consecutive decoded clips. Explicit
         # cumulative selection uses its own validated native sampling windows.
@@ -56091,9 +56101,14 @@ async def generate(request: Request):
             existing_submission = _studio_submission_lookup(submission_context)
             if existing_submission is not None:
                 return _studio_submission_response(submission_context, existing_submission, request, reused=True)
-            raise HTTPException(status_code=error.status_code, detail={"admission_state": "rejected",
+            rejection = {"admission_state": "rejected",
                 "generation_request_id": generation_request_id, "workspace": workspace,
-                "message": str(error.detail)}) from error
+                "message": str(error.detail)}
+            # Only the fixed ingress validator's own result supplies structured
+            # fields; other exception dictionaries keep their existing envelope.
+            if audio_error is not None and error.detail is audio_error:
+                rejection.update({key: audio_error[key] for key in ("message", "code", "field")})
+            raise HTTPException(status_code=error.status_code, detail=rejection) from error
         raise
     job_id = _new_generation_job_id()
     if submission_context is not None:
@@ -78676,10 +78691,12 @@ def _run_generation(
                             task_params,
                         )
                     )
+                validation_errors = []
                 try:
                     validated_params = wgp.validate_task(
                         task,
                         state,
+                        validation_errors=validation_errors,
                         **({"_h3_prompt_template_resolved": True} if h3_templates_resolved else {}),
                         _h3_turbo_validation_authorized=(
                             server_h3_turbo_validation_authorized
@@ -78731,6 +78748,20 @@ def _run_generation(
                         cumulative_predecessor,
                     )
                 if validated_params is None:
+                    if first_task_error is None:
+                        validation_error = validation_errors[0] if validation_errors else {
+                            "code": "task_validation_failed",
+                            "message": "Task validation failed. Check the selected model settings and required inputs.",
+                        }
+                        failure = _safe_failure_updates(
+                            _GenerationStageFailure(
+                                validation_error["message"], stage="generation",
+                                code=validation_error["code"],
+                            ),
+                            job,
+                        )
+                        first_task_error = failure["error"]
+                        first_failure_details = failure["failure_details"]
                     print(f"  [SKIP] Task {task_no} failed validation")
                     skipped += 1
                     continue
