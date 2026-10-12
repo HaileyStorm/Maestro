@@ -95,7 +95,7 @@ _JOB_FIELDS = frozenset({
     "credit_queue", "prompt_result_reference", "prompt_result_consumed",
     "editor_retake_origin", "editor_retake_closed",
     "resource_admission_failures",
-    "_credit_account_id",
+    "_credit_account_id", "_native_acceptance_manual_recovery",
 })
 _GLOBAL_FIELDS = frozenset({
     "paused", "pause_after_current", "manual_order_sequence", "queue_order",
@@ -1223,9 +1223,9 @@ def serialize_job(
                 result[key] = validated_resource_admission_failures(value)
             except ValueError as error:
                 raise QueueRecoveryAdapterError("Resource admission diagnostics are invalid.") from error
-        elif key == "_recovery_worker_pending":
+        elif key in {"_recovery_worker_pending", "_native_acceptance_manual_recovery"}:
             if type(value) is not bool:
-                raise QueueRecoveryAdapterError("Pending worker receipt is invalid.")
+                raise QueueRecoveryAdapterError("Private recovery marker is invalid.")
             result[key] = value
         elif key == "release_generation_model_on_completion":
             if type(value) is not bool:
@@ -1688,7 +1688,9 @@ def _validated_recovered_state(
                 and clean.get("recovery_state") == "blocked_preparation" and clean.get("resource_state") == "blocked")
             clean["resource_state"] = "blocked" if admission_blocked else "queued"
             clean.setdefault("execution_attempt", 1)
-            if sample_preemption_requested:
+            if clean.get("_native_acceptance_manual_recovery") is True:
+                clean["queue_held"] = True
+            if sample_preemption_requested and clean.get("_native_acceptance_manual_recovery") is not True:
                 if clean["execution_attempt"] >= _MAX_EXECUTION_ATTEMPT:
                     raise QueueRecoveryAdapterError(
                         "Recovered sample execution attempt is exhausted."

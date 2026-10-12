@@ -2179,6 +2179,8 @@ def update_queue_job(
         if priority is not None:
             candidate["queue_priority"] = max(-1_000_000, min(1_000_000, int(priority)))
         if held is not None:
+            if not held and not _native_acceptance.prepare_job_release(job, candidate):
+                return False
             candidate["queue_held"] = bool(held)
             candidate["message"] = "Held" if held else "Queued"
         _append_job_event_unlocked(candidate)
@@ -2206,6 +2208,8 @@ def set_job_hold(
         status = job.get("status")
         if status == "queued" and not is_cancel_requested(job):
             candidate = _copy_job_for_transition(job)
+            if not held and not _native_acceptance.prepare_job_release(job, candidate):
+                return None
             candidate["queue_held"] = bool(held)
             candidate["hold_after_output"] = False
             candidate["message"] = "Held" if held else "Queued"
@@ -2224,6 +2228,8 @@ def set_job_hold(
                 candidate["message"] = "Will hold after the current output"
                 result = "after_output"
             elif job.get("hold_after_output", False):
+                if not _native_acceptance.prepare_job_release(job, candidate):
+                    return None
                 candidate["hold_after_output"] = False
                 candidate["message"] = "Running"
                 result = "resumed"
@@ -2254,6 +2260,8 @@ def promote_queued_job(job: MutableMapping[str, Any]) -> bool:
         ):
             return False
         candidate = _copy_job_for_transition(job)
+        if not _native_acceptance.prepare_job_release(job, candidate):
+            return False
         next_manual_order = _queue_manual_order_sequence + 1
         candidate["queue_held"] = False
         candidate["queue_priority"] = 1_000_000
@@ -3935,6 +3943,7 @@ def try_start(
                 return False
             admission_blocked = bool(
                 job.get("queue_held", False) or _queue_paused
+                or not _native_acceptance.permits_job_release(job)
             )
             if not admission_blocked:
                 candidate = _copy_job_for_transition(job)
@@ -4748,10 +4757,29 @@ def acquire_generation_slot(
                             if is_cancel_requested(job):
                                 return False
                             continue
-                        _record_queue_admission(
-                            job, reason or "queue_order", skipped, eligible,
-                        )
-                        _native_acceptance.admitted(job, generation_lock)
+                        try:
+                            if not _native_acceptance.permits_job_release(job):
+                                generation_lock.release()
+                                continue
+                            if (_native_acceptance.target is not None
+                                    and job.get("_native_acceptance_manual_recovery") is not True):
+                                candidate = _copy_job_for_transition(job)
+                                if not _native_acceptance.prepare_job_release(job, candidate):
+                                    generation_lock.release()
+                                    continue
+                                _persist_prospective_unlocked(
+                                    "native_acceptance_admission", jobs=(candidate,),
+                                    global_state=_global_state_unlocked(replacements={id(job): candidate}),
+                                )
+                                _publish_job_unlocked(job, candidate)
+                            _record_queue_admission(
+                                job, reason or "queue_order", skipped, eligible,
+                            )
+                            _native_acceptance.admitted(job, generation_lock)
+                        except Exception:
+                            _native_acceptance.released(job)
+                            generation_lock.release()
+                            raise
                         _queue_waiters.pop(waiter_key, None)
                         return True
                 _queue_condition.wait(timeout=max(0.01, poll_interval))

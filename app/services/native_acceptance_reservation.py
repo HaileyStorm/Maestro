@@ -124,10 +124,25 @@ class Reservation:
         except (OSError, ValueError, TypeError, KeyError, IndexError, AttributeError):
             return False
 
+    def permits_job_release(self, job):
+        if self.target is None:
+            return job.get("_native_acceptance_manual_recovery") is not True
+        return self.eligible(job)
+
+    def prepare_job_release(self, job, candidate):
+        """Stamp only server-owned operational state before durable release."""
+        if not self.permits_job_release(job):
+            return False
+        if self.target is not None:
+            candidate["_native_acceptance_manual_recovery"] = True
+        return True
+
     def eligible(self, job):
         """Queue admission always uses the frozen pre-start attempt."""
         if self.target is None:
-            return True
+            return job.get("_native_acceptance_manual_recovery") is not True
+        if not self.dispatch_ready():
+            return False
         if self.target.get("kind") == "director_planning":
             return False
         if self.target.get("kind") in {"director_images", "director_saved_images", "director_saved_video"}:
@@ -530,10 +545,10 @@ class Reservation:
             return False
 
     def admitted(self, job, generation_lock):
+        if not self.permits_job_release(job) or not generation_lock.locked():
+            raise NativeAcceptanceReserved("Native acceptance admission changed")
         if self.target is None:
             return
-        if not self.eligible(job) or not generation_lock.locked():
-            raise NativeAcceptanceReserved("Native acceptance admission changed")
         with self._lock:
             current = threading.current_thread()
             worker = self._workers.get(current)

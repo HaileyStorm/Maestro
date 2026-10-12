@@ -288,11 +288,19 @@ remain set while automatic recovery is starting; it does not prove that no
 worker is active. Check Queue and the returned recovery metadata.
 Inspect `recovery_interrupted`, `recovery_blocked`, `recovery_actionable` and
 `recovery_actions` along with status. Python and TypeScript `wait` return blocked
-or actionable recovery snapshots without cancelling or retrying. The interruption flag alone does not end a
-wait during automatic recovery. A wait timeout leaves execution unchanged;
+or actionable recovery snapshots without cancelling or retrying. The
+interruption flag alone does not end a wait during automatic recovery. A wait
+timeout leaves execution unchanged;
 reconcile the same identifiers and Queue rather than resubmitting. If recovery
 stays unavailable, reconcile with the owner; do not create another generation
 request to bypass recovery.
+
+An interrupted job admitted under an operator's supervised GPU reservation
+stays held after startup. The operator must renew its exact reservation before
+the usual release or recovery operation can resume it. An individual release
+request otherwise returns `409` with a next-step instruction; bulk release
+leaves it held. Clients cannot renew that authority through this API. Ordinary
+jobs retain their existing automatic recovery.
 
 If an accepted, never-started Studio job encounters resource-admission failure,
 keep its original request ID and job ID. Read `recovery_actions`; when it offers

@@ -10686,7 +10686,11 @@ def _queue_recovery_materialize_job(
             "queue_held": True,
             "recovery_state": "restored",
             "reruns_denoise": status == "running" or snapshot.get("reruns_denoise") is True,
-            "message": str(snapshot.get("message") or "Queued"),
+            "message": (
+                "Held after a supervised run. Renew its GPU reservation before resuming."
+                if snapshot.get("_native_acceptance_manual_recovery") is True
+                else str(snapshot.get("message") or "Queued")
+            ),
         })
         # Startup deliberately attaches no worker while held. Every validated
         # restart-safe kind needs its own worker after an explicit release;
@@ -11332,6 +11336,18 @@ def _restore_queue_recovery_on_startup(
                 job, persist_baseline=True,
             ):
                 unsettled_terminal_credit = True
+        # A process-local acceptance permit cannot survive recovery, including
+        # specialized materializers that would otherwise attach their own worker.
+        if (job.get("_native_acceptance_manual_recovery") is True and auto_resume
+                and job.get("status") not in {"completed", "failed", "cancelled", "canceled"}):
+            job.update({
+                "status": "queued", "queue_held": True,
+                "resource_state": "queued", "recovery_state": "restored",
+                "recovery_attempt": snapshot.get("recovery_attempt", 0),
+                "_recovery_worker_pending": True,
+                "message": "Held after a supervised run. Renew its GPU reservation before resuming.",
+            })
+            auto_resume = False
         # Persist every startup normalization before publication, including a
         # receipt-proven final that closes an older nonterminal snapshot.
         if (
@@ -11728,6 +11744,7 @@ def _start_restored_held_generation_worker(job: dict) -> None:
             or _queue_recovery_is_blocked(job)
         ):
             return
+        _require_native_supervised_job_release(job)
         if not _queue_recovery_revalidate_job(job):
             _queue_recovery_checkpoint(
                 job,
@@ -21735,8 +21752,20 @@ def _require_job_krea_actor_admission(job: dict) -> None:
         raise HTTPException(status_code=409, detail=str(error)) from error
 
 
+def _require_native_supervised_job_release(job: dict) -> None:
+    if job.get("_native_acceptance_manual_recovery") is not True:
+        return
+    from services.native_acceptance_reservation import reservation
+    if not reservation.permits_job_release(job):
+        raise HTTPException(
+            status_code=409,
+            detail="This supervised job needs a fresh GPU reservation before resuming. Keep it held until then.",
+        )
+
+
 def _require_job_runtime_model_admission(job: dict) -> None:
     """Revalidate generic role snapshots and legacy terms before execution."""
+    _require_native_supervised_job_release(job)
     from services.h3_cumulative_execution import prepare_h3_cumulative_request
 
     params = job.get("params")
@@ -52797,6 +52826,7 @@ def _generation_enhancement_request(body: dict, workspace: str) -> dict:
 
 def _start_generation_worker(job: dict, *, name_prefix: str) -> None:
     """Start the ordinary GPU worker after a durable queued transition."""
+    _require_native_supervised_job_release(job)
     if _queue_recovery_delivery_pending(job) is None:
         _require_h3_legal_execution(_h3_job_model_types(job))
     _require_h3_offload_plan_parity(job)
@@ -71991,6 +72021,8 @@ def _try_automatic_resource_retry(
     retryable: bool | None = None,
 ) -> bool:
     """Durably re-admit one exact job, or leave unsafe work terminal/held."""
+    if job.get("_native_acceptance_manual_recovery") is True:
+        return False
     cursor = job.get("recovery_cursor")
     if isinstance(cursor, dict) and any(key in cursor for key in ("director_image_custody", "director_video_custody")):
         return False
@@ -85211,11 +85243,12 @@ def start_studio_queue(request: Request, response: Response):
             owned = _require_generic_queue_control_job(job_id, request)
         except HTTPException:
             continue
-        if _queue_recovery_delivery_pending(owned) is None:
-            try:
+        try:
+            _require_native_supervised_job_release(owned)
+            if _queue_recovery_delivery_pending(owned) is None:
                 _require_job_runtime_model_admission(owned)
-            except HTTPException:
-                continue
+        except HTTPException:
+            continue
         mode = set_job_hold(owned, False)
         if mode:
             _start_restored_held_generation_worker(owned)
@@ -85228,6 +85261,7 @@ def resume_held_job(job_id: str, request: Request, response: Response):
     _set_recovery_no_store(response)
     job = _require_generic_queue_control_job(job_id, request)
     _reject_generic_sample_campaign_release(job)
+    _require_native_supervised_job_release(job)
     if _queue_recovery_delivery_pending(job) is None:
         _require_job_runtime_model_admission(job)
     mode = set_job_hold(job, False)
@@ -85846,6 +85880,7 @@ def _resume_recovered_job(
                 "recovery_attempt": attempt, "recovery_state": "restored",
                 "reruns_denoise": False,
             }
+        _require_native_supervised_job_release(job)
         if reason == "h3_ordinary_restart_required" and not (
             job.get("status") == "queued" and job.get("queue_held") is True
             and _h3_ordinary_restart_allowed(job)
@@ -86431,6 +86466,7 @@ def start_local_h3_generation_recovery(
                 "Recovery project or input evidence changed."
             )
         job["_recovery_reason_code"] = reason
+        _require_native_supervised_job_release(job)
         if reason == "h3_ordinary_restart_required" and not _h3_ordinary_restart_allowed(job):
             raise QueueRecoveryRuntimeError("Whole-clip recovery evidence changed.")
         if _queue_recovery_delivery_pending(job) is None:
@@ -86865,6 +86901,7 @@ def start_queued_job_next(job_id: str, request: Request, response: Response):
     job = _require_generic_queue_control_job(job_id, request)
     _reject_generic_sample_campaign_release(job)
     _require_remote_queue_generation_permission(job, request)
+    _require_native_supervised_job_release(job)
     if _queue_recovery_delivery_pending(job) is None:
         _require_job_runtime_model_admission(job)
     promoted = promote_queued_job(job)
