@@ -417,6 +417,30 @@ reconcile. Saved pipeline tags, repairs, reruns and rejoin use `/director/pipeli
 routes. Repair state is not a generation status. Direct start/rerun operations
 without an admission receipt must not be blindly retried after a timeout.
 
+For an ordinary saved clip video rerun, POST the explicit `workspace` and an
+optional `prompt` to `/api/v1/director/pipelines/{pid}/clips/{clip_index}/rerun-video`.
+The successful response includes the actual child `job_id` and output
+`filename`. This awaited call can exceed a client's timeout. Read
+`GET /api/v1/director/pipelines/{pid}?workspace=...` and inspect
+`recovery.video_repairs["0"]` for clip zero: `state`, `revision`, `job_id` and
+`output_files` describe its retained attempt. Use `/status/{job_id}` for the
+generation child when it remains available; the saved repair and clip output
+remain the reconciliation record after completed queue rows retire. A parent
+can remain `cancelled` while its separately requested clip repair completes.
+H3 scene reruns instead retain `recovery.scene_repairs` and may omit the response
+`job_id`. There is no caller idempotency key for either operation. Matching
+unresolved ordinary work can attach to its saved intent; repeating a completed
+rerun can create another revision. Read first and never automatically retry.
+Private frozen inputs, process identities and execution authority are not part
+of the public repair record.
+
+```bash
+# Observe a retained clip attempt after a lost rerun response; this starts no work.
+curl --fail-with-body -b "$MAESTRO_COOKIE_FILE" \
+  --get --data-urlencode "workspace=$MAESTRO_PROJECT" \
+  "$MAESTRO_URL/api/v1/director/pipelines/$PIPELINE_ID"
+```
+
 Director music preparation uses `/director/preparation` and its saved
 `director_request_id`; `/director/generate-music` consumes that request. YuE2
 uses take IDs and its own compose, plan review/continue/cancel, library and audio

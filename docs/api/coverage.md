@@ -205,6 +205,15 @@ Director cursors gained only their saved pause reason. Because the original
 child rows were already retired, this establishes metadata reconstruction,
 not future native child-row survival. Subjective image quality and video
 execution remain distinct acceptance requirements.
+The subsequent saved-video recovery update is deployed. Authenticated saved
+pipeline reads exposed three bounded repair observations without private request
+or custody data, and the two changed live OpenAPI operations matched their
+authored contracts. The maintained client references were regenerated from that
+fresh live export; the TypeScript client build passed. All 24 retained job
+identities, the saved parent and the environment remained unchanged across the
+coordinated restart. This establishes the public reconciliation contract and
+deployment, not the rerun response's child identifier or native video execution;
+those require a separate fresh model journey and GPU authority.
 Historical attempt receipts remain
 retained separately rather than becoming routine regression scenarios.
 

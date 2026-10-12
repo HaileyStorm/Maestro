@@ -58254,9 +58254,6 @@ export const operationReference: readonly OperationReference[] = [
             "schema": {
               "type": "object",
               "properties": {
-                "pipeline_id": {
-                  "type": "string"
-                },
                 "status": {
                   "type": "string"
                 },
@@ -58285,6 +58282,270 @@ export const operationReference: readonly OperationReference[] = [
                   "items": {
                     "type": "string"
                   }
+                },
+                "id": {
+                  "type": "string",
+                  "description": "Saved pipeline ID returned as pipeline_id by admission."
+                },
+                "workspace": {
+                  "type": "string"
+                },
+                "clips": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "video_filename": {
+                        "type": "string"
+                      },
+                      "video_stale": {
+                        "type": "boolean"
+                      },
+                      "start_image_filename": {
+                        "type": "string"
+                      }
+                    },
+                    "additionalProperties": true
+                  }
+                },
+                "recovery": {
+                  "type": "object",
+                  "description": "Bounded retained attempt observations. Repair maps use decimal clip-index keys; saved-image/child maps use server-owned unit tokens. Private frozen inputs, custody, producer evidence and owner/process identities remain server-side. These observations grant no execution authority.",
+                  "properties": {
+                    "video_repairs": {
+                      "type": "object",
+                      "additionalProperties": {
+                        "type": "object",
+                        "properties": {
+                          "version": {
+                            "type": "integer"
+                          },
+                          "revision": {
+                            "type": "integer",
+                            "minimum": 1
+                          },
+                          "state": {
+                            "type": "string",
+                            "enum": [
+                              "submitted",
+                              "completed",
+                              "failed",
+                              "cancelled"
+                            ]
+                          },
+                          "job_id": {
+                            "type": "string"
+                          },
+                          "attempt": {
+                            "type": "integer",
+                            "minimum": 0
+                          },
+                          "unit": {
+                            "type": "object",
+                            "properties": {
+                              "kind": {
+                                "type": "string"
+                              },
+                              "variant": {
+                                "type": "integer",
+                                "minimum": 1
+                              },
+                              "index": {
+                                "type": "integer",
+                                "minimum": 0
+                              }
+                            },
+                            "additionalProperties": false
+                          },
+                          "output_files": {
+                            "type": "array",
+                            "items": {
+                              "type": "string"
+                            }
+                          }
+                        },
+                        "additionalProperties": false
+                      }
+                    },
+                    "scene_repairs": {
+                      "type": "object",
+                      "additionalProperties": {
+                        "type": "object",
+                        "properties": {
+                          "version": {
+                            "type": "integer"
+                          },
+                          "revision": {
+                            "type": "integer",
+                            "minimum": 1
+                          },
+                          "state": {
+                            "type": "string",
+                            "enum": [
+                              "submitted",
+                              "completed",
+                              "failed",
+                              "cancelled"
+                            ]
+                          },
+                          "job_id": {
+                            "type": "string"
+                          },
+                          "attempt": {
+                            "type": "integer",
+                            "minimum": 0
+                          },
+                          "unit": {
+                            "type": "object",
+                            "properties": {
+                              "kind": {
+                                "type": "string"
+                              },
+                              "variant": {
+                                "type": "integer",
+                                "minimum": 1
+                              },
+                              "index": {
+                                "type": "integer",
+                                "minimum": 0
+                              }
+                            },
+                            "additionalProperties": false
+                          },
+                          "output_files": {
+                            "type": "array",
+                            "items": {
+                              "type": "string"
+                            }
+                          }
+                        },
+                        "additionalProperties": false
+                      }
+                    },
+                    "saved_images": {
+                      "type": "object",
+                      "additionalProperties": {
+                        "type": "object",
+                        "properties": {
+                          "version": {
+                            "type": "integer"
+                          },
+                          "revision": {
+                            "type": "integer",
+                            "minimum": 1
+                          },
+                          "state": {
+                            "type": "string",
+                            "enum": [
+                              "submitted",
+                              "completed",
+                              "failed",
+                              "cancelled"
+                            ]
+                          },
+                          "job_id": {
+                            "type": "string"
+                          },
+                          "attempt": {
+                            "type": "integer",
+                            "minimum": 0
+                          },
+                          "unit": {
+                            "type": "object",
+                            "properties": {
+                              "kind": {
+                                "type": "string"
+                              },
+                              "variant": {
+                                "type": "integer",
+                                "minimum": 0
+                              },
+                              "index": {
+                                "type": "integer",
+                                "minimum": 0
+                              }
+                            },
+                            "additionalProperties": false
+                          },
+                          "output_files": {
+                            "type": "array",
+                            "items": {
+                              "type": "string"
+                            }
+                          },
+                          "outputs": {
+                            "type": "array",
+                            "items": {
+                              "type": "string"
+                            }
+                          }
+                        },
+                        "additionalProperties": false
+                      }
+                    },
+                    "children": {
+                      "type": "object",
+                      "additionalProperties": {
+                        "type": "object",
+                        "properties": {
+                          "version": {
+                            "type": "integer"
+                          },
+                          "revision": {
+                            "type": "integer",
+                            "minimum": 1
+                          },
+                          "state": {
+                            "type": "string",
+                            "enum": [
+                              "submitted",
+                              "completed",
+                              "failed",
+                              "cancelled"
+                            ]
+                          },
+                          "job_id": {
+                            "type": "string"
+                          },
+                          "attempt": {
+                            "type": "integer",
+                            "minimum": 0
+                          },
+                          "unit": {
+                            "type": "object",
+                            "properties": {
+                              "kind": {
+                                "type": "string"
+                              },
+                              "variant": {
+                                "type": "integer",
+                                "minimum": 0
+                              },
+                              "index": {
+                                "type": "integer",
+                                "minimum": 0
+                              }
+                            },
+                            "additionalProperties": false
+                          },
+                          "output_files": {
+                            "type": "array",
+                            "items": {
+                              "type": "string"
+                            }
+                          },
+                          "outputs": {
+                            "type": "array",
+                            "items": {
+                              "type": "string"
+                            }
+                          }
+                        },
+                        "additionalProperties": false
+                      }
+                    }
+                  },
+                  "additionalProperties": false
                 }
               },
               "additionalProperties": true
@@ -59748,6 +60009,10 @@ export const operationReference: readonly OperationReference[] = [
                 },
                 "clip_index": {
                   "type": "integer"
+                },
+                "job_id": {
+                  "type": "string",
+                  "description": "Actual generation child ID for an ordinary clip rerun; inspect /status/{job_id}. Not a pipeline ID or caller idempotency key. May be absent for the separate H3 scene-rerun path."
                 }
               },
               "additionalProperties": true
@@ -59923,7 +60188,7 @@ export const operationReference: readonly OperationReference[] = [
         "project.mutate"
       ],
       "boundary": "Exact project, browser-session pipeline owner and recovered owner/project incarnation checks; saved inputs are revalidated before restarting work. Host paths and private recovery state are not public execution authority.",
-      "idempotency": "No caller-owned idempotency key is declared; reconcile uncertain outcomes before repeating.",
+      "idempotency": "No caller-owned idempotency key. Ordinary reruns retain a submitted intent with a deterministic server-owned job_id; matching unresolved work can attach through its existing repair path. Read the saved pipeline and child status after an uncertain outcome. A completed call does not deduplicate a later rerun; never retry automatically.",
       "operation_kind": "director_clip_rerun_video",
       "mcp": true,
       "contract_status": "authored"

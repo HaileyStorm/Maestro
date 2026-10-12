@@ -2689,13 +2689,93 @@ def _quantize_clip_frame_schedule(
 
 
 @_exclusive_pipeline_operation
-def rerun_clip_video(out_dir: str, pid: str, clip_index: int, prompt_override: str = None) -> dict:
-    return _rerun_clip_video_impl(out_dir, pid, clip_index, prompt_override)
+def rerun_clip_video(out_dir: str, pid: str, clip_index: int, prompt_override: str = None, *, saved_video_binding=None) -> dict:
+    from services.native_acceptance_reservation import reservation
+    reserved = reservation.target is not None and reservation.target.get("kind") == "director_saved_video"
+    if not reserved and saved_video_binding is None:
+        return _rerun_clip_video_impl(out_dir, pid, clip_index, prompt_override)
+    if (not reserved or type(saved_video_binding) is not tuple or len(saved_video_binding) != 2
+            or prompt_override is not None):
+        raise ValueError("Saved video work needs its exact unchanged request")
+    parent, pipeline = saved_video_binding
+    filepath = _find_pipeline_file(out_dir, pid)
+    if not filepath:
+        raise ValueError("Saved video checkpoint is unavailable")
+    with _pipeline_file_lock:
+        with open(filepath, "rb") as handle:
+            raw = handle.read(4 * 1024 * 1024 + 1)
+        if len(raw) > 4 * 1024 * 1024:
+            raise ValueError("Saved video checkpoint is too large")
+        state = json.loads(raw)
+        descriptor = _pipeline_payload_descriptor(pid, raw)
+        prepared = prepare_saved_clip_video_request(out_dir, pid, clip_index, state=state)
+        with _pipeline_lock:
+            operation_id = (_pipeline_repairs.get(pid) or {}).get("operation_id")
+        token = reservation.bind_saved_video(pid, parent, pipeline, state, descriptor, prepared,
+            clip_index, operation_id=operation_id)
+    try:
+        return _rerun_clip_video_impl(out_dir, pid, clip_index, None,
+            saved_video_admission=token, saved_video_state=state)
+    except BaseException:
+        reservation.abandon_images(token)
+        raise
 
 
-def _rerun_clip_video_impl(out_dir: str, pid: str, clip_index: int, prompt_override: str = None) -> dict:
+def prepare_saved_clip_video_request(out_dir: str, pid: str, clip_index: int, *, state=None) -> dict:
+    """Read the actual ordinary rerun builder and its sealed image dependency."""
+    state = load_pipeline_state(out_dir, pid) if state is None else state
+    snapshot = state.get("_params_snapshot") if isinstance(state, dict) else None
+    if (not isinstance(snapshot, dict) or state.get("status") != "cancelled"
+            or state.get("phase") != "cancelled" or type(clip_index) is not int or clip_index != 0
+            or len(state.get("clips") or []) != 1 or state.get("video_model") != "minimax_h3"
+            or snapshot.get("pipeline_type") != "short_film_story" or snapshot.get("audio_path")
+            or snapshot.get("_h3_longform") or snapshot.get("_director_video_lora_snapshot")
+            or state.get("video_loras") or snapshot.get("_director_custom_style_video_snapshot")):
+        raise ValueError("Saved video preparation requires one ordinary retained H3 story clip")
+    filepath = _find_pipeline_file(out_dir, pid)
+    project_dir = os.path.dirname(filepath) if filepath else out_dir
+    from services.queue_recovery_runtime import validate_artifact_descriptor
+    from services.native_acceptance_reservation import digest
+    filename = state["clips"][0].get("start_image_filename")
+    matches = []
+    for token, entry in ((state.get("recovery") or {}).get("saved_images") or {}).items():
+        unit = entry.get("unit") if isinstance(entry, dict) else None
+        evidence = entry.get("evidence") if isinstance(entry, dict) else None
+        artifacts = evidence.get("artifacts") if isinstance(evidence, dict) else None
+        if (not isinstance(unit, dict) or unit.get("kind") != "image_start" or unit.get("index") != 0
+                or type(unit.get("variant")) is not int or unit["variant"] < 1
+                or token != _child_unit_token(unit) or entry.get("state") != "completed"
+                or type(entry.get("attempt")) is not int or entry["attempt"] != 0
+                or entry.get("job_id") != _director_child_job_id(pid, unit, 0)
+                or not isinstance(entry.get("identity"), dict) or evidence.get("outputs") != [filename]
+                or not isinstance(artifacts, list) or len(artifacts) != 1
+                or artifacts[0].get("basename") != filename
+                or not validate_artifact_descriptor(project_dir, artifacts[0])):
+            continue
+        matches.append({"unit": unit, "job_id": entry["job_id"], "identity": entry["identity"],
+            "artifact": artifacts[0]})
+    if len(matches) != 1:
+        raise ValueError("Saved video requires its exact sealed editor image")
+    prior = ((state.get("recovery") or {}).get("video_repairs") or {}).get("0")
+    if isinstance(prior, dict) and prior.get("state") == "submitted":
+        raise ValueError("Saved video has an unresolved intent; reconcile without replay")
+    revision = prior.get("revision", 0) if isinstance(prior, dict) else 0
+    if type(revision) is not int or revision < 0:
+        raise ValueError("Saved video repair revision is invalid")
+    request = _rerun_clip_video_impl(out_dir, pid, clip_index, None,
+        saved_video_state=state, prepare_only=True)
+    if (os.path.realpath(request.get("image_start") or "")
+            != os.path.realpath(os.path.join(project_dir, filename)) or request.get("image_refs")):
+        raise ValueError("Saved video request does not consume its sealed editor image")
+    return {"request": request, "unit": {"kind": "video_clip_rerun", "variant": revision + 1, "index": 0},
+        "input_seal": matches[0], "generated_request_sha256": digest(request),
+        "input_seal_sha256": digest(matches[0])}
+
+
+def _rerun_clip_video_impl(out_dir: str, pid: str, clip_index: int, prompt_override: str = None,
+        *, saved_video_admission=None, saved_video_state=None, prepare_only=False) -> dict:
     """Re-generate the video for a single clip. Returns {job_id, filename} or raises."""
-    state = load_pipeline_state(out_dir, pid)
+    state = saved_video_state if saved_video_state is not None else load_pipeline_state(out_dir, pid)
     if not state:
         raise ValueError(f"Pipeline {pid} not found")
     clips = state.get("clips", [])
@@ -2721,8 +2801,7 @@ def _rerun_clip_video_impl(out_dir: str, pid: str, clip_index: int, prompt_overr
         return _rerun_h3_scene_video_impl(out_dir, pid, clip_index, state, prompt_override=prompt_override)
 
     prior_repair = ((state.get("recovery") or {}).get("video_repairs") or {}).get(str(clip_index))
-    if ("_director_video_lora_snapshot" in snapshot
-            and isinstance(prior_repair, dict) and prior_repair.get("state") == "submitted"):
+    if isinstance(prior_repair, dict) and prior_repair.get("state") == "submitted":
         retained = prior_repair.get("params")
         if (not isinstance(retained, dict) or prior_repair.get("authored_prompt") != prompt
                 or retained.get("model_type") != video_model):
@@ -2731,7 +2810,9 @@ def _rerun_clip_video_impl(out_dir: str, pid: str, clip_index: int, prompt_overr
             copy.deepcopy(retained), state, out_dir, pid, clip_index,
             authored_prompt=prompt, prompt_override=prompt_override,
         )
-        return _finish_director_clip_repair(output_files, out_dir, pid, clip_index, prompt_override, persist=False)
+        result = _finish_director_clip_repair(output_files, out_dir, pid, clip_index, prompt_override, persist=False)
+        result["job_id"] = prior_repair["job_id"]
+        return result
 
     # Determine the output directory
     pipeline_file = _find_pipeline_file(out_dir, pid)
@@ -2847,13 +2928,6 @@ def _rerun_clip_video_impl(out_dir: str, pid: str, clip_index: int, prompt_overr
         "_director_pipeline_id": pid,
         "_director_detached_operation": True,
     }
-    with _pipeline_lock:
-        repair_control = _pipeline_repairs.get(pid)
-        repair_operation_id = (
-            repair_control.get("operation_id") if repair_control else None
-        )
-    if repair_operation_id:
-        gen_params["_director_repair_operation_id"] = repair_operation_id
     if start_path:
         gen_params["image_start"] = start_path
     elif (
@@ -2947,36 +3021,24 @@ def _rerun_clip_video_impl(out_dir: str, pid: str, clip_index: int, prompt_overr
 
     _bind_director_custom_style_video(gen_params, snapshot)
     _bind_director_video_lora_parent(gen_params, snapshot)
-    try:
-        if "_director_video_lora_parent_snapshot" in gen_params:
-            output_files = _submit_director_parameterized_clip_repair(
-                gen_params, state, out_dir, pid, clip_index,
-                authored_prompt=prompt, prompt_override=prompt_override,
-            )
-        else:
-            output_files = _submit_and_wait(
-                gen_params, timeout_s=3600, out_dir=clip_out_dir,
-            )
-    finally:
-        # Retained repair inputs must outlive an unresolved submission. The
-        # ordinary temporary-slice path keeps its existing cleanup behavior.
-        retained_repair = "_director_video_lora_parent_snapshot" in gen_params
-        if not retained_repair and slice_path and os.path.isfile(slice_path):
-            try:
-                os.remove(slice_path)
-            except OSError:
-                pass
-        if not retained_repair and vocal_slice_path and os.path.isfile(vocal_slice_path):
-            try:
-                os.remove(vocal_slice_path)
-            except OSError:
-                pass
-    return _finish_director_clip_repair(output_files, out_dir, pid, clip_index, prompt_override,
-                                       persist=not retained_repair)
+    if prepare_only:
+        return gen_params
+    # A retained repair intent may still need these inputs after an
+    # ambiguous submission; the waiter cannot delete them on exception.
+    output_files = _submit_director_parameterized_clip_repair(
+        gen_params, state, out_dir, pid, clip_index,
+        authored_prompt=prompt, prompt_override=prompt_override,
+        saved_video_admission=saved_video_admission,
+    )
+    result = _finish_director_clip_repair(output_files, out_dir, pid, clip_index, prompt_override,
+                                       persist=False)
+    result["job_id"] = gen_params["_director_recovery_job_id"]
+    return result
 
 
 def _submit_director_parameterized_clip_repair(
     params, state, out_dir, pid, clip_index, *, authored_prompt, prompt_override,
+    saved_video_admission=None,
 ):
     """Submit or attach one immutable owner-authorized parameterized repair."""
     filepath = _find_pipeline_file(out_dir, pid)
@@ -2985,12 +3047,19 @@ def _submit_director_parameterized_clip_repair(
     repairs = (state.get("recovery") or {}).get("video_repairs") or {}
     prior = repairs.get(str(clip_index))
     pending = prior if isinstance(prior, dict) and prior.get("state") == "submitted" else None
+    if saved_video_admission is not None:
+        from services.native_acceptance_reservation import reservation, digest
+        reservation._require_image_worker(saved_video_admission)
+        if pending is not None or digest(params) != digest(saved_video_admission.settings):
+            raise RuntimeError("Saved video request or prior intent changed")
     if pending is None:
         previous_revision = prior.get("revision", 0) if isinstance(prior, dict) else 0
         if type(previous_revision) is not int or previous_revision < 0:
             raise ValueError("Saved clip repair revision is invalid")
         revision = previous_revision + 1
         unit = {"kind": "video_clip_rerun", "variant": revision, "index": clip_index}
+        if saved_video_admission is not None and unit != saved_video_admission.slot:
+            raise RuntimeError("Saved video repair unit changed")
         params.update(_director_recovery_unit=unit, _director_recovery_parent_id=pid,
             _director_recovery_job_id=_director_child_job_id(pid, unit, 0), _director_recovery_attempt=0)
         params["_maestro_session_id"] = snapshot.get("_maestro_session_id")
@@ -2999,8 +3068,12 @@ def _submit_director_parameterized_clip_repair(
             "attempt": 0, "job_id": params["_director_recovery_job_id"],
             "params": copy.deepcopy(params), "authored_prompt": authored_prompt,
             "prompt_override": prompt_override}
+        if saved_video_admission is not None:
+            pending["custody"] = {"pipeline_id": pid, "request_sha256": reservation.target["request_sha256"]}
 
         def save_intent(current):
+            if saved_video_admission is not None:
+                reservation._require_image_worker(saved_video_admission)
             existing = (current.get("recovery") or {}).get("video_repairs") or {}
             if existing.get(str(clip_index)) != prior:
                 raise RuntimeError("Clip repair intent changed before publication.")
@@ -3008,6 +3081,9 @@ def _submit_director_parameterized_clip_repair(
 
         if _update_saved_pipeline(out_dir, pid, save_intent) is None:
             raise RuntimeError("Clip repair intent could not be saved.")
+        if saved_video_admission is not None:
+            reservation.publish_saved_image_intent(saved_video_admission,
+                saved_video_admission.parent["recovery_cursor"]["state"])
     unit = _normalized_child_unit(pending.get("unit"))
     if (unit is None or unit.get("kind") != "video_clip_rerun" or unit.get("index") != clip_index
             or type(pending.get("revision")) is not int or unit.get("variant") != pending["revision"]
@@ -3023,7 +3099,8 @@ def _submit_director_parameterized_clip_repair(
             params["_director_repair_operation_id"] = control.get("operation_id")
     try:
         outputs = _submit_and_wait(params, timeout_s=3600,
-            workspace=state.get("workspace") or "default", out_dir=project_dir)
+            workspace=state.get("workspace") or "default", out_dir=project_dir,
+            saved_video_admission=saved_video_admission)
     except (DirectorChildGenerationError, GenerationCancelledError) as error:
         outcome = "cancelled" if isinstance(error, GenerationCancelledError) else "failed"
 
@@ -3037,17 +3114,27 @@ def _submit_director_parameterized_clip_repair(
     # Unknown/ambiguous failures leave the submitted intent intact for attach.
     if not outputs:
         raise RuntimeError("Clip repair completed without a recorded output.")
+    evidence = identity = None
+    if saved_video_admission is not None:
+        evidence = _recovery_verify_child(_jobs[pending["job_id"]], project_dir)
+        identity = reservation.verify_saved_video_completion(saved_video_admission, evidence)
     def save_result(current):
         saved = (current.get("recovery") or {}).get("video_repairs") or {}
         if saved.get(str(clip_index)) != pending:
             raise RuntimeError("Clip repair intent changed before replacement.")
+        if saved_video_admission is not None:
+            reservation.verify_saved_video_completion(saved_video_admission, evidence)
         # Adopt the verified output in the same durable checkpoint that ends
         # retention. A crash must not drop the child between these steps.
         _apply_director_clip_repair_result(current, clip_index, outputs[-1], prompt_override)
         saved[str(clip_index)] = dict(pending, state="completed", output_files=list(outputs))
+        if saved_video_admission is not None:
+            saved[str(clip_index)].update(evidence=copy.deepcopy(evidence), identity=identity)
 
     if _update_saved_pipeline(out_dir, pid, save_result) is None:
         raise RuntimeError("Clip repair result could not be saved.")
+    if saved_video_admission is not None:
+        reservation.publish_saved_video(saved_video_admission)
     return outputs
 
 
@@ -4352,6 +4439,7 @@ def _submit_and_wait(
     *,
     h3_scene_rerun_admission: dict | None = None,
     saved_image_admission=None,
+    saved_video_admission=None,
 ) -> list[str]:
     """Submit a generation job and block until it completes.
 
@@ -4371,14 +4459,22 @@ def _submit_and_wait(
     pipeline_id = params.get("_director_pipeline_id")
     _detached_operation = bool(params.get("_director_detached_operation"))
     _repair_operation_id = params.get("_director_repair_operation_id")
-    if saved_image_admission is not None:
+    if saved_video_admission is not None:
+        from services.native_acceptance_reservation import _SavedVideoAdmission, reservation
+        if (type(saved_video_admission) is not _SavedVideoAdmission or saved_image_admission is not None
+                or h3_scene_rerun_admission is not None):
+            raise ValueError("Saved video child admission changed")
+        reservation._require_image_worker(saved_video_admission)
+        image_admission = saved_video_admission
+    elif saved_image_admission is not None:
         from services.native_acceptance_reservation import _SavedImageAdmission, reservation
         if type(saved_image_admission) is not _SavedImageAdmission or h3_scene_rerun_admission is not None:
             raise ValueError("Saved image child admission changed")
         reservation.saved_image_unit(saved_image_admission)
         image_admission = saved_image_admission
     else:
-        image_admission = _require_pipeline_image_custody(pipeline_id) if pipeline_id else None
+        image_admission = (_require_pipeline_image_custody(pipeline_id)
+            if pipeline_id and params.get("generation_mode") == "image" else None)
     params = dict(params)
     recovery_unit = _normalized_child_unit(
         params.pop("_director_recovery_unit", None)
@@ -4517,6 +4613,8 @@ def _submit_and_wait(
         try:
             if saved_image_admission is not None and _job_id != job_id:
                 raise RuntimeError("Saved image registered worker identity changed")
+            if saved_video_admission is not None and _job_id != job_id:
+                raise RuntimeError("Saved video registered worker identity changed")
             # A repair cancellation may win before this newly published
             # child thread begins executing. Do not invoke generation for a
             # detached repair child that registration already made terminal.
@@ -4528,6 +4626,8 @@ def _submit_and_wait(
         finally:
             if saved_image_admission is not None:
                 (_jobs.get(job_id) or job)["_director_saved_image_worker_active"] = False
+            if saved_video_admission is not None:
+                (_jobs.get(job_id) or job)["_director_saved_video_worker_active"] = False
             if h3_scene_rerun_admission is not None:
                 (_jobs.get(job_id) or job)["_director_scene_repair_worker_active"] = False
             if _dir_pid:
@@ -4555,6 +4655,8 @@ def _submit_and_wait(
                 private_options["image_admission"] = image_admission
                 if saved_image_admission is not None:
                     private_options["saved_image_worker"] = _run_tracked_generation
+                if saved_video_admission is not None:
+                    private_options["saved_image_worker"] = _run_tracked_generation
             if h3_scene_rerun_admission is not None:
                 def lease_before_worker(candidate):
                     with _pipeline_lock:
@@ -4580,7 +4682,7 @@ def _submit_and_wait(
             job = attached
             job_id = str(job.get("id") or job_id)
             thread = None
-            if _dir_pid and saved_image_admission is None:
+            if _dir_pid and saved_image_admission is None and saved_video_admission is None:
                 with _pipeline_lock:
                     _pipeline_child_jobs.setdefault(_dir_pid, set()).add(job_id)
         elif _dir_pid:
@@ -4613,8 +4715,11 @@ def _submit_and_wait(
             _jobs[job_id] = job
             thread.start()
     except BaseException:
-        if _dir_pid and not (h3_scene_rerun_admission is not None
-                and (_jobs.get(job_id) or {}).get("_director_scene_repair_worker_active") is True):
+        if _dir_pid and not (
+                h3_scene_rerun_admission is not None
+                and (_jobs.get(job_id) or {}).get("_director_scene_repair_worker_active") is True
+                or saved_video_admission is not None
+                and (_jobs.get(job_id) or {}).get("_director_saved_video_worker_active") is True):
             with _pipeline_lock:
                 child_jobs = _pipeline_child_jobs.get(_dir_pid)
                 if child_jobs is not None:
@@ -4648,6 +4753,8 @@ def _submit_and_wait(
             return
         if saved_image_admission is not None and job.get("_director_saved_image_worker_active") is True:
             return
+        if saved_video_admission is not None and job.get("_director_saved_video_worker_active") is True:
+            return
         with _pipeline_lock:
             child_jobs = _pipeline_child_jobs.get(_dir_pid)
             if child_jobs is not None:
@@ -4680,6 +4787,12 @@ def _submit_and_wait(
             # bounded no-progress window when the owner releases this child.
             deadline = time.monotonic() + timeout_s
         if j["status"] == "completed":
+            if saved_video_admission is not None and j.get("_director_saved_video_worker_active"):
+                reservation._require_image_worker(saved_video_admission)
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("Saved video worker did not release its native custody")
+                time.sleep(0.05)
+                continue
             if saved_image_admission is not None and j.get("_director_saved_image_worker_active"):
                 reservation.saved_image_unit(saved_image_admission)
                 if time.monotonic() >= deadline:
@@ -4691,8 +4804,9 @@ def _submit_and_wait(
                 verified = _recovery_verify_child(j, out_dir)
                 if not isinstance(verified, dict):
                     _release_managed_child()
-                    if h3_scene_rerun_admission is not None or image_admission is not None:
-                        raise RuntimeError("Repaired scene completed without valid producer evidence; its attempt is retained.")
+                    if (h3_scene_rerun_admission is not None or image_admission is not None
+                            or _detached_operation and recovery_unit.get("kind") == "video_clip_rerun"):
+                        raise RuntimeError("Repair completed without valid producer evidence; its attempt is retained.")
                     if recovery_attempt >= 2:
                         raise RuntimeError(
                             "Director child completed without valid recovery evidence"

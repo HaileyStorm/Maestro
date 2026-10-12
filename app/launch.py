@@ -5602,6 +5602,8 @@ def _queue_recovery_register_and_publish(
     except Exception as error:
         if before_worker is not None:
             prepared["_director_scene_repair_worker_active"] = False
+            if "director_video_custody" in (prepared.get("recovery_cursor") or {}):
+                prepared["_director_saved_video_worker_active"] = False
         credit_release = globals().get("_credit_release_accounting")
         if callable(credit_release):
             credit_release(prepared, persist_baseline=True)
@@ -7839,19 +7841,23 @@ def _director_recovery_submit_child(
     # registration or immutable-manifest attachment validates child identity.
     job["kind"] = "director_child"
     from services.native_acceptance_reservation import reservation
-    if reservation.target is not None and reservation.target.get("kind") in {"director_images", "director_saved_images"}:
+    if reservation.target is not None and reservation.target.get("kind") in {"director_images", "director_saved_images", "director_saved_video"}:
         # Only the retained Director worker can carry this private capability.
         reservation.validate_image_child(image_admission, job, unit, attempt)
     if image_admission is not None:
+        from services.native_acceptance_reservation import _SavedVideoAdmission
+        saved_video = type(image_admission) is _SavedVideoAdmission
         if h3_scene_rerun_admission is not None or h3_scene_rerun_before_worker is not None:
             raise QueueRecoveryRuntimeError("Director image admission cannot authorize a repair.")
-        job["recovery_cursor"] = dict(job.get("recovery_cursor") or {},
-            director_image_custody={"pipeline_id": pid,
-                "request_sha256": reservation.target["request_sha256"]})
+        job["recovery_cursor"] = dict(job.get("recovery_cursor") or {})
+        job["recovery_cursor"]["director_video_custody" if saved_video else "director_image_custody"] = {
+            "pipeline_id": pid, "request_sha256": reservation.target["request_sha256"]}
         def enroll_image(candidate):
+            if saved_video and not validate_artifact_descriptor(candidate["out_dir"], image_admission.input_seal["artifact"]):
+                raise QueueRecoveryRuntimeError("Saved Director video image seal changed before enrollment")
             reservation.enroll_image_child(image_admission, candidate, unit, attempt)
             if saved_image_worker is not None:
-                candidate["_director_saved_image_worker_active"] = True
+                candidate["_director_saved_video_worker_active" if saved_video else "_director_saved_image_worker_active"] = True
                 from services import director_pipeline as director_service
                 with director_service._pipeline_lock:
                     director_service._pipeline_child_jobs.setdefault(pid, set()).add(candidate["id"])
@@ -7859,7 +7865,7 @@ def _director_recovery_submit_child(
         h3_scene_rerun_before_worker = enroll_image
         if saved_image_worker is not None:
             from services.native_acceptance_reservation import _SavedImageAdmission
-            if type(image_admission) is not _SavedImageAdmission or not callable(saved_image_worker):
+            if type(image_admission) not in {_SavedImageAdmission, _SavedVideoAdmission} or not callable(saved_image_worker):
                 raise QueueRecoveryRuntimeError("Saved image worker ownership changed")
             h3_scene_rerun_worker = saved_image_worker
     elif saved_image_worker is not None:
@@ -10262,10 +10268,13 @@ def _queue_recovery_materialize_job(
         runtime["recovery_state"] = "terminal"
         return runtime, False
 
-    if runtime.get("kind") == "director_child" and "director_image_custody" in (snapshot.get("recovery_cursor") or {}):
+    if runtime.get("kind") == "director_child" and any(key in (snapshot.get("recovery_cursor") or {})
+            for key in ("director_image_custody", "director_video_custody")):
+        is_video = "director_video_custody" in (snapshot.get("recovery_cursor") or {})
         runtime.update(queue_held=True, recovery_state="blocked", reruns_denoise=False,
-            _recovery_reason_code="director_image_admission_required",
-            message="Interrupted Director images require their original execution admission")
+            _recovery_reason_code="director_video_admission_required" if is_video else "director_image_admission_required",
+            message="Interrupted Director video requires its original execution admission; reconcile the saved repair without replay"
+                if is_video else "Interrupted Director images require their original execution admission")
         return runtime, False
 
     # Classify from both cursors before normalization discards failed units or
@@ -11651,7 +11660,8 @@ def _restore_queue_recovery_on_startup(
 
 def _queue_recovery_revalidate_job(job: dict) -> bool:
     """Recheck project marker, manifest, and all inputs for manual resume."""
-    if job.get("kind") == "director_child" and "director_image_custody" in (job.get("recovery_cursor") or {}):
+    if job.get("kind") == "director_child" and any(key in (job.get("recovery_cursor") or {})
+            for key in ("director_image_custody", "director_video_custody")):
         return False
     workspace = str(job.get("workspace") or "default")
     try:
@@ -48285,11 +48295,38 @@ def _require_saved_pipeline(
     return state, out_dir
 
 
+def _public_director_saved_recovery(recovery) -> dict:
+    """Expose retained attempt identifiers, never private execution bindings."""
+    if not isinstance(recovery, dict):
+        return {}
+    public = {}
+    for table in ("video_repairs", "scene_repairs", "saved_images", "children"):
+        entries = recovery.get(table)
+        if not isinstance(entries, dict):
+            continue
+        public[table] = {}
+        for key, entry in entries.items():
+            if not isinstance(entry, dict):
+                continue
+            observation = {field: entry[field] for field in (
+                "version", "revision", "state", "job_id", "attempt",
+                "output_files", "outputs",
+            ) if field in entry}
+            unit = entry.get("unit")
+            if isinstance(unit, dict):
+                observation["unit"] = {field: unit[field]
+                    for field in ("kind", "variant", "index") if field in unit}
+            public[table][key] = observation
+    return public
+
+
 def _public_pipeline_state(state: dict) -> dict:
     import copy
     from services.director.nsfw_guidance import EXPLICIT_GUIDANCE_SNAPSHOT_KEY
     from services.director_pipeline import scrub_director_public_credentials
     public = scrub_director_public_credentials(copy.deepcopy(state))
+    if "recovery" in public:
+        public["recovery"] = _public_director_saved_recovery(public["recovery"])
     public.pop("_planning_custody_required", None)
     public.pop("_image_custody_required", None)
     # Historical raw planner logs predate request-scoped streaming. Keep the
@@ -49533,6 +49570,11 @@ async def rerun_pipeline_clip_image(pid: str, clip_index: int, request: Request)
 async def rerun_pipeline_clip_video(pid: str, clip_index: int, request: Request):
     """Re-generate the video for a specific clip in a saved pipeline."""
     body = await request.json()
+    from services.native_acceptance_reservation import reservation
+    reserved = reservation.target is not None and reservation.target.get("kind") == "director_saved_video"
+    if reserved and (not isinstance(body, dict) or set(body) - {"workspace"}
+            or clip_index != 0 or pid != reservation.target["pipeline_id"]):
+        raise HTTPException(status_code=400, detail="Rerun the retained saved video unchanged")
     selected_workspace = _request_project_workspace(
         request, body.get("workspace"),
     )
@@ -49544,6 +49586,15 @@ async def rerun_pipeline_clip_video(pid: str, clip_index: int, request: Request)
     )
     _state, base = _require_saved_pipeline(request, pid, selected_workspace)
     _revalidate_saved_director_runtime(request, _state)
+    saved_video_binding = None
+    if reserved:
+        from services import director_pipeline as pipeline_service
+        with pipeline_service._pipeline_lock:
+            live = pipeline_service._pipelines.get(pid)
+            parent = _director_recovery_parents.get(pid)
+            if not isinstance(live, dict) or not isinstance(parent, dict):
+                raise HTTPException(status_code=409, detail="Saved Director video parent is unavailable")
+            saved_video_binding = (parent, live)
     _begin_workspace_operation(selected_workspace)
     try:
         result = await upload_usage.to_thread(
@@ -49552,6 +49603,7 @@ async def rerun_pipeline_clip_video(pid: str, clip_index: int, request: Request)
             pid,
             clip_index,
             prompt_override=body.get("prompt"),
+            saved_video_binding=saved_video_binding,
         )
         return result
     except PipelineBusyError as e:
@@ -71912,7 +71964,7 @@ def _try_automatic_resource_retry(
 ) -> bool:
     """Durably re-admit one exact job, or leave unsafe work terminal/held."""
     cursor = job.get("recovery_cursor")
-    if isinstance(cursor, dict) and "director_image_custody" in cursor:
+    if isinstance(cursor, dict) and any(key in cursor for key in ("director_image_custody", "director_video_custody")):
         return False
     details = failure_updates.get("failure_details")
     if not isinstance(details, dict):
