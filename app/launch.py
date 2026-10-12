@@ -3788,6 +3788,10 @@ def _credit_prepare_submission_manifest(job: dict) -> bool:
     params.pop(_CREDIT_OWNER_LINEAGE_PARAM, None)
     params.pop(_CREDIT_BASELINE_PARAM, None)
     params.pop(_CREDIT_CLEANUP_PARAM, None)
+    owner_exempt = _credit_owner_exempt(job, persisted=False)
+    if owner_exempt:
+        # Worker admission must not add lineage after the manifest is sealed.
+        params[_CREDIT_OWNER_LINEAGE_PARAM] = True
     policy = _credit_runtime_policy()
     realm = _credit_server_execution_realm()
     if not policy.enforcement_enabled or realm != "hosted":
@@ -3795,7 +3799,6 @@ def _credit_prepare_submission_manifest(job: dict) -> bool:
     if not _credit_job_is_remote_origin(job):
         return False
     account_id = _credit_account_id(job, persisted=False)
-    owner_exempt = _credit_owner_exempt(job, persisted=False)
     if account_id:
         job["_credit_account_id"] = account_id
         params[_CREDIT_ACCOUNT_PARAM] = account_id
@@ -3806,7 +3809,6 @@ def _credit_prepare_submission_manifest(job: dict) -> bool:
     if callable(lineage_only) and lineage_only(job):
         return True
     if owner_exempt:
-        params[_CREDIT_OWNER_LINEAGE_PARAM] = True
         return False
     quote, allowance_revision = _credit_evaluation(job)
     job["_credit_submission_preflight"] = (quote, allowance_revision)
