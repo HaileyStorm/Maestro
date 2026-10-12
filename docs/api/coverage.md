@@ -175,7 +175,18 @@ attempt's `story_description` had not reached the planner, which read only
 `scene_description`: the resulting car scene did not match the submitted cup
 story. The story alias binding is corrected in both planning paths and saved/
 queue projections. The retained mismatched plan is failure evidence, not an
-accepted story result; corrected native story planning remains to be verified.
+accepted story result. A fresh held admission after the fix completed native
+CUDA planning under a separate exact GPU lease. The resulting cup, window,
+curtain and morning-light plan followed the submitted story and paused for
+prompt review without error. After LLM release, bounded runtime drain and
+lease withdrawal, normal service was restored. Authenticated reads returned
+the same prompts and structured timing, with only empty/default planning
+fields added by recovery, and an explicit Continue action. All 23 unrelated
+retained queue payloads were unchanged. This establishes the corrected story
+input binding and retained review state, not subjective plan quality or
+image/video execution. The structured plan is 124 frames at 24 fps; the raw
+LLM prompt says eight seconds. Review timing before execution; no encoded
+video duration has been verified for this plan.
 Historical attempt receipts remain
 retained separately rather than becoming routine regression scenarios.
 
