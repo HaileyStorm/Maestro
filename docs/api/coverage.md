@@ -214,6 +214,15 @@ identities, the saved parent and the environment remained unchanged across the
 coordinated restart. This establishes the public reconciliation contract and
 deployment, not the rerun response's child identifier or native video execution;
 those require a separate fresh model journey and GPU authority.
+Actual model-free preparation then found that an independent H3 clip rerun was
+applying its saved parent's whole-pipeline Seamless compatibility check. The
+correction clears that flag only in the temporary assessment for an ordinary
+independent rerun. Saved settings and H3 scene assessments remain unchanged.
+The deployed correction preserved the same 24 retained identities and parent
+bytes. The original builder now prepares the sealed-image request as 124 frames
+at 24 fps, eight steps and the saved rerun's 1280x720 request. Authorized live
+discovery matches its scalar model metadata; nested diagnostic values are
+abbreviated, so this is not full registry equivalence or native execution proof.
 Historical attempt receipts remain
 retained separately rather than becoming routine regression scenarios.
 

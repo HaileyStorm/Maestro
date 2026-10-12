@@ -2795,6 +2795,9 @@ def _rerun_clip_video_impl(out_dir: str, pid: str, clip_index: int, prompt_overr
     )
     validation_params = _director_params_from_saved_state(state)
     validation_params["video_model"] = video_model
+    if not isinstance(snapshot.get("_h3_longform"), dict):
+        # An independent clip replacement does not use pipeline continuation.
+        validation_params["seamless"] = False
     _validate_director_models(validation_params, stages=("video",))
 
     if isinstance(snapshot.get("_h3_longform"), dict):
