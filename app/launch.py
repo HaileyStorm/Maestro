@@ -18074,6 +18074,7 @@ def _init_pipeline():
             recovery_prepare_h3_scene_rerun=_director_recovery_prepare_h3_scene_rerun,
             runtime_admission=_director_recovery_runtime_admission,
             video_lora_child_admission=_admit_director_video_lora_child,
+            llm_default_device=_llm_default_device,
         )
         _pipeline_initialized = True
 
@@ -49058,6 +49059,8 @@ async def director_pipeline_start(request: Request):
     body = await request.json()
     if not isinstance(body, dict):
         raise HTTPException(status_code=400, detail="Director request must be an object")
+    # A fresh HTTP request cannot impersonate a retained server admission.
+    body.pop("_director_llm_selection_receipt", None)
     if "hold_planning" in body and type(body["hold_planning"]) is not bool:
         raise HTTPException(status_code=400, detail="Planning hold must be true or false")
     if body.get("hold_planning") is True and (

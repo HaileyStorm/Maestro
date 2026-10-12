@@ -68,6 +68,7 @@ _recovery_validate_child = None
 _recovery_prepare_h3_scene_rerun = None
 _runtime_admission = None
 _video_lora_child_admission = None
+_llm_default_device = None
 _director_native_gpu_slot_state = threading.local()
 
 _pipelines: dict = {}
@@ -490,7 +491,15 @@ def _director_llm_selection_from_snapshot(
         desired_model = (
             services_cfg.get("llm_model_id") or _DEFAULT_DIRECTOR_LLM_MODEL
         )
-        desired_device = services_cfg.get("llm_device") or "cpu"
+        desired_device = (
+            services_cfg.get("llm_device")
+            or (
+                params.get("llm_device")
+                if params.get(_DIRECTOR_LLM_SELECTION_RECEIPT_KEY) is not None
+                else None
+            )
+            or "cpu"
+        )
     else:
         # Isolated legacy/test configurations with no provider use their
         # explicit request selection and carry no cross-provider credential.
@@ -576,6 +585,10 @@ def _bind_director_llm_selection(
         if isinstance(services_cfg, dict)
         else _director_llm_services_snapshot()
     )
+    # Resolve the displayed host default only when freezing a new admission.
+    # Saved runs retain their already bound device; no global config is written.
+    if not snapshot.get("llm_device") and callable(_llm_default_device):
+        snapshot["llm_device"] = _llm_default_device()
     configured_provider = str(
         snapshot.get("llm_provider") or ""
     ).strip().lower()
@@ -3999,6 +4012,7 @@ def init(
     recovery_prepare_h3_scene_rerun=None,
     runtime_admission=None,
     video_lora_child_admission=None,
+    llm_default_device=None,
 ):
     """Called by launch.py to wire up shared references."""
     global _jobs, _run_generation, _wgp, _gen_lock, _active_gen_states
@@ -4007,7 +4021,7 @@ def init(
     global _recovery_remove_parent
     global _recovery_submit_child, _recovery_verify_child
     global _recovery_validate_child, _recovery_prepare_h3_scene_rerun, _runtime_admission
-    global _video_lora_child_admission
+    global _video_lora_child_admission, _llm_default_device
     _jobs = jobs_dict
     _run_generation = run_gen_fn
     _wgp = wgp_module
@@ -4024,6 +4038,7 @@ def init(
     _recovery_prepare_h3_scene_rerun = recovery_prepare_h3_scene_rerun
     _runtime_admission = runtime_admission
     _video_lora_child_admission = video_lora_child_admission
+    _llm_default_device = llm_default_device
 
 
 class _DirectorOutputs(list):

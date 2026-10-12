@@ -379,6 +379,13 @@ curl --fail-with-body -b "$MAESTRO_COOKIE_FILE" \
   "$MAESTRO_URL/api/v1/director/pipeline/$PIPELINE_ID"
 ```
 
+Director freezes the Services provider, model and device at admission. With no
+saved device override, a new admission uses the displayed host default: CUDA
+when available, otherwise CPU. An explicitly saved CPU selection stays on CPU.
+Saved parents retain their frozen device; changing Services is not permission to
+rewrite or replay them. CPU planning can take much longer than video duration.
+Read the returned planning progress and retain the pipeline identity.
+
 The initial status is `paused` with `pause_reason:"before_planning"`; no model
 work has begun. After satisfying the selected model's terms/readiness and the
 host's compute authority, POST `{}` to

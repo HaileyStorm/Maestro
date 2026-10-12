@@ -2420,7 +2420,7 @@
     "method": "POST",
     "path": "/api/v1/director/pipeline/start",
     "summary": "Start Director now or hold before planning",
-    "description": "hold_planning must be boolean and cannot accompany prepared_clip_plans/prepared_planned_clips. A supplied public director_request_id must identify completed preparation. Role/media/terms admission remains server-owned; never submit private underscore snapshots. This route has no public caller-stable pipeline creation idempotency key.",
+    "description": "hold_planning must be boolean and cannot accompany prepared_clip_plans/prepared_planned_clips. A supplied public director_request_id must identify completed preparation. Role/media/terms admission remains server-owned; never submit private underscore snapshots. This route has no public caller-stable pipeline creation idempotency key. New admissions with no saved Services device use the host default advertised by GET /api/v1/services-config (CUDA when available, otherwise CPU). Explicit saved selections win. A retained admission keeps its frozen device; real selection/revision drift requires review. Client-authored internal selection receipts are discarded on fresh HTTP start.",
     "responses": {
       "200": {
         "description": "Start Director now or hold before planning result.",
