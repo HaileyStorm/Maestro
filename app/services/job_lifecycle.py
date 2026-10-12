@@ -3600,7 +3600,8 @@ def validated_resource_admission_failures(value: Any) -> list[dict]:
         raise ValueError("Invalid resource admission diagnostics")
     for record in value:
         if (type(record) is not dict or set(record) != {"stage", "exception_class", "frames"}
-                or type(record["stage"]) is not str or record["stage"] not in {"queue_acquisition", "queue_register"}
+                or type(record["stage"]) is not str or record["stage"] not in {
+                    "queue_acquisition", "queue_register", "queue_start", "credit_admission", "credit_dispatch"}
                 or type(record["exception_class"]) is not str
                 or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", record["exception_class"]) is None
                 or type(record["frames"]) is not list or len(record["frames"]) > 8):
@@ -3632,6 +3633,11 @@ def _resource_admission_diagnostic(error: Exception, stage: str) -> dict:
     return validated_resource_admission_failures([{
         "stage": stage, "exception_class": name, "frames": frames[-8:],
     }])[0]
+
+
+def resource_admission_failure_history(job: Mapping[str, Any], error: Exception, stage: str) -> list[dict]:
+    history = validated_resource_admission_failures(job["resource_admission_failures"]) if job.get("resource_admission_failures") else []
+    return (history + [_resource_admission_diagnostic(error, stage)])[-4:]
 
 
 def resource_admission_recovery_allowed(job: Mapping[str, Any]) -> bool:
@@ -3666,7 +3672,10 @@ def resource_admission_recovery_allowed(job: Mapping[str, Any]) -> bool:
             and isinstance(cursor, Mapping) and not cursor.get("completed_units"))
 
 
-def recover_resource_admission_held(job: MutableMapping[str, Any], *, recovery_attempt: int) -> bool:
+def recover_resource_admission_held(
+    job: MutableMapping[str, Any], *, recovery_attempt: int,
+    credit_account_id: str | None = None,
+) -> bool:
     """Re-register sealed, owner-revalidated work without releasing its hold."""
     with _queue_condition, _lifecycle_lock:
         if (type(recovery_attempt) is not int or recovery_attempt < 1
@@ -3674,7 +3683,16 @@ def recover_resource_admission_held(job: MutableMapping[str, Any], *, recovery_a
                 or recovery_attempt != job.get("recovery_attempt", 0) + 1
                 or not resource_admission_recovery_allowed(job)):
             return False
+        if credit_account_id is not None:
+            params = job.get("params") if isinstance(job.get("params"), Mapping) else {}
+            if (not isinstance(credit_account_id, str)
+                    or re.fullmatch(r"[0-9a-f]{32}", credit_account_id) is None
+                    or any(value is not None and value != credit_account_id for value in (
+                        job.get("_credit_account_id"), params.get("_maestro_credit_account_id")))):
+                return False
         candidate = _copy_job_for_transition(job)
+        if credit_account_id is not None:
+            candidate["_credit_account_id"] = credit_account_id
         candidate.update(queue_held=True, recovery_state="restored", resource_state="queued",
                          phase="queued", message="Request recovered and held; start when ready",
                          error=None, reruns_denoise=False, recovery_attempt=recovery_attempt,
@@ -3734,8 +3752,7 @@ def block_resource_admission_failure(
             "error": message,
         })
         if admission_error is not None:
-            history = validated_resource_admission_failures(candidate["resource_admission_failures"]) if candidate.get("resource_admission_failures") else []
-            candidate["resource_admission_failures"] = (history + [_resource_admission_diagnostic(admission_error, stage)])[-4:]
+            candidate["resource_admission_failures"] = resource_admission_failure_history(candidate, admission_error, stage)
         if is_prompt_enhancement:
             candidate["finished_at"] = time.time()
         if candidate.get("resource_intent") in _RESOURCE_INTENTS:
@@ -3936,10 +3953,10 @@ def try_start(
                             replacements={id(job): candidate},
                         ),
                     )
-                except Exception:
+                except Exception as error:
                     if not block_on_persistence_failure:
                         raise
-                    block_resource_admission_failure(job)
+                    block_resource_admission_failure(job, admission_error=error, stage="queue_start")
                     return False
                 _publish_job_unlocked(job, candidate)
                 _queue_condition.notify_all()

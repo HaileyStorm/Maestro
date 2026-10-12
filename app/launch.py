@@ -1812,6 +1812,7 @@ from services.job_lifecycle import (
     queue_scheduler_snapshot,
     queue_wait_reason,
     resource_descriptor,
+    resource_admission_failure_history,
     record_job_outputs,
     residency_configuration_update,
     register_abort_state,
@@ -3783,13 +3784,16 @@ def _credit_prepare_submission_manifest(job: dict) -> bool:
     if params is None:
         return False
     # Fresh clients cannot nominate account or execution authority. Only the
-    # server-side top-level lineage and host realm are copied into the private
-    # request manifest when hosted enforcement is explicitly active.
+    # server-side account lineage survives recovery in every execution realm.
     params.pop(_CREDIT_ACCOUNT_PARAM, None)
     params.pop(_CREDIT_REALM_PARAM, None)
     params.pop(_CREDIT_OWNER_LINEAGE_PARAM, None)
     params.pop(_CREDIT_BASELINE_PARAM, None)
     params.pop(_CREDIT_CLEANUP_PARAM, None)
+    account_id = _credit_account_id(job, persisted=False)
+    if account_id:
+        job["_credit_account_id"] = account_id
+        params[_CREDIT_ACCOUNT_PARAM] = account_id
     owner_exempt = _credit_owner_exempt(job, persisted=False)
     if owner_exempt:
         # Worker admission must not add lineage after the manifest is sealed.
@@ -3800,10 +3804,6 @@ def _credit_prepare_submission_manifest(job: dict) -> bool:
         return False
     if not _credit_job_is_remote_origin(job):
         return False
-    account_id = _credit_account_id(job, persisted=False)
-    if account_id:
-        job["_credit_account_id"] = account_id
-        params[_CREDIT_ACCOUNT_PARAM] = account_id
     params[_CREDIT_REALM_PARAM] = realm
     if not account_id:
         return False
@@ -4133,16 +4133,17 @@ def _credit_prepare_dispatch(job: dict) -> bool:
     return consumed
 
 
-def _credit_block_runtime_error(job: dict) -> None:
+def _credit_block_runtime_error(job: dict, *, admission_error: Exception, stage: str) -> None:
     """Durably remove an invalid credit waiter and wake queue followers."""
     _credit_admission_evaluations.pop(str(job.get("id") or ""), None)
     if str(job.get("status") or "") == "queued":
-        block_resource_admission_failure(job)
+        block_resource_admission_failure(job, admission_error=admission_error, stage=stage)
         return
     if str(job.get("status") or "") == "running":
         finish_job(
             job,
             "failed",
+            resource_admission_failures=resource_admission_failure_history(job, admission_error, stage),
             error="Queue admission validation failed",
             message="Queue admission validation failed",
             recovery_state="terminal",
@@ -75737,10 +75738,10 @@ def _run_generation(
 
     try:
         _credit_prepare_admission(job)
-    except (CreditRuntimeError, EntitlementError, ValueError):
+    except (CreditRuntimeError, EntitlementError, ValueError) as error:
         # A malformed server stamp is never repaired from client/job content.
         # Park it durably and wake followers instead of stranding queue head.
-        _credit_block_runtime_error(job)
+        _credit_block_runtime_error(job, admission_error=error, stage="credit_admission")
         return False
 
     # Director/internal callers can enter this worker without using the main
@@ -75829,8 +75830,8 @@ def _run_generation(
 
             try:
                 _credit_prepare_dispatch(job)
-            except (CreditRuntimeError, EntitlementError, ValueError):
-                _credit_block_runtime_error(job)
+            except (CreditRuntimeError, EntitlementError, ValueError) as error:
+                _credit_block_runtime_error(job, admission_error=error, stage="credit_dispatch")
                 return False
 
             # Per-job VRAM coefficient adjustment — accounts for active
@@ -85673,6 +85674,33 @@ async def _reattach_blend_recovery_inputs_reserved(
     }
 
 
+def _credit_reauthenticate_held_owner_lineage(job: dict, request: Request) -> str | None:
+    """Bind missing legacy lineage only after exact held-request revalidation."""
+    params = job.get("params") if isinstance(job.get("params"), dict) else {}
+    if params.get(_CREDIT_OWNER_LINEAGE_PARAM) is not True:
+        return None
+    principal = _require_account_principal(request)
+    account_id = principal.get("id")
+    if (not isinstance(account_id, str)
+            or re.fullmatch(r"[0-9a-f]{32}", account_id) is None):
+        raise HTTPException(status_code=409, detail="The held request's account could not be verified")
+    known = (job.get("_credit_account_id"), params.get(_CREDIT_ACCOUNT_PARAM))
+    if any(value is not None and value != account_id for value in known):
+        raise HTTPException(status_code=409, detail="Recover this held request with its original account")
+    if not _credit_owner_exempt({"_credit_account_id": account_id}, persisted=False):
+        raise HTTPException(status_code=409, detail="This held request requires an enabled owner account")
+    if any(value is not None for value in known):
+        return None
+    # Older local manifests sealed owner exemption without its account ID.
+    # Never use this reauthentication to replace hosted or reclassified holds.
+    if (job.get("kind") != "studio_generation" or job.get("source_remote") is not False
+            or params.get(_CREDIT_REALM_PARAM) is not None
+            or job.get("credit_queue") is not None
+            or _CREDIT_BASELINE_PARAM in params or _CREDIT_CLEANUP_PARAM in params):
+        raise HTTPException(status_code=409, detail="The held request's original account lineage is required")
+    return account_id
+
+
 def _resume_recovered_job(
     job_id: str,
     request: Request,
@@ -85777,7 +85805,10 @@ def _resume_recovered_job(
             attempt, may_retry = next_recovery_attempt(job)
             if not may_retry or not _held_resource_admission_recovery_allowed(job):
                 raise HTTPException(status_code=409, detail="This held request is no longer eligible for admission recovery")
-            if not recover_resource_admission_held(job, recovery_attempt=attempt):
+            credit_account_id = _credit_reauthenticate_held_owner_lineage(job, request)
+            if not recover_resource_admission_held(
+                job, recovery_attempt=attempt, credit_account_id=credit_account_id,
+            ):
                 raise HTTPException(status_code=409, detail="Resource admission remains blocked; request preserved")
             return {
                 "job_id": job_id, "status": "queued", "held": True,

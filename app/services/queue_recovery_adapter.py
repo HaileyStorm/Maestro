@@ -95,6 +95,7 @@ _JOB_FIELDS = frozenset({
     "credit_queue", "prompt_result_reference", "prompt_result_consumed",
     "editor_retake_origin", "editor_retake_closed",
     "resource_admission_failures",
+    "_credit_account_id",
 })
 _GLOBAL_FIELDS = frozenset({
     "paused", "pause_after_current", "manual_order_sequence", "queue_order",
@@ -1213,7 +1214,11 @@ def serialize_job(
             "failed_child_status", "failed_child_reason",
         } and value is None:
             continue
-        if key == "resource_admission_failures":
+        if key == "_credit_account_id":
+            if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{32}", value) is None:
+                raise QueueRecoveryAdapterError("Private credit account lineage is invalid.")
+            result[key] = value
+        elif key == "resource_admission_failures":
             try:
                 result[key] = validated_resource_admission_failures(value)
             except ValueError as error:
