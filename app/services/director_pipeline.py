@@ -2284,13 +2284,38 @@ def _delete_pipeline_locked(out_dir: str, pid: str) -> dict:
 
 
 @_exclusive_pipeline_operation
-def rerun_clip_image(out_dir: str, pid: str, clip_index: int, prompt_override: str = None) -> dict:
-    return _rerun_clip_image_impl(out_dir, pid, clip_index, prompt_override)
+def rerun_clip_image(out_dir: str, pid: str, clip_index: int, prompt_override: str = None, *, saved_image_binding=None) -> dict:
+    from services.native_acceptance_reservation import reservation
+    reserved = reservation.target is not None and reservation.target.get("kind") == "director_saved_images"
+    if not reserved and saved_image_binding is None:
+        return _rerun_clip_image_impl(out_dir, pid, clip_index, prompt_override)
+    if (not reserved or type(saved_image_binding) is not tuple or len(saved_image_binding) != 2
+            or prompt_override is not None):
+        raise ValueError("Saved image work needs its exact unchanged request")
+    parent, pipeline = saved_image_binding
+    filepath = _find_pipeline_file(out_dir, pid)
+    if not filepath:
+        raise ValueError("Saved image checkpoint is unavailable")
+    with _pipeline_file_lock:
+        with open(filepath, "rb") as handle:
+            raw = handle.read(4 * 1024 * 1024 + 1)
+        if len(raw) > 4 * 1024 * 1024:
+            raise ValueError("Saved image checkpoint is too large")
+        state = json.loads(raw)
+        descriptor = _pipeline_payload_descriptor(pid, raw)
+        token = reservation.bind_saved_images(pid, parent, pipeline, state, descriptor,
+            _director_image_admission_settings(_director_params_from_saved_state(state)), clip_index)
+    try:
+        return _rerun_clip_image_impl(out_dir, pid, clip_index, None,
+            saved_image_admission=token, saved_image_state=state)
+    except BaseException:
+        reservation.abandon_images(token)
+        raise
 
 
-def _rerun_clip_image_impl(out_dir: str, pid: str, clip_index: int, prompt_override: str = None) -> dict:
+def _rerun_clip_image_impl(out_dir: str, pid: str, clip_index: int, prompt_override: str = None, *, saved_image_admission=None, saved_image_state=None) -> dict:
     """Re-generate the start image for a single clip. Returns {job_id, filename} or raises."""
-    state = load_pipeline_state(out_dir, pid)
+    state = saved_image_state if saved_image_admission is not None else load_pipeline_state(out_dir, pid)
     if not state:
         raise ValueError(f"Pipeline {pid} not found")
     clips = state.get("clips", [])
@@ -2368,6 +2393,8 @@ def _rerun_clip_image_impl(out_dir: str, pid: str, clip_index: int, prompt_overr
     image_loras = _director_image_role_loras(validation_params, role)
     image_params = _director_image_params(validation_params, image_model)
     all_refs = _limit_director_image_refs(image_model, all_refs, pid=pid)
+    if saved_image_admission is not None:
+        all_refs = [os.path.realpath(path) for path in all_refs]
     prompt = _director_role_prompt(prompt, image_loras, role)
 
     gen_params = {
@@ -2404,13 +2431,65 @@ def _rerun_clip_image_impl(out_dir: str, pid: str, clip_index: int, prompt_overr
     if repair_operation_id:
         gen_params["_director_repair_operation_id"] = repair_operation_id
 
-    output_files = _submit_and_wait(gen_params, timeout_s=600, out_dir=clip_out_dir)
+    if saved_image_admission is not None:
+        from services.native_acceptance_reservation import reservation
+        unit = reservation.saved_image_unit(saved_image_admission)
+        gen_params.update(_director_recovery_unit=unit, _director_recovery_parent_id=pid,
+            _director_recovery_job_id=_director_child_job_id(pid, unit, 0), _director_recovery_attempt=0)
+        with _pipeline_file_lock:
+            with open(pipeline_file, "rb") as handle:
+                current_raw = handle.read(4 * 1024 * 1024 + 1)
+            if _pipeline_payload_descriptor(pid, current_raw) != saved_image_admission.descriptor:
+                raise RuntimeError("Saved image parent changed before its child intent")
+            current = json.loads(current_raw)
+            operations = current.setdefault("recovery", {}).setdefault("saved_images", {})
+            key = _child_unit_token(unit)
+            if key in operations or gen_params["_director_recovery_job_id"] in _jobs:
+                raise RuntimeError("Saved image child intent already exists; reconcile without replay")
+            reservation.saved_image_unit(saved_image_admission)
+            operations[key] = {"state": "submitted", "unit": unit,
+                "job_id": gen_params["_director_recovery_job_id"], "attempt": 0,
+                "custody": {"pipeline_id": pid, "request_sha256": reservation.target["request_sha256"]}}
+            descriptor = _commit_pipeline_json_unlocked(pipeline_file, pid, current, recovery_required=True)
+            reservation.publish_saved_image_intent(saved_image_admission, descriptor)
+    if saved_image_admission is not None:
+        output_files = _submit_and_wait(gen_params, timeout_s=600, out_dir=clip_out_dir,
+            workspace=state.get("workspace") or "default", saved_image_admission=saved_image_admission)
+    else:
+        output_files = _submit_and_wait(gen_params, timeout_s=600, out_dir=clip_out_dir)
     new_filename = output_files[0] if output_files else ""
 
     if not new_filename:
         raise RuntimeError(
             "Start-image generation completed without a recorded output."
         )
+
+    if saved_image_admission is not None:
+        job_id = gen_params["_director_recovery_job_id"]
+        evidence = _recovery_verify_child(_jobs[job_id], clip_out_dir)
+        job, unit, filename = reservation.verify_saved_image_completion(saved_image_admission, evidence)
+        if filename != new_filename:
+            raise RuntimeError("Saved image output differs from its producer seal")
+        with _pipeline_file_lock:
+            with open(pipeline_file, "rb") as handle:
+                current_raw = handle.read(4 * 1024 * 1024 + 1)
+            if _pipeline_payload_descriptor(pid, current_raw) != saved_image_admission.descriptor:
+                raise RuntimeError("Saved image parent changed before publication")
+            current = json.loads(current_raw)
+            reservation.verify_saved_image_completion(saved_image_admission, evidence)
+            if unit["kind"] == "image_anchor":
+                current["generated_reference_image_filename"] = filename
+                current["_params_snapshot"]["generated_reference_image_filename"] = filename
+            current["clips"][clip_index]["start_image_filename"] = filename
+            current.setdefault("recovery", {}).setdefault("saved_images", {})[_child_unit_token(unit)] = {
+                "state": "completed", "unit": unit, "job_id": job_id, "attempt": 0,
+                "identity": reservation.children_identity(saved_image_admission, unit),
+                "evidence": copy.deepcopy(evidence),
+                "custody": {"pipeline_id": pid, "request_sha256": reservation.target["request_sha256"]},
+            }
+            descriptor = _commit_pipeline_json_unlocked(pipeline_file, pid, current, recovery_required=True)
+            reservation.publish_saved_image(saved_image_admission, descriptor, filename)
+        return {"filename": filename, "clip_index": clip_index}
 
     if not ref_path:
         anchor_to_persist = new_filename
@@ -4272,6 +4351,7 @@ def _submit_and_wait(
     job_id: str = None,
     *,
     h3_scene_rerun_admission: dict | None = None,
+    saved_image_admission=None,
 ) -> list[str]:
     """Submit a generation job and block until it completes.
 
@@ -4291,7 +4371,14 @@ def _submit_and_wait(
     pipeline_id = params.get("_director_pipeline_id")
     _detached_operation = bool(params.get("_director_detached_operation"))
     _repair_operation_id = params.get("_director_repair_operation_id")
-    image_admission = _require_pipeline_image_custody(pipeline_id) if pipeline_id else None
+    if saved_image_admission is not None:
+        from services.native_acceptance_reservation import _SavedImageAdmission, reservation
+        if type(saved_image_admission) is not _SavedImageAdmission or h3_scene_rerun_admission is not None:
+            raise ValueError("Saved image child admission changed")
+        reservation.saved_image_unit(saved_image_admission)
+        image_admission = saved_image_admission
+    else:
+        image_admission = _require_pipeline_image_custody(pipeline_id) if pipeline_id else None
     params = dict(params)
     recovery_unit = _normalized_child_unit(
         params.pop("_director_recovery_unit", None)
@@ -4428,6 +4515,8 @@ def _submit_and_wait(
 
     def _run_tracked_generation(_job_id=None) -> None:
         try:
+            if saved_image_admission is not None and _job_id != job_id:
+                raise RuntimeError("Saved image registered worker identity changed")
             # A repair cancellation may win before this newly published
             # child thread begins executing. Do not invoke generation for a
             # detached repair child that registration already made terminal.
@@ -4437,6 +4526,8 @@ def _submit_and_wait(
                 return
             _run_generation(job_id)
         finally:
+            if saved_image_admission is not None:
+                (_jobs.get(job_id) or job)["_director_saved_image_worker_active"] = False
             if h3_scene_rerun_admission is not None:
                 (_jobs.get(job_id) or job)["_director_scene_repair_worker_active"] = False
             if _dir_pid:
@@ -4462,6 +4553,8 @@ def _submit_and_wait(
             private_options = {}
             if image_admission is not None:
                 private_options["image_admission"] = image_admission
+                if saved_image_admission is not None:
+                    private_options["saved_image_worker"] = _run_tracked_generation
             if h3_scene_rerun_admission is not None:
                 def lease_before_worker(candidate):
                     with _pipeline_lock:
@@ -4487,7 +4580,7 @@ def _submit_and_wait(
             job = attached
             job_id = str(job.get("id") or job_id)
             thread = None
-            if _dir_pid:
+            if _dir_pid and saved_image_admission is None:
                 with _pipeline_lock:
                     _pipeline_child_jobs.setdefault(_dir_pid, set()).add(job_id)
         elif _dir_pid:
@@ -4553,6 +4646,8 @@ def _submit_and_wait(
             return
         if h3_scene_rerun_admission is not None and job.get("_director_scene_repair_worker_active") is True:
             return
+        if saved_image_admission is not None and job.get("_director_saved_image_worker_active") is True:
+            return
         with _pipeline_lock:
             child_jobs = _pipeline_child_jobs.get(_dir_pid)
             if child_jobs is not None:
@@ -4585,12 +4680,18 @@ def _submit_and_wait(
             # bounded no-progress window when the owner releases this child.
             deadline = time.monotonic() + timeout_s
         if j["status"] == "completed":
+            if saved_image_admission is not None and j.get("_director_saved_image_worker_active"):
+                reservation.saved_image_unit(saved_image_admission)
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("Saved image worker did not release its native custody")
+                time.sleep(0.05)
+                continue
             outputs = _director_job_outputs(j)
             if recovery_managed:
                 verified = _recovery_verify_child(j, out_dir)
                 if not isinstance(verified, dict):
                     _release_managed_child()
-                    if h3_scene_rerun_admission is not None:
+                    if h3_scene_rerun_admission is not None or image_admission is not None:
                         raise RuntimeError("Repaired scene completed without valid producer evidence; its attempt is retained.")
                     if recovery_attempt >= 2:
                         raise RuntimeError(

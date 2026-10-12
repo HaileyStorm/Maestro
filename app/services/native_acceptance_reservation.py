@@ -76,9 +76,18 @@ class _ImageAdmission:
         self.closed = False
 
 
+class _SavedImageAdmission(_ImageAdmission):
+    """Two fresh detached image operations on one terminal saved parent."""
+    def __init__(self, reservation, pid, parent, pipeline, settings, descriptor):
+        super().__init__(reservation, pid, parent, pipeline, settings)
+        self.descriptor = json.loads(json.dumps(descriptor))
+        self.next_slot = 0
+        self.started = False
+
+
 class Reservation:
     def __init__(self, target=None, dispatch_check=None, *, release_action="start-next"):
-        if type(release_action) is not str or release_action not in {"start-next", "resume", "continue"}:
+        if type(release_action) is not str or release_action not in {"start-next", "resume", "continue", "rerun-image"}:
             raise ValueError("Invalid native acceptance release action")
         self.target = json.loads(json.dumps(target)) if target is not None else None
         if self.target is not None and "running_execution_attempt" in self.target:
@@ -109,7 +118,7 @@ class Reservation:
             return True
         if self.target.get("kind") == "director_planning":
             return False
-        if self.target.get("kind") == "director_images":
+        if self.target.get("kind") in {"director_images", "director_saved_images"}:
             with self._lock:
                 token = self._images
                 return (token is not None and self._images_matches(token)
@@ -132,6 +141,8 @@ class Reservation:
 
     def _images_matches(self, token):
         try:
+            if type(token) is _SavedImageAdmission:
+                return self._saved_images_matches(token)
             params = dict(token.params)
             if token.anchor is not None:
                 if params.pop("generated_reference_image_filename", None) != token.anchor:
@@ -153,6 +164,121 @@ class Reservation:
         except (ValueError, TypeError, KeyError, AttributeError):
             return False
 
+    def _saved_images_matches(self, token):
+        params = dict(token.params)
+        if token.anchor is not None:
+            if params.pop("generated_reference_image_filename", None) != token.anchor:
+                return False
+            params.update(token.anchor_original)
+        cursor = token.parent.get("recovery_cursor") or {}
+        return (not token.closed and self.target.get("kind") == "director_saved_images"
+            and token.reservation is self and token.pid == self.target["pipeline_id"]
+            and token.pipeline.get("params") is token.params
+            and token.pipeline.get("status") == "cancelled"
+            and token.pipeline.get("created_at") == token.parent.get("created_at")
+            and str(token.pipeline.get("workspace") or "default") == str(token.parent.get("workspace") or "default")
+            and token.parent.get("kind") == "director_pipeline"
+            and job_identity(token.parent) == self.target["identity"]
+            and cursor.get("state") == token.descriptor and not cursor.get("pending_state")
+            and digest(params) == self.target["request_sha256"]
+            and digest(token.settings) == self.target["image_settings_sha256"]
+            and digest({"clip_plans": token.pipeline.get("clip_plans"),
+                "planned_clips": token.pipeline.get("_planned_clips")}) == self.target["plans_sha256"]
+            and (token.thread is None or token.thread() is not None and token.thread().is_alive()))
+
+    def bind_saved_images(self, pid, parent, pipeline, state, descriptor, settings, clip_index):
+        with self._lock:
+            token = self._images
+            if token is None:
+                token = _SavedImageAdmission(self, pid, parent, pipeline, settings, descriptor)
+                if (descriptor.get("sha256") != self.target.get("state_sha256")
+                        or state.get("status") != "cancelled" or state.get("phase") != "cancelled"
+                        or len(state.get("clips") or []) != 1
+                        or state.get("generated_reference_image_filename")
+                        or state["clips"][0].get("start_image_filename")
+                        or state["clips"][0].get("video_filename")
+                        or state.get("output_files")
+                        or state.get("_params_snapshot", {}).get("hold_video") is not True
+                        or state.get("_params_snapshot", {}).get("auto_mode") is not False):
+                    raise NativeAcceptanceReserved("Saved Director image checkpoint changed")
+            if (type(token) is not _SavedImageAdmission or token.pid != pid
+                    or token.parent is not parent or token.pipeline is not pipeline
+                    or descriptor != token.descriptor or settings != token.settings
+                    or type(clip_index) is not int or clip_index != 0
+                    or token.thread is not None or token.started or token.next_slot >= 2
+                    or not self._images_matches(token) or not self.dispatch_ready()):
+                raise NativeAcceptanceReserved("Saved Director image operation is unavailable")
+            self._images = token
+            token.thread = weakref.ref(threading.current_thread())
+            token.started = True
+            return token
+
+    def saved_image_unit(self, token):
+        with self._lock:
+            self._require_image_worker(token)
+            if type(token) is not _SavedImageAdmission or not token.started:
+                raise NativeAcceptanceReserved("Saved Director image operation changed")
+            return dict(self.target["image_slots"][token.next_slot])
+
+    def verify_saved_image_completion(self, token, evidence):
+        with self._lock:
+            unit = self.saved_image_unit(token)
+            entry = token.children.get(digest(unit))
+            job = entry[0] if entry is not None else {}
+            units = (job.get("recovery_cursor") or {}).get("completed_units") or []
+            outputs = evidence.get("outputs") if isinstance(evidence, dict) else None
+            if (entry is None or not self._image_child_matches(job, entry)
+                    or job.get("status") != "completed" or job.get("_director_saved_image_worker_active")
+                    or id(job) in self._permits
+                    or not isinstance(outputs, list) or len(outputs) != 1
+                    or len(units) != 1 or units[0].get("kind") != "ordinary_repeat"
+                    or units[0].get("state") != "completed" or units[0].get("dependencies")
+                    or len(evidence.get("artifacts") or []) != 1
+                    or evidence["artifacts"] != units[0].get("artifacts")
+                    or job.get("output_files") != outputs
+                    or type(outputs[0]) is not str or os.path.basename(outputs[0]) != outputs[0]
+                    or outputs[0].startswith(".")
+                    or Path(outputs[0]).suffix.lower() not in {".png", ".jpg", ".jpeg", ".webp"}
+                    or token.next_slot == 1 and outputs[0] == token.anchor):
+                raise NativeAcceptanceReserved("Saved Director image lacks drained producer evidence")
+            token.verified_output = outputs[0]
+            return job, unit, outputs[0]
+
+    def children_identity(self, token, unit):
+        with self._lock:
+            self._require_image_worker(token)
+            entry = token.children.get(digest(unit))
+            if entry is None or not self._image_child_matches(entry[0], entry):
+                raise NativeAcceptanceReserved("Director image child identity changed")
+            return json.loads(json.dumps(entry[1]))
+
+    def publish_saved_image_intent(self, token, descriptor):
+        with self._lock:
+            if (type(token) is not _SavedImageAdmission or token is not self._images
+                    or token.closed or not token.started or token.thread() is not threading.current_thread()
+                    or (token.parent.get("recovery_cursor") or {}).get("state") != descriptor
+                    or not self.dispatch_ready()):
+                raise NativeAcceptanceReserved("Saved Director image intent changed")
+            token.descriptor = json.loads(json.dumps(descriptor))
+
+    def publish_saved_image(self, token, descriptor, filename):
+        with self._lock:
+            # The committed parent descriptor advances before this capability.
+            if (type(token) is not _SavedImageAdmission or token is not self._images
+                    or token.closed or not token.started or token.thread() is not threading.current_thread()
+                    or filename != getattr(token, "verified_output", None)
+                    or (token.parent.get("recovery_cursor") or {}).get("state") != descriptor
+                    or not self.dispatch_ready()):
+                raise NativeAcceptanceReserved("Saved Director image publication changed")
+            if token.next_slot == 0:
+                token.anchor = filename
+                token.params["generated_reference_image_filename"] = filename
+            token.descriptor = json.loads(json.dumps(descriptor))
+            token.next_slot += 1
+            token.started = False
+            token.thread = None
+            token.closed = token.next_slot == 2
+
     def activate_images(self, token, worker):
         with self._lock:
             if (type(token) is not _ImageAdmission or token is not self._images
@@ -162,7 +288,7 @@ class Reservation:
             token.thread = weakref.ref(worker)
 
     def _require_image_worker(self, token):
-        if (type(token) is not _ImageAdmission or token is not self._images
+        if (type(token) not in {_ImageAdmission, _SavedImageAdmission} or token is not self._images
                 or token.thread is None or token.thread() is not threading.current_thread()
                 or not self._images_matches(token) or not self.dispatch_ready()):
             raise NativeAcceptanceReserved("Director image parent admission changed")
@@ -173,6 +299,11 @@ class Reservation:
             slot = {key: unit.get(key) for key in ("kind", "variant", "index")}
             key = digest(slot)
             params = job.get("params") or {}
+            if type(token) is _SavedImageAdmission:
+                expected = self.saved_image_unit(token)
+                child_id = f"director-{token.pid}-0-{digest({'parent': token.pid, 'unit': expected, 'attempt': 0})[:24]}"
+                if slot != expected or job.get("id") != child_id or params.get("_director_detached_operation") is not True:
+                    raise NativeAcceptanceReserved("Saved Director image child identity changed")
             if (slot not in self.target["image_slots"] or key in token.children
                     or any(type(slot[name]) is not int for name in ("variant", "index"))
                     or type(attempt) is not int or attempt != 0
@@ -243,7 +374,7 @@ class Reservation:
 
     def abandon_images(self, token):
         with self._lock:
-            if type(token) is _ImageAdmission and token is self._images:
+            if type(token) in {_ImageAdmission, _SavedImageAdmission} and token is self._images:
                 token.closed = True
 
     def bind_planning(self, pid, parent, params, selection):
@@ -381,7 +512,7 @@ class Reservation:
     def require_model_admission(self, *, workload=None):
         if self.target is None:
             return
-        if workload == "llm" and self.target.get("kind") == "director_images":
+        if workload == "llm" and self.target.get("kind") in {"director_images", "director_saved_images"}:
             raise NativeAcceptanceReserved("LLM work is outside the Director image reservation")
         if not self.dispatch_ready():
             raise NativeAcceptanceReserved("The native acceptance guardian is not ready")
@@ -416,6 +547,17 @@ class Reservation:
         }:
             return True
         target = self.target["identity"]["id"]
+        if self.target.get("kind") == "director_saved_images":
+            base = f"/api/v1/director/pipelines/{self.target['pipeline_id']}"
+            if (method.upper(), path) == ("POST", base + "/clips/0/rerun-image"):
+                with self._lock:
+                    return (self._images is None or type(self._images) is _SavedImageAdmission
+                        and not self._images.closed and not self._images.started) and self.dispatch_ready()
+            with self._lock:
+                children = self._images.children.values() if self._images is not None else ()
+                if any((method.upper(), path) == ("POST", f"/api/v1/cancel/{entry[0]['id']}") for entry in children):
+                    return True
+            return (method.upper(), path) == ("PUT", "/api/v1/access-context/share-url")
         if self.target.get("kind") in {"director_planning", "director_images"}:
             base = f"/api/v1/director/pipeline/{self.target['pipeline_id']}"
             if (method.upper(), path) == ("POST", base + "/continue"):
@@ -490,20 +632,32 @@ def _load_startup_plan():
         plan = json.loads(raw)
         target = plan["target"]
         planning = target.get("kind") == "director_planning"
-        images = target.get("kind") == "director_images"
+        saved_images = target.get("kind") == "director_saved_images"
+        images = target.get("kind") in {"director_images", "director_saved_images"}
         if planning or images:
             required_target = {"kind", "identity", "pipeline_id", "request_sha256"}
             required_target |= {"plans_sha256", "image_slots", "image_settings_sha256"} if images else {"llm_selection_sha256"}
+            if saved_images:
+                required_target.add("state_sha256")
             hash_keys = ("request_sha256", "plans_sha256", "image_settings_sha256") if images else (
                 "request_sha256", "llm_selection_sha256")
             if (set(target) != required_target
                     or not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", target["pipeline_id"])
                     or any(not re.fullmatch(r"[0-9a-f]{64}", target[key])
                         for key in hash_keys)
-                    or images and target["image_slots"] != [
+                    or saved_images and (not re.fullmatch(r"[0-9a-f]{64}", target["state_sha256"])
+                        or type(target["image_slots"]) is not list
+                        or len(target["image_slots"]) != 2
+                        or any(type(slot) is not dict for slot in target["image_slots"])
+                        or type(target["image_slots"][0].get("variant")) is not int
+                        or target["image_slots"][0]["variant"] < 1
+                        or target["image_slots"] != [
+                            {"kind": "image_anchor", "variant": target["image_slots"][0]["variant"], "index": 0},
+                            {"kind": "image_start", "variant": target["image_slots"][0]["variant"], "index": 0}])
+                    or images and not saved_images and target["image_slots"] != [
                         {"kind": "image_anchor", "variant": 0, "index": 0},
                         {"kind": "image_start", "variant": 0, "index": 0}]
-                    or plan.get("release_action") != "continue"):
+                    or plan.get("release_action") != ("rerun-image" if saved_images else "continue")):
                 raise ValueError()
         elif (target.get("kind", "generation") != "generation"
                 or type(target["execution_attempt"]) is not int or target["execution_attempt"] < 1
@@ -688,7 +842,7 @@ def _guardian_ready():
         return False
     receipt = json.loads(raw)
     fresh_at = receipt.get("last_check", receipt.get("ready_at"))
-    freshness = 2 if _PLAN["target"].get("kind") in {"director_planning", "director_images"} else 10
+    freshness = 2 if _PLAN["target"].get("kind") in {"director_planning", "director_images", "director_saved_images"} else 10
     if type(fresh_at) not in {int, float} or not 0 <= time.time() - fresh_at < freshness:
         return False
     if (receipt.get("ready") is not True or receipt.get("failure")

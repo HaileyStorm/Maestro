@@ -7636,7 +7636,26 @@ def _director_recovery_checkpoint_parent(
     cursor.pop("pending_state", None)
     cursor.pop("h3_pending_scene_repairs", None)
     cursor.pop("director_pending_clip_repairs", None)
+    cursor.pop("director_saved_image_repairs", None)
     recovery = state.get("recovery")
+    saved_images = recovery.get("saved_images") if isinstance(recovery, dict) else None
+    retained_images = []
+    if isinstance(saved_images, dict):
+        from services.director_pipeline import _director_child_job_id, _child_unit_token
+        for key, repair in saved_images.items():
+            if not isinstance(repair, dict) or repair.get("state") not in {"submitted", "completed"}:
+                continue
+            unit = repair.get("unit")
+            if (not isinstance(unit, dict) or unit.get("kind") not in {"image_anchor", "image_start"}
+                    or type(unit.get("index")) is not int or unit["index"] != 0
+                    or type(unit.get("variant")) is not int or unit["variant"] < 1
+                    or key != _child_unit_token(unit) or repair.get("attempt") != 0
+                    or repair.get("job_id") != _director_child_job_id(pid, unit, 0)):
+                continue
+            retained_images.append({"job_id": repair["job_id"], "index": 0,
+                "revision": unit["variant"], "director_kind": unit["kind"]})
+    if retained_images:
+        cursor["director_saved_image_repairs"] = retained_images
     repairs = recovery.get("video_repairs") if isinstance(recovery, dict) else None
     retained_repairs = []
     if isinstance(repairs, dict):
@@ -7799,13 +7818,14 @@ def _director_recovery_submit_child(
     h3_scene_rerun_before_worker=None,
     h3_scene_rerun_worker=None,
     image_admission=None,
+    saved_image_worker=None,
 ) -> dict:
     """Attach to one deterministic child, or durably register it once."""
     # This trusted entry point owns the incoming kind before either fresh
     # registration or immutable-manifest attachment validates child identity.
     job["kind"] = "director_child"
     from services.native_acceptance_reservation import reservation
-    if reservation.target is not None and reservation.target.get("kind") == "director_images":
+    if reservation.target is not None and reservation.target.get("kind") in {"director_images", "director_saved_images"}:
         # Only the retained Director worker can carry this private capability.
         reservation.validate_image_child(image_admission, job, unit, attempt)
     if image_admission is not None:
@@ -7816,8 +7836,20 @@ def _director_recovery_submit_child(
                 "request_sha256": reservation.target["request_sha256"]})
         def enroll_image(candidate):
             reservation.enroll_image_child(image_admission, candidate, unit, attempt)
+            if saved_image_worker is not None:
+                candidate["_director_saved_image_worker_active"] = True
+                from services import director_pipeline as director_service
+                with director_service._pipeline_lock:
+                    director_service._pipeline_child_jobs.setdefault(pid, set()).add(candidate["id"])
             return True
         h3_scene_rerun_before_worker = enroll_image
+        if saved_image_worker is not None:
+            from services.native_acceptance_reservation import _SavedImageAdmission
+            if type(image_admission) is not _SavedImageAdmission or not callable(saved_image_worker):
+                raise QueueRecoveryRuntimeError("Saved image worker ownership changed")
+            h3_scene_rerun_worker = saved_image_worker
+    elif saved_image_worker is not None:
+        raise QueueRecoveryRuntimeError("Saved image worker requires its private admission")
     try:
         from services import director_pipeline as _director_service
 
@@ -49423,6 +49455,11 @@ def cancel_saved_pipeline_repair(request: Request, pid: str, workspace: str = ""
 async def rerun_pipeline_clip_image(pid: str, clip_index: int, request: Request):
     """Re-generate the start image for a specific clip in a saved pipeline."""
     body = await request.json()
+    from services.native_acceptance_reservation import reservation
+    reserved = reservation.target is not None and reservation.target.get("kind") == "director_saved_images"
+    if reserved and (not isinstance(body, dict) or set(body) - {"workspace"}
+            or clip_index != 0 or pid != reservation.target["pipeline_id"]):
+        raise HTTPException(status_code=400, detail="Rerun the retained saved image unchanged")
     selected_workspace = _request_project_workspace(
         request, body.get("workspace"),
     )
@@ -49434,6 +49471,15 @@ async def rerun_pipeline_clip_image(pid: str, clip_index: int, request: Request)
     )
     _state, base = _require_saved_pipeline(request, pid, selected_workspace)
     _revalidate_saved_director_runtime(request, _state)
+    saved_image_binding = None
+    if reserved:
+        from services import director_pipeline as pipeline_service
+        with pipeline_service._pipeline_lock:
+            live = pipeline_service._pipelines.get(pid)
+            parent = _director_recovery_parents.get(pid)
+            if not isinstance(live, dict) or not isinstance(parent, dict):
+                raise HTTPException(status_code=409, detail="Saved Director image parent is unavailable")
+            saved_image_binding = (parent, live)
     _begin_workspace_operation(selected_workspace)
     try:
         # Image generation can take minutes. Running it directly inside this
@@ -49446,6 +49492,7 @@ async def rerun_pipeline_clip_image(pid: str, clip_index: int, request: Request)
             pid,
             clip_index,
             prompt_override=body.get("prompt"),
+            saved_image_binding=saved_image_binding,
         )
         return result
     except PipelineBusyError as e:

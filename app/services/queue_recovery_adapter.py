@@ -204,7 +204,8 @@ def director_h3_source_job_ids(jobs: Mapping[str, Mapping[str, Any]]) -> frozens
                 and same_child(source_id)):
             retained.add(source_id)
         for field, kind in (("h3_pending_scene_repairs", "video_scene_rerun"),
-                            ("director_pending_clip_repairs", "video_clip_rerun")):
+                            ("director_pending_clip_repairs", "video_clip_rerun"),
+                            ("director_saved_image_repairs", None)):
             repairs = cursor.get(field)
             if not isinstance(repairs, list):
                 continue
@@ -214,9 +215,14 @@ def director_h3_source_job_ids(jobs: Mapping[str, Mapping[str, Any]]) -> frozens
                         or repair["revision"] < 1 or type(repair.get("job_id")) is not str):
                     continue
                 repair_id = repair["job_id"]
+                selected_kind = kind
+                if field == "director_saved_image_repairs":
+                    selected_kind = repair.get("director_kind")
+                    if selected_kind not in {"image_anchor", "image_start"} or repair["index"] != 0:
+                        continue
                 # Native safe-unit checkpoints advance recovery_unit. The
                 # immutable job ID continues to bind the submitted repair.
-                unit = {"kind": kind, "variant": repair["revision"], "index": repair["index"]}
+                unit = {"kind": selected_kind, "variant": repair["revision"], "index": repair["index"]}
                 identity = json.dumps({"parent": pid, "unit": unit, "attempt": 0},
                                       sort_keys=True, separators=(",", ":"))
                 expected_id = f"director-{pid}-0-{hashlib.sha256(identity.encode('utf-8')).hexdigest()[:24]}"
