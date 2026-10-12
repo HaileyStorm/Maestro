@@ -7613,21 +7613,15 @@ def _director_recovery_register_parent(
     return {"id": parent_id, "inputs": input_descriptors}
 
 
-def _director_recovery_checkpoint_parent(
+def _director_recovery_parent_cursor(
     pid: str,
     state: dict,
     state_descriptor: dict,
-) -> None:
-    parent = _director_recovery_parents.get(pid)
-    if not isinstance(parent, dict):
-        raise QueueRecoveryRuntimeError("Director recovery parent is unavailable.")
-    status = str(state.get("status") or "running")
-    recovery_state = (
-        "terminal" if status in {"completed", "failed", "cancelled"}
-        else "paused" if status == "paused"
-        else "restored"
-    )
-    cursor = dict(parent.get("recovery_cursor") or {})
+    *,
+    current_cursor: dict | None = None,
+) -> dict:
+    """Derive retention from sealed state before live or startup compaction."""
+    cursor = dict(current_cursor or {})
     cursor.update({
         "pipeline_id": pid,
         "state": dict(state_descriptor),
@@ -7714,6 +7708,26 @@ def _director_recovery_checkpoint_parent(
                                              "revision": repair["revision"]})
             if retained_repairs:
                 cursor["h3_pending_scene_repairs"] = retained_repairs
+    return cursor
+
+
+def _director_recovery_checkpoint_parent(
+    pid: str,
+    state: dict,
+    state_descriptor: dict,
+) -> None:
+    parent = _director_recovery_parents.get(pid)
+    if not isinstance(parent, dict):
+        raise QueueRecoveryRuntimeError("Director recovery parent is unavailable.")
+    status = str(state.get("status") or "running")
+    recovery_state = (
+        "terminal" if status in {"completed", "failed", "cancelled"}
+        else "paused" if status == "paused"
+        else "restored"
+    )
+    cursor = _director_recovery_parent_cursor(
+        pid, state, state_descriptor, current_cursor=parent.get("recovery_cursor"),
+    )
     _queue_recovery_checkpoint(
         parent,
         # The generic journal drops terminal statuses during compaction.
@@ -10805,6 +10819,10 @@ def _director_recovery_restore_parent(
         not blocked_reason
         and bool(snapshot.get("source_remote", False))
         and active
+    )
+    parent["recovery_cursor"] = _director_recovery_parent_cursor(
+        pid, state, dict(sealed_state or {}),
+        current_cursor=parent.get("recovery_cursor"),
     )
     _queue_recovery_checkpoint(
         parent,

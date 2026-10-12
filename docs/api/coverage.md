@@ -187,6 +187,19 @@ input binding and retained review state, not subjective plan quality or
 image/video execution. The structured plan is 124 frames at 24 fps; the raw
 LLM prompt says eight seconds. Review timing before execution; no encoded
 video duration has been verified for this plan.
+
+Two subsequent saved-image reruns used the production authenticated clip
+rerun operation under one fresh GPU lease: a creator anchor, followed by a
+distinct editor start image referencing that exact anchor. Both returned
+successful receipts and committed PNGs with sealed producer metadata. The
+cancelled parent stayed cancelled; these were saved-image repairs, not a
+completed pipeline or video. After normal-service restoration, authenticated
+reads and exact saved-state, media and sidecar hashes confirmed both outputs.
+Startup had omitted their state-derived retention metadata and retired their
+completed queue rows. The saved producer records and files survived; retired
+rows were not recreated and neither image was replayed. The startup retention
+correction is tracked separately. Subjective image quality, future child-row
+retention and video execution remain distinct acceptance requirements.
 Historical attempt receipts remain
 retained separately rather than becoming routine regression scenarios.
 
