@@ -93,13 +93,16 @@ class _SavedVideoAdmission(_ImageAdmission):
         self.slot = dict(prepared["unit"])
         self.operation_id = operation_id
         self.input_seal = json.loads(json.dumps(prepared["input_seal"]))
+        self.original_terminal = json.loads(json.dumps(prepared.get("original_terminal")))
+        self.parent_status = pipeline.get("status")
+        self.child_snapshot = None
         self.started = True
         self.thread = weakref.ref(threading.current_thread())
 
 
 class Reservation:
     def __init__(self, target=None, dispatch_check=None, *, release_action="start-next"):
-        if type(release_action) is not str or release_action not in {"start-next", "resume", "continue", "rerun-image", "rerun-video"}:
+        if type(release_action) is not str or release_action not in {"start-next", "resume", "recovery-retry", "continue", "rerun-image", "rerun-video"}:
             raise ValueError("Invalid native acceptance release action")
         self.target = json.loads(json.dumps(target)) if target is not None else None
         if self.target is not None and "running_execution_attempt" in self.target:
@@ -109,10 +112,19 @@ class Reservation:
                     or type(running) is not int or running != baseline + 1):
                 raise ValueError("Invalid native acceptance running attempt")
         self.release_action = release_action
+        if release_action == "recovery-retry":
+            if (self.target is None or self.target.get("kind") != "generation"
+                    or self.target.get("running_execution_attempt") != self.target.get("execution_attempt", 0) + 1
+                    or type(self.target.get("running_recovery_attempt")) is not int
+                    or self.target["running_recovery_attempt"] != self.target.get("recovery_attempt", -1) + 1):
+                raise ValueError("Invalid native acceptance failed retry")
+        self._retry_job = None
+        self._retry_committed = False
         self._permits = {}
         self._workers = {}
         self._planning = {}
         self._images = None
+        self._director_manifests = {}
         self._lock = threading.RLock()
         self._dispatch_check = dispatch_check
 
@@ -137,8 +149,54 @@ class Reservation:
             candidate["_native_acceptance_manual_recovery"] = True
         return True
 
+    @contextmanager
+    def failed_recovery_retry(self, job, *, held_director=False):
+        """Bind one owner-validated durable retry before publishing its worker.
+
+        A spent transition cannot be resent, including after uncertain
+        persistence. Never hold our lock across the lifecycle checkpoint.
+        """
+        from services.job_lifecycle import held_director_recovery_retry_allowed
+        if type(held_director) is not bool:
+            raise ValueError("Held Director retry option must be boolean")
+        if self.target is None:
+            yield False
+            return
+        with self._lock:
+            if (self.release_action != "recovery-retry" or self._retry_job is not None
+                    or not self.dispatch_ready()
+                    or not (held_director_recovery_retry_allowed(job) if held_director
+                            else job.get("status") == "failed")
+                    or not self._matches_job(job, self.target["execution_attempt"])
+                    or job.get("output_files") or job.get("clip_output_files")
+                    or (job.get("recovery_cursor") or {}).get("completed_units")
+                    or job.get("_director_video_lora_task_retention_pending")):
+                raise NativeAcceptanceReserved("Failed retry reservation changed; reconcile without resending")
+            self._retry_job = job
+        yield True
+        with self._lock:
+            if (job.get("status") != "queued" or job.get("queue_held") is not False
+                    or job.get("_native_acceptance_manual_recovery") is not True
+                    or not self._matches_job(job, self.target["running_execution_attempt"],
+                        self.target["running_recovery_attempt"])):
+                raise NativeAcceptanceReserved("Failed retry acknowledgement changed; reconcile without resending")
+            self._retry_committed = True
+
+    def _retry_matches(self, job, *, completed_director=False):
+        return (self._retry_job is job and self._retry_committed
+            and self._matches_job(job, self.target["running_execution_attempt"],
+                self.target["running_recovery_attempt"], completed_director=completed_director))
+
+    def permits_original_retry_attachment(self, job):
+        """Read-only Director attachment; never grants model/release authority."""
+        if (self.target is None or not self.dispatch_ready()
+                or job.get("kind") != "director_child"
+                or job.get("_native_acceptance_manual_recovery") is not True):
+            return False
+        return self._retry_matches(job, completed_director=True)
+
     def eligible(self, job):
-        """Queue admission always uses the frozen pre-start attempt."""
+        """Admit the frozen attempt or its one committed failed-retry successor."""
         if self.target is None:
             return job.get("_native_acceptance_manual_recovery") is not True
         if not self.dispatch_ready():
@@ -151,6 +209,8 @@ class Reservation:
                 return (token is not None and self._images_matches(token)
                     and any(self._image_child_matches(job, entry)
                         for entry in token.children.values()))
+        if self._retry_job is not None:
+            return self._retry_matches(job)
         return self._matches_job(job, self.target.get("execution_attempt"))
 
     def bind_images(self, pid, parent, pipeline, slots, settings):
@@ -220,7 +280,11 @@ class Reservation:
         return (not token.closed and self.target.get("kind") == "director_saved_video"
             and token.reservation is self and token.pid == self.target["pipeline_id"]
             and token.pipeline.get("params") is token.params
-            and token.pipeline.get("status") == "cancelled"
+            and token.pipeline.get("status") == token.parent_status
+            and (token.parent_status == "cancelled" and token.original_terminal is None
+                and "original_terminal_sha256" not in self.target
+                or token.parent_status == "failed" and isinstance(token.original_terminal, dict)
+                and digest(token.original_terminal) == self.target.get("original_terminal_sha256"))
             and token.pipeline.get("created_at") == token.parent.get("created_at")
             and str(token.pipeline.get("workspace") or "default") == str(token.parent.get("workspace") or "default")
             and token.parent.get("kind") == "director_pipeline"
@@ -229,7 +293,8 @@ class Reservation:
             and digest(token.params) == self.target["request_sha256"]
             and digest(token.settings) == self.target["generated_request_sha256"]
             and digest(token.input_seal) == self.target["input_seal_sha256"]
-            and all(token.input_seal["identity"].get(key) == self.target["identity"][key]
+            and all((token.input_seal.get("owner_project") if token.original_terminal is not None
+                    else token.input_seal.get("identity") or {}).get(key) == self.target["identity"][key]
                 for key in ("project_instance_sha256", "owner_principal_sha256"))
             and token.slot == self.target["video_slot"]
             and digest({"clip_plans": token.pipeline.get("clip_plans"),
@@ -242,7 +307,8 @@ class Reservation:
             if (self._images is not None or clip_index != 0 or type(clip_index) is not int
                     or operation_id is not None and (type(operation_id) is not str or not operation_id)
                     or descriptor.get("sha256") != self.target.get("state_sha256")
-                    or state.get("status") != "cancelled" or state.get("phase") != "cancelled"
+                    or state.get("status") != token.parent_status
+                    or state.get("status") == "cancelled" and state.get("phase") != "cancelled"
                     or len(state.get("clips") or []) != 1 or state["clips"][0].get("video_filename")
                     or state.get("_params_snapshot", {}).get("hold_video") is not True
                     or state.get("_params_snapshot", {}).get("auto_mode") is not False
@@ -251,13 +317,41 @@ class Reservation:
             self._images = token
             return token
 
+    def seal_saved_video_child_request(self, token, params):
+        self._require_image_worker(token)
+        if type(token) is not _SavedVideoAdmission or token.children or token.child_snapshot is not None:
+            raise NativeAcceptanceReserved("Saved video child admission changed")
+        expected = dict(token.settings)
+        for key in ("_director_recovery_unit", "_director_recovery_parent_id", "_director_recovery_job_id", "_director_recovery_attempt"):
+            expected.pop(key, None)
+        expected["_maestro_session_id"] = token.params.get("_maestro_session_id")
+        expected["_maestro_access_policy"] = token.params.get("_maestro_access_policy") or {}
+        if token.operation_id is not None:
+            expected["_director_repair_operation_id"] = token.operation_id
+        snapshot = params.get("_director_video_lora_child_snapshot")
+        observed = dict(params)
+        observed.pop("_director_video_lora_child_snapshot", None)
+        expected.pop("_director_video_lora_child_snapshot", None)
+        if (not isinstance(snapshot, dict) or observed != expected
+                or params.get("_director_video_lora_parent_snapshot") != token.settings.get("_director_video_lora_parent_snapshot")):
+            raise NativeAcceptanceReserved("Saved video creative request changed during admission")
+        token.child_snapshot = json.loads(json.dumps(snapshot))
+
     def validate_saved_video_child(self, token, job, unit, attempt):
         self._require_image_worker(token)
         params = dict(job.get("params") or {})
         for key in ("_h3_offload_plan", "_maestro_credit_owner_lineage"):
             params.pop(key, None)
+        account_key = "_maestro_credit_account_id"
+        if account_key in params and account_key not in token.settings:
+            if (type(job.get("_credit_account_id")) is not str or not job["_credit_account_id"]
+                    or params[account_key] != job["_credit_account_id"]):
+                raise NativeAcceptanceReserved("Saved video server account lineage changed")
+            params.pop(account_key)
         expected_id = f"director-{token.pid}-0-{digest({'parent': token.pid, 'unit': token.slot, 'attempt': 0})[:24]}"
         expected_params = dict(token.settings)
+        if token.child_snapshot is not None:
+            expected_params["_director_video_lora_child_snapshot"] = token.child_snapshot
         if token.operation_id is not None:
             expected_params["_director_repair_operation_id"] = token.operation_id
         if (token.children or unit != token.slot or type(attempt) is not int or attempt != 0
@@ -460,10 +554,22 @@ class Reservation:
 
     def _image_child_matches(self, job, entry):
         try:
-            return (entry[0] is job and job_identity(job) == entry[1]
+            identity = job_identity(job)
+            params_sha256 = digest(job.get("params"))
+            lineage = self._director_manifests.get(id(job))
+            if lineage is not None and type(self._images) is _SavedVideoAdmission:
+                original_job, parent_ref, manifests, params_hashes = lineage
+                parent = parent_ref()
+                if (original_job is not job or identity["request_manifest_sha256"] not in manifests
+                        or params_sha256 not in params_hashes
+                        or job.get("status") != "completed" and (parent is None or not parent.is_alive())):
+                    return False
+                identity["request_manifest_sha256"] = entry[1]["request_manifest_sha256"]
+                params_sha256 = entry[4]
+            return (entry[0] is job and identity == entry[1]
                 and type(job.get("execution_attempt")) is int and job["execution_attempt"] == entry[2]
                 and type(job.get("recovery_attempt", 0)) is int and job.get("recovery_attempt", 0) == entry[3]
-                and digest(job.get("params")) == entry[4])
+                and params_sha256 == entry[4])
         except (ValueError, TypeError, KeyError):
             return False
 
@@ -534,15 +640,80 @@ class Reservation:
             if self._planning.get(current) is token:
                 del self._planning[current]
 
-    def _matches_job(self, job, execution_attempt):
+    def _matches_job(self, job, execution_attempt, recovery_attempt=None, *, completed_director=False):
         try:
-            return (job_identity(job) == self.target["identity"]
+            identity = job_identity(job)
+            lineage = self._director_manifests.get(id(job))
+            if lineage is not None:
+                original_job, parent_ref, manifests, _ = lineage
+                parent = parent_ref()
+                terminal_adoption = (completed_director and job.get("kind") == "director_child"
+                    and job.get("status") == "completed")
+                if (original_job is not job or not terminal_adoption and (parent is None or not parent.is_alive())
+                        or identity["request_manifest_sha256"] not in manifests):
+                    return False
+                identity["request_manifest_sha256"] = self.target["identity"]["request_manifest_sha256"]
+            return (identity == self.target["identity"]
                 and type(job.get("execution_attempt")) is int
                 and type(job.get("recovery_attempt", 0)) is int
                 and job.get("execution_attempt") == execution_attempt
-                and job.get("recovery_attempt", 0) == self.target["recovery_attempt"])
+                and job.get("recovery_attempt", 0) == (
+                    self.target["recovery_attempt"] if recovery_attempt is None else recovery_attempt))
         except (ValueError, TypeError, KeyError):
             return False
+
+    @contextmanager
+    def director_manifest_checkpoint(self, job, predecessor, successor, *, successor_params=None):
+        """Keep validated execution-record retention within its live admission.
+
+        The Director owner seals and validates both manifests before entering.
+        Only the validated manifest and record hashes may advance; the startup
+        target and the enrolled creative request remain unchanged.
+        Do not hold our lock across the durable lifecycle callback, which takes
+        the queue lock. Readers see one immutable, exact-job lineage tuple.
+        """
+        if self.target is None:
+            yield
+            return
+        with self._lock:
+            admission = self._permits.get(id(job))
+            worker = self._workers.get(threading.current_thread())
+            if (self.target.get("kind") not in {"generation", "director_saved_video"}
+                    or self.target.get("kind") == "director_saved_video" and (type(successor_params) is not dict
+                        or type(self._images) is not _SavedVideoAdmission
+                        or not any(entry[0] is job for entry in self._images.children.values()))
+                    or job.get("kind") != "director_child" or job.get("status") != "running"
+                    or job.get("_recovery_manifest_pointer") != predecessor
+                    or type(predecessor) is not dict or type(successor) is not dict
+                    or not predecessor or not successor or admission is None
+                    or not self._parent_valid(admission)
+                    or not (admission[0]() is threading.current_thread()
+                            or worker is not None and worker.admission is admission)):
+                raise NativeAcceptanceReserved("Director manifest admission changed")
+            previous = self._director_manifests.get(id(job))
+            before = job_identity(job)
+            attempts = (job.get("execution_attempt"), job.get("recovery_attempt", 0))
+            after = {**before, "request_manifest_sha256": digest(successor)}
+            self._director_manifests[id(job)] = (
+                job, admission[0], (digest(predecessor), digest(successor)),
+                (digest(job.get("params")), digest(successor_params if successor_params is not None else job.get("params"))))
+        try:
+            yield
+            if (job.get("_recovery_manifest_pointer") != successor
+                    or job_identity(job) != after
+                    or (job.get("execution_attempt"), job.get("recovery_attempt", 0)) != attempts
+                    or successor_params is not None and digest(job.get("params")) != digest(successor_params)):
+                raise NativeAcceptanceReserved("Director manifest checkpoint was not published")
+        except BaseException:
+            with self._lock:
+                if previous is None:
+                    self._director_manifests.pop(id(job), None)
+                else:
+                    self._director_manifests[id(job)] = previous
+            raise
+        else:
+            with self._lock:
+                self._director_manifests[id(job)] = (job, admission[0], (digest(successor),), (digest(job.get("params")),))
 
     def admitted(self, job, generation_lock):
         if not self.permits_job_release(job) or not generation_lock.locked():
@@ -566,7 +737,7 @@ class Reservation:
         thread, job, lock = admission
         parent = thread()
         running = self.target.get("running_execution_attempt")
-        if running is None:
+        if running is None or self.release_action == "recovery-retry":
             matches = self.eligible(job)
         else:
             # Composition starts advance the durable attempt after acquiring
@@ -651,6 +822,20 @@ class Reservation:
     def wrap_lock(self, lock):
         return _ReservedLock(lock, self) if self.target is not None else lock
 
+    def require_director_repair_target(self, pipeline_id, plan, job):
+        """Admit only a waiter for the reserved original held video."""
+        if self.target is None:
+            return
+        if (self.target.get("kind", "generation") != "generation"
+                or not self.dispatch_ready() or not isinstance(job, dict)
+                or not (self.permits_original_retry_attachment(job)
+                    or self._matches_job(job, self.target["execution_attempt"], completed_director=True))
+                or (job.get("params") or {}).get("_director_pipeline_id") != pipeline_id
+                or job.get("kind") != "director_child"
+                or plan.get("image_indices") or plan.get("video_indices") != [0]
+                or plan.get("clip_count") != 1 or plan.get("should_rejoin")):
+            raise NativeAcceptanceReserved("Repair must attach only the reserved original video")
+
     def permits_http_action(self, method, path):
         if self.target is None or method.upper() in {"GET", "HEAD", "OPTIONS"}:
             return True
@@ -692,6 +877,13 @@ class Reservation:
                 ("PUT", "/api/v1/access-context/share-url")}
         if (method.upper(), path) == ("POST", f"/api/v1/queue/{target}/{self.release_action}"):
             return self.dispatch_ready()
+        original = re.fullmatch(r"director-([0-9a-f]{8})-[0-9]+-[0-9a-f]{24}", target)
+        if original is not None:
+            base = f"/api/v1/director/pipelines/{original[1]}"
+            if (method.upper(), path) == ("POST", base + "/repair"):
+                return self.dispatch_ready()
+            if (method.upper(), path) == ("POST", base + "/repair/cancel"):
+                return True
         return (method.upper(), path) in {
             ("POST", f"/api/v1/cancel/{target}"),
             ("PUT", "/api/v1/access-context/share-url"),
@@ -764,6 +956,8 @@ def _load_startup_plan():
         if saved_video:
             required = {"kind", "identity", "pipeline_id", "request_sha256", "plans_sha256",
                 "state_sha256", "generated_request_sha256", "input_seal_sha256", "video_slot"}
+            if "original_terminal_sha256" in target:
+                required.add("original_terminal_sha256")
             slot = target.get("video_slot")
             if (set(target) != required or not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", target["pipeline_id"])
                     or any(not re.fullmatch(r"[0-9a-f]{64}", target[key]) for key in required - {
@@ -804,7 +998,12 @@ def _load_startup_plan():
                 or ("running_execution_attempt" in target and (
                     type(target["running_execution_attempt"]) is not int
                     or target["running_execution_attempt"] != target["execution_attempt"] + 1))
-                or plan.get("release_action", "start-next") not in {"start-next", "resume"}):
+                or plan.get("release_action", "start-next") not in {"start-next", "resume", "recovery-retry"}
+                or plan.get("release_action") == "recovery-retry" and (
+                    target.get("running_execution_attempt") != target["execution_attempt"] + 1
+                    or type(target.get("running_recovery_attempt")) is not int
+                    or target["running_recovery_attempt"] != target["recovery_attempt"] + 1)
+                or plan.get("release_action") != "recovery-retry" and "running_recovery_attempt" in target):
             raise ValueError()
         if (plan["schema"] != "maestro/native-acceptance-reservation/v1"
                 or plan["workspace"] != str(root)

@@ -109,7 +109,10 @@ def run_native_generation(wgp, task, params, *, identity, consumer, send_cmd,
     # Only these explicitly bound callbacks have replacements in the child.
     if any(callable(value) for value in worker_params.values()):
         raise NativeProcessError("unsupported_director_callback")
-    packet = {"identity": copy.deepcopy(identity), "task": task, "params": worker_params,
+    worker_task = dict(task)
+    worker_task["params"] = dict(task["params"])
+    worker_task["params"]["state"] = worker_params["state"]
+    packet = {"identity": copy.deepcopy(identity), "task": worker_task, "params": worker_params,
               "plugin_data": plugin_data, "runtime": runtime_binding(wgp, params["model_type"]),
               "consumer": consumer.worker_binding()}
 
@@ -280,7 +283,20 @@ def _installed_model_only(wgp, model_filename=None, model_type=None,
 
 
 def run_worker(channel, packet):
-    """Run exactly one bound invocation; completion follows model release."""
+    """Run once; report only bounded source metadata after owned cleanup."""
+    stage, failure = ["validate_packet"], []
+    try:
+        return _run_worker(channel, packet, stage, failure)
+    except BaseException as exc:
+        failed_stage, failed_exc = failure[0] if failure else (stage[0], exc)
+        try:
+            channel.fail(failed_stage, failed_exc, trusted_source=__file__)
+        except BaseException:
+            pass  # Socket loss still requires the parent's independent custody drain.
+        raise SystemExit(1) from None
+
+
+def _run_worker(channel, packet, stage, failure):
     if (type(packet) is not dict or set(packet) != {"identity", "task", "params", "plugin_data", "runtime", "consumer"}
             or type(packet["identity"]) is not dict
             or not {"job_id", "execution_attempt", "task_index", "child_digest", "task_digest"} <= set(packet["identity"])):
@@ -310,17 +326,20 @@ def run_worker(channel, packet):
             or set(runtime["globals"]) != set(_RUNTIME_FIELDS)
             or set(runtime["args"]) != set(_ARG_FIELDS)):
         raise RuntimeError("Director native configuration has unknown fields")
+    stage[0] = "parent_watch"
     watcher, watcher_stop = _start_parent_watch(channel)
     wgp = None
     try:
         # Authenticate the exact projection and any completed prefix before
         # importing the GPU runtime. A generic RPC ACK cannot establish it.
+        stage[0] = "consumer_binding"
         from services.director_video_lora_execution import DirectorLoraConsumer
         consumer = DirectorLoraConsumer(plan,
             transformer_count=consumer_binding["transformer_count"],
             validate_current=lambda: channel.request("validate_current", identity),
             retain_preparation=lambda record: channel.request("retain_preparation", {"identity": identity, "record": record}))
         consumer.restore_completed_prefix(validate_completed=lambda: consumer_binding["completed_repeats"])
+        stage[0] = "private_runtime"
         with tempfile.TemporaryDirectory(prefix="maestro-director-native-") as private:
             os.chmod(private, 0o700)
             config_dir = Path(private) / "config"
@@ -335,8 +354,10 @@ def run_worker(channel, packet):
             sys.argv = ["maestro-director-native", "--config", str(config_dir), "--settings", str(settings_dir),
                         "--gpu", runtime["args"]["gpu"], "--vram-safety-coefficient",
                         str(runtime["args"]["vram_safety_coefficient"])]
+            stage[0] = "wgp_import"
             import wgp as native_wgp
             wgp = native_wgp
+            stage[0] = "runtime_binding"
             wgp.app = None
             if wgp.processing_device != runtime["globals"]["processing_device"]:
                 raise RuntimeError("Director native startup selected a different device")
@@ -397,12 +418,19 @@ def run_worker(channel, packet):
             params["_maestro_director_repeat_output"] = retain_repeat
             def send_cmd(name, *values):
                 channel.send_event(name, {"identity": identity, "values": values, "gen": _generation_state(gen)})
+            stage[0] = "generation"
             success = wgp.generate_video(packet["task"], send_cmd,
                 plugin_data=packet["plugin_data"], **params)
             final = {"identity": identity, "success": bool(success), "gen": _generation_state(gen)}
+            stage[0] = "model_release"
             wgp.release_model()
+            stage[0] = "finish"
             channel.finish(final)
+    except BaseException as exc:
+        failure.append((stage[0], exc))
+        raise
     finally:
+        stage[0] = "cleanup"
         # Keep the independent watcher until native cleanup has returned.
         if wgp is not None:
             wgp.release_model()
@@ -414,4 +442,12 @@ def run_worker(channel, packet):
 if __name__ == "__main__":
     from services.director_native_process import worker_channel_from_fd
     native_channel = worker_channel_from_fd()
-    run_worker(native_channel, native_channel.receive())
+    try:
+        native_packet = native_channel.receive()
+    except BaseException as exc:
+        try:
+            native_channel.fail("bootstrap", exc, trusted_source=__file__)
+        except BaseException:
+            pass
+        raise SystemExit(1) from None
+    run_worker(native_channel, native_packet)

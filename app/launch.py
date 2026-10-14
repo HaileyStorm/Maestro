@@ -6369,7 +6369,8 @@ def _director_video_lora_current_parent(params, *, pipeline_id, workspace, proje
                        "_director_video_lora_native_plans", "_director_video_lora_preparation_plans", "_director_video_lora_consumption_plans", "_director_recovery_unit",
                        "_director_recovery_parent_id", "_director_recovery_job_id", "_director_recovery_attempt",
                        H3_OFFLOAD_PLAN_PARAM_KEY, "_h3_lightx2v_identity"}
-            project = lambda value: {key: item for key, item in value.items() if key not in ignored}
+            project = lambda value: {key: item for key, item in value.items()
+                                     if key not in ignored and key not in _CREDIT_INTERNAL_PARAMS}
             if not isinstance(retained, dict) or project(retained) != project(params):
                 raise ValueError("Director video LoRA clip repair request changed")
         from services import director_pipeline as director
@@ -6382,6 +6383,18 @@ def _director_video_lora_current_parent(params, *, pipeline_id, workspace, proje
                 raise ValueError("Director video LoRA current repair was cancelled")
     binding = _validate_director_video_lora_parameters(parent_params, current_scope=scope)
     return binding, scope
+
+
+def _director_video_lora_requested_params(params):
+    ignored = {"_maestro_session_id", "_maestro_access_policy", "_director_detached_operation",
+               "_director_repair_operation_id", "_director_video_lora_parent_snapshot",
+               "_director_video_lora_child_snapshot", "_director_video_lora_task_plans", "_director_video_lora_task_inventory",
+               "_director_video_lora_native_plans", "_director_video_lora_preparation_plans", "_director_video_lora_consumption_plans",
+               H3_OFFLOAD_PLAN_PARAM_KEY, "_h3_lightx2v_identity",
+               "_h3_rerun_input", "_h3_rerun_predecessor_path"}
+    requested = {key: value for key, value in params.items()
+                 if key not in ignored and key not in _CREDIT_INTERNAL_PARAMS}
+    return json.loads(json.dumps(requested, allow_nan=False))
 
 
 def _director_video_lora_child_binding(params, *, pipeline_id, workspace, project_dir, session_id, unit):
@@ -6423,13 +6436,7 @@ def _director_video_lora_child_binding(params, *, pipeline_id, workspace, projec
     # Lifecycle credentials and separately authenticated server staging are
     # not creative intent. Retain the entire H3 plan, authored media paths,
     # prompt partitioning and sampling settings.
-    ignored = {"_maestro_session_id", "_maestro_access_policy", "_director_detached_operation",
-               "_director_repair_operation_id", "_director_video_lora_parent_snapshot",
-               "_director_video_lora_child_snapshot", "_director_video_lora_task_plans", "_director_video_lora_task_inventory",
-               "_director_video_lora_native_plans", "_director_video_lora_preparation_plans", "_director_video_lora_consumption_plans",
-               H3_OFFLOAD_PLAN_PARAM_KEY, "_h3_lightx2v_identity",
-               "_h3_rerun_input", "_h3_rerun_predecessor_path"}
-    requested = {key: value for key, value in params.items() if key not in ignored}
+    requested = _director_video_lora_requested_params(params)
     return json.loads(json.dumps({
         "version": 1, "pipeline_id": pipeline_id, "unit": unit, "scope": scope,
         "parent_digest": params["_director_video_lora_parent_snapshot"]["digest"],
@@ -6519,10 +6526,12 @@ def _retain_director_video_lora_record(job, child_snapshot, task_index, field, b
         candidate = write_sealed_request_manifest(job["out_dir"], job_id=job["id"],
             params=successor, inputs=manifest["inputs"])
         job["_director_video_lora_task_retention_pending"]["candidate"] = candidate
-        if not checkpoint_director_execution_manifest(job,
-                expected_execution_attempt=attempt, expected_request_manifest=pointer,
-                request_manifest=candidate, params=successor):
-            raise QueueRecoveryRuntimeError("Director retention was not acknowledged.")
+        from services.native_acceptance_reservation import reservation
+        with reservation.director_manifest_checkpoint(job, pointer, candidate, successor_params=successor):
+            if not checkpoint_director_execution_manifest(job,
+                    expected_execution_attempt=attempt, expected_request_manifest=pointer,
+                    request_manifest=candidate, params=successor):
+                raise QueueRecoveryRuntimeError("Director retention was not acknowledged.")
         job.pop("_director_video_lora_task_retention_pending", None)
         return copy.deepcopy(record)
 
@@ -7451,6 +7460,19 @@ def _build_director_video_lora_consumer(job, child_snapshot, task_index, task_re
     return consumer
 
 
+def _director_video_lora_creative_binding(binding):
+    """Project only server accounting metadata out of a validated child seal.
+
+    Historical seals remain byte-for-byte intact. Account lineage is admitted
+    separately by the credit path and retained in the signed request manifest;
+    it can be stamped after creative admission without changing that intent.
+    """
+    projected = dict(binding)
+    projected["requested"] = {key: value for key, value in binding["requested"].items()
+                              if key not in _CREDIT_INTERNAL_PARAMS}
+    return projected
+
+
 def _admit_director_video_lora_child(params, *, pipeline_id, workspace, project_dir, session_id, unit):
     key = "_director_video_lora_child_snapshot"
     if "_director_video_lora_parent_snapshot" not in params:
@@ -7461,8 +7483,16 @@ def _admit_director_video_lora_child(params, *, pipeline_id, workspace, project_
         workspace=workspace, project_dir=project_dir, session_id=session_id, unit=unit)
     expected = {"binding": binding, "digest": _project_reference_private_commitment(binding)}
     if key in params:
-        if params[key] != expected:
+        retained = params[key]
+        if (not isinstance(retained, dict) or set(retained) != {"binding", "digest"}
+                or not isinstance(retained.get("binding"), dict)
+                or not isinstance(retained["binding"].get("requested"), dict)
+                or not isinstance(retained.get("digest"), str)
+                or not hmac.compare_digest(retained["digest"],
+                    _project_reference_private_commitment(retained["binding"]))
+                or _director_video_lora_creative_binding(retained["binding"]) != binding):
             raise ValueError("Retained Director video LoRA child intent changed")
+        return retained
     else:
         params[key] = expected
     return expected
@@ -7521,7 +7551,9 @@ def _require_director_video_lora_child_manifest(existing, incoming):
     validate_manifest_inputs(manifest, lambda descriptor: _queue_recovery_manifest_validator(
         dict(descriptor), owner_digest=scope["owner_digest"], workspace=incoming["workspace"],
         project_dir=existing["out_dir"]))
-    if retained != expected or manifest["params"].get(key) != expected:
+    if (_director_video_lora_creative_binding(retained["binding"])
+            != _director_video_lora_creative_binding(expected["binding"])
+            or manifest["params"].get(key) != retained):
         raise ValueError("Director child manifest contains a different LoRA intent")
 
 
@@ -7962,7 +7994,10 @@ def _director_recovery_submit_child(
                     ) from error
             existing["session_id"] = session_id
             existing["access_policy"] = dict(job.get("access_policy") or {})
-            held = existing.get("_recovery_original_held") is True
+            # Reauthorization is not a Queue release. Fresh held children may
+            # have no restoration-only marker yet; preserve their actual hold.
+            held = (existing.get("queue_held") is True
+                    or existing.get("_recovery_original_held") is True)
             _queue_recovery_checkpoint(
                 existing,
                 status="queued",
@@ -8280,6 +8315,85 @@ def _director_recovery_verified_child(job: dict, project_dir: str) -> dict | Non
         "artifacts": evidence,
         **style_evidence,
     }
+
+
+def _director_recovery_exhausted_video_context(project_dir, pid, state):
+    """Read immutable original lineage without minting replacement admission."""
+    from services.job_lifecycle import exhausted_director_original_failed
+    from services.native_acceptance_reservation import digest, job_identity
+    from services.director_pipeline import _child_unit_token, _director_child_job_id, pipeline_state_filename
+    parent = _director_recovery_parents.get(pid)
+    workspace = str(state.get("workspace") or "default")
+    if (state.get("status") != "failed" or state.get("pipeline_id") != pid
+            or not isinstance(parent, dict) or parent.get("workspace") != workspace
+            or state.get("created_at") != parent.get("created_at")
+            or (parent.get("recovery_cursor") or {}).get("delete_pending")
+            or os.path.realpath(_existing_workspace_dir(workspace)) != os.path.realpath(project_dir)
+            or not hmac.compare_digest(_queue_recovery_existing_project_identity(project_dir),
+                str(parent.get("_recovery_project_digest") or ""))):
+        raise ValueError("Original video project changed")
+    cursor = copy.deepcopy(parent.get("recovery_cursor") or {})
+    sealed, _, pending = _load_director_recovery_cursor_state(project_dir,
+        pipeline_state_filename(pid), cursor)
+    if pending or not isinstance(sealed, dict) or digest(sealed) != digest(state):
+        raise ValueError("Original video parent checkpoint changed")
+    parent_identity = job_identity(parent)
+    scope = {"project_id": workspace, "workspace_id": "main",
+        "project_instance": parent["_recovery_project_digest"], "owner_digest": parent["_recovery_owner_digest"]}
+    snapshot = state.get("_params_snapshot") or {}
+    parent_binding = _validate_director_video_lora_parameters(snapshot, current_scope=scope)
+    unit = {"kind": "video_generation", "variant": 0, "index": 0}
+    token = _child_unit_token(unit)
+    entry = ((state.get("recovery") or {}).get("children") or {}).get(token)
+    job_id = _director_child_job_id(pid, unit, 0)
+    job = _jobs.get(job_id)
+    if (not isinstance(entry, dict) or entry.get("unit") != unit
+            or any(type(entry["unit"].get(key)) is not int for key in ("index", "variant"))
+            or entry.get("attempt") != 0
+            or type(entry.get("attempt")) is not int or entry.get("job_id") != job_id
+            or entry.get("state") not in {"submitted", "failed"} or entry.get("evidence")
+            or not isinstance(job, dict) or job.get("workspace") != workspace
+            or os.path.realpath(job.get("out_dir") or "") != os.path.realpath(project_dir)
+            or not exhausted_director_original_failed(job, active_states=_active_gen_states,
+                recovery_limit=MAX_RECOVERY_ATTEMPTS)):
+        raise ValueError("Original video is not exhausted with released custody")
+    identity = job_identity(job)
+    if any(identity[key] != parent_identity[key] for key in (
+            "project_instance_sha256", "owner_principal_sha256")):
+        raise ValueError("Original video owner or project changed")
+    manifest = load_request_manifest(project_dir, job["_recovery_manifest_pointer"], expected_job_id=job_id)
+    params = job.get("params") or {}
+    if manifest["params"] != params:
+        raise ValueError("Original video manifest changed")
+    validate_manifest_inputs(manifest, lambda descriptor: _queue_recovery_manifest_validator(dict(descriptor),
+        owner_digest=parent["_recovery_owner_digest"], workspace=workspace, project_dir=project_dir))
+    child_seal = params.get("_director_video_lora_child_snapshot")
+    binding = child_seal.get("binding") if isinstance(child_seal, dict) else None
+    if (not isinstance(binding, dict) or set(child_seal) != {"binding", "digest"}
+            or not isinstance(child_seal["digest"], str)
+            or not hmac.compare_digest(child_seal["digest"], _project_reference_private_commitment(binding))
+            or binding.get("pipeline_id") != pid or binding.get("unit") != unit
+            or binding.get("scope") != scope or binding.get("parent_digest") != snapshot["_director_video_lora_snapshot"]["digest"]
+            or params.get("_director_video_lora_parent_snapshot") != snapshot["_director_video_lora_snapshot"]
+            or _director_video_lora_creative_binding(binding)["requested"] != _director_video_lora_requested_params(params)
+            or params.get("activated_loras") != parent_binding["activated_loras"]
+            or params.get("loras_multipliers", "") != parent_binding["loras_multipliers"]
+            or params.get("lora_parameters", {}) != parent_binding["lora_parameters"]):
+        raise ValueError("Original video immutable LoRA admission changed")
+    terminal = {"version": 1, "identity": identity, "execution_attempt": job["execution_attempt"],
+        "recovery_attempt": job["recovery_attempt"], "manifest_sha256": digest(job["_recovery_manifest_pointer"]),
+        "params_sha256": digest(params), "child_digest": child_seal["digest"], "outcome": "failed"}
+    if (entry.get("state") == "failed" and entry.get("terminal") != terminal
+            or _jobs.get(job_id) is not job or job_identity(job) != identity
+            or _director_recovery_parents.get(pid) is not parent or job_identity(parent) != parent_identity
+            or parent.get("recovery_cursor") != cursor
+            or digest(job.get("params")) != terminal["params_sha256"]
+            or not exhausted_director_original_failed(job, active_states=_active_gen_states,
+                recovery_limit=MAX_RECOVERY_ATTEMPTS)):
+        raise ValueError("Original video terminal lineage changed")
+    return {"original_terminal": {"token": token, "entry_sha256": digest(entry), "terminal": terminal},
+        "owner_project": {key: parent_identity[key] for key in (
+            "project_instance_sha256", "owner_principal_sha256")}}
 
 
 def _director_recovery_validate_child(
@@ -10283,7 +10397,8 @@ def _queue_recovery_materialize_job(
     # Classify from both cursors before normalization discards failed units or
     # old failure envelopes. A negative ordinary classification stays durable.
     ordinary_request = (
-        runtime.get("kind") == "studio_generation"
+        (runtime.get("kind") == "studio_generation"
+         or _h3_director_original_restart_intent(runtime))
         and isinstance(runtime_params, dict)
         and runtime_params.get("model_type") == "minimax_h3"
         and not runtime_params.get("_h3_longform")
@@ -14603,6 +14718,39 @@ def _h3_ordinary_oom_hold(job: dict) -> bool:
     )
 
 
+def _h3_director_original_restart_intent(job: dict) -> bool:
+    """Recognize a sealed single original video; never a replacement repair."""
+    from services.director_pipeline import _normalized_child_unit, _director_child_job_id
+    from services.job_lifecycle import director_submitted_original_video_intent
+    if not director_submitted_original_video_intent(job):
+        return False
+    params = job.get("params")
+    if not isinstance(params, dict):
+        return False
+    snapshot = params.get("_director_video_lora_child_snapshot")
+    if (job.get("kind") != "director_child" or not isinstance(snapshot, dict)
+            or set(snapshot) != {"binding", "digest"}
+            or not isinstance(snapshot.get("binding"), dict)
+            or not isinstance(snapshot.get("digest"), str)):
+        return False
+    binding = snapshot["binding"]
+    unit = binding.get("unit")
+    pid = params.get("_director_pipeline_id")
+    identity = re.fullmatch(r"director-" + re.escape(str(pid)) + r"-(0|[1-9][0-9]{0,8})-[0-9a-f]{24}", str(job.get("id") or ""))
+    try:
+        return (isinstance(pid, str) and bool(pid) and identity is not None
+            and isinstance(unit, dict) and _normalized_child_unit(unit) == unit
+            and type(unit.get("index")) is int and type(unit.get("variant")) is int
+            and unit == {"kind": "video_generation", "index": 0, "variant": 0}
+            and binding.get("pipeline_id") == pid
+            and identity[1] == "0" and job["id"] == _director_child_job_id(pid, unit, 0)
+            and hmac.compare_digest(snapshot["digest"], _project_reference_private_commitment(binding))
+            and not any(params.get(key) for key in (
+                "_director_video_lora_preparation_plans", "_director_video_lora_consumption_plans")))
+    except (TypeError, ValueError, KeyError):
+        return False
+
+
 def _h3_ordinary_restart_allowed(job: dict) -> bool:
     """Recognize an evidence-free whole clip, never a resumable prefix.
 
@@ -14612,17 +14760,20 @@ def _h3_ordinary_restart_allowed(job: dict) -> bool:
     """
     params = job.get("params")
     cursor = job.get("recovery_cursor")
+    director = _h3_director_original_restart_intent(job)
+    from services.job_lifecycle import held_director_recovery_retry_allowed
+    retained_director_hold = director and held_director_recovery_retry_allowed(job)
     if (
-        job.get("kind") != "studio_generation"
+        (job.get("kind") != "studio_generation" and not director)
         or not isinstance(params, dict)
         or params.get("model_type") != "minimax_h3"
         or job.get("cancel_requested")
         or job.get("status") not in {"queued", "running", "failed"}
-        or job.get("_recovery_reason_code") not in {
+        or (job.get("_recovery_reason_code") not in {
             None, "", "h3_generation_recovery_authorization_required",
             "h3_ordinary_restart_required", "generation_failed",
             "owner_reauthentication_required", "worker_start_failed",
-        }
+        } and not (job.get("_recovery_reason_code") == "recovery_unavailable" and retained_director_hold))
         or type(job.get("execution_attempt")) is not int
         or job["execution_attempt"] < 1
         or type(job.get("recovery_attempt", 0)) is not int
@@ -14637,14 +14788,14 @@ def _h3_ordinary_restart_allowed(job: dict) -> bool:
             "image_creator_loras", "image_editor_loras",
         ))
         or job.get("_recovery_final_adoption") is not None
-        or job.get("recovery_unit") is not None
+        or (job.get("recovery_unit") is not None and not director)
         or cursor.get("completed_units") != []
         or type(cursor.get("ordinary_repeat_offset", 0)) is not int
         or cursor.get("ordinary_repeat_offset", 0) != 0
         or any(value for key, value in cursor.items()
                if key not in {"completed_units", "ordinary_repeat_offset"})
         or any(job.get(key) for key in (
-            "parent_job_id", "recovery_unit", "output_files", "artifact_files",
+            "parent_job_id", "output_files", "artifact_files",
             "clip_output_files", "join_output_file", "_recovery_final_adoption",
             "h3_delivery_recovery_control", "_recovery_completed_h3_graph",
             "_h3_delivery_publication",
@@ -14658,7 +14809,7 @@ def _h3_ordinary_restart_allowed(job: dict) -> bool:
             "h3_native_boundary_conditioning", "video_source",
             "_continuation", "_ref2va_continuation", "_defer_output_publication",
             "delivery_resolution",
-        ))
+        ) if not director or key not in {"_director_pipeline_id", "_director_final_video_postprocess"})
         or job.get("oom_info") is not None
         or job.get("resource_retry_reason") == "generation_oom"
     ):
@@ -18198,6 +18349,7 @@ def _init_pipeline():
             recovery_submit_child=_director_recovery_submit_child,
             recovery_verify_child=_director_recovery_verified_child,
             recovery_validate_child=_director_recovery_validate_child,
+            recovery_exhausted_video_context=_director_recovery_exhausted_video_context,
             recovery_prepare_h3_scene_rerun=_director_recovery_prepare_h3_scene_rerun,
             runtime_admission=_director_recovery_runtime_admission,
             video_lora_child_admission=_admit_director_video_lora_child,
@@ -48115,6 +48267,7 @@ def _require_director_recovery_parent_access(
     *,
     revalidate_inputs: bool,
     allow_blocked: bool = False,
+    read_only: bool = False,
 ) -> bool | dict:
     """Authorize a journal-known parent without permitting legacy fallback."""
     parent = _director_recovery_parents.get(pid)
@@ -48135,9 +48288,8 @@ def _require_director_recovery_parent_access(
         request_owner = owner_principal_digest(
             _session_secret(), request.state.maestro_session_id,
         )
-        current_project = _queue_recovery_project_identity(
-            workspace, project_dir,
-        )
+        current_project = (_queue_recovery_existing_project_identity(project_dir) if read_only
+            else _queue_recovery_project_identity(workspace, project_dir))
     except (ValueError, QueueRecoveryAdapterError):
         raise HTTPException(status_code=404, detail="Pipeline not found")
     if (
@@ -48164,7 +48316,8 @@ def _require_director_recovery_parent_access(
         if cursor.get("delete_pending") and not os.path.isfile(
             os.path.join(project_dir, state_filename)
         ):
-            _director_recovery_remove_parent(pid, project_dir)
+            if not read_only:
+                _director_recovery_remove_parent(pid, project_dir)
             raise HTTPException(status_code=404, detail="Pipeline not found")
         sealed_state, sealed_descriptor, used_pending = (
             _load_director_recovery_cursor_state(
@@ -48201,6 +48354,8 @@ def _require_director_recovery_parent_access(
                 project_dir=project_dir,
             ),
         )
+        if used_pending and read_only:
+            raise QueueRecoveryRuntimeError("Director checkpoint is awaiting reconciliation")
         if used_pending:
             _director_recovery_checkpoint_parent(
                 pid, sealed_state, dict(sealed_descriptor or {}),
@@ -48215,7 +48370,16 @@ def _require_director_recovery_parent_access(
                 "inputs changed."
             ),
         )
-    return sealed_state
+    if read_only:
+        return sealed_state
+    from services.director_pipeline import normalize_saved_pipeline_repair
+    try:
+        return normalize_saved_pipeline_repair(project_dir, pid, sealed_state)
+    except (OSError, ValueError, RuntimeError) as error:
+        if allow_blocked:
+            return False
+        raise HTTPException(status_code=409,
+            detail="Director changed while checking repair status. Read it again before continuing.") from error
 
 
 def _require_live_pipeline(request: Request, pid: str) -> dict:
@@ -48264,6 +48428,8 @@ def _require_live_pipeline(request: Request, pid: str) -> dict:
             pid,
             "Recovery inputs changed; manual repair is required.",
         ) or pipeline
+    if isinstance(recovery_valid, dict) and isinstance(recovery_valid.get("repair"), dict):
+        pipeline["repair"] = copy.deepcopy(recovery_valid["repair"])
     return pipeline
 
 
@@ -48293,6 +48459,7 @@ def _require_saved_pipeline(
     request: Request,
     pid: str,
     workspace: str,
+    *, read_only: bool = False,
 ) -> tuple[dict, str]:
     """Authorize one direct-child saved pipeline in an explicit project."""
     from services.director_pipeline import pipeline_state_filename
@@ -48308,7 +48475,8 @@ def _require_saved_pipeline(
         workspace,
         out_dir,
         revalidate_inputs=True,
-        allow_blocked=True,
+        allow_blocked=not read_only,
+        read_only=read_only,
     )
     if isinstance(recovery_state, dict):
         state = recovery_state
@@ -49611,6 +49779,48 @@ async def rerun_pipeline_clip_image(pid: str, clip_index: int, request: Request)
         return _director_action_failure_response()
     finally:
         _end_workspace_operation(selected_workspace)
+
+
+@api.get("/api/v1/director/pipelines/{pid}/clips/{clip_index}/rerun-video/prepare")
+async def prepare_pipeline_clip_video(pid: str, clip_index: int, request: Request, workspace: str = ""):
+    """Inspect one retained H3 rerun; this observation cannot submit it."""
+    selected_workspace = _request_project_workspace(request, workspace)
+    _init_pipeline()
+    from services.director_pipeline import (
+        PipelineBusyError, inspect_saved_clip_video_request, scrub_director_public_credentials,
+    )
+    state, base = _require_saved_pipeline(request, pid, selected_workspace, read_only=True)
+    _revalidate_saved_director_runtime(request, copy.deepcopy(state))
+    if state.get("video_model") != "minimax_h3" or len(state.get("clips") or []) != 1 or clip_index != 0:
+        raise HTTPException(status_code=400, detail="Read-only rerun preparation supports one retained H3 story clip")
+    try:
+        prepared = await upload_usage.to_thread(
+            inspect_saved_clip_video_request, base, pid, clip_index, state=state)
+    except PipelineBusyError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    except ValueError as error:
+        raise HTTPException(status_code=400,
+            detail="Saved H3 rerun preparation is unavailable. Reconcile its retained attempt and sealed inputs before submitting.") from error
+    except Exception:
+        return _director_action_failure_response()
+    generated = scrub_director_public_credentials(prepared["request"])
+    def public_request(value):
+        if isinstance(value, dict):
+            return {key: public_request(item) for key, item in value.items() if not key.startswith("_")}
+        if isinstance(value, list):
+            return [public_request(item) for item in value]
+        return value
+    response = {
+        "pipeline_id": pid, "clip_index": clip_index, "workspace": selected_workspace,
+        "generated_request": _redact_local_paths(public_request(generated)),
+        "unit": prepared["unit"], "generated_request_sha256": prepared["generated_request_sha256"],
+        "input_seal_sha256": prepared["input_seal_sha256"],
+        "submission_endpoint": f"/api/v1/director/pipelines/{pid}/clips/{clip_index}/rerun-video",
+        "idempotency": False,
+    }
+    if "original_terminal_sha256" in prepared:
+        response["original_terminal_sha256"] = prepared["original_terminal_sha256"]
+    return response
 
 
 @api.post("/api/v1/director/pipelines/{pid}/clips/{clip_index}/rerun-video")
@@ -79526,7 +79736,9 @@ def _run_generation(
                                         # consumption and durable output seals.
                                         filtered_params["_maestro_director_lora_guard"] = director_native_consumer
                                         filtered_params["_maestro_director_repeat_output"] = _retain_director_repeat_output
-                                    if admitted_params.get("lora_parameters") or "_studio_lora_parameter_snapshot" in admitted_params:
+                                    if director_lora_snapshot is None and (
+                                            admitted_params.get("lora_parameters")
+                                            or "_studio_lora_parameter_snapshot" in admitted_params):
                                         lora_binding = _validate_studio_image_lora_parameters(admitted_params)
                                         if lora_binding["generation_mode"] == "video":
                                             _validate_studio_video_lora_native(filtered_params, lora_binding)
@@ -79578,6 +79790,15 @@ def _run_generation(
                                                 update_job(job, message="Stopping generation…", phase="Stopping generation")
                                                 while not reap_owned_after_failure(error):
                                                     time.sleep(1)
+                                                error.exit_code = error.process.returncode
+                                            # The transport validates this bounded
+                                            # metadata. Keep the native cause in the
+                                            # operator log without worker text,
+                                            # prompts, paths or runtime configuration.
+                                            print("[Director native] " + json.dumps({
+                                                "worker_failure": error.worker_failure,
+                                                "exit_code": error.exit_code,
+                                            }, sort_keys=True, allow_nan=False))
                                             raise
                                     nonlocal completion_model_type
                                     completion_model_type = call_model
@@ -83232,12 +83453,16 @@ def _queue_recovery_reason_code(job: dict) -> str | None:
     if _h3_ordinary_oom_hold(job):
         return "recovery_unavailable"
     explicit = str(job.get("_recovery_reason_code") or "")
+    if explicit == "recovery_unavailable" and _h3_ordinary_restart_allowed(job):
+        from services.job_lifecycle import held_director_recovery_retry_allowed
+        if held_director_recovery_retry_allowed(job):
+            return "h3_ordinary_restart_required"
     if explicit in _QUEUE_RECOVERY_REASON_TEXT:
         return explicit
     if explicit:
         return "recovery_unavailable"
     state = str(job.get("recovery_state") or "")
-    if failed and state in {"", "terminal"}:
+    if failed and state in {"", "terminal", "retrying"}:
         return "generation_failed"
     if state == "blocked_preparation":
         return "preparation_must_resubmit"
@@ -83279,7 +83504,7 @@ def _public_queue_recovery_metadata(job: dict) -> dict:
             actions = ["resume"]
         elif (
             state == "blocked"
-            or (state in {"", "terminal"} and str(job.get("status") or "") == "failed")
+            or (state in {"", "terminal", "retrying"} and str(job.get("status") or "") == "failed")
         ) and reason in {
             "input_missing_or_changed", "worker_start_failed",
             "h3_generation_recovery_authorization_required",
@@ -83305,7 +83530,8 @@ def _public_queue_recovery_metadata(job: dict) -> dict:
     }
     supervised_hold = (
         job.get("_native_acceptance_manual_recovery") is True
-        and job.get("status") == "queued" and job.get("queue_held") is True
+        and (job.get("status") == "failed"
+             or job.get("status") == "queued" and job.get("queue_held") is True)
     )
     public["recovery_requires_gpu_reservation"] = supervised_hold
     if supervised_hold:
@@ -85811,7 +86037,7 @@ def _resume_recovered_job(
             else "resume" if state == "blocked" and legal_resume
             else "retry" if state == "blocked"
             else "retry" if (
-                state in {"", "terminal"}
+                state in {"", "terminal", "retrying"}
                 and str(job.get("status") or "") == "failed"
                 and requested_action == "retry"
             )
@@ -85897,6 +86123,17 @@ def _resume_recovered_job(
                 "recovery_attempt": attempt, "recovery_state": "restored",
                 "reruns_denoise": False,
             }
+        from services.job_lifecycle import held_director_recovery_retry_allowed
+        held_director_retry = (held_director_recovery_retry_allowed(job)
+            and _h3_ordinary_restart_allowed(job))
+        if held_director_retry:
+            try:
+                admitted = dict(job, session_id=request.state.maestro_session_id)
+                _validate_director_video_lora_child_job(admitted)
+            except (ValueError, TypeError, QueueRecoveryRuntimeError) as error:
+                raise HTTPException(status_code=409,
+                    detail="The retained Director video intent cannot be retried safely") from error
+            reason = "h3_ordinary_restart_required"
         _require_native_supervised_job_release(job)
         if reason == "h3_ordinary_restart_required" and not (
             job.get("status") == "queued" and job.get("queue_held") is True
@@ -86021,13 +86258,23 @@ def _resume_recovered_job(
             if "processed_tool_completion_retry" in retry_updates["recovery_cursor"]:
                 reruns_denoise = False
                 retry_updates["reruns_denoise"] = False
-        if str(job.get("status") or "") == "failed":
-            committed = retry_failed_recovery_job(
-                job,
-                expected_execution_attempt=job.get("execution_attempt", 1),
-                expected_recovery_attempt=attempt - 1,
-                **retry_updates,
-            )
+        if str(job.get("status") or "") == "failed" or held_director_retry:
+            from services.native_acceptance_reservation import NativeAcceptanceReserved, reservation
+            try:
+                with reservation.failed_recovery_retry(job, held_director=held_director_retry) as supervised:
+                    if supervised:
+                        retry_updates["_native_acceptance_manual_recovery"] = True
+                    committed = retry_failed_recovery_job(
+                        job,
+                        expected_execution_attempt=job.get("execution_attempt", 1),
+                        expected_recovery_attempt=attempt - 1,
+                        held_director=held_director_retry,
+                        **retry_updates,
+                    )
+                    if not committed:
+                        raise HTTPException(status_code=409, detail="Recovery was cancelled")
+            except NativeAcceptanceReserved as error:
+                raise HTTPException(status_code=409, detail=str(error)) from error
         else:
             committed = _queue_recovery_checkpoint(
                 job, status="queued", **retry_updates,

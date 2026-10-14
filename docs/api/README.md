@@ -479,6 +479,40 @@ reconcile. Saved pipeline tags, repairs, reruns and rejoin use `/director/pipeli
 routes. Repair state is not a generation status. Direct start/rerun operations
 without an admission receipt must not be blindly retried after a timeout.
 
+For the currently supported one-clip H3 story shapes, inspect
+`GET /api/v1/director/pipelines/{pid}/clips/0/rerun-video/prepare?workspace=...`
+first. This read-only operation invokes the production builder and validates
+its sealed starting image; it creates no job, intent, output or model load.
+`generated_request` shows the derived public controls. Its hashes are current
+observations, not execution authority or idempotency keys. Preparation currently
+supports a cancelled pipeline with a retained editor image, or a failed
+supervised LoRA original whose retries are exhausted and custody is released.
+Other shapes return a state or unsupported error. Preparation does not promise
+that the request will still be admissible when submitted.
+
+Read the derived controls with the authenticated Python client from setup:
+
+```python
+from urllib.parse import quote
+
+prepared = maestro.request(
+    "GET",
+    f"/api/v1/director/pipelines/{quote(pipeline_id, safe='')}/clips/0/rerun-video/prepare",
+    query={"workspace": project_id},
+)
+print(prepared["generated_request"], prepared["unit"])
+# Review these controls and current model readiness before the separate POST.
+```
+
+The same read is available through the generated TypeScript operation reference
+and MCP's discovered operation tools. Neither returns private execution seals.
+
+For an exhausted original, a supported rerun creates a distinct child and
+atomically retains the original failure alongside the new intent. It does not
+reset the original attempts or regenerate the accepted starting image. The
+rerun builder derives frames and window size from the saved clip plan, so its
+request can differ from the original generation; inspect those values first.
+
 For an ordinary saved clip video rerun, POST the explicit `workspace` and an
 optional `prompt` to `/api/v1/director/pipelines/{pid}/clips/{clip_index}/rerun-video`.
 The successful response includes the actual child `job_id` and output

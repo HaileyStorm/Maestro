@@ -14013,5 +14013,179 @@
       "operation_kind": "llm_legacy_stream_status",
       "mcp": true
     }
+  },
+  {
+    "method": "GET",
+    "path": "/api/v1/director/pipelines/{pid}/clips/{clip_index}/rerun-video/prepare",
+    "summary": "Prepare a saved Director clip video without execution",
+    "description": "Read the initialized production rerun builder and sealed start-image dependency without creating a job, repair intent, model load or output. Currently supports clip zero of one ordinary H3 short_film_story: a cancelled retained editor-image pipeline, or a failed supervised LoRA original at its exhausted retry limit with released custody and unchanged sealed lineage. Other shapes return an unsupported/state error; this does not establish complete rerun parity. The subsequent POST creates a distinct child and never resets the exhausted original. Hashes observe current inputs; they are not authority, reservations or mutation replay tokens. Actual execution still needs normal project/session/model/terms/resource checks and fresh GPU authority.",
+    "parameters": [
+      {
+        "name": "pid",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string"
+        }
+      },
+      {
+        "name": "clip_index",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "description": "Current preparation supports clip zero only."
+      },
+      {
+        "name": "workspace",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "string",
+          "default": ""
+        },
+        "description": "Explicit authorized project recommended; empty uses existing session project-resolution rules."
+      }
+    ],
+    "responses": {
+      "200": {
+        "description": "Read-only controls and opaque current-input observations. No execution occurred.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "pipeline_id",
+                "clip_index",
+                "workspace",
+                "generated_request",
+                "unit",
+                "generated_request_sha256",
+                "input_seal_sha256",
+                "submission_endpoint",
+                "idempotency"
+              ],
+              "properties": {
+                "pipeline_id": {
+                  "type": "string"
+                },
+                "clip_index": {
+                  "type": "integer",
+                  "const": 0
+                },
+                "workspace": {
+                  "type": "string"
+                },
+                "generated_request": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "description": "Public controls from the production rerun builder. Execution metadata is omitted; media paths are project-scoped basenames. This observation is not a body to replay to /generate."
+                },
+                "unit": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "kind",
+                    "variant",
+                    "index"
+                  ],
+                  "properties": {
+                    "kind": {
+                      "type": "string",
+                      "const": "video_clip_rerun"
+                    },
+                    "variant": {
+                      "type": "integer",
+                      "minimum": 1
+                    },
+                    "index": {
+                      "type": "integer",
+                      "const": 0
+                    }
+                  }
+                },
+                "generated_request_sha256": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{64}$",
+                  "description": "Opaque observation of current input; not execution authority or an idempotency key. Re-read after state changes."
+                },
+                "input_seal_sha256": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{64}$",
+                  "description": "Opaque observation of current input; not execution authority or an idempotency key. Re-read after state changes."
+                },
+                "original_terminal_sha256": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{64}$",
+                  "description": "Opaque observation of current input; not execution authority or an idempotency key. Re-read after state changes."
+                },
+                "submission_endpoint": {
+                  "type": "string",
+                  "description": "Existing project-authorized POST rerun-video route; preparation creates no intent or child."
+                },
+                "idempotency": {
+                  "type": "boolean",
+                  "const": false,
+                  "description": "The subsequent POST has no caller idempotency key. This GET itself is read-only."
+                }
+              },
+              "example": {
+                "pipeline_id": "saved-story",
+                "clip_index": 0,
+                "workspace": "my-project",
+                "generated_request": {
+                  "model_type": "minimax_h3",
+                  "video_length": 121,
+                  "num_inference_steps": 4,
+                  "resolution": "864x480",
+                  "seed": -1,
+                  "image_start": "accepted-start.png"
+                },
+                "unit": {
+                  "kind": "video_clip_rerun",
+                  "variant": 1,
+                  "index": 0
+                },
+                "generated_request_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                "input_seal_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+                "submission_endpoint": "/api/v1/director/pipelines/saved-story/clips/0/rerun-video",
+                "idempotency": false
+              }
+            }
+          }
+        }
+      },
+      "default": {
+        "description": "Request rejected or operation unavailable. Preserve server authorization, consent, locality and recovery errors; do not retry an uncertain mutation with a new identity.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "detail": {},
+                "error": {},
+                "code": {
+                  "type": "string"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    "x-maestro": {
+      "feature": "director",
+      "permissions": [
+        "project.read"
+      ],
+      "boundary": "Read-only inspection uses existing saved-pipeline ownership, project/session and current runtime/terms admission. Private seals, identities, credentials and execution authority are omitted. Supported retained shapes are limited.",
+      "idempotency": "Read only. The later POST is not idempotent; observe saved recovery.video_repairs and child status after an uncertain response.",
+      "operation_kind": "director_clip_rerun_preparation",
+      "mcp": true
+    }
   }
 ]

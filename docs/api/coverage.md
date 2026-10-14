@@ -42,7 +42,7 @@ constraints. API availability is separate from native or human acceptance.
 | Director video LoRA strengths and parameters | `GET /loras/{video_model}/details`; `video_loras` on `/director/pipeline/start` or held `/director/queue` request | Exact catalog filenames and schema digests; generation scope with empty roles. Admission freezes the complete selection. Native model/scheduler support and installed readiness remain separate; see below. |
 | Director start now, save planning for later, review and continue | `/director/pipeline/start` (`hold_planning`), `/pipeline/{pid}`, `/continue`, `/stop`, `/resume` | Hold registers an empty paused pipeline without planning. Continuing may load models. Manual plan/image review and video holds remain real states. |
 | Director queues, editing, reordering, start/pause and removing entries | `/director/queue` and `/queue/{entry_id}`, `/start`, `/pause`, `/reorder` | Request ID plus project-instance scope; held queue is separate from a live pipeline and Studio Queue. |
-| Director saved history, tagging, repair, image/video reruns and rejoin | `/director/pipelines`, `/pipelines/{pid}`, clip tag/rerun routes, `/repair`, `/repair/cancel`, `/rejoin`, DELETE | Read/permission checks bind retained sources and parent identity. Uncertain reruns without a caller receipt must be reconciled from history before another submission. |
+| Director saved history, tagging, repair, image/video reruns and rejoin | `/director/pipelines`, `/pipelines/{pid}`, clip tag/rerun routes, read-only `/clips/{clip_index}/rerun-video/prepare`, `/repair`, `/repair/cancel`, `/rejoin`, DELETE | Preparation supports one-clip ordinary H3: cancelled with retained editor image, or failed exhausted supervised LoRA original with released custody. Other shapes return a documented error. A rerun creates a distinct child and preserves the original failure and accepted image. Uncertain submissions must be reconciled from saved repair history. |
 | List/create/select/lock/unlock/delete projects; manage membership | `/workspaces` and account project/member routes | Passwords, credentials, bootstrap, reauthentication, recovery codes and membership administration remain human/owner operations, excluded from MCP; ordinary project use has public operations. |
 | Project reference library: create/edit/delete assets and variants, candidate generation, quad sheet | `/projects/{project}/assets`, variant/reference-authoring/media routes, `/assets/generate`, `/character-sheet/quad` | Project/type/privacy/provenance constraints retained. Browser drag/drop and selection are presentation. No arbitrary file read. |
 | Saved visual styles: list/read/create/update/delete/resolve references and select | `/projects/{project}/visual-styles` and item/resolve routes; select public style field in generation/Director | Revision/provenance are server-owned. Image-reference capability stays unavailable until its independent native acceptance; text/style support does not imply it. |
@@ -93,6 +93,46 @@ held queue entry goes through fresh admission; continuing an admitted pipeline
 does not replace its LoRAs. Preserve the original request identity and reconcile
 it after a lost acknowledgement. Source or schema changes require a new reviewed
 selection rather than a retry with altered bindings.
+
+For a failed pipeline with one unfinished original video, Dashboard
+`POST /director/pipelines/{pid}/repair` attaches that exact held child before
+considering a replacement. It preserves the request, LoRA seal and attempt;
+`queue/{job_id}/start-next` remains the separate execution action. Read the
+same saved pipeline's `repair.operation_id` and `repair.status` to reconnect
+after an uncertain response. An active repair returns the existing operation.
+The original failed status remains historical; successful recovery completes
+the repair and adopts verified child outputs. Changed prompts, conflicting
+repairs, missing children, and unfinished batch or scene intents require
+explicit recovery rather than a duplicate submission. This contract does not
+claim native acceptance of an unfinished child.
+
+If that original child failed, or restart restored its empty ordinary H3
+attempt as queued, held and blocked, use its explicit Queue `recovery-retry`
+action only after resolving the reported prerequisite. The held ordinary
+single-clip retry preserves the original request and retained seed; it does
+not substitute a calibrated scene recipe. Its execution and recovery counters
+advance together before a worker starts. A supervised retry needs a
+fresh reservation for the same job and its next execution/recovery counters;
+the reservation permits one committed transition. Dashboard repair can then
+attach the authorized queued or running retry, or adopt its verified completion.
+Keep the returned job ID and repair operation ID. An uncertain retry response
+must be reconciled through status; never repeat it to obtain a new attempt.
+Earlier task plans and seeds remain retained intent; preparation, consumption
+and output evidence must come from the actual new execution.
+Once the original retries are exhausted, `recovery-retry` is unavailable. The
+supported saved-video preparation/rerun path creates a distinct replacement
+while retaining the exhausted original and its counters. It requires released
+custody and the current sealed start image; it never resets the retry limit.
+An authenticated read reports a saved active Repair as interrupted when its
+worker was lost during restart. The historical operation ID remains available;
+starting Repair reconnects through the existing saved-state path.
+
+Completed Director children can retire from the live Queue during normal
+compaction. Reconnect with the saved pipeline operation and inspect its clips,
+outputs and recovery actions. The saved parent keeps verified artifact seals;
+a missing completed child in Queue does not mean its output was cancelled or
+that it should be submitted again. Continue validates retained images through
+the production recovery path before reusing them.
 
 Native execution is distinct from parameter discovery. Wan has an installed
 schedule callback; ordinary H3 now applies the retained schedule to its actual

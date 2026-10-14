@@ -9,6 +9,7 @@ descendants from its owned session/group. No payload or worker output is logged.
 from __future__ import annotations
 
 import base64
+import builtins
 import json
 import math
 import os
@@ -28,13 +29,59 @@ AUTHORITY_INTERVAL = 1.0
 AUTHORITY_DEADLINE = 4.0
 DRAIN_SECONDS = 5.0
 WORKER_FD_ENV = "MAESTRO_NATIVE_WORKER_FD"
+FAILURE_STAGES = frozenset({
+    "bootstrap", "validate_packet", "parent_watch", "consumer_binding", "private_runtime",
+    "wgp_import", "runtime_binding", "generation", "model_release", "finish", "cleanup",
+})
+_TRUSTED_FAILURE_FILES = frozenset({"director_native_process.py", "director_native_generation.py"})
+
+
+def _failure_record(stage, exc, trusted_source):
+    source = None
+    trusted = Path(trusted_source).absolute()
+    if trusted.parent == Path(__file__).absolute().parent and trusted.name in _TRUSTED_FAILURE_FILES:
+        frame = exc.__traceback__
+        for _ in range(128):
+            if frame is None:
+                break
+            code = frame.tb_frame.f_code
+            if (Path(code.co_filename).absolute() == trusted and code.co_name.isascii()
+                    and code.co_name.isidentifier() and len(code.co_name) <= 128):
+                source = {"basename": trusted.name, "function": code.co_name, "line": frame.tb_lineno}
+            frame = frame.tb_next
+    cls = type(exc)
+    exception_type = cls.__name__ if getattr(builtins, cls.__name__, None) is cls else "Exception"
+    if cls is NativeProcessError:
+        exception_type = "NativeProcessError"
+    return {"stage": stage, "exception_type": exception_type, "source": source}
+
+
+def _validate_failure(record):
+    if (type(record) is not dict or set(record) != {"stage", "exception_type", "source"}
+            or type(record["stage"]) is not str or record["stage"] not in FAILURE_STAGES
+            or type(record["exception_type"]) is not str):
+        raise NativeProcessError("invalid_worker_failure")
+    name = record["exception_type"]
+    cls = getattr(builtins, name, None)
+    if name != "NativeProcessError" and (not isinstance(cls, type) or not issubclass(cls, BaseException)):
+        raise NativeProcessError("invalid_worker_failure")
+    source = record["source"]
+    if source is not None and (type(source) is not dict or set(source) != {"basename", "function", "line"}
+            or type(source["basename"]) is not str or source["basename"] not in _TRUSTED_FAILURE_FILES
+            or type(source["function"]) is not str or not source["function"].isascii()
+            or not source["function"].isidentifier() or len(source["function"]) > 128
+            or type(source["line"]) is not int or not 0 < source["line"] <= 1_000_000):
+        raise NativeProcessError("invalid_worker_failure")
+    return record
 
 
 class NativeProcessError(RuntimeError):
     """Content-free transport failure; do not chain private worker exceptions."""
 
-    def __init__(self, code):
+    def __init__(self, code, *, worker_failure=None, exit_code=None):
         self.code = code
+        self.worker_failure = worker_failure
+        self.exit_code = exit_code
         super().__init__(f"Director native process failed ({code})")
 
 
@@ -291,6 +338,12 @@ class Channel:
             self._terminal = True
             self.socket.shutdown(socket.SHUT_WR)
 
+    def fail(self, stage, exc, *, trusted_source):
+        with self._lock:
+            self._send("failure", "", _validate_failure(_failure_record(stage, exc, trusted_source)))
+            self._terminal = True
+            self.socket.shutdown(socket.SHUT_WR)
+
     def close(self):
         self.socket.close()
 
@@ -388,6 +441,7 @@ def run_native_process(packet, *, command, on_request, on_event, cancelled,
     parent, child = socket.socketpair()
     channel = Channel(parent, uuid.uuid4().hex, stopped)
     process = None
+    worker_failure, raised_error = None, None
 
     def fence(code, *, force=False):
         with abort_lock:
@@ -513,6 +567,9 @@ def run_native_process(packet, *, command, on_request, on_event, cancelled,
             elif kind == "request":
                 result = callback(on_request, name, payload)
                 channel._send("ack", name, {"request_seq": message["seq"], "result": result})
+            elif kind == "failure" and name == "":
+                worker_failure = _validate_failure(payload)
+                raise NativeProcessError("worker_failure", worker_failure=worker_failure)
             elif kind == "finish" and name == "":
                 result = payload
                 break
@@ -541,7 +598,8 @@ def run_native_process(packet, *, command, on_request, on_event, cancelled,
         return result
     except BaseException as exc:
         fence(exc.code if isinstance(exc, NativeProcessError) else "transport_failed", force=True)
-        raise NativeProcessError(reason[0]) from None
+        raised_error = NativeProcessError(reason[0], worker_failure=worker_failure)
+        raise raised_error from None
     finally:
         try:
             if process is not None and process.returncode is None:
@@ -582,13 +640,17 @@ def run_native_process(packet, *, command, on_request, on_event, cancelled,
                     signal_group(signal.SIGKILL)
                 except OSError:
                     pass
-                error = NativeProcessError("custody_unresolved")
+                error = NativeProcessError("custody_unresolved", worker_failure=worker_failure,
+                                           exit_code=process.returncode)
+                raised_error = error
                 error.process = process
                 with callbacks_lock:
                     error.callback_completion = [event for event in callbacks if not event.is_set()]
                 raise error from None
             raise NativeProcessError("cleanup_failed") from None
         finally:
+            if raised_error is not None and process is not None:
+                raised_error.exit_code = process.returncode
             done.set()
             channel.close()
             child.close()

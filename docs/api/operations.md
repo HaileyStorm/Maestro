@@ -226,6 +226,7 @@ See [API setup and workflows](README.md). Current server discovery controls avai
 | `repair_saved_pipeline_api_v1_director_pipelines__pid__repair_post` | `POST /api/v1/director/pipelines/{pid}/repair` | authored | True |
 | `cancel_saved_pipeline_repair_api_v1_director_pipelines__pid__repair_cancel_post` | `POST /api/v1/director/pipelines/{pid}/repair/cancel` | authored | True |
 | `rerun_pipeline_clip_image_api_v1_director_pipelines__pid__clips__clip_index__rerun_image_post` | `POST /api/v1/director/pipelines/{pid}/clips/{clip_index}/rerun-image` | authored | True |
+| `prepare_pipeline_clip_video_api_v1_director_pipelines__pid__clips__clip_index__rerun_video_prepare_get` | `GET /api/v1/director/pipelines/{pid}/clips/{clip_index}/rerun-video/prepare` | authored | True |
 | `rerun_pipeline_clip_video_api_v1_director_pipelines__pid__clips__clip_index__rerun_video_post` | `POST /api/v1/director/pipelines/{pid}/clips/{clip_index}/rerun-video` | authored | True |
 | `rejoin_pipeline_clips_api_v1_director_pipelines__pid__rejoin_post` | `POST /api/v1/director/pipelines/{pid}/rejoin` | authored | True |
 | `director_v2_plan_api_v1_director_v2_plan_post` | `POST /api/v1/director/v2/plan` | authored | True |

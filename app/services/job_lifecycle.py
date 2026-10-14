@@ -3306,24 +3306,124 @@ def checkpoint_recovery_job(
         return True
 
 
+def director_submitted_original_video_intent(job: Mapping[str, Any]) -> bool:
+    """Recognize registration metadata, not a completed native recovery unit."""
+    params = job.get("params")
+    snapshot = params.get("_director_video_lora_child_snapshot") if isinstance(params, dict) else None
+    binding = snapshot.get("binding") if isinstance(snapshot, dict) else None
+    unit = binding.get("unit") if isinstance(binding, dict) else None
+    pid = params.get("_director_pipeline_id") if isinstance(params, dict) else None
+    retained = job.get("recovery_unit")
+    return (
+        job.get("kind") == "director_child" and isinstance(pid, str) and bool(pid)
+        and isinstance(binding, dict) and binding.get("pipeline_id") == pid
+        and isinstance(unit, dict) and type(unit.get("index")) is int
+        and type(unit.get("variant")) is int
+        and unit == {"kind": "video_generation", "index": 0, "variant": 0}
+        and isinstance(retained, dict)
+        and all(type(retained.get(key)) is int for key in ("index", "variant", "attempt"))
+        and retained == {"kind": "director_child_intent", "state": "submitted",
+            "director_kind": "video_generation", "index": 0, "variant": 0, "attempt": 0}
+        and re.fullmatch(r"director-" + re.escape(pid) + r"-0-[0-9a-f]{24}", str(job.get("id") or "")) is not None
+    )
+
+
+def exhausted_director_original_failed(job, *, active_states, recovery_limit) -> bool:
+    """Prove released lifecycle custody; native drain is also a supervisor duty."""
+    with _queue_condition, _lifecycle_lock:
+        params, cursor = job.get("params"), job.get("recovery_cursor")
+        return (
+            type(recovery_limit) is int and recovery_limit > 0
+            and job.get("status") == "failed" and not is_cancel_requested(job)
+            and director_submitted_original_video_intent(job)
+            and type(job.get("execution_attempt")) is int
+            and job["execution_attempt"] == recovery_limit + 1
+            and type(job.get("recovery_attempt")) is int and job["recovery_attempt"] == recovery_limit
+            and job.get("resource_state") == "released" and job.get("_native_acceptance_manual_recovery") is True
+            and active_states is not None and job.get("id") not in active_states
+            and job.get("id") not in _registrations and id(job) not in _queue_waiters
+            and not any(job.get(key) for key in (
+                "_generation_slot_owned", "_director_saved_video_worker_active",
+                "_director_saved_image_worker_active", "_director_scene_repair_worker_active",
+                "_director_video_lora_task_retention_pending", "completion_cleanup",
+                "output_files", "clip_output_files", "artifact_files", "join_output_file", "_recovery_final_adoption"))
+            and isinstance(cursor, dict) and cursor.get("completed_units") == []
+            and cursor.get("ordinary_repeat_offset", 0) == 0
+            and isinstance(params, dict) and params.get("model_type") == "minimax_h3"
+            and params.get("_h3_longform") is None and params.get("repeat_generation", 1) == 1
+            and not any(params.get(key) for key in (
+                "_director_video_lora_preparation_plans", "_director_video_lora_consumption_plans"))
+        )
+
+
+def held_director_recovery_retry_allowed(job: Mapping[str, Any]) -> bool:
+    """Recognize an empty supervised original child parked after interruption."""
+    params = job.get("params")
+    cursor = job.get("recovery_cursor")
+    return (
+        job.get("kind") == "director_child" and job.get("status") == "queued"
+        and job.get("queue_held") is True and job.get("recovery_state") == "blocked"
+        and job.get("resource_state") == "queued"
+        and job.get("_recovery_worker_pending") is True
+        and job.get("_native_acceptance_manual_recovery") is True
+        and job.get("_recovery_reason_code") in {
+            "h3_generation_recovery_authorization_required", "h3_ordinary_restart_required",
+            "recovery_unavailable"}
+        and director_submitted_original_video_intent(job)
+        and not is_cancel_requested(job)
+        and isinstance(params, dict) and params.get("model_type") == "minimax_h3"
+        and params.get("_h3_longform") is None
+        and isinstance(params.get("_director_video_lora_child_snapshot"), dict)
+        and isinstance(cursor, dict) and cursor.get("completed_units") == []
+        and cursor.get("ordinary_repeat_offset", 0) == 0
+        and not any(job.get(key) for key in (
+            "output_files", "clip_output_files", "artifact_files", "join_output_file",
+            "_recovery_final_adoption", "_director_video_lora_task_retention_pending"))
+        and not any(params.get(key) for key in (
+            "_director_video_lora_preparation_plans", "_director_video_lora_consumption_plans"))
+        and job.get("oom_info") is None and job.get("resource_retry_reason") != "generation_oom"
+        and (job.get("failure_details") is None or (
+            isinstance(job.get("failure_details"), dict)
+            and job["failure_details"].get("is_oom") is False
+            and job["failure_details"].get("code") != "h3_output_integrity_failed"))
+    )
+
+
 def retry_failed_recovery_job(
     job: MutableMapping[str, Any],
     *,
     expected_execution_attempt: int,
     expected_recovery_attempt: int,
+    held_director: bool = False,
     **updates: Any,
 ) -> bool:
-    """Commit one owner-validated failed retry and fence its previous worker.
+    """Commit one validated failed or empty held-Director retry.
 
     The caller must validate owner/project/input/admission and the retry limit.
     Generic checkpoints still cannot revive terminal jobs.
     """
+    if type(held_director) is not bool:
+        raise ValueError("Held Director retry option must be boolean")
     if "status" in updates or "execution_attempt" in updates:
         raise ValueError("Lifecycle and execution attempt are transition-owned")
     with _queue_condition, _lifecycle_lock:
+        predecessor_fields = (
+            "id", "kind", "created_at", "workspace", "out_dir", "session_id", "params",
+            "_recovery_manifest_pointer", "_recovery_owner_digest", "_recovery_project_digest",
+            "recovery_cursor", "status", "queue_held", "resource_state", "recovery_state",
+            "_recovery_reason_code", "execution_attempt", "recovery_attempt",
+            "_native_acceptance_manual_recovery", "_recovery_worker_pending",
+            "output_files", "clip_output_files", "artifact_files", "join_output_file",
+            "recovery_unit", "_recovery_final_adoption", "_director_video_lora_task_retention_pending",
+            "failure_details", "oom_info", "resource_retry_reason",
+        )
+        predecessor = deepcopy({key: job.get(key) for key in predecessor_fields}) if held_director else None
+
         def still_failed():
             return (
-                job.get("status") == "failed"
+                ((held_director_recovery_retry_allowed(job)
+                  and predecessor == {key: job.get(key) for key in predecessor_fields})
+                 if held_director else job.get("status") == "failed")
                 and job.get(_TERMINAL_TRANSITION_MARKER) is not True
                 and job.get("kind") != SAMPLE_CAMPAIGN_JOB_KIND
                 and not is_cancel_requested(job)
