@@ -52400,9 +52400,7 @@ export const operationReference: readonly OperationReference[] = [
                 "type": "boolean"
               },
               "video_loras": {
-                "type": "object",
-                "properties": {},
-                "additionalProperties": true
+                "$ref": "#/components/schemas/DirectorVideoLoras"
               },
               "custom_visual_style_selection": {
                 "type": "object",
@@ -52464,6 +52462,41 @@ export const operationReference: readonly OperationReference[] = [
               "h3_style_workflow": {
                 "type": "string",
                 "description": "Exact server-catalog workflow ID only; no caller workflow metadata."
+              },
+              "video_params": {
+                "$ref": "#/components/schemas/DirectorRenderSettings"
+              },
+              "image_params": {
+                "$ref": "#/components/schemas/DirectorRenderSettings"
+              },
+              "shot_image_guidance": {
+                "type": "string",
+                "default": "auto",
+                "enum": [
+                  "auto",
+                  "prompt_only",
+                  "generate"
+                ],
+                "description": "Request per-shot image behavior. Models requiring start images still generate them; direct-reference models retain direct references. Optional-image models can use prompt_only. Auto uses their references when present. The effective policy is frozen at admission."
+              },
+              "director_max_shot_frames": {
+                "anyOf": [
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Optional expert H3 segment ceiling, aligned and clamped to the selected model's native frame lattice. Omit for automatic planning. It does not override resource limits or a model's minimum frames."
+              },
+              "seamless": {
+                "type": "boolean",
+                "default": true,
+                "description": "Request continuity across video shots. Compatibility is model-specific; it may require native endpoint conditioning. False keeps independent shots."
               }
             },
             "additionalProperties": true
@@ -52840,9 +52873,7 @@ export const operationReference: readonly OperationReference[] = [
                 "type": "boolean"
               },
               "video_loras": {
-                "type": "object",
-                "properties": {},
-                "additionalProperties": true
+                "$ref": "#/components/schemas/DirectorVideoLoras"
               },
               "custom_visual_style_selection": {
                 "type": "object",
@@ -52912,6 +52943,41 @@ export const operationReference: readonly OperationReference[] = [
               "h3_style_workflow": {
                 "type": "string",
                 "description": "Exact server-catalog workflow ID only; no caller workflow metadata."
+              },
+              "video_params": {
+                "$ref": "#/components/schemas/DirectorRenderSettings"
+              },
+              "image_params": {
+                "$ref": "#/components/schemas/DirectorRenderSettings"
+              },
+              "shot_image_guidance": {
+                "type": "string",
+                "default": "auto",
+                "enum": [
+                  "auto",
+                  "prompt_only",
+                  "generate"
+                ],
+                "description": "Request per-shot image behavior. Models requiring start images still generate them; direct-reference models retain direct references. Optional-image models can use prompt_only. Auto uses their references when present. The effective policy is frozen at admission."
+              },
+              "director_max_shot_frames": {
+                "anyOf": [
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Optional expert H3 segment ceiling, aligned and clamped to the selected model's native frame lattice. Omit for automatic planning. It does not override resource limits or a model's minimum frames."
+              },
+              "seamless": {
+                "type": "boolean",
+                "default": true,
+                "description": "Request continuity across video shots. Compatibility is model-specific; it may require native endpoint conditioning. False keeps independent shots."
               }
             },
             "additionalProperties": true,
@@ -53282,9 +53348,7 @@ export const operationReference: readonly OperationReference[] = [
                 "type": "boolean"
               },
               "video_loras": {
-                "type": "object",
-                "properties": {},
-                "additionalProperties": true
+                "$ref": "#/components/schemas/DirectorVideoLoras"
               },
               "custom_visual_style_selection": {
                 "type": "object",
@@ -53346,6 +53410,41 @@ export const operationReference: readonly OperationReference[] = [
               "h3_style_workflow": {
                 "type": "string",
                 "description": "Exact server-catalog workflow ID only; no caller workflow metadata."
+              },
+              "video_params": {
+                "$ref": "#/components/schemas/DirectorRenderSettings"
+              },
+              "image_params": {
+                "$ref": "#/components/schemas/DirectorRenderSettings"
+              },
+              "shot_image_guidance": {
+                "type": "string",
+                "default": "auto",
+                "enum": [
+                  "auto",
+                  "prompt_only",
+                  "generate"
+                ],
+                "description": "Request per-shot image behavior. Models requiring start images still generate them; direct-reference models retain direct references. Optional-image models can use prompt_only. Auto uses their references when present. The effective policy is frozen at admission."
+              },
+              "director_max_shot_frames": {
+                "anyOf": [
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Optional expert H3 segment ceiling, aligned and clamped to the selected model's native frame lattice. Omit for automatic planning. It does not override resource limits or a model's minimum frames."
+              },
+              "seamless": {
+                "type": "boolean",
+                "default": true,
+                "description": "Request continuity across video shots. Compatibility is model-specific; it may require native endpoint conditioning. False keeps independent shots."
               }
             },
             "additionalProperties": true,
@@ -53726,9 +53825,7 @@ export const operationReference: readonly OperationReference[] = [
                 "type": "boolean"
               },
               "video_loras": {
-                "type": "object",
-                "properties": {},
-                "additionalProperties": true
+                "$ref": "#/components/schemas/DirectorVideoLoras"
               },
               "custom_visual_style_selection": {
                 "type": "object",
@@ -53790,6 +53887,41 @@ export const operationReference: readonly OperationReference[] = [
               "h3_style_workflow": {
                 "type": "string",
                 "description": "Exact server-catalog workflow ID only; no caller workflow metadata."
+              },
+              "video_params": {
+                "$ref": "#/components/schemas/DirectorRenderSettings"
+              },
+              "image_params": {
+                "$ref": "#/components/schemas/DirectorRenderSettings"
+              },
+              "shot_image_guidance": {
+                "type": "string",
+                "default": "auto",
+                "enum": [
+                  "auto",
+                  "prompt_only",
+                  "generate"
+                ],
+                "description": "Request per-shot image behavior. Models requiring start images still generate them; direct-reference models retain direct references. Optional-image models can use prompt_only. Auto uses their references when present. The effective policy is frozen at admission."
+              },
+              "director_max_shot_frames": {
+                "anyOf": [
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Optional expert H3 segment ceiling, aligned and clamped to the selected model's native frame lattice. Omit for automatic planning. It does not override resource limits or a model's minimum frames."
+              },
+              "seamless": {
+                "type": "boolean",
+                "default": true,
+                "description": "Request continuity across video shots. Compatibility is model-specific; it may require native endpoint conditioning. False keeps independent shots."
               }
             },
             "additionalProperties": true
@@ -56904,9 +57036,7 @@ export const operationReference: readonly OperationReference[] = [
                 "type": "boolean"
               },
               "video_loras": {
-                "type": "object",
-                "properties": {},
-                "additionalProperties": true
+                "$ref": "#/components/schemas/DirectorVideoLoras"
               },
               "custom_visual_style_selection": {
                 "type": "object",
@@ -57008,6 +57138,41 @@ export const operationReference: readonly OperationReference[] = [
                 "type": "boolean",
                 "default": true,
                 "description": "False pauses after planning for prompt review and after image generation for image review. True proceeds automatically. Planning and video holds remain separate."
+              },
+              "video_params": {
+                "$ref": "#/components/schemas/DirectorRenderSettings"
+              },
+              "image_params": {
+                "$ref": "#/components/schemas/DirectorRenderSettings"
+              },
+              "shot_image_guidance": {
+                "type": "string",
+                "default": "auto",
+                "enum": [
+                  "auto",
+                  "prompt_only",
+                  "generate"
+                ],
+                "description": "Request per-shot image behavior. Models requiring start images still generate them; direct-reference models retain direct references. Optional-image models can use prompt_only. Auto uses their references when present. The effective policy is frozen at admission."
+              },
+              "director_max_shot_frames": {
+                "anyOf": [
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Optional expert H3 segment ceiling, aligned and clamped to the selected model's native frame lattice. Omit for automatic planning. It does not override resource limits or a model's minimum frames."
+              },
+              "seamless": {
+                "type": "boolean",
+                "default": true,
+                "description": "Request continuity across video shots. Compatibility is model-specific; it may require native endpoint conditioning. False keeps independent shots."
               }
             },
             "additionalProperties": true
@@ -60879,9 +61044,7 @@ export const operationReference: readonly OperationReference[] = [
                 "type": "boolean"
               },
               "video_loras": {
-                "type": "object",
-                "properties": {},
-                "additionalProperties": true
+                "$ref": "#/components/schemas/DirectorVideoLoras"
               },
               "custom_visual_style_selection": {
                 "type": "object",
@@ -60961,6 +61124,41 @@ export const operationReference: readonly OperationReference[] = [
               "h3_style_workflow": {
                 "type": "string",
                 "description": "Exact server-catalog workflow ID only; no caller workflow metadata."
+              },
+              "video_params": {
+                "$ref": "#/components/schemas/DirectorRenderSettings"
+              },
+              "image_params": {
+                "$ref": "#/components/schemas/DirectorRenderSettings"
+              },
+              "shot_image_guidance": {
+                "type": "string",
+                "default": "auto",
+                "enum": [
+                  "auto",
+                  "prompt_only",
+                  "generate"
+                ],
+                "description": "Request per-shot image behavior. Models requiring start images still generate them; direct-reference models retain direct references. Optional-image models can use prompt_only. Auto uses their references when present. The effective policy is frozen at admission."
+              },
+              "director_max_shot_frames": {
+                "anyOf": [
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Optional expert H3 segment ceiling, aligned and clamped to the selected model's native frame lattice. Omit for automatic planning. It does not override resource limits or a model's minimum frames."
+              },
+              "seamless": {
+                "type": "boolean",
+                "default": true,
+                "description": "Request continuity across video shots. Compatibility is model-specific; it may require native endpoint conditioning. False keeps independent shots."
               }
             },
             "additionalProperties": true,
@@ -76174,7 +76372,8 @@ export const operationReference: readonly OperationReference[] = [
                   "type": "boolean"
                 },
                 "recovery_blocked": {
-                  "type": "boolean"
+                  "type": "boolean",
+                  "description": "Recovery cannot proceed without an execution prerequisite or repair; includes a queued supervised hold requiring fresh GPU reservation."
                 },
                 "recovery_attempt": {
                   "type": "integer",
@@ -76412,6 +76611,10 @@ export const operationReference: readonly OperationReference[] = [
                     "execution_attempt"
                   ],
                   "additionalProperties": false
+                },
+                "recovery_requires_gpu_reservation": {
+                  "type": "boolean",
+                  "description": "True only for a queued, held job retained from supervised native execution. A fresh matching operator GPU reservation is required before releasing this same job; not a grant/readiness receipt. SDK waits return this recovery-blocked checkpoint. Ordinary held and terminal jobs return false."
                 }
               },
               "additionalProperties": true,
@@ -77384,7 +77587,8 @@ export const operationReference: readonly OperationReference[] = [
                         "type": "boolean"
                       },
                       "recovery_blocked": {
-                        "type": "boolean"
+                        "type": "boolean",
+                        "description": "Recovery cannot proceed without an execution prerequisite or repair; includes a queued supervised hold requiring fresh GPU reservation."
                       },
                       "recovery_attempt": {
                         "type": "integer",
@@ -77567,6 +77771,10 @@ export const operationReference: readonly OperationReference[] = [
                           ]
                         },
                         "maxItems": 100
+                      },
+                      "recovery_requires_gpu_reservation": {
+                        "type": "boolean",
+                        "description": "True only for a queued, held job retained from supervised native execution. A fresh matching operator GPU reservation is required before releasing this same job; not a grant/readiness receipt. SDK waits return this recovery-blocked checkpoint. Ordinary held and terminal jobs return false."
                       }
                     },
                     "additionalProperties": true,
@@ -79250,7 +79458,8 @@ export const operationReference: readonly OperationReference[] = [
                         "type": "boolean"
                       },
                       "recovery_blocked": {
-                        "type": "boolean"
+                        "type": "boolean",
+                        "description": "Recovery cannot proceed without an execution prerequisite or repair; includes a queued supervised hold requiring fresh GPU reservation."
                       },
                       "recovery_attempt": {
                         "type": "integer",
@@ -79344,6 +79553,10 @@ export const operationReference: readonly OperationReference[] = [
                           "missing_count",
                           "quarantined_count"
                         ]
+                      },
+                      "recovery_requires_gpu_reservation": {
+                        "type": "boolean",
+                        "description": "True only for a queued, held job retained from supervised native execution. A fresh matching operator GPU reservation is required before releasing this same job; not a grant/readiness receipt. SDK waits return this recovery-blocked checkpoint. Ordinary held and terminal jobs return false."
                       }
                     },
                     "additionalProperties": true,

@@ -120,6 +120,22 @@ def enrich_openapi(schema: dict) -> dict:
                 }},
         },
     }
+    schema["components"]["schemas"]["DirectorRenderSettings"] = {
+        "type": "object", "additionalProperties": True,
+        "description": "Director render settings. Discover /api/v1/defaults/{model_type} and "
+            "/api/v1/model-options/{model_type}; model locks, native canvas and frame constraints still apply. "
+            "Extra saved fields remain compatible but do not imply native forwarding: current video builders "
+            "use steps, guidance and resolution, set seed to -1, and do not forward arbitrary flow_shift or "
+            "custom_settings. H3 may use extra profile settings for shot planning.",
+        "properties": {
+            "resolution": {"type": "string", "description": "Exact native canvas from model discovery; "
+                "must agree with the selected Director preset/aspect and resolved video or image resolution."},
+            "num_inference_steps": {"type": "integer", "description": "Requested native steps; respect "
+                "model/accelerator locks. Director's generic fallback is 8, not the model's recommended default."},
+            "guidance_scale": {"type": "number", "description": "Native guidance strength; discover model "
+                "locks and supported phases. Director's generic fallback is 1."},
+        },
+    }
     schema["info"].update(
         title="Maestro Continuum HTTP API",
         version="1.0.0",
@@ -163,6 +179,23 @@ def enrich_openapi(schema: dict) -> dict:
                         properties = value.get("properties")
                         if isinstance(properties, dict) and "video_loras" in properties:
                             properties["video_loras"] = {"$ref": "#/components/schemas/DirectorVideoLoras"}
+                            properties.update({
+                                "video_params": {"$ref": "#/components/schemas/DirectorRenderSettings"},
+                                "image_params": {"$ref": "#/components/schemas/DirectorRenderSettings"},
+                                "shot_image_guidance": {"type": "string", "default": "auto",
+                                    "enum": ["auto", "prompt_only", "generate"],
+                                    "description": "Request per-shot image behavior. Models requiring start images "
+                                        "still generate them; direct-reference models retain direct references. "
+                                        "Optional-image models can use prompt_only. Auto uses their references when present. "
+                                        "The effective policy is frozen at admission."},
+                                "director_max_shot_frames": {"anyOf": [{"type": "integer"}, {"type": "string"},
+                                    {"type": "null"}], "description": "Optional expert H3 segment ceiling, aligned and "
+                                        "clamped to the selected model's native frame lattice. Omit for automatic planning. "
+                                        "It does not override resource limits or a model's minimum frames."},
+                                "seamless": {"type": "boolean", "default": True,
+                                    "description": "Request continuity across video shots. Compatibility is model-specific; "
+                                        "it may require native endpoint conditioning. False keeps independent shots."},
+                            })
                         for nested in value.values():
                             bind_video_loras(nested)
                     elif isinstance(value, list):

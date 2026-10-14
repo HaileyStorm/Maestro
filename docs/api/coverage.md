@@ -106,6 +106,29 @@ The `parameter_execution` fields in LoRA details describe Studio operations,
 not Director qualification. Owner-authored parameter sidecars remain local
 configuration; this API does not expose arbitrary host-file editing.
 
+Director's nested `video_params` and `image_params` carry render settings,
+including steps, guidance and resolution. Discover
+`/api/v1/defaults/{model_type}` and `/api/v1/model-options/{model_type}` first;
+Director's generic fallbacks are not the selected model's recommended defaults.
+Use its returned resolution preset/aspect and matching resolved canvases.
+`shot_image_guidance` requests `auto`, `prompt_only` or `generate`; the selected
+model still determines whether images are required or references are consumed
+directly. `director_max_shot_frames` is an optional H3 segment ceiling aligned
+to the native frame lattice. `seamless` defaults to true and requires matching
+model support; choose false for independent shots.
+Extra saved settings do not establish native support: current Director video
+builders choose a random seed (`-1`) and do not forward arbitrary `flow_shift`
+or `custom_settings` to generation. H3 can use profile settings during shot
+planning. Use Studio generation for those native controls; Director parity for
+them remains a documented limitation.
+
+Pipeline creation has no caller-owned idempotency key. If its acknowledgement
+is lost, retain the original body and submission time. List authorized saved
+pipelines in the explicit workspace, match the original request and birth, and
+read that pipeline's saved and live status before continuing. A unique matching
+held parent can be adopted; an absent or ambiguous match does not authorize a
+blind retry. Waiting for a response is not cancellation.
+
 ## Gallery Extend recipe
 
 Read the selected authorized output and current model options/defaults. Fetch its
