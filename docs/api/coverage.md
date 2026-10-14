@@ -116,6 +116,11 @@ model still determines whether images are required or references are consumed
 directly. `director_max_shot_frames` is an optional H3 segment ceiling aligned
 to the native frame lattice. `seamless` defaults to true and requires matching
 model support; choose false for independent shots.
+New H3 FL2VA requests honor `prompt_only`; Ref2VA advertises direct references
+but remains subject to Director's model compatibility check. Saved pipelines
+retain their resolved image policy, including older H3 pipelines that resolved
+to `generate` before the capability metadata was corrected. Continue does not
+change that policy; inspect the saved `shot_image_policy` before resuming.
 Extra saved settings do not establish native support: current Director video
 builders choose a random seed (`-1`) and do not forward arbitrary `flow_shift`
 or `custom_settings` to generation. H3 can use profile settings during shot

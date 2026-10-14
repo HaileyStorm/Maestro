@@ -434,6 +434,9 @@ class family_handler:
             "sliding_window": False,
             "t2v_class": True,
             "i2v_class": not reference_mode,
+            "director_shot_image_support": (
+                "direct_references" if reference_mode else "optional"
+            ),
             "image_prompt_types_allowed": "T" if reference_mode else "TSE",
             "end_frames_always_enabled": not reference_mode,
             "returns_audio": True,
