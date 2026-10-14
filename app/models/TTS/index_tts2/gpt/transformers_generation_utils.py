@@ -30,7 +30,6 @@ from transformers.cache_utils import (
     DynamicCache,
     EncoderDecoderCache,
     OffloadedCache,
-    QuantizedCacheConfig,
     StaticCache,
 )
 from transformers.configuration_utils import PretrainedConfig
@@ -59,8 +58,6 @@ from transformers.generation.candidate_generator import (
     _prepare_token_type_ids,
 )
 from transformers.generation.configuration_utils import (
-    NEED_SETUP_CACHE_CLASSES_MAPPING,
-    QUANT_BACKEND_CLASSES_MAPPING,
     GenerationConfig,
     GenerationMode,
 )
@@ -1594,6 +1591,13 @@ class GenerationMixin:
 
         Returns the resulting cache object.
         """
+        try:
+            from transformers.generation.configuration_utils import NEED_SETUP_CACHE_CLASSES_MAPPING
+        except ImportError as exc:
+            raise ValueError(
+                "This Transformers version does not support IndexTTS2's legacy configured caches. "
+                "Use the default IndexTTS2 cache."
+            ) from exc
         cache_cls: Cache = NEED_SETUP_CACHE_CLASSES_MAPPING[cache_implementation]
         requires_cross_attention_cache = (
             self.config.is_encoder_decoder or model_kwargs.get("encoder_outputs") is not None
@@ -1755,6 +1759,16 @@ class GenerationMixin:
             generation_config.cache_implementation = None
 
         if generation_config.cache_implementation is not None:
+            # IndexTTS2 normally uses legacy tuple caches. Optional configured
+            # cache interfaces were removed in newer Transformers versions;
+            # importing them here keeps ordinary synthesis compatible.
+            try:
+                from transformers.generation.configuration_utils import NEED_SETUP_CACHE_CLASSES_MAPPING
+            except ImportError as exc:
+                raise ValueError(
+                    "This Transformers version does not support IndexTTS2's legacy configured caches. "
+                    "Use the default IndexTTS2 cache."
+                ) from exc
             if generation_config.cache_implementation in NEED_SETUP_CACHE_CLASSES_MAPPING:
                 if generation_config.cache_implementation == "static" and not self._supports_static_cache:
                     raise ValueError(
@@ -1774,6 +1788,15 @@ class GenerationMixin:
                         "This model does not support the quantized cache. If you want your model to support quantized "
                         "cache, please open an issue and tag @zucchini-nlp."
                     )
+
+                try:
+                    from transformers.cache_utils import QuantizedCacheConfig
+                    from transformers.generation.configuration_utils import QUANT_BACKEND_CLASSES_MAPPING
+                except ImportError as exc:
+                    raise ValueError(
+                        "This Transformers version does not support IndexTTS2's legacy quantized cache. "
+                        "Use the default IndexTTS2 cache."
+                    ) from exc
 
                 cache_config = (
                     generation_config.cache_config

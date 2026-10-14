@@ -21,6 +21,8 @@ still apply. Start with
 catalog, operation identities, boundaries and capability discovery links.
 The [feature coverage map](coverage.md) explains compositions and human
 boundaries. The [operation reference](operations.md) contains generated IDs.
+The [Drama 3 guide](drama3.md) covers directed speech, reference voices, FP8 CPU
+offload and its experimental execution boundaries through the same API.
 The [exported OpenAPI](openapi.json) is an offline snapshot; current server
 discovery remains authoritative.
 

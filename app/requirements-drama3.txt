@@ -1,0 +1,4 @@
+# Optional codec packages. Fish's inference source is pinned and shipped locally.
+# Install with scripts/install_drama3_runtime.py to preserve the existing AI ABI.
+descript-audio-codec==1.0.0
+descript-audiotools==0.7.2

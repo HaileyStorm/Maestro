@@ -18912,6 +18912,23 @@ def _retake_engines_for_architecture(architecture):
     return ["native", "legacy"] if architecture in ("ltx2_19B", "ltx2_22B", "ltx2_25") else []
 
 
+def _speech_capabilities_for_model(architecture):
+    if architecture in ("voxcpm2", "index_tts2"):
+        return {"speech_capabilities": {
+            "decoder_steps": {"parameter": "num_inference_steps", "minimum": 1, "maximum": 100,
+                "default": 30 if architecture == "voxcpm2" else 25,
+                "legacy_zero_uses_default": True,
+                "description": "Iterative speech decoder steps. More steps cost time; quality remains model-dependent."},
+            "sampling": "flow_matching" if architecture == "voxcpm2" else "autoregressive_then_diffusion",
+            "ignored_controls": ["temperature", "top_p", "top_k", "seed", "duration_seconds"] if architecture == "voxcpm2" else [],
+            "wav_subtype": "PCM_24",
+        }}
+    if architecture != "drama3":
+        return {}
+    from models.TTS.drama3_handler import speech_capabilities
+    return {"speech_capabilities": speech_capabilities()}
+
+
 @api.get("/api/v1/models")
 def list_models(request: Request):
     """List available model families and model types."""
@@ -18996,6 +19013,7 @@ def list_models(request: Request):
             "supports_audio_input": bool(md.get("any_audio_prompt", False)),
             "generates_audio": bool(md.get("returns_audio", False) or md.get("audio_only", False)),
             "audio_only": bool(md.get("audio_only", False)),
+            **_speech_capabilities_for_model(architecture),
             "supports_ref_images": bool(md.get("image_ref_choices")),
             "image_outputs": bool(md.get("image_outputs", False)),
             "director": director,
@@ -28645,6 +28663,7 @@ def get_model_options(model_type: str, request: Request):
 
         # TTS-specific
         "audio_only": md.get("audio_only", False),
+        **_speech_capabilities_for_model(wgp.get_base_model_type(model_type)),
         "duration_slider": md.get("duration_slider"),
         "pause_between_sentences": md.get("pause_between_sentences", False),
         "temperature_enabled": md.get("temperature", False),

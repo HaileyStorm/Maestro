@@ -193,7 +193,11 @@ class IndexTTS2:
                 "Download it via the IndexTTS2 handler model files."
             )
         with _quiet_load_output(self.show_load_logs):
-            safetensors.torch.load_model(semantic_codec, semantic_code_ckpt)
+            # MMGP supplies the CPU tensor loader; newer Safetensors load_model
+            # passes a backend keyword that this loader does not accept.
+            semantic_codec.load_state_dict(
+                safetensors.torch.load_file(semantic_code_ckpt, device="cpu"), strict=True
+            )
         self.semantic_codec = semantic_codec.to("cpu")
         self.semantic_codec.eval()
         self._load_log('>> semantic_codec weights restored from: {}'.format(semantic_code_ckpt))
@@ -689,10 +693,12 @@ class IndexTTS2:
             self._infer_emotion_vector_cached(one_text, log_if_default=False)
 
     @torch.no_grad()
-    def synthesize_from_segment_payloads(self, segment_payloads, verbose=False):
+    def synthesize_from_segment_payloads(self, segment_payloads, verbose=False, diffusion_steps=25):
         if segment_payloads is None or len(segment_payloads) == 0:
             return []
-        diffusion_steps = 25
+        if isinstance(diffusion_steps, bool) or int(diffusion_steps) != diffusion_steps or not 1 <= int(diffusion_steps) <= 100:
+            raise ValueError("IndexTTS2 diffusion_steps must be an integer from 1 to 100.")
+        diffusion_steps = int(diffusion_steps)
         inference_cfg_rate = 0.7
         results = []
         prompt_condition_cache = {}
@@ -995,6 +1001,10 @@ class IndexTTS2:
         shared_segment_generation_tokens = generation_kwargs.pop("cg_segment_generation_tokens", None)
         defer_s2mel = bool(generation_kwargs.pop("defer_s2mel", False))
         defer_bigvgan = bool(generation_kwargs.pop("defer_bigvgan", False))
+        diffusion_steps = generation_kwargs.pop("diffusion_steps", 25)
+        if isinstance(diffusion_steps, bool) or int(diffusion_steps) != diffusion_steps or not 1 <= int(diffusion_steps) <= 100:
+            raise ValueError("IndexTTS2 diffusion_steps must be an integer from 1 to 100.")
+        diffusion_steps = int(diffusion_steps)
         sampling_rate = 22050
         hop_size = int(self.cfg.s2mel["preprocess_params"]["spect_params"]["hop_length"])
         ref_mel_cpu = ref_mel.detach().cpu().contiguous() if defer_s2mel and not stream_return else None
@@ -1170,7 +1180,6 @@ class IndexTTS2:
                     dtype = None
                     with torch.amp.autocast(text_tokens.device.type, enabled=dtype is not None, dtype=dtype):
                         m_start_time = time.perf_counter()
-                        diffusion_steps = 25
                         inference_cfg_rate = 0.7
                         latent = self.s2mel.models['gpt_layer'](latent)
                         quantizer_device = next(self.semantic_codec.quantizer.parameters()).device

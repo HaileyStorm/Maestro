@@ -1,0 +1,118 @@
+"""Drama 3 catalog: official FP8 experts with eager partial CPU offload."""
+from __future__ import annotations
+
+import importlib.util
+import os
+
+MODEL_TYPE = "drama3"
+REPOSITORY = "fishaudio/drama-3"
+REVISION = "e0a9218aa48888270f06ef1ed9ea67622c0e17d2"
+FILES = (
+    "config.json", "tokenizer.json", "tokenizer_config.json",
+    "special_tokens_map.json", "chat_template.jinja", "LICENSE", "codec.pth",
+    "model.safetensors.index.json",
+    *(f"model-{i:05d}-of-00008.safetensors" for i in range(1, 9)),
+)
+
+
+def checkpoint_root():
+    from shared.utils import files_locator as fl
+    folder = fl.locate_folder("drama3", error_if_none=False, required_files=FILES)
+    return folder if folder and all(os.path.isfile(os.path.join(folder, f)) for f in FILES) else None
+
+
+def runtime_status():
+    missing = [name for name in ("dac", "audiotools", "hydra", "omegaconf", "triton")
+               if importlib.util.find_spec(name) is None]
+    return {"installed": not missing, "missing_packages": missing,
+            "experimental": True, "precision": "block_fp8_w8a8",
+            "offload": "cpu_routed_experts", "cuda_graph": False,
+            "next_step": "Install the optional Drama 3 runtime in Pinokio's terminal: python scripts/install_drama3_runtime.py" if missing else "Use an authorized generation job; GPU readiness is checked at execution."}
+
+
+def speech_capabilities():
+    return {"experimental": True, "native_qualified": False,
+            "runtime": runtime_status(), "weights_installed": checkpoint_root() is not None,
+            "performance_direction": True, "direction_field": "alt_prompt",
+            "speaker_notation": "<|speaker:0|> through <|speaker:15|>, or Speaker 1: through Speaker 16:",
+            "emotion_notation": "Inline [emotion or delivery] cues; model adherence is not guaranteed.",
+            "maximum_speakers": 16, "maximum_reference_voices": 3,
+            "reference_transcript_required": True, "maximum_reference_seconds": 60,
+            "reference_fields": ["audio_guide", "audio_guide2", "audio_guide3"],
+            "maximum_duration_seconds": 300, "duration_is_upper_bound": True,
+            "history_scope": "Within one generation job; no cross-request history handle.",
+            "precision": "Official block FP8 experts, BF16 backbone, CPU FP32 codec; no Q6 variant.",
+            "gpu_budget_gib": {"minimum": 8, "maximum": 26, "default": 22,
+                "scope": "Weights plus worst-case expert staging; caches and CUDA overhead need additional VRAM."},
+            "execution": "Existing project-authorized generation queue; NVIDIA CUDA and Triton required.",
+            "terms": "fish_drama3_self_review"}
+
+
+def model_definition():
+    return {
+        "audio_only": True, "returns_audio": True, "image_outputs": False,
+        "sliding_window": False, "guidance_max_phases": 0,
+        "no_negative_prompt": True, "inference_steps": False, "temperature": True,
+        "top_k_slider": True, "top_p_slider": True, "compile": False, "dtype": "bf16",
+        "source": True, "image_prompt_types_allowed": "", "supports_early_stop": True,
+        "profiles_dir": [MODEL_TYPE], "parent_model_type": MODEL_TYPE,
+        "automatic_routing": False, "verified": False,
+        "compatible_model_paths": {FILES[-8]: ["drama3/" + FILES[-8]]},
+        "required_runtime_assets": {"processor": ["drama3/" + f for f in FILES]},
+        "duration_slider": {"label": "Maximum speech duration (seconds)", "min": 1,
+                            "max": 300, "increment": 1, "default": 20},
+        "any_audio_prompt": True, "max_voice_count": 3, "one_speaker_only": True,
+        "audio_guide_label": "Speaker 0 reference audio (optional; transcript required)",
+        "audio_prompt_type_sources": {"selection": ["", "A", "AB", "ABC"],
+            "labels": {"": "Text only", "A": "One reference voice", "AB": "Two reference voices",
+                       "ABC": "Three reference voices"}, "letters_filter": "ABC", "default": ""},
+        "alt_prompt": {"label": "Performance direction", "placeholder": "whispering, tense",
+                       "lines": 2},
+        "custom_settings": [
+            {"id": "drama3_gpu_budget_gib", "label": "GPU weights and staging budget (GiB)",
+             "type": "float", "default": 22.0},
+            *[{"id": "drama3_reference_text" + (str(i) if i > 1 else ""),
+               "label": f"Speaker {i-1} reference transcript", "type": "text", "default": ""}
+              for i in range(1, 4)],
+        ],
+    }
+
+
+class family_handler:
+    @staticmethod
+    def query_supported_types(): return [MODEL_TYPE]
+    @staticmethod
+    def query_family_maps(): return {}, {}
+    @staticmethod
+    def query_model_family(): return "tts"
+    @staticmethod
+    def query_family_infos(): return {"tts": (200, "TTS")}
+    @staticmethod
+    def get_lora_dir(base_model_type, args, lora_root): return os.path.join(lora_root, MODEL_TYPE)
+    @staticmethod
+    def query_model_def(base_model_type, model_def): return model_definition()
+    @staticmethod
+    def query_model_files(computeList, base_model_type, model_def=None):
+        return {"repoId": REPOSITORY, "revision": REVISION, "sourceFolderList": [""],
+                "targetFolderList": [MODEL_TYPE], "fileList": [list(FILES)]}
+    @staticmethod
+    def validate_generative_settings(base_model_type, model_def, inputs):
+        status = runtime_status()
+        if not status["installed"]: return status["next_step"]
+        from .drama3.pipeline import validate_inputs
+        return validate_inputs(inputs)
+    @staticmethod
+    def load_model(model_filename, model_type, base_model_type, model_def, **kwargs):
+        from .drama3.pipeline import Drama3Pipeline
+        if checkpoint_root() is None:
+            raise RuntimeError("Download the complete Drama 3 model before generating speech.")
+        # The pipeline owns expert placement. MMGP must not move its FP8 buffers.
+        return Drama3Pipeline(checkpoint_root()), {}
+    @staticmethod
+    def fresh_default_settings(base_model_type, model_def): return {"audio_prompt_type": ""}
+    @staticmethod
+    def update_default_settings(base_model_type, model_def, ui_defaults):
+        ui_defaults.update(audio_prompt_type="", repeat_generation=1, video_length=0,
+                           num_inference_steps=0, negative_prompt="", temperature=0.7,
+                           top_p=0.7, top_k=30, guidance_scale=1.0,
+                           multi_prompts_gen_type=2, duration_seconds=20)

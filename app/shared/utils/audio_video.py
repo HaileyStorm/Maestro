@@ -47,7 +47,8 @@ def write_wav_file(path, audio_data, sample_rate):
     # soundfile infers the container from the extension; the .tmp suffix
     # hides it, so derive the format from the FINAL path instead.
     fmt = (os.path.splitext(str(path))[1][1:] or "wav").upper()
-    sf.write(tmp_path, audio_array, int(sample_rate), format=fmt)
+    sf.write(tmp_path, audio_array, int(sample_rate), format=fmt,
+             subtype="PCM_24" if fmt == "WAV" else None)
     os.replace(tmp_path, path)
     return path
 

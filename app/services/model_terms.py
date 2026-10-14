@@ -26,6 +26,7 @@ from services.host_terms import (
     KREA2_MOODY_RECIPE_GRAPHS,
     KREA2_REVIEW_TERM,
     MUSIC3_REVIEW_TERM,
+    DRAMA3_REVIEW_TERM,
     PONPOKE_FLUX2_KLEIN4B_TERM,
     PONPOKE_FLUX2_KLEIN9B_TERM,
     PORNMASTER_V4_RECIPE_GRAPH,
@@ -53,6 +54,12 @@ REGISTERED_MANUAL_RECIPE_IDS = frozenset({
 
 
 MODEL_TERM_DOCUMENTS: dict[str, dict[str, Any]] = {
+    DRAMA3_REVIEW_TERM: {
+        "title": "Fish Audio Community License v1.0 · Drama 3",
+        "license_url": "https://huggingface.co/fishaudio/drama-3/blob/e0a9218aa48888270f06ef1ed9ea67622c0e17d2/LICENSE",
+        "review_mode": "manual_self_review",
+        "notice": "Review Fish Audio's Community License for your use before downloading or running Drama 3. Keep its license and attribution with distributions; commercial and hosted services have separate conditions. Built with Fish Audio.",
+    },
     BFL_FLUX1_REVIEW_TERM: {
         "title": "FLUX.1 dev non-commercial license and self-review",
         "license_url": (
@@ -246,6 +253,7 @@ _RECIPE_TERM_ROOTS = {
     "krea2_raw": KREA2_REVIEW_TERM,
     "krea2_turbo": KREA2_REVIEW_TERM,
     "minimax_music3": MUSIC3_REVIEW_TERM,
+    "drama3": DRAMA3_REVIEW_TERM,
 }
 
 _RELATION_KEYS = (

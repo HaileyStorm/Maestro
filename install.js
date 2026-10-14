@@ -81,6 +81,19 @@ module.exports = async (kernel) => {
         }
       }
     },
+    {
+      // Drama 3's native FP8 path currently requires Linux Triton. Keep the
+      // selected Torch/CUDA bindings while adding its optional CPU codec.
+      when: "{{platform === 'linux' && gpu === 'nvidia'}}",
+      method: "shell.run",
+      params: {
+        env: runtimeSecretEnv,
+        venv: runtime.env,
+        venv_python: runtime.python,
+        path: "app",
+        message: "python scripts/install_drama3_runtime.py"
+      }
+    },
     // Install pre-built llama.cpp CUDA kernels for GGUF models if a
     // wheel matches the current Python / PyTorch / CUDA combo. Without
     // this, mmgp prints "[GGUF][llama.cpp CUDA] kernels unavailable,

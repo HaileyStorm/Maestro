@@ -519,10 +519,18 @@ class IndexTTS2Pipeline:
         temperature: float = 0.8,
         top_p: float = 0.8,
         top_k: int = 30,
+        sampling_steps: int = 25,
         set_progress_status=None,
         callback=None,
         **kwargs,
     ):
+        if isinstance(sampling_steps, bool):
+            raise ValueError("IndexTTS2 num_inference_steps must be an integer, not a boolean.")
+        diffusion_steps = 25 if sampling_steps in (None, 0) else sampling_steps
+        if isinstance(diffusion_steps, bool) or int(diffusion_steps) != diffusion_steps or not 1 <= int(diffusion_steps) <= 100:
+            raise ValueError("IndexTTS2 num_inference_steps must be an integer from 1 to 100 (0 uses 25).")
+        diffusion_steps = int(diffusion_steps)
+        print(f"IndexTTS2 synthesis: diffusion_steps={diffusion_steps}")
         self._interrupt = False
         self._early_stop = False
         self.model.abort_checker = lambda: self._abort_requested() or self._early_stop_requested()
@@ -780,7 +788,7 @@ class IndexTTS2Pipeline:
             self.model.abort_checker = lambda: self._abort_requested()
             try:
                 _set_progress_phase("Preparing vocoder conditioning")
-                collected_vc_targets = self.model.synthesize_from_segment_payloads(collected_segment_payloads, verbose=False)
+                collected_vc_targets = self.model.synthesize_from_segment_payloads(collected_segment_payloads, verbose=False, diffusion_steps=diffusion_steps)
                 collected_segment_payloads.clear()
                 del collected_segment_payloads
                 gc.collect()
@@ -965,7 +973,7 @@ class IndexTTS2Pipeline:
         self.model.abort_checker = lambda: self._abort_requested()
         try:
             _set_progress_phase("Preparing vocoder conditioning")
-            collected_vc_targets = self.model.synthesize_from_segment_payloads(collected_segment_payloads, verbose=False)
+            collected_vc_targets = self.model.synthesize_from_segment_payloads(collected_segment_payloads, verbose=False, diffusion_steps=diffusion_steps)
             collected_segment_payloads.clear()
             del collected_segment_payloads
             gc.collect()

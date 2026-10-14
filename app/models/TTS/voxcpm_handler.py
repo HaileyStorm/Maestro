@@ -39,10 +39,9 @@ def _get_voxcpm2_model_def() -> dict:
         "audio_only": True,
         "image_outputs": False,
         "sliding_window": False,
-        "guidance_max_phases": 0,
+        "guidance_max_phases": 1,
         "no_negative_prompt": True,
-        "inference_steps": False,
-        "temperature": True,
+        "inference_steps": True,
         "image_prompt_types_allowed": "",
         "supports_early_stop": True,
         "profiles_dir": [VOXCPM2_FOLDER],
@@ -68,6 +67,14 @@ def _get_voxcpm2_model_def() -> dict:
             "lines": 2,
         },
         "custom_settings": [
+            {
+                "id": "voxcpm_max_len", "label": "Speech token limit (2-4096)",
+                "name": "Speech token limit", "type": "int", "default": 4096,
+            },
+            {
+                "id": "voxcpm_retry_badcase", "label": "Automatic bad-case retries (0=off, 1=on)",
+                "name": "Automatic retries", "type": "int", "default": 1,
+            },
             {
                 "id": "voxcpm_speaker_count",
                 "label": "Speakers (1-4)",
@@ -180,10 +187,10 @@ class family_handler:
                 "audio_prompt_type": "",
                 "repeat_generation": 1,
                 "video_length": 0,
-                "num_inference_steps": 0,
+                "num_inference_steps": 30,
                 "negative_prompt": "",
                 "temperature": 0.8,
-                "guidance_scale": 1.0,
+                "guidance_scale": 2.0,
                 "multi_prompts_gen_type": 2,
                 "duration_seconds": 20,
             }

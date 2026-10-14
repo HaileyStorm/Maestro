@@ -28,6 +28,7 @@ BFL_FLUX1_REVIEW_TERM = "bfl_flux1_self_review"
 BFL_FLUX2_REVIEW_TERM = "bfl_flux2_self_review"
 KREA2_REVIEW_TERM = "krea2_self_review"
 MUSIC3_REVIEW_TERM = "minimax_music3_self_review"
+DRAMA3_REVIEW_TERM = "fish_drama3_self_review"
 KREA2_MOODY_MIX_V7_CREATOR_TERM = (
     "civitai_2731187_3209007_creator_terms"
 )
@@ -293,6 +294,7 @@ CURRENT_HOST_TERM_VERSIONS = {
     BFL_FLUX2_REVIEW_TERM: 1,
     KREA2_REVIEW_TERM: 2,
     MUSIC3_REVIEW_TERM: 1,
+    DRAMA3_REVIEW_TERM: 1,
     KREA2_MOODY_MIX_V7_CREATOR_TERM: 1,
     KREA2_MOODY_CUTIE_V4_CREATOR_TERM: 1,
     PONPOKE_FLUX2_KLEIN4B_TERM: 1,
@@ -305,6 +307,11 @@ CURRENT_HOST_TERM_VERSIONS = {
 # acknowledgements are accepted only for this exact license/repository/
 # revision tuple.  Changing any tuple must also advance its notice version.
 CURRENT_HOST_TERM_BINDINGS = {
+    DRAMA3_REVIEW_TERM: {
+        "license_id": "fish-audio-community-license-v1.0-2026-10-13",
+        "repository": "fishaudio/drama-3",
+        "revision": "e0a9218aa48888270f06ef1ed9ea67622c0e17d2",
+    },
     BFL_FLUX1_REVIEW_TERM: {
         "license_id": "flux-1-dev-non-commercial-license-v1.1.1",
         "repository": "black-forest-labs/FLUX.1-dev",
@@ -580,6 +587,7 @@ def accept_host_term(
 
 
 __all__ = [
+    "DRAMA3_REVIEW_TERM",
     "BFL_FLUX1_REVIEW_TERM",
     "BFL_FLUX2_REVIEW_TERM",
     "CHARACTER_SHEET_QUAD_CREATOR_TERM",

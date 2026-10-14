@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from typing import Any, Optional
 
@@ -76,8 +77,28 @@ class VoxCpmPipeline:
         alt_prompt: str = "",
         temperature: float = 0.8,
         guidance_scale: float = 2.0,
+        guide_scale: Optional[float] = None,
+        sampling_steps: int = 30,
+        custom_settings: Optional[dict[str, Any]] = None,
         **_kwargs: Any,
     ) -> dict[str, Any]:
+        # WanGP's public guidance_scale/num_inference_steps arrive under these
+        # production aliases. Keep guidance_scale for direct Python callers.
+        cfg_value = float(guidance_scale if guide_scale is None else guide_scale)
+        if not math.isfinite(cfg_value) or not 0 < cfg_value <= 20:
+            raise ValueError("VoxCPM guidance_scale must be greater than 0 and at most 20.")
+        if isinstance(sampling_steps, bool):
+            raise ValueError("VoxCPM num_inference_steps must be an integer, not a boolean.")
+        steps = 30 if sampling_steps in (None, 0) else sampling_steps
+        if isinstance(steps, bool) or int(steps) != steps or not 1 <= int(steps) <= 100:
+            raise ValueError("VoxCPM num_inference_steps must be an integer from 1 to 100 (0 uses 30).")
+        settings = custom_settings or {}
+        max_len = settings.get("voxcpm_max_len", 4096)
+        retry = settings.get("voxcpm_retry_badcase", 1)
+        if isinstance(max_len, bool) or int(max_len) != max_len or not 2 <= int(max_len) <= 4096:
+            raise ValueError("voxcpm_max_len must be an integer from 2 to 4096.")
+        if isinstance(retry, bool) or retry not in (0, 1):
+            raise ValueError("voxcpm_retry_badcase must be 0 (disabled) or 1 (enabled).")
         if self.model is None:
             self.load()
         if not input_prompt or not str(input_prompt).strip():
@@ -92,10 +113,7 @@ class VoxCpmPipeline:
             and audio_guide.lower().endswith((".wav", ".flac", ".mp3", ".ogg"))
         ):
             clone = audio_guide
-        try:
-            cfg_value = float(guidance_scale)
-        except (TypeError, ValueError):
-            cfg_value = 2.0
+        print(f"VoxCPM synthesis: steps={int(steps)}, cfg={cfg_value}, max_len={int(max_len)}, retry_badcase={bool(retry)}")
         pieces: list[np.ndarray] = []
         for turn in turns:
             text = format_voxcpm_turn_text(
@@ -109,7 +127,11 @@ class VoxCpmPipeline:
             generate_kwargs: dict[str, Any] = {
                 "text": text,
                 "cfg_value": cfg_value,
-                "inference_timesteps": 10,
+                "inference_timesteps": int(steps),
+                "max_len": int(max_len),
+                "normalize": False,
+                "denoise": False,
+                "retry_badcase": bool(retry),
             }
             if clone:
                 generate_kwargs["reference_wav_path"] = clone

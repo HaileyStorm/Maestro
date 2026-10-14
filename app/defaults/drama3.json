@@ -1,0 +1,16 @@
+{
+  "model": {
+    "name": "Drama 3 · FP8 / CPU offload",
+    "architecture": "drama3",
+    "description": "Built with Fish Audio. Local expressive speech with speaker tags and performance cues. Official FP8 experts, partial CPU offload; experimental runtime. Accept the Fish Audio Community License before download or generation.",
+    "URLs": ["https://huggingface.co/fishaudio/drama-3/resolve/e0a9218aa48888270f06ef1ed9ea67622c0e17d2/model-00001-of-00008.safetensors"]
+  },
+  "prompt": "<|speaker:0|> [warm] I checked the schedule twice, and everything still lines up.",
+  "alt_prompt": "",
+  "temperature": 0.7,
+  "top_p": 0.7,
+  "top_k": 30,
+  "multi_prompts_gen_type": 2,
+  "duration_seconds": 20,
+  "custom_settings": {"drama3_gpu_budget_gib": 22.0}
+}

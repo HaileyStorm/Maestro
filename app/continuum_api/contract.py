@@ -79,6 +79,69 @@ def enrich_openapi(schema: dict) -> dict:
     timeline["required"] = ["schema_version", "id", "name", "workspace", "revision", "created_at", "updated_at",
                             "canvas", "assets", "tracks", "markers", "export", "exports"]
     schema.setdefault("components", {}).setdefault("schemas", {})["EditorTimeline"] = timeline
+    schema["components"]["schemas"]["Drama3CustomSettings"] = {
+        "type": "object", "additionalProperties": True,
+        "description": "Drama 3 optional settings. References use authorized uploads and require actual transcripts. "
+            "The GPU budget covers weights and worst-case expert staging; caches and CUDA overhead are additional.",
+        "properties": {
+            "drama3_gpu_budget_gib": {"type": "number", "minimum": 8, "maximum": 26, "default": 22},
+            **{("drama3_reference_text" + (str(i) if i > 1 else "")): {
+                "type": "string", "default": "", "description":
+                    f"Actual transcript of audio_guide{str(i) if i > 1 else ''} for zero-based Speaker {i-1}; "
+                    "required when that reference is present, at most 16000 UTF-8 bytes."}
+               for i in range(1, 4)},
+        },
+    }
+    schema["components"]["schemas"]["Drama3GenerationSettings"] = {
+        "type": "object", "additionalProperties": True, "required": ["model_type", "prompt", "workspace"],
+        "description": "Model-specific projection of the existing /api/v1/generate request. Start from discovered "
+            "defaults. Experimental local NVIDIA FP8/CPU expert offload; no cross-request history, Q6 or LoRA "
+            "support. Duration caps output and can truncate speech. Terms and GPU authority remain required.",
+        "properties": {
+            "model_type": {"type": "string", "const": "drama3"},
+            "workspace": {"type": "string"}, "prompt": {"type": "string", "minLength": 1,
+                "description": "Speech with inline [delivery] cues and <|speaker:0|> through <|speaker:15|>, "
+                    "or Maestro Speaker 1: through Speaker 16: lines."},
+            "alt_prompt": {"type": "string", "default": "", "description": "Performance cue applied to every "
+                "speaker in this job; adherence depends on the model."},
+            "duration_seconds": {"type": "number", "minimum": 1, "maximum": 300, "default": 20},
+            "temperature": {"type": "number", "exclusiveMinimum": 0, "maximum": 2, "default": 0.7},
+            "top_p": {"type": "number", "exclusiveMinimum": 0, "maximum": 1, "default": 0.7},
+            "top_k": {"type": "integer", "minimum": 1, "maximum": 4096, "default": 30},
+            "audio_prompt_type": {"type": "string", "enum": ["", "A", "AB", "ABC"], "default": ""},
+            **{("audio_guide" + (str(i) if i > 1 else "")): {"type": "string", "description":
+                "Project-authorized upload filename; maximum 60 seconds, with its corresponding transcript. "
+                "Never an arbitrary filesystem path."} for i in range(1, 4)},
+            "custom_settings": {"$ref": "#/components/schemas/Drama3CustomSettings"},
+        },
+    }
+    for model, name, steps in (("voxcpm2", "VoxCPM2GenerationSettings", 30),
+                               ("index_tts2", "IndexTTS2GenerationSettings", 25)):
+        properties = {
+            "model_type": {"type": "string", "const": model},
+            "workspace": {"type": "string"}, "prompt": {"type": "string", "minLength": 1},
+            "num_inference_steps": {"type": "integer", "minimum": 0, "maximum": 100, "default": steps,
+                "description": f"Iterative decoder steps, 1–100; legacy 0 uses {steps}. More steps cost time and do not guarantee better quality."},
+            "audio_guide": {"type": "string", "description": "Project-authorized uploaded voice reference filename. Required for IndexTTS2."},
+            "alt_prompt": {"type": "string", "default": "", "description": "Voice/emotion direction; adherence is model-dependent."},
+        }
+        if model == "voxcpm2":
+            properties.update({
+                "guidance_scale": {"type": "number", "exclusiveMinimum": 0, "maximum": 20, "default": 2},
+                "custom_settings": {"type": "object", "additionalProperties": True, "properties": {
+                    "voxcpm_max_len": {"type": "integer", "minimum": 2, "maximum": 4096, "default": 4096},
+                    "voxcpm_retry_badcase": {"type": "integer", "enum": [0, 1], "default": 1,
+                        "description": "0 disables native automatic bad-case retries; 1 enables them."},
+                }},
+            })
+        schema["components"]["schemas"][name] = {
+            "type": "object", "additionalProperties": True,
+            "required": ["model_type", "workspace", "prompt"] + (["audio_guide"] if model == "index_tts2" else []),
+            "description": "Projection of the existing generation operation; discover current model-options/defaults. "
+                + ("VoxCPM ignores temperature, top_p, top_k, seed and duration_seconds; token limit bounds speech."
+                   if model == "voxcpm2" else "IndexTTS2 uses these steps in its diffusion decoder; GPT sampler settings remain separate."),
+            "properties": properties,
+        }
     schema["components"]["schemas"]["DirectorVideoLoras"] = {
         "type": "object", "additionalProperties": True,
         "description": (
@@ -202,6 +265,13 @@ def enrich_openapi(schema: dict) -> dict:
                         for nested in value:
                             bind_video_loras(nested)
                 bind_video_loras(operation.get("requestBody", {}))
+            if method == "post" and path == "/api/v1/generate":
+                operation["x-maestro-model-contracts"] = {model: {
+                    "$ref": "#/components/schemas/" + name} for model, name in (
+                        ("drama3", "Drama3GenerationSettings"), ("voxcpm2", "VoxCPM2GenerationSettings"),
+                        ("index_tts2", "IndexTTS2GenerationSettings"))}
+                operation["description"] += " Drama 3's directed speech and reference settings are documented " \
+                    "in Drama3GenerationSettings; use current defaults and model-options. No extra TTS execution path."
             metadata = operation.setdefault("x-maestro", {})
             metadata.setdefault("mcp", False)
             metadata.setdefault("contract_status", "source_extracted" if item else "framework_only")

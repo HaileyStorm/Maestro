@@ -86,6 +86,16 @@ module.exports = async (kernel) => {
       message: "uv pip install --no-deps --reinstall-package mmgp ./dependencies/mmgp"
     }
   }, ...lightxRepairSteps, {
+    when: "{{platform === 'linux' && gpu === 'nvidia'}}",
+    method: "shell.run",
+    params: {
+      env: runtimeSecretEnv,
+      venv: runtime.env,
+      venv_python: runtime.python,
+      path: "app",
+      message: "python scripts/install_drama3_runtime.py"
+    }
+  }, {
     // Reached ONLY when the repo was already current (the "build" path
     // jumps over this step). Before halting, self-heal the seed-vc
     // component if it's missing (GPL-3.0, cloned from its own repo — see
