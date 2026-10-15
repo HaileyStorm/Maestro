@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import base64
 import builtins
+from contextlib import nullcontext
 import json
 import math
 import os
@@ -489,7 +490,7 @@ def reap_owned_after_failure(error):
 
 def run_native_process(packet, *, command, on_request, on_event, cancelled,
                        validate_authority, on_started=None, on_abort=None,
-                       cwd=None, environment=None, invocation_fence=None):
+                       cwd=None, environment=None, invocation_fence=None, callback_context=None):
     """Launch once, fence callbacks on abort, drain owned group, then reap.
 
     Authority must return exactly True. on_started receives the Popen object;
@@ -615,9 +616,11 @@ def run_native_process(packet, *, command, on_request, on_event, cancelled,
             callbacks[:] = [event for event in callbacks if not event.is_set()]
             callbacks.append(completed)
         deadline = time.monotonic() + timeout if timeout is not None else None
+        context = None
         def invoke():
             try:
-                result.append(function(*args))
+                with context:
+                    result.append(function(*args))
             except BaseException as exc:
                 error.append(True)
                 try:
@@ -630,7 +633,13 @@ def run_native_process(packet, *, command, on_request, on_event, cancelled,
                         callback_failure[0] = record
             finally:
                 completed.set()
-        threading.Thread(target=invoke, daemon=True).start()
+        thread = threading.Thread(target=invoke, daemon=True)
+        try:
+            context = callback_context(role, operation, thread) if callback_context is not None else nullcontext()
+            thread.start()
+        except BaseException:
+            completed.set()
+            raise
         while not completed.wait(0.1):
             if deadline is not None and time.monotonic() >= deadline:
                 fence("authority_timeout")

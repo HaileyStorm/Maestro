@@ -7,6 +7,7 @@ promotion and finality. Importing this module does not load WGP or use CUDA.
 from __future__ import annotations
 
 import copy
+from contextlib import nullcontext
 import json
 import os
 from pathlib import Path
@@ -87,7 +88,7 @@ def run_native_generation(wgp, task, params, *, identity, consumer, send_cmd,
     callback ACK nor the worker's result grants authority or authenticates media.
     """
     from services.director_native_process import run_native_process, NativeProcessError
-    from services.native_acceptance_reservation import prepare_stdio_ownership, finish_stdio_ownership
+    from services.native_acceptance_reservation import prepare_stdio_ownership, finish_stdio_ownership, reservation
 
     fence = invocation_fence if invocation_fence is not None else threading.Event()
     gen = params["state"]["gen"]
@@ -139,6 +140,13 @@ def run_native_generation(wgp, task, params, *, identity, consumer, send_cmd,
             if type(total) is not int or type(target) is not int:
                 raise NativeProcessError("director_output_count")
             gen["extra_orders"] = target - total
+
+    def callback_context(role, operation, callback_thread):
+        if role != "on_request" or operation not in {"retain_preparation", "retain_repeat"}:
+            return nullcontext()
+        token = reservation.capture_director_callback(identity, fence, callback_thread,
+            role=role, operation=operation)
+        return reservation.director_callback(token)
 
     def on_request(name, payload):
         if name == "validate_current":
@@ -202,7 +210,7 @@ def run_native_generation(wgp, task, params, *, identity, consumer, send_cmd,
             cwd=str(Path(wgp.__file__).resolve().parent), environment=environment,
             on_request=on_request, on_event=on_event, cancelled=cancelled,
             validate_authority=validate_authority, on_started=on_started,
-            on_abort=on_abort, invocation_fence=fence)
+            on_abort=on_abort, invocation_fence=fence, callback_context=callback_context)
         if (type(result) is not dict or set(result) != {"identity", "success", "gen"}
                 or type(result["success"]) is not bool):
             raise NativeProcessError("director_result_binding")

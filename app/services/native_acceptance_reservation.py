@@ -6,7 +6,7 @@ It is an admission boundary, never GPU lease authority.
 """
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import hashlib
 import json
 import os
@@ -52,6 +52,16 @@ class _WorkerAdmission:
         self.admission = admission
         self.native_slot = native_slot
         self.used = False
+
+
+class _DirectorCallbackAdmission:
+    def __init__(self, reservation, worker, owner, callback, identity, fence, operation):
+        self.reservation, self.worker = reservation, worker
+        self.owner, self.callback = weakref.ref(owner), weakref.ref(callback)
+        self.identity = job_identity(worker.admission[1])
+        self.attempts = (worker.admission[1].get("execution_attempt"), worker.admission[1].get("recovery_attempt", 0))
+        self.binding, self.fence, self.operation = dict(identity), fence, operation
+        self.used = self.closed = self.checkpointed = False
 
 
 class _PlanningAdmission:
@@ -122,6 +132,7 @@ class Reservation:
         self._retry_committed = False
         self._permits = {}
         self._workers = {}
+        self._director_callbacks = {}
         self._planning = {}
         self._images = None
         self._director_manifests = {}
@@ -662,6 +673,87 @@ class Reservation:
         except (ValueError, TypeError, KeyError):
             return False
 
+    def capture_director_callback(self, identity, fence, callback_thread, *, role, operation):
+        if self.target is None:
+            return None
+        current = threading.current_thread()
+        with self._lock:
+            worker = self._workers.get(current)
+        if (role != "on_request" or operation not in {"retain_preparation", "retain_repeat"}
+                or type(fence) is not threading.Event or fence.is_set()
+                or not isinstance(callback_thread, threading.Thread) or callback_thread is current
+                or callback_thread.ident is not None or worker is None):
+            raise NativeAcceptanceReserved("Director callback capability is unavailable")
+        with worker.native_slot._guard, self._lock:
+            job = worker.admission[1]
+            params = job.get("params") or {}
+            if (self.target.get("kind") not in {"generation", "director_saved_video"}
+                    or self._workers.get(current) is not worker or not self._worker_valid(worker)
+                    or job.get("kind") != "director_child" or job.get("status") != "running"
+                    or type(identity) is not dict or set(identity) != {
+                        "job_id", "execution_attempt", "task_index", "child_digest", "task_digest"}
+                    or identity["job_id"] != job.get("id")
+                    or identity["execution_attempt"] != job.get("execution_attempt")
+                    or type(identity["task_index"]) is not int or identity["task_index"] < 0
+                    or (params.get("_director_video_lora_child_snapshot") or {}).get("digest") != identity["child_digest"]
+                    or ((params.get("_director_video_lora_task_plans") or {}).get(str(identity["task_index"])) or {}).get("digest") != identity["task_digest"]
+                    or fence.is_set()):
+                raise NativeAcceptanceReserved("Director callback origin changed")
+            return _DirectorCallbackAdmission(self, worker, current, callback_thread, identity, fence, operation)
+
+    def _director_callback_live(self, token, job, admission):
+        # Caller holds this token's native slot guard, then our lock.
+        if type(token) is not _DirectorCallbackAdmission:
+            return False
+        owner, current = token.owner(), threading.current_thread()
+        identity = job_identity(job)
+        return (token.reservation is self and token.used and not token.closed
+            and token.callback() is current and self._director_callbacks.get(current) is token
+            and not token.fence.is_set() and owner is not None and owner.is_alive()
+            and self._workers.get(owner) is token.worker and token.worker.admission is admission
+            and admission[1] is job and self._worker_valid(token.worker)
+            and (job.get("execution_attempt"), job.get("recovery_attempt", 0)) == token.attempts
+            and all(identity[key] == value for key, value in token.identity.items()
+                if key != "request_manifest_sha256"))
+
+    @contextmanager
+    def director_callback(self, token):
+        if self.target is None:
+            yield
+            return
+        if type(token) is not _DirectorCallbackAdmission or token.reservation is not self:
+            raise NativeAcceptanceReserved("Director callback capability is unavailable")
+        current = threading.current_thread()
+        with token.worker.native_slot._guard, self._lock:
+            if (token.used or token.closed or token.callback() is not current
+                    or current in self._director_callbacks or current in self._workers):
+                raise NativeAcceptanceReserved("Director callback capability was already spent")
+            token.used = True
+            self._director_callbacks[current] = token
+            if not self._director_callback_live(token, token.worker.admission[1], token.worker.admission):
+                del self._director_callbacks[current]
+                token.closed = True
+                raise NativeAcceptanceReserved("Director callback admission expired")
+        try:
+            yield
+        finally:
+            with self._lock:
+                if self._director_callbacks.get(current) is token:
+                    del self._director_callbacks[current]
+                token.closed = True
+
+    def _director_callback_change(self, token, job, predecessor, successor_params):
+        field = {"retain_preparation": "_director_video_lora_preparation_plans",
+                 "retain_repeat": "_director_video_lora_consumption_plans"}[token.operation]
+        if token.checkpointed or digest(predecessor) != token.identity["request_manifest_sha256"] or type(successor_params) is not dict:
+            return False
+        before, after = dict(job.get("params") or {}), dict(successor_params)
+        old_records, new_records = before.pop(field, {}), after.pop(field, None)
+        key = str(token.binding["task_index"])
+        return (before == after and type(old_records) is dict and type(new_records) is dict
+            and key in new_records and {k: v for k, v in old_records.items() if k != key}
+                == {k: v for k, v in new_records.items() if k != key})
+
     @contextmanager
     def director_manifest_checkpoint(self, job, predecessor, successor, *, successor_params=None):
         """Keep validated execution-record retention within its live admission.
@@ -675,9 +767,12 @@ class Reservation:
         if self.target is None:
             yield
             return
-        with self._lock:
+        callback = self._director_callbacks.get(threading.current_thread())
+        guard = callback.worker.native_slot._guard if callback is not None else nullcontext()
+        with guard, self._lock:
             admission = self._permits.get(id(job))
             worker = self._workers.get(threading.current_thread())
+            delegated = callback is not None and self._director_callback_live(callback, job, admission)
             if (self.target.get("kind") not in {"generation", "director_saved_video"}
                     or self.target.get("kind") == "director_saved_video" and (type(successor_params) is not dict
                         or type(self._images) is not _SavedVideoAdmission
@@ -688,8 +783,12 @@ class Reservation:
                     or not predecessor or not successor or admission is None
                     or not self._parent_valid(admission)
                     or not (admission[0]() is threading.current_thread()
-                            or worker is not None and worker.admission is admission)):
+                            or worker is not None and worker.admission is admission or delegated)):
                 raise NativeAcceptanceReserved("Director manifest admission changed")
+            if callback is not None:
+                if not delegated or not self._director_callback_change(callback, job, predecessor, successor_params):
+                    raise NativeAcceptanceReserved("Director callback checkpoint changed")
+                callback.checkpointed = True
             previous = self._director_manifests.get(id(job))
             before = job_identity(job)
             attempts = (job.get("execution_attempt"), job.get("recovery_attempt", 0))
@@ -699,11 +798,13 @@ class Reservation:
                 (digest(job.get("params")), digest(successor_params if successor_params is not None else job.get("params"))))
         try:
             yield
-            if (job.get("_recovery_manifest_pointer") != successor
-                    or job_identity(job) != after
-                    or (job.get("execution_attempt"), job.get("recovery_attempt", 0)) != attempts
-                    or successor_params is not None and digest(job.get("params")) != digest(successor_params)):
-                raise NativeAcceptanceReserved("Director manifest checkpoint was not published")
+            with guard, self._lock:
+                if (callback is not None and not self._director_callback_live(callback, job, admission)
+                        or job.get("_recovery_manifest_pointer") != successor
+                        or job_identity(job) != after
+                        or (job.get("execution_attempt"), job.get("recovery_attempt", 0)) != attempts
+                        or successor_params is not None and digest(job.get("params")) != digest(successor_params)):
+                    raise NativeAcceptanceReserved("Director manifest checkpoint was not published")
         except BaseException:
             with self._lock:
                 if previous is None:
@@ -1180,7 +1281,13 @@ def _guardian_ready():
         return False
     receipt = json.loads(raw)
     fresh_at = receipt.get("last_check", receipt.get("ready_at"))
-    freshness = 2 if _PLAN["target"].get("kind") in {"director_planning", "director_images", "director_saved_images", "director_saved_video"} else 10
+    kind = _PLAN["target"].get("kind")
+    # Saved-video supervision budgets three seconds for authority, journal and
+    # custody observation together. Keep its receipt window below the GPU
+    # coordinator's ten-second limit without rejecting an in-budget loop.
+    freshness = 4 if kind == "director_saved_video" else (
+        2 if kind in {"director_planning", "director_images", "director_saved_images"} else 10
+    )
     if type(fresh_at) not in {int, float} or not 0 <= time.time() - fresh_at < freshness:
         return False
     if (receipt.get("ready") is not True or receipt.get("failure")
