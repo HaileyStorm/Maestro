@@ -11,7 +11,7 @@ import numpy as np
 import torch
 
 from shared.utils import files_locator as fl
-from ..voxcpm_handler import _get_voxcpm2_checkpoint_root
+from ..voxcpm_handler import _get_voxcpm2_checkpoint_root, _validate_voxcpm_reference
 
 from services.tts_script_breakdown import (
     format_voxcpm_turn_text,
@@ -92,7 +92,14 @@ class VoxCpmPipeline:
         steps = 30 if sampling_steps in (None, 0) else sampling_steps
         if isinstance(steps, bool) or int(steps) != steps or not 1 <= int(steps) <= 100:
             raise ValueError("VoxCPM num_inference_steps must be an integer from 1 to 100 (0 uses 30).")
+        error = _validate_voxcpm_reference(
+            audio_guide, custom_settings, alt_prompt=alt_prompt,
+            model_mode=model_mode, input_prompt=input_prompt,
+        )
+        if error:
+            raise ValueError(error)
         settings = custom_settings or {}
+        reference_text = settings.get("voxcpm_reference_text", "")
         max_len = settings.get("voxcpm_max_len", 4096)
         retry = settings.get("voxcpm_retry_badcase", 1)
         if isinstance(max_len, bool) or int(max_len) != max_len or not 2 <= int(max_len) <= 4096:
@@ -135,6 +142,9 @@ class VoxCpmPipeline:
             }
             if clone:
                 generate_kwargs["reference_wav_path"] = clone
+                if reference_text:
+                    generate_kwargs["prompt_wav_path"] = clone
+                    generate_kwargs["prompt_text"] = reference_text
             # VoxCPM tokenizes with torch.LongTensor (always CPU) then
             # torch.empty() for a zero-shot pad, which follows the implicit
             # default device. Maestro often leaves CUDA as that default, so

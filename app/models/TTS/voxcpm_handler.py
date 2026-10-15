@@ -21,6 +21,38 @@ VOXCPM2_FILES = (
 )
 
 
+def _validate_voxcpm_reference(audio_guide, custom_settings=None, *,
+                              alt_prompt="", model_mode="", input_prompt=""):
+    settings = {} if custom_settings is None else custom_settings
+    if not isinstance(settings, dict):
+        return "VoxCPM custom settings must be an object."
+    transcript = settings.get("voxcpm_reference_text", "")
+    if not isinstance(transcript, str):
+        return "VoxCPM reference transcript must be a string."
+    try:
+        size = len(transcript.encode("utf-8"))
+    except UnicodeEncodeError:
+        return "VoxCPM reference transcript must contain valid UTF-8 text."
+    if size > 16000:
+        return "VoxCPM reference transcript is limited to 16000 UTF-8 bytes."
+    if transcript:
+        if not transcript.strip():
+            return "VoxCPM reference transcript must contain text or be empty to disable it."
+        if not (isinstance(audio_guide, str) and os.path.isfile(audio_guide)
+                and audio_guide.lower().endswith((".wav", ".flac", ".mp3", ".ogg"))):
+            return "VoxCPM reference transcript requires an existing WAV, FLAC, MP3 or OGG reference audio file."
+        from services.tts_script_breakdown import parse_tts_script_turns
+        if (str(alt_prompt or "").strip() or str(model_mode or "").strip()
+                or any(turn.get("emotion") for turn in parse_tts_script_turns(input_prompt))):
+            return (
+                "VoxCPM audio-plus-transcript cloning requires empty voice directions "
+                "(alt_prompt, model_mode and speaker emotion tags): this mode can read "
+                "them aloud. Use the reference recording's delivery, or clear the "
+                "reference transcript to use directed reference-only cloning."
+            )
+    return None
+
+
 def _get_voxcpm2_checkpoint_root():
     from shared.utils import files_locator as fl
 
@@ -66,7 +98,25 @@ def _get_voxcpm2_model_def() -> dict:
             "placeholder": "warm, unhurried, slightly amused",
             "lines": 2,
         },
+        "reference_text_cloning": {
+            "field": "custom_settings.voxcpm_reference_text",
+            "default": "",
+            "maximum_utf8_bytes": 16000,
+            "audio_field": "audio_guide",
+            "mode": "reference_and_continuation",
+            "description": "An exact reference transcript enables cloning with the same clip as voice reference and continuation audio. Empty keeps ordinary cloning or text-only speech.",
+            "direction_limitation": "Separate voice directions are unsupported with audio continuation and are rejected because they can be spoken aloud. The reference supplies its delivery.",
+            "experimental": True,
+            "direction_supported": False,
+        },
         "custom_settings": [
+            {
+                "id": "voxcpm_reference_text",
+                "label": "Reference audio transcript (optional; enables continuation cloning)",
+                "name": "Reference transcript",
+                "type": "text", "default": "",
+                "description": "Exact words in the reference clip, up to 16000 UTF-8 bytes. Requires reference audio and empty separate voice directions; delivery comes from the recording.",
+            },
             {
                 "id": "voxcpm_max_len", "label": "Speech token limit (2-4096)",
                 "name": "Speech token limit", "type": "int", "default": 4096,
@@ -144,6 +194,13 @@ class family_handler:
 
     @staticmethod
     def validate_generative_settings(base_model_type, model_def, inputs):
+        error = _validate_voxcpm_reference(
+            inputs.get("audio_guide"), inputs.get("custom_settings"),
+            alt_prompt=inputs.get("alt_prompt"), model_mode=inputs.get("model_mode"),
+            input_prompt=inputs.get("prompt", ""),
+        )
+        if error:
+            return error
         if not _get_voxcpm2_checkpoint_root():
             return (
                 "VoxCPM 2 is listed, but its weights are not installed on this "

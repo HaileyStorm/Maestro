@@ -37,14 +37,15 @@ function customSettingInputValue(
   return String(settings?.[settingId] ?? '')
 }
 
-function withNumericCustomSetting(
+function withCustomSetting(
   settings: Record<string, unknown> | undefined,
   settingId: string,
   input: string,
+  type: string,
 ): Record<string, unknown> | undefined {
   const next = { ...(settings || {}) }
   if (input === '') delete next[settingId]
-  else next[settingId] = Number.parseFloat(input)
+  else next[settingId] = type === 'text' ? input : Number.parseFloat(input)
   return Object.keys(next).length > 0 ? next : undefined
 }
 
@@ -647,15 +648,16 @@ export function AdvancedSettings() {
                     <div key={setting.id}>
                       <label className="text-[11px] text-text-muted uppercase tracking-wider mb-1.5 block">{setting.name}</label>
                       <input
-                        type="number"
+                        type={setting.type === 'text' ? 'text' : 'number'}
                         placeholder="Empty = disabled"
                         value={customSettingInputValue(params.custom_settings, setting.id)}
                         onChange={e => {
-                          const val = e.target.value.trim()
-                          setParam('custom_settings', withNumericCustomSetting(
+                          const val = setting.type === 'text' ? e.target.value : e.target.value.trim()
+                          setParam('custom_settings', withCustomSetting(
                             params.custom_settings,
                             setting.id,
                             val,
+                            setting.type,
                           ))
                         }}
                         className="w-full bg-bg-tertiary border border-border rounded-lg px-3 py-2 text-sm text-text-primary focus:outline-none focus:border-accent-blue"

@@ -72,7 +72,7 @@ Model-specific inputs remain owned by discovery and the execution handler:
 | --- | --- | --- |
 | Drama 3 | `custom_settings.drama3_reference_text` | Speaker tags and `alt_prompt`; experimental, inspect actual output |
 | Qwen3 TTS Base | `alt_prompt` | Reference-conditioned speech; CustomVoice is a separate preset-voice architecture |
-| VoxCPM2 | Audio reference; the shipped adapter uses `reference_wav_path`, without a transcript parameter | Speaker/emotion tags and `alt_prompt` |
+| VoxCPM2 | Optional `custom_settings.voxcpm_reference_text` enables combined reference-and-continuation cloning with the same audio clip; exact transcript, at most 16000 UTF-8 bytes | Reference-only mode supports speaker/emotion tags and `alt_prompt`. Combined mode requires empty separate directions; delivery comes from the recording. |
 | KugelAudio | Audio reference; no separate transcript input in the shipped pipeline | No separate character-description input; `num_inference_steps` controls native diffusion steps, 1–100 (default 20; legacy 0 uses 20) |
 | Chatterbox | Audio reference; no separate transcript input | `custom_settings.exaggeration` and `pace` controls; `num_inference_steps` controls acoustic flow-matching steps, 1–100 (default 10; legacy 0 uses 10). `alt_prompt` is unused. |
 
@@ -86,6 +86,80 @@ do not pass unsupported prose and claim that the model used it. Model
 availability, installed assets, applicable terms, native readiness and output
 quality are separate facts. A completed download or saved card does not prove
 a completed clone take.
+
+## VoxCPM2 audio-plus-transcript cloning
+
+Set `custom_settings.voxcpm_reference_text` to the exact words in the selected
+recording. A nonempty transcript requires an existing `audio_guide` reference.
+The adapter supplies that same recording as both upstream `reference_wav_path`
+and `prompt_wav_path`, with the unchanged transcript as `prompt_text`. The
+transcript must be a string containing at most 16000 UTF-8 bytes; whitespace-only
+text is invalid. Leaving it empty preserves reference-only cloning or text-only
+speech, according to whether reference audio is supplied.
+
+Within the same open `MaestroClient` session after preparing `reference`, build
+the body below. Select the actual VoxCPM2 model ID from discovery, then use the
+held-job submission and uncertain-submission workflow in the next section.
+
+```python
+import uuid
+
+model = os.environ["MAESTRO_VOXCPM_MODEL"]
+defaults = maestro.request("GET", f"/api/v1/defaults/{model}")
+body = {
+    **defaults,
+    "generation_request_id": str(uuid.uuid4()),
+    "workspace": project,
+    "model_type": model,
+    "generation_mode": "audio",
+    "audio_prompt_type": "A",
+    "audio_guide": reference["upload"]["filename"],
+    "custom_settings": {
+        **(defaults.get("custom_settings") or {}),
+        "voxcpm_reference_text": reference["transcript"],
+    },
+    "alt_prompt": "",
+    "model_mode": "",
+    "prompt": "Stay close. I know a safe path through these woods.",
+    "repeat_generation": 1,
+    "private_output": True,
+    "enhance_before_generate": False,
+    "_queue_mode": "held",
+}
+```
+
+Combined cloning uses the recording's delivery. It requires empty `alt_prompt`
+and `model_mode`, and no speaker emotion tags. In retained native comparisons,
+combined mode spoke the parenthetical direction aloud and some takes lost
+dialogue. Maestro therefore rejects this unsupported input combination before
+loading the model. Clear the transcript to use directed reference-only cloning;
+use a reference with the desired delivery for transcript-conditioned cloning.
+Neither successful execution nor a higher step count establishes voice quality;
+comparative listening is still needed.
+
+## Saved inputs and prepared voice memory
+
+Project voice cards save portable recordings, transcripts and provenance. Loading
+a card prepares a session upload; it does not load trained speaker weights or a
+persisted native tensor cache. The same source card can be used by different
+models through their respective inputs. Native prepared representations are
+model-specific and are not interchangeable.
+
+| Model | Current retention and reuse | Lower-level possibility, not a saved-voice API |
+| --- | --- | --- |
+| Drama 3 | By default, reference codes are rebuilt for each generation job. The opt-in `custom_settings.drama3_reference_cache: 1` implementation retains up to six exact-reference code tensors, at most 8 MiB total, in CPU RAM while the pipeline remains loaded; release clears them. It defaults to off. Retained native WAV comparisons establish execution and byte-identical audio for the measured cache case; they do not establish subjective quality for every voice. | Encoded reference codes can condition further speech. No disk save/load of prepared voice tensors is exposed. The separate FP8 expert cache holds model weights, not a prepared voice. |
+| VoxCPM2 | The loaded model is retained, but each high-level generation call rebuilds reference features. Combined mode encodes the same recording for its two roles, with different padding; the wrapper retains no prepared voice cache across turns or jobs. | Native `build_prompt_cache` returns CPU-RAM latent features plus transcript and mode; `generate_with_prompt_cache` can reuse them. Maestro has not integrated that reuse or persisted those tensors. Conditioning is transferred to the model device during generation. |
+| Qwen3 TTS Base | Reference speech codes and speaker embeddings are prepared for the request. Split speech and dialogue paths reuse request-local prompt items; a new job rebuilds them. No project-card restore of prepared tensors is exposed. | Native `create_voice_clone_prompt` items can be supplied to `generate_voice_clone`. That makes reuse possible, but does not establish cross-job RAM/VRAM retention or a portable tensor format. CustomVoice uses preset voices and is a separate architecture. |
+| KugelAudio | The wrapper reloads/processes the reference into each generation's inputs. It does not retain a prepared voice cache for later jobs. | Lower-level `encode_voice_prompt` and `voice_cache` support prepared features; the wrapper does not use that path as a saved-voice facility. |
+| Chatterbox | The loaded model retains its latest conditioning on the model device, but the wrapper prepares the supplied reference again on each request. A saved card does not restore that conditioning directly; release drops the loaded model. | Native generation can reuse current conditioning without another audio path. A save helper exists, but the installed multilingual loader does not honor the requested file and loads bundled conditioning instead. Those helpers do not establish working prepared-voice save/load. |
+
+There is no general public API here for saving prepared voice tensors to disk,
+loading arbitrary tensor files, or pinning a named voice in RAM or VRAM. Do not
+deserialize arbitrary Torch/pickle files as voice profiles. Use the authorized
+project recording and transcript; any future prepared-cache persistence needs
+explicit model/codec identity, bounded memory and a supported private format.
+These are source-level retention descriptions, not memory measurements or native
+quality acceptance. A model's `native_qualified` status remains separate.
 
 ## Submit speech from a saved voice
 
@@ -217,11 +291,10 @@ that use them, including Qwen's full reference conditioning and Drama. Qwen's
 x-vector-only mode is a different quality tradeoff, not an equivalent substitute.
 No length/phonetic-variety optimum has been qualified here.
 
-VoxCPM2 upstream also offers combined audio-plus-transcript continuation cloning
-(`prompt_wav_path`, `prompt_text` and `reference_wav_path`). Maestro's current
-adapter uses isolated reference-audio cloning only; the upstream maximum-fidelity
-mode is not exposed by that adapter. Do not infer its quality from the existing
-Vox reference-only comparisons.
+VoxCPM2 combined audio-plus-transcript continuation cloning is available through
+`custom_settings.voxcpm_reference_text` as described above. Its quality still
+needs a separate comparison against reference-only cloning with the same source
+recording and settings; the presence of the option does not prove better output.
 
 Corpus accent/region labels describe source speakers. Record a listener's
 perceived generated accent and accent retention separately from speaker identity,
