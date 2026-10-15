@@ -240,6 +240,13 @@ workspace, a catalog model ID, prompt and model-specific settings. The public
 `_queue_mode` is `now` or `held`; `held` saves a genuine job without releasing it
 for model work. Preserve the exact submitted JSON before sending it.
 
+New generation admissions default to the current `settings_version` from the
+model defaults. Preserve an explicit old version when importing legacy saved
+settings: historical migrations can change audio-processing flags. A normal
+clean voice reference uses `audio_prompt_type: "A"`; vocal extraction is an
+optional processing choice, rather than a requirement for cloning. Existing
+admitted jobs and repeated submission IDs retain their original settings.
+
 ```python
 import os, uuid
 from maestro_continuum import MaestroClient, UncertainSubmission

@@ -41,6 +41,9 @@ def speech_capabilities():
             "reference_fields": ["audio_guide", "audio_guide2", "audio_guide3"],
             "maximum_duration_seconds": 300, "duration_is_upper_bound": True,
             "history_scope": "Within one generation job; no cross-request history handle.",
+            "separate_speaker_turns": {"field": "custom_settings.drama3_separate_turns",
+                "default": 0, "values": [0, 1],
+                "description": "1 generates each explicitly tagged speaker turn separately with native history. Experimental mitigation for skipped turns; words and quality still require inspection."},
             "precision": "Official block FP8 experts, BF16 backbone, CPU FP32 codec; no Q6 variant.",
             "gpu_budget_gib": {"minimum": 8, "maximum": 26, "default": 22,
                 "scope": "Weights plus worst-case expert staging; caches and CUDA overhead need additional VRAM."},
@@ -69,6 +72,8 @@ def model_definition():
         "alt_prompt": {"label": "Performance direction", "placeholder": "whispering, tense",
                        "lines": 2},
         "custom_settings": [
+            {"id": "drama3_separate_turns", "label": "Generate each marked speaker turn separately (0 or 1)",
+             "type": "int", "default": 0},
             {"id": "drama3_gpu_budget_gib", "label": "GPU weights and staging budget (GiB)",
              "type": "float", "default": 22.0},
             *[{"id": "drama3_reference_text" + (str(i) if i > 1 else ""),

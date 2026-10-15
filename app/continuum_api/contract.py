@@ -85,6 +85,8 @@ def enrich_openapi(schema: dict) -> dict:
             "The GPU budget covers weights and worst-case expert staging; caches and CUDA overhead are additional.",
         "properties": {
             "drama3_gpu_budget_gib": {"type": "number", "minimum": 8, "maximum": 26, "default": 22},
+            "drama3_separate_turns": {"type": "integer", "enum": [0, 1], "default": 0,
+                "description": "1 preserves each explicitly tagged speaker turn as a separate generation chunk, including repeated speakers, with native audio history. Experimental mitigation for skipped turns; not a word-completeness guarantee. 0 retains Fish's native batching."},
             **{("drama3_reference_text" + (str(i) if i > 1 else "")): {
                 "type": "string", "default": "", "description":
                     f"Actual transcript of audio_guide{str(i) if i > 1 else ''} for zero-based Speaker {i-1}; "
@@ -116,7 +118,9 @@ def enrich_openapi(schema: dict) -> dict:
         },
     }
     for model, name, steps in (("voxcpm2", "VoxCPM2GenerationSettings", 30),
-                               ("index_tts2", "IndexTTS2GenerationSettings", 25)):
+                               ("index_tts2", "IndexTTS2GenerationSettings", 25),
+                               ("kugelaudio_0_open", "KugelAudioGenerationSettings", 20),
+                               ("chatterbox", "ChatterboxGenerationSettings", 10)):
         properties = {
             "model_type": {"type": "string", "const": model},
             "workspace": {"type": "string"}, "prompt": {"type": "string", "minLength": 1},
@@ -134,12 +138,21 @@ def enrich_openapi(schema: dict) -> dict:
                         "description": "0 disables native automatic bad-case retries; 1 enables them."},
                 }},
             })
+        if model == "chatterbox":
+            properties["alt_prompt"]["description"] = "Unused by Chatterbox; use custom_settings.exaggeration and pace."
+            properties["custom_settings"] = {"type": "object", "additionalProperties": True, "properties": {
+                "exaggeration": {"type": "number", "minimum": 0.25, "maximum": 2, "default": 0.5},
+                "pace": {"type": "number", "minimum": 0.2, "maximum": 1, "default": 0.5,
+                    "description": "Classifier-free guidance weight, exposed as Pace."},
+            }}
         schema["components"]["schemas"][name] = {
             "type": "object", "additionalProperties": True,
             "required": ["model_type", "workspace", "prompt"] + (["audio_guide"] if model == "index_tts2" else []),
             "description": "Projection of the existing generation operation; discover current model-options/defaults. "
                 + ("VoxCPM ignores temperature, top_p, top_k, seed and duration_seconds; token limit bounds speech."
-                   if model == "voxcpm2" else "IndexTTS2 uses these steps in its diffusion decoder; GPT sampler settings remain separate."),
+                   if model == "voxcpm2" else "KugelAudio uses these steps in its native diffusion head; alt_prompt is not a voice-direction input."
+                   if model == "kugelaudio_0_open" else "Chatterbox uses these steps in its acoustic flow-matching decoder; autoregressive sampler settings remain separate."
+                   if model == "chatterbox" else "IndexTTS2 uses these steps in its diffusion decoder; GPT sampler settings remain separate."),
             "properties": properties,
         }
     schema["components"]["schemas"]["DirectorVideoLoras"] = {

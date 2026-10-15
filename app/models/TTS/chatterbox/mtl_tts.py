@@ -163,15 +163,15 @@ class ChatterboxMultilingualTTS:
         ckpt_dir = Path(ckpt_dir)
         from mmgp import offload
         ve = VoiceEncoder()
-        offload.load_model_data(ve, fl.locate_file(os.path.join(ckpt_folder, "ve.safetensors")), writable_tensors=False)
+        offload.load_model_data(ve, fl.locate_file(os.path.join(ckpt_folder, "ve.safetensors")), writable_tensors=False, default_dtype=torch.float32)
         ve.eval()
         # from accelerate import init_empty_weights
         # with init_empty_weights():
         t3 = T3(T3Config.multilingual())
-        offload.load_model_data(t3, fl.locate_file(os.path.join(ckpt_folder, "t3_mtl23ls_v2.safetensors")), writable_tensors=False)
+        offload.load_model_data(t3, fl.locate_file(os.path.join(ckpt_folder, "t3_mtl23ls_v2.safetensors")), writable_tensors=False, default_dtype=torch.float32)
         t3.eval()
         s3gen = S3Gen()
-        offload.load_model_data(s3gen, fl.locate_file(os.path.join(ckpt_folder, "s3gen.pt")), writable_tensors=False)
+        offload.load_model_data(s3gen, fl.locate_file(os.path.join(ckpt_folder, "s3gen.pt")), writable_tensors=False, default_dtype=torch.float32)
         s3gen.eval()
 
         tokenizer = MTLTokenizer(
@@ -235,6 +235,8 @@ class ChatterboxMultilingualTTS:
         repetition_penalty=2.0,
         min_p=0.05,
         top_p=1.0,
+        *,
+        num_inference_steps=10,
     ):
         # Validate language_id
         if language_id and language_id.lower() not in SUPPORTED_LANGUAGES:
@@ -289,6 +291,7 @@ class ChatterboxMultilingualTTS:
             wav, _ = self.s3gen.inference(
                 speech_tokens=speech_tokens,
                 ref_dict=self.conds.gen,
+                num_inference_steps=num_inference_steps,
             )
             watermarked_wav = wav.squeeze(0).detach().cpu().numpy()
             # watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)

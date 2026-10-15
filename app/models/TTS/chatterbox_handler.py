@@ -53,6 +53,10 @@ CHATTERBOX_DEFAULT_CUSTOM_SETTINGS = {
     "exaggeration": 0.5,
     "pace": 0.5,
 }
+CHATTERBOX_REQUIRED_FILES = (
+    "ve.safetensors", "t3_mtl23ls_v2.safetensors", "s3gen.pt",
+    "grapheme_mtl_merged_expanded_v1.json", "conds.pt", "Cangjie5_TC.json",
+)
 CHATTERBOX_CUSTOM_SETTINGS = [
     {
         "id": "exaggeration",
@@ -78,7 +82,7 @@ def _get_chatterbox_model_def():
         "sliding_window": False,
         "guidance_max_phases": 0,
         "no_negative_prompt": True,
-        "inference_steps": False,
+        "inference_steps": True,
         "temperature": True,
         "image_prompt_types_allowed": "",
         "profiles_dir": ["chatterbox"],
@@ -89,6 +93,9 @@ def _get_chatterbox_model_def():
             "label": "Language",
         },
         "any_audio_prompt": True,
+        "required_runtime_assets": {
+            "processor": ["chatterbox/" + name for name in CHATTERBOX_REQUIRED_FILES],
+        },
         "custom_settings": [one.copy() for one in CHATTERBOX_CUSTOM_SETTINGS],
         "text_prompt_enhancer_instructions": TTS_MONOLOGUE_PROMPT,
         "prompt_enhancer_button_label": "Write Speech",
@@ -96,14 +103,7 @@ def _get_chatterbox_model_def():
 
 
 def _get_chatterbox_download_def():
-    mandatory_files = [
-        "ve.safetensors",
-        "t3_mtl23ls_v2.safetensors",
-        "s3gen.pt",
-        "grapheme_mtl_merged_expanded_v1.json",
-        "conds.pt",
-        "Cangjie5_TC.json",
-    ]
+    mandatory_files = list(CHATTERBOX_REQUIRED_FILES)
     return {
         "repoId": "ResembleAI/chatterbox",
         "sourceFolderList": [""],
@@ -225,7 +225,7 @@ class family_handler:
                 "model_mode": "en",
                 "repeat_generation": 1,
                 "video_length": 0,
-                "num_inference_steps": 0,
+                "num_inference_steps": 10,
                 "negative_prompt": "",
                 "custom_settings": dict(CHATTERBOX_DEFAULT_CUSTOM_SETTINGS),
                 "temperature": 0.8,
@@ -233,6 +233,14 @@ class family_handler:
                 "multi_prompts_gen_type": 2,
             }
         )
+
+    @staticmethod
+    def validate_generative_settings(base_model_type, model_def, inputs):
+        steps = inputs.get("num_inference_steps", 0)
+        if (isinstance(steps, bool) or not isinstance(steps, (int, float))
+                or not 0 <= steps <= 100 or int(steps) != steps):
+            return "Chatterbox acoustic steps must be an integer from 1 to 100 (0 uses 10)."
+        return None
 
     @staticmethod
     def validate_generative_prompt(base_model_type, model_def, inputs, one_prompt):

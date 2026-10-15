@@ -68,7 +68,7 @@ def _get_kugelaudio_model_def():
         "sliding_window": False,
         "guidance_max_phases": 1,
         "no_negative_prompt": True,
-        "inference_steps": False,
+        "inference_steps": True,
         "temperature": True,
         "image_prompt_types_allowed": "",
         "supports_early_stop": True,
@@ -250,7 +250,7 @@ class family_handler:
                 "duration_seconds": duration_def.get("default", 60),
                 "pause_seconds": 0.5,
                 "video_length": 0,
-                "num_inference_steps": 0,
+                "num_inference_steps": 20,
                 "negative_prompt": "",
                 "temperature": 1.0,
                 "guidance_scale": 3.0,
@@ -301,6 +301,9 @@ class family_handler:
 
     @staticmethod
     def validate_generative_settings(base_model_type, model_def, inputs):
+        steps = inputs.get("num_inference_steps", 0)
+        if isinstance(steps, bool) or not isinstance(steps, (int, float)) or int(steps) != steps or not 0 <= steps <= 100:
+            return "KugelAudio diffusion steps must be an integer from 1 to 100 (0 uses 20)."
         custom_settings = inputs.get("custom_settings", None)
         if custom_settings is None:
             return None

@@ -68026,7 +68026,8 @@ export const operationReference: readonly OperationReference[] = [
                 "type": "number"
               },
               "settings_version": {
-                "type": "number"
+                "type": "number",
+                "description": "When omitted, a new HTTP admission uses the current settings version returned by /api/v1/defaults/{model_type}. Retain an explicitly saved old version only when importing its legacy settings; it enables historical migrations, including audio processing flags. Existing admitted jobs and repeated submission identities are unchanged."
               },
               "self_refiner_setting": {
                 "type": "number"

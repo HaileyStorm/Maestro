@@ -972,10 +972,19 @@ class Qwen3TTSPipeline:
         return {"x": wav, "audio_sampling_rate": int(sr)}
 
     def release(self) -> None:
-        if self.model is not None and hasattr(self.model, "release_decode_cuda_graph"):
-            self.model.release_decode_cuda_graph()
-        for module in [self.model, getattr(self.speech_tokenizer, "model", None)]:
-            if hasattr(module, "to"):
-                module.to("cpu")
-        self.model = None
-        self.speech_tokenizer = None
+        try:
+            if self.model is not None and hasattr(self.model, "release_decode_cuda_graph"):
+                self.model.release_decode_cuda_graph()
+            for module in [self.model, getattr(self.speech_tokenizer, "model", None)]:
+                if hasattr(module, "to"):
+                    # MMGP registers its LoRA owner pointer as a child module.
+                    # Its release runs first, but leaves that backedge behind;
+                    # recursive tensor moves would follow it back to this root.
+                    for child in list(module.modules()):
+                        if child._modules.get("_mm_lora_model") is module:
+                            delattr(child, "_mm_lora_model")
+                    module.to("cpu")
+        finally:
+            self.tts = None
+            self.model = None
+            self.speech_tokenizer = None

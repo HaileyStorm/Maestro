@@ -54,4 +54,6 @@ def encode_reference(path, codec):
 @torch.inference_mode()
 def decode_audio(codes, codec):
     with torch.device("cpu"):
-        return codec.from_indices(codes.cpu().unsqueeze(0))[0, 0].float().cpu()
+        # The native codec clamps indices in place. Keep the generated codes
+        # unchanged for subsequent speech-history conditioning.
+        return codec.from_indices(codes.cpu().unsqueeze(0).clone())[0, 0].float().cpu()

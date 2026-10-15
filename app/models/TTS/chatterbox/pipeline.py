@@ -55,11 +55,17 @@ class ChatterboxPipeline:
         repetition_penalty: float = 2.0,
         min_p: float = 0.05,
         top_p: float = 1.0,
+        sampling_steps: int = 10,
         **bkwargs
     ) -> torch.Tensor:
         text = input_prompt
         if not text or not text.strip():
             raise ValueError("Prompt text cannot be empty for Chatterbox generation.")
+
+        if (isinstance(sampling_steps, bool) or not isinstance(sampling_steps, (int, float))
+                or not 0 <= sampling_steps <= 100 or int(sampling_steps) != sampling_steps):
+            raise ValueError("Chatterbox acoustic steps must be an integer from 1 to 100 (0 uses 10).")
+        num_inference_steps = int(sampling_steps) or 10
 
         language_id = model_mode
         custom_settings = bkwargs.get("custom_settings", None)
@@ -104,6 +110,7 @@ class ChatterboxPipeline:
             repetition_penalty=repetition_penalty,
             min_p=min_p,
             top_p=top_p,
+            num_inference_steps=num_inference_steps,
         )
         return {"x": wav, "audio_sampling_rate": self.sr } 
 

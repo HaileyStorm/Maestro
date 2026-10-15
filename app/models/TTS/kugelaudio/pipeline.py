@@ -221,10 +221,6 @@ class KugelAudioPipeline:
 
         max_new_tokens = kwargs.get("max_new_tokens")
         if max_new_tokens is None:
-            sampling_steps = kwargs.get("sampling_steps")
-            if sampling_steps:
-                max_new_tokens = sampling_steps
-        if max_new_tokens is None:
             max_new_tokens = self.generation_config.get("max_new_tokens", 2048)
         try:
             return max(1, int(max_new_tokens))
@@ -338,10 +334,17 @@ class KugelAudioPipeline:
         audio_guide: Optional[str],
         *,
         temperature: float = 1.0,
+        sampling_steps: int = 20,
         **kwargs,
     ):
         self._interrupt = False
         self._early_stop = False
+        steps = 20 if sampling_steps in (None, 0) else sampling_steps
+        if isinstance(sampling_steps, bool) or not isinstance(steps, (int, float)) or int(steps) != steps or not 1 <= steps <= 100:
+            raise ValueError("KugelAudio num_inference_steps must be an integer from 1 to 100 (0 uses 20).")
+        # WanGP passes the public num_inference_steps as sampling_steps.
+        # Set on every request so a cached model cannot retain a previous override.
+        self.model.set_ddpm_inference_steps(int(steps))
         def _finish(value):
             self.model.release_decode_cuda_graph()
             return value

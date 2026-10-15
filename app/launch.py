@@ -18492,7 +18492,7 @@ def _check_model_downloaded(model_type: str) -> bool:
         ):
             return False
         groups = _model_weight_groups(model_type)
-        if not groups:
+        if not groups and not model_def.get("required_runtime_assets"):
             return False
         if not all(
             _variant_group_downloaded(g, model_type=model_type)
@@ -18913,14 +18913,16 @@ def _retake_engines_for_architecture(architecture):
 
 
 def _speech_capabilities_for_model(architecture):
-    if architecture in ("voxcpm2", "index_tts2"):
+    if architecture in ("voxcpm2", "index_tts2", "kugelaudio_0_open", "chatterbox"):
         return {"speech_capabilities": {
             "decoder_steps": {"parameter": "num_inference_steps", "minimum": 1, "maximum": 100,
-                "default": 30 if architecture == "voxcpm2" else 25,
+                "default": {"voxcpm2": 30, "index_tts2": 25, "kugelaudio_0_open": 20, "chatterbox": 10}[architecture],
                 "legacy_zero_uses_default": True,
                 "description": "Iterative speech decoder steps. More steps cost time; quality remains model-dependent."},
-            "sampling": "flow_matching" if architecture == "voxcpm2" else "autoregressive_then_diffusion",
-            "ignored_controls": ["temperature", "top_p", "top_k", "seed", "duration_seconds"] if architecture == "voxcpm2" else [],
+            "sampling": "flow_matching" if architecture == "voxcpm2" else
+                "autoregressive_then_flow_matching" if architecture == "chatterbox" else "autoregressive_then_diffusion",
+            "ignored_controls": ["temperature", "top_p", "top_k", "seed", "duration_seconds"] if architecture == "voxcpm2" else
+                ["top_k", "alt_prompt", "duration_seconds"] if architecture == "chatterbox" else [],
             "wav_subtype": "PCM_24",
         }}
     if architecture != "drama3":
@@ -19378,6 +19380,16 @@ def _download_model_files(model_type: str):
 
     for filename, source_type, submodel_no in zip(model_file_list, source_type_list, submodel_no_list):
         if len(filename) == 0:
+            if source_type == 0 and submodel_no == 1:
+                # Bundle-backed models have no standalone transformer URL.
+                # Reuse their production handler's exact file declaration.
+                handler = wgp.get_model_handler(model_type)
+                bundles = handler.query_model_files(
+                    lambda value: [os.path.basename(value)] if value else [],
+                    wgp.get_base_model_type(model_type), model_def,
+                )
+                for bundle in bundles if isinstance(bundles, list) else [bundles]:
+                    wgp.process_files_def(**bundle)
             continue
         wgp.download_models(filename, model_type, source_type, submodel_no)
 
@@ -56035,6 +56047,10 @@ async def generate(request: Request):
                 raise HTTPException(status_code=400, detail="enhance_before_generate must be a boolean")
             if queue_mode not in {"now", "held"}:
                 raise HTTPException(status_code=400, detail="_queue_mode must be either 'now' or 'held'")
+        # New HTTP admissions use the current settings contract. An explicitly
+        # supplied old version retains its legacy migration behavior. Without
+        # a version, clean API audio references acquired legacy vocal extraction.
+        body.setdefault("settings_version", wgp.settings_version)
         if "lora_parameters" in body:
             _resolve_studio_image_lora_parameters({
                 **body, "enhance_before_generate": enhance_before_generate,

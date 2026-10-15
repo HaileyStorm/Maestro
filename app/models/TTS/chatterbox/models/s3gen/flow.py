@@ -132,7 +132,11 @@ class MaskedDiffWithXvec(torch.nn.Module):
                   prompt_feat,
                   prompt_feat_len,
                   embedding,
-                  flow_cache):
+                  flow_cache,
+                  *,
+                  n_timesteps=10):
+        if type(n_timesteps) is not int or not 1 <= n_timesteps <= 100:
+            raise ValueError("Chatterbox acoustic steps must be an integer from 1 to 100.")
         if self.fp16 is True:
             prompt_feat = prompt_feat.half()
             embedding = embedding.half()
@@ -171,7 +175,7 @@ class MaskedDiffWithXvec(torch.nn.Module):
             mask=mask.unsqueeze(1),
             spks=embedding,
             cond=conds,
-            n_timesteps=10,
+            n_timesteps=n_timesteps,
             prompt_len=mel_len1,
             flow_cache=flow_cache
         )
@@ -250,7 +254,11 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
                   prompt_feat,
                   prompt_feat_len,
                   embedding,
-                  finalize):
+                  finalize,
+                  *,
+                  n_timesteps=10):
+        if type(n_timesteps) is not int or not 1 <= n_timesteps <= 100:
+            raise ValueError("Chatterbox acoustic steps must be an integer from 1 to 100.")
         if self.fp16 is True:
             prompt_feat = prompt_feat.half()
             embedding = embedding.half()
@@ -283,7 +291,7 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
             mask=mask.unsqueeze(1),
             spks=embedding,
             cond=conds,
-            n_timesteps=10
+            n_timesteps=n_timesteps
         )
         feat = feat[:, :, mel_len1:]
         assert feat.shape[2] == mel_len2
