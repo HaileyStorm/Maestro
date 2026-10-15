@@ -34,6 +34,30 @@ FAILURE_STAGES = frozenset({
     "wgp_import", "runtime_binding", "generation", "model_release", "finish", "cleanup",
 })
 _TRUSTED_FAILURE_FILES = frozenset({"director_native_process.py", "director_native_generation.py"})
+_CALLBACK_SOURCE_PATHS = frozenset(
+    Path(__file__).absolute().parent.parent / relative for relative in (
+        "services/director_native_process.py", "services/director_native_generation.py",
+        "services/director_video_lora_execution.py", "launch.py", "shared/utils/thread_utils.py",
+    )
+)
+_CALLBACK_ROLES = frozenset({"authority", "on_started", "on_request", "on_event"})
+_CALLBACK_OPERATIONS = {
+    "authority": frozenset({"none"}), "on_started": frozenset({"none"}),
+    "on_request": frozenset({"validate_current", "retain_preparation", "retain_repeat",
+        "after_repeat", "after_segment", "profile_observation", "style_begin", "style_fail", "style_encoded"}),
+    "on_event": frozenset({"status", "progress", "preview", "output", "refresh_models",
+        "info", "error", "worker_exit", "exit"}),
+}
+_CALLBACK_EXCEPTION_TYPES = frozenset({
+    ("services.director_video_lora_execution", "DirectorLoraExecutionError"),
+    ("services.queue_recovery_runtime", "QueueRecoveryRuntimeError"),
+    ("services.native_acceptance_reservation", "NativeAcceptanceReserved"),
+})
+_CALLBACK_NATIVE_CODES = frozenset({
+    "cancelled", "director_callback_binding", "director_output_count", "director_repeat_binding",
+    "director_segment_binding", "director_observation_binding", "unsupported_director_request",
+    "director_event_binding",
+})
 _CAUSE_CODES = frozenset({
     "aborted", "ack_mismatch", "authority_revoked", "authority_timeout", "callback_failed",
     "cancelled", "drain_timeout", "duplicate_key", "frame_limit", "group_inspection_limit",
@@ -69,18 +93,18 @@ def _failure_record(stage, exc, trusted_source):
     return {"stage": stage, "exception_type": exception_type, "source": source}
 
 
-def _validate_failure(record):
+def _validate_failure(record, *, trusted_files=_TRUSTED_FAILURE_FILES, exception_types=frozenset()):
     if (type(record) is not dict or set(record) != {"stage", "exception_type", "source"}
             or type(record["stage"]) is not str or record["stage"] not in FAILURE_STAGES
             or type(record["exception_type"]) is not str):
         raise NativeProcessError("invalid_worker_failure")
     name = record["exception_type"]
     cls = getattr(builtins, name, None)
-    if name != "NativeProcessError" and (not isinstance(cls, type) or not issubclass(cls, BaseException)):
+    if name not in exception_types and name != "NativeProcessError" and (not isinstance(cls, type) or not issubclass(cls, BaseException)):
         raise NativeProcessError("invalid_worker_failure")
     source = record["source"]
     if source is not None and (type(source) is not dict or set(source) != {"basename", "function", "line"}
-            or type(source["basename"]) is not str or source["basename"] not in _TRUSTED_FAILURE_FILES
+            or type(source["basename"]) is not str or source["basename"] not in trusted_files
             or type(source["function"]) is not str or not source["function"].isascii()
             or not source["function"].isidentifier() or len(source["function"]) > 128
             or type(source["line"]) is not int or not 0 < source["line"] <= 1_000_000):
@@ -88,15 +112,55 @@ def _validate_failure(record):
     return record
 
 
+def _callback_failure_record(role, operation, exc):
+    failure = _failure_record("generation", exc, __file__)
+    cls = type(exc)
+    if (cls.__module__, cls.__name__) in _CALLBACK_EXCEPTION_TYPES:
+        failure["exception_type"] = cls.__name__
+    frame = exc.__traceback__
+    for _ in range(128):
+        if frame is None:
+            break
+        code = frame.tb_frame.f_code
+        source = Path(code.co_filename).absolute()
+        if (source in _CALLBACK_SOURCE_PATHS and code.co_name.isascii()
+                and code.co_name.isidentifier() and len(code.co_name) <= 128):
+            failure["source"] = {"basename": source.name, "function": code.co_name, "line": frame.tb_lineno}
+        frame = frame.tb_next
+    native_code = next((code for code in _CALLBACK_NATIVE_CODES
+                        if cls is NativeProcessError and type(exc.code) is str and exc.code == code), None)
+    return _validate_callback_failure({
+        "role": role, "operation": operation if operation in _CALLBACK_OPERATIONS[role] else "unknown",
+        "native_code": native_code, "failure": failure,
+    })
+
+
+def _validate_callback_failure(record):
+    if (type(record) is not dict or set(record) != {"role", "operation", "native_code", "failure"}
+            or type(record["role"]) is not str or record["role"] not in _CALLBACK_ROLES
+            or type(record["operation"]) is not str
+            or record["operation"] not in _CALLBACK_OPERATIONS[record["role"]] | {"unknown"}):
+        raise NativeProcessError("invalid_callback_failure")
+    _validate_failure(record["failure"], trusted_files=frozenset(path.name for path in _CALLBACK_SOURCE_PATHS),
+                      exception_types=frozenset(name for _, name in _CALLBACK_EXCEPTION_TYPES))
+    if record["native_code"] is not None and (
+            type(record["native_code"]) is not str or record["native_code"] not in _CALLBACK_NATIVE_CODES
+            or record["failure"]["exception_type"] != "NativeProcessError"):
+        raise NativeProcessError("invalid_callback_failure")
+    return record
+
+
 class NativeProcessError(RuntimeError):
     """Content-free transport failure; do not chain private worker exceptions."""
 
-    def __init__(self, code, *, worker_failure=None, exit_code=None, cause_code=None, cleanup_code=None):
+    def __init__(self, code, *, worker_failure=None, exit_code=None, cause_code=None, cleanup_code=None,
+                 callback_failure=None):
         self.code = code
         self.worker_failure = worker_failure
         self.exit_code = exit_code
         self.cause_code = cause_code if type(cause_code) is str and cause_code in _CAUSE_CODES else None
         self.cleanup_code = cleanup_code if type(cleanup_code) is str and cleanup_code in _CLEANUP_CODES else None
+        self.callback_failure = None if callback_failure is None else _validate_callback_failure(callback_failure)
         super().__init__(f"Director native process failed ({code})")
 
 
@@ -457,6 +521,7 @@ def run_native_process(packet, *, command, on_request, on_event, cancelled,
     channel = Channel(parent, uuid.uuid4().hex, stopped)
     process = None
     worker_failure, raised_error = None, None
+    callback_failure = [None]
 
     def fence(code, *, force=False):
         with abort_lock:
@@ -536,7 +601,7 @@ def run_native_process(packet, *, command, on_request, on_event, cancelled,
         except (OSError, ValueError):
             fence("output_read_failed")
 
-    def callback(function, *args, timeout=None):
+    def callback(function, *args, role, operation="none", timeout=None):
         completed, result, error = threading.Event(), [], []
         with callbacks_lock:
             callbacks[:] = [event for event in callbacks if not event.is_set()]
@@ -545,8 +610,16 @@ def run_native_process(packet, *, command, on_request, on_event, cancelled,
         def invoke():
             try:
                 result.append(function(*args))
-            except BaseException:
+            except BaseException as exc:
                 error.append(True)
+                try:
+                    record = _callback_failure_record(role, operation, exc)
+                except BaseException:
+                    record = {"role": role, "operation": "unknown", "native_code": None,
+                              "failure": {"stage": "generation", "exception_type": "Exception", "source": None}}
+                with callbacks_lock:
+                    if callback_failure[0] is None:
+                        callback_failure[0] = record
             finally:
                 completed.set()
         threading.Thread(target=invoke, daemon=True).start()
@@ -556,11 +629,11 @@ def run_native_process(packet, *, command, on_request, on_event, cancelled,
             channel._check()
         channel._check()
         if error:
-            raise NativeProcessError("callback_failed")
+            raise NativeProcessError("callback_failed", callback_failure=callback_failure[0])
         return result[0]
 
     try:
-        callback(authority, timeout=AUTHORITY_DEADLINE)
+        callback(authority, role="authority", timeout=AUTHORITY_DEADLINE)
         channel._check()
         env = dict(os.environ if environment is None else environment)
         env[WORKER_FD_ENV] = str(child.fileno())
@@ -572,15 +645,15 @@ def run_native_process(packet, *, command, on_request, on_event, cancelled,
         threading.Thread(target=check_authority, daemon=True).start()
         threading.Thread(target=capture_output, daemon=True).start()
         if on_started is not None:
-            callback(on_started, process)
+            callback(on_started, process, role="on_started")
         channel._send("bootstrap", "", bootstrap, encoded=True)
         while True:
             message = channel._receive()
             kind, name, payload = message["kind"], message["name"], message["payload"]
             if kind == "event":
-                callback(on_event, name, payload)
+                callback(on_event, name, payload, role="on_event", operation=name)
             elif kind == "request":
-                result = callback(on_request, name, payload)
+                result = callback(on_request, name, payload, role="on_request", operation=name)
                 channel._send("ack", name, {"request_seq": message["seq"], "result": result})
             elif kind == "failure" and name == "":
                 worker_failure = _validate_failure(payload)
@@ -602,7 +675,7 @@ def run_native_process(packet, *, command, on_request, on_event, cancelled,
         else:
             raise NativeProcessError("drain_timeout")
         channel._check()
-        callback(authority, timeout=AUTHORITY_DEADLINE)
+        callback(authority, role="authority", timeout=AUTHORITY_DEADLINE)
         with abort_lock:
             channel._check()
             done.set()
@@ -613,7 +686,8 @@ def run_native_process(packet, *, command, on_request, on_event, cancelled,
         return result
     except BaseException as exc:
         fence(exc.code if isinstance(exc, NativeProcessError) else "transport_failed", force=True)
-        raised_error = NativeProcessError(reason[0], worker_failure=worker_failure, cause_code=reason[0])
+        raised_error = NativeProcessError(reason[0], worker_failure=worker_failure, cause_code=reason[0],
+                                          callback_failure=callback_failure[0])
         raise raised_error from None
     finally:
         try:
@@ -659,14 +733,17 @@ def run_native_process(packet, *, command, on_request, on_event, cancelled,
                     pass
                 error = NativeProcessError("custody_unresolved", worker_failure=worker_failure,
                                            exit_code=process.returncode, cause_code=cause_code,
-                                           cleanup_code=cleanup_code)
+                                           cleanup_code=cleanup_code, callback_failure=callback_failure[0])
                 raised_error = error
                 error.process = process
                 with callbacks_lock:
                     error.callback_completion = [event for event in callbacks if not event.is_set()]
                 raise error from None
-            raise NativeProcessError("cleanup_failed", cause_code=cause_code, cleanup_code=cleanup_code) from None
+            raise NativeProcessError("cleanup_failed", cause_code=cause_code, cleanup_code=cleanup_code,
+                                     callback_failure=callback_failure[0]) from None
         finally:
+            if raised_error is not None and raised_error.callback_failure is None:
+                raised_error.callback_failure = callback_failure[0]
             if raised_error is not None and process is not None:
                 raised_error.exit_code = process.returncode
             done.set()

@@ -80025,6 +80025,7 @@ def _run_generation(
                                                 "exit_code": error.exit_code,
                                                 "cause_code": error.cause_code,
                                                 "cleanup_code": error.cleanup_code,
+                                                "callback_failure": error.callback_failure,
                                             }, sort_keys=True, allow_nan=False))
                                             raise
                                     nonlocal completion_model_type
