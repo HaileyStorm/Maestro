@@ -534,6 +534,59 @@ The successful response includes the actual child `job_id` and output
 generation child when it remains available; the saved repair and clip output
 remain the reconciliation record after completed queue rows retire. A parent
 can remain `cancelled` while its separately requested clip repair completes.
+If an interrupted ordinary clip rerun retains a submitted repair, use
+`POST /api/v1/director/pipelines/{pid}/clips/{clip_index}/rerun-video/reconcile`
+with the explicit `workspace`, retained `job_id`, and integer `revision` from
+`recovery.video_repairs`. This operation only checkpoints an already terminal
+child; it cannot start or resume generation. A still held or running child
+returns `409` with its next recovery action. A lost client response or a drained
+worker alone is never terminal evidence. Where the owner explicitly chooses to
+cancel an unwanted attempt, cancel that exact child through `/cancel/{job_id}`
+and observe its durable cancellation before reconciliation. Reconciliation of
+the same terminal child and revision is idempotent; a different identity or
+revision conflicts. It preserves accepted images and the original attempts.
+
+```python
+saved = maestro.request(
+    "GET", f"/api/v1/director/pipelines/{quote(pipeline_id, safe='')}",
+    query={"workspace": project_id},
+)
+repair = saved["recovery"]["video_repairs"]["0"]
+reconciled = maestro.request(
+    "POST",
+    f"/api/v1/director/pipelines/{quote(pipeline_id, safe='')}/clips/0/rerun-video/reconcile",
+    body={"workspace": project_id, "job_id": repair["job_id"], "revision": repair["revision"]},
+)
+print(reconciled)
+```
+
+The same terminal operation through TypeScript (using the client from setup):
+
+```typescript
+const saved = await maestro.request('GET',
+  `/api/v1/director/pipelines/${encodeURIComponent(pipelineId)}`,
+  { query: { workspace: projectId } }) as {
+    recovery: { video_repairs: Record<string, { job_id: string; revision: number }> };
+  };
+const repair = saved.recovery.video_repairs['0'];
+const reconciled = await maestro.request('POST',
+  `/api/v1/director/pipelines/${encodeURIComponent(pipelineId)}/clips/0/rerun-video/reconcile`,
+  { body: { workspace: projectId, job_id: repair.job_id, revision: repair.revision } });
+console.log(reconciled);
+```
+
+For curl, save those same three fields as `repair.json`, then submit once:
+
+```bash
+curl --fail-with-body -b "$MAESTRO_COOKIE_FILE" -H "Origin: $MAESTRO_ORIGIN" \
+  -H 'Content-Type: application/json' --data-binary @repair.json \
+  "$MAESTRO_URL/api/v1/director/pipelines/$PIPELINE_ID/clips/0/rerun-video/reconcile"
+```
+
+An uncertain response to this terminal-only operation can be reconciled by
+reading the saved repair and repeating the same identity. This guarantee does
+not apply to the separate generation rerun endpoint.
+
 H3 scene reruns instead retain `recovery.scene_repairs` and may omit the response
 `job_id`. There is no caller idempotency key for either operation. Matching
 unresolved ordinary work can attach to its saved intent; repeating a completed

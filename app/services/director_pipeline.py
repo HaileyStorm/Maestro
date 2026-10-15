@@ -66,6 +66,7 @@ _recovery_submit_child = None
 _recovery_verify_child = None
 _recovery_validate_child = None
 _recovery_exhausted_video_context = None
+_recovery_saved_video_terminal = None
 _recovery_prepare_h3_scene_rerun = None
 _runtime_admission = None
 _video_lora_child_admission = None
@@ -115,15 +116,16 @@ _DIRECTOR_SINGLE_ASSET_KEYS = (
 )
 
 
-def scrub_director_public_credentials(value):
-    """Deep-copy public Director state while removing legacy credentials."""
+def scrub_director_public_credentials(value, *, _preserve_private_recovery=False):
+    """Deep-copy Director state, excluding private receipts from public projections."""
     if isinstance(value, dict):
         scrubbed = {}
         for key, item in value.items():
             normalized = str(key).strip().lower()
             compact = re.sub(r"[^a-z0-9]", "", normalized)
             if (
-                normalized in _DIRECTOR_LEGACY_SECRET_FIELDS
+                (normalized == "_director_saved_video_terminal_receipt" and not _preserve_private_recovery)
+                or normalized in _DIRECTOR_LEGACY_SECRET_FIELDS
                 or normalized.endswith("_api_key")
                 or normalized.endswith("_access_token")
                 or normalized.endswith("_auth_token")
@@ -150,12 +152,15 @@ def scrub_director_public_credentials(value):
                 }
             ):
                 continue
-            scrubbed[key] = scrub_director_public_credentials(item)
+            scrubbed[key] = scrub_director_public_credentials(
+                item, _preserve_private_recovery=_preserve_private_recovery)
         return scrubbed
     if isinstance(value, list):
-        return [scrub_director_public_credentials(item) for item in value]
+        return [scrub_director_public_credentials(
+            item, _preserve_private_recovery=_preserve_private_recovery) for item in value]
     if isinstance(value, tuple):
-        return tuple(scrub_director_public_credentials(item) for item in value)
+        return tuple(scrub_director_public_credentials(
+            item, _preserve_private_recovery=_preserve_private_recovery) for item in value)
     return copy.deepcopy(value)
 _DIRECTOR_LIST_ASSET_KEYS = (
     "character_ref_paths",
@@ -1260,7 +1265,7 @@ def _pipeline_state_descriptor(out_dir: str, pid: str) -> dict:
 
 
 def _pipeline_state_payload(state: dict) -> bytes:
-    durable_state = scrub_director_public_credentials(state)
+    durable_state = scrub_director_public_credentials(state, _preserve_private_recovery=True)
     return json.dumps(
         repair_payload(durable_state), indent=2, ensure_ascii=False, default=str,
     ).encode("utf-8")
@@ -1321,7 +1326,7 @@ def _commit_pipeline_json_unlocked(
     recovery_required: bool = False,
 ) -> dict:
     """Two-phase commit semantic JSON against its journal-owned descriptor."""
-    durable_state = scrub_director_public_credentials(state)
+    durable_state = scrub_director_public_credentials(state, _preserve_private_recovery=True)
     payload = _pipeline_state_payload(durable_state)
     descriptor = _pipeline_payload_descriptor(pid, payload)
     previous_payload = None
@@ -3224,6 +3229,75 @@ def _attach_original_video_repair(out_dir, pid, clip_index, state, original):
                     _pipeline_child_jobs.pop(pid, None)
 
 
+class SavedVideoReconcileError(RuntimeError):
+    def __init__(self, code, message, next_action):
+        super().__init__(message)
+        self.detail = {"code": code, "message": message, "next_action": next_action}
+
+
+def _checkpoint_saved_video_repair(out_dir, pid, clip_index, pending, outcome, *,
+        outputs=(), evidence=None, identity=None, terminal=None, validate=None):
+    def save_result(current):
+        saved = (current.get("recovery") or {}).get("video_repairs") or {}
+        if saved.get(str(clip_index)) != pending:
+            raise SavedVideoReconcileError("director_repair_changed",
+                "The saved video attempt changed. Read its current state before continuing.", "read_saved_pipeline")
+        if validate is not None:
+            validate(current)
+        result = dict(pending, state=outcome)
+        if outcome == "completed":
+            _apply_director_clip_repair_result(current, clip_index, outputs[-1], pending.get("prompt_override"))
+            result["output_files"] = list(outputs)
+            if evidence is not None:
+                result.update(evidence=copy.deepcopy(evidence), identity=copy.deepcopy(identity))
+        if terminal is not None:
+            result["_director_saved_video_terminal_receipt"] = copy.deepcopy(terminal)
+        saved[str(clip_index)] = result
+
+    if _update_saved_pipeline(out_dir, pid, save_result) is None:
+        raise RuntimeError("Clip repair result could not be saved.")
+
+
+@_exclusive_pipeline_operation
+def reconcile_saved_clip_video(out_dir, pid, clip_index, job_id, revision):
+    filepath = _find_pipeline_file(out_dir, pid)
+    if not filepath:
+        raise ValueError("Saved video clip is unavailable")
+    with _pipeline_file_lock:
+        with open(filepath, encoding="utf-8") as handle:
+            state = json.load(handle)
+    if (not isinstance(state, dict) or state.get("pipeline_id") != pid
+            or type(clip_index) is not int or not 0 <= clip_index < len(state.get("clips") or [])):
+        raise ValueError("Saved video clip is unavailable")
+    entry = ((state.get("recovery") or {}).get("video_repairs") or {}).get(str(clip_index))
+    if (not isinstance(entry, dict) or entry.get("job_id") != job_id
+            or type(entry.get("revision")) is not int or entry["revision"] != revision
+            or entry.get("state") not in {"submitted", "completed", "failed", "cancelled"}):
+        raise SavedVideoReconcileError("director_repair_changed",
+            "The job and revision must identify the retained video attempt.", "read_saved_pipeline")
+    if not callable(_recovery_saved_video_terminal):
+        raise RuntimeError("Saved video terminal validation is unavailable")
+    project_dir = os.path.dirname(filepath)
+    terminal = _recovery_saved_video_terminal(project_dir, pid, state, entry)
+    binding = terminal["binding"]
+    already = entry.get("_director_saved_video_terminal_receipt") is not None
+    if not already:
+        _checkpoint_saved_video_repair(out_dir, pid, clip_index, entry, binding["status"],
+            outputs=binding["output_files"], evidence=binding.get("evidence"),
+            identity=binding["identity"], terminal=terminal,
+            validate=lambda current: _require_saved_video_terminal_unchanged(
+                project_dir, pid, current, entry, terminal))
+    return {"pipeline_id": pid, "clip_index": clip_index, "job_id": job_id,
+        "revision": revision, "status": binding["status"],
+        "output_files": list(binding["output_files"]), "already_reconciled": already}
+
+
+def _require_saved_video_terminal_unchanged(project_dir, pid, state, entry, terminal):
+    if _recovery_saved_video_terminal(project_dir, pid, state, entry) != terminal:
+        raise SavedVideoReconcileError("director_repair_changed",
+            "The terminal video attempt changed before reconciliation.", "read_saved_pipeline")
+
+
 def _submit_director_parameterized_clip_repair(
     params, state, out_dir, pid, clip_index, *, authored_prompt, prompt_override,
     saved_video_admission=None, original_terminal=None,
@@ -3298,12 +3372,7 @@ def _submit_director_parameterized_clip_repair(
     except (DirectorChildGenerationError, GenerationCancelledError) as error:
         outcome = "cancelled" if isinstance(error, GenerationCancelledError) else "failed"
 
-        def save_terminal(current):
-            saved = (current.get("recovery") or {}).get("video_repairs") or {}
-            if saved.get(str(clip_index)) == pending:
-                saved[str(clip_index)] = dict(pending, state=outcome)
-
-        _update_saved_pipeline(out_dir, pid, save_terminal)
+        _checkpoint_saved_video_repair(out_dir, pid, clip_index, pending, outcome)
         raise
     # Unknown/ambiguous failures leave the submitted intent intact for attach.
     if not outputs:
@@ -3312,21 +3381,10 @@ def _submit_director_parameterized_clip_repair(
     if saved_video_admission is not None:
         evidence = _recovery_verify_child(_jobs[pending["job_id"]], project_dir)
         identity = reservation.verify_saved_video_completion(saved_video_admission, evidence)
-    def save_result(current):
-        saved = (current.get("recovery") or {}).get("video_repairs") or {}
-        if saved.get(str(clip_index)) != pending:
-            raise RuntimeError("Clip repair intent changed before replacement.")
-        if saved_video_admission is not None:
-            reservation.verify_saved_video_completion(saved_video_admission, evidence)
-        # Adopt the verified output in the same durable checkpoint that ends
-        # retention. A crash must not drop the child between these steps.
-        _apply_director_clip_repair_result(current, clip_index, outputs[-1], prompt_override)
-        saved[str(clip_index)] = dict(pending, state="completed", output_files=list(outputs))
-        if saved_video_admission is not None:
-            saved[str(clip_index)].update(evidence=copy.deepcopy(evidence), identity=identity)
-
-    if _update_saved_pipeline(out_dir, pid, save_result) is None:
-        raise RuntimeError("Clip repair result could not be saved.")
+    _checkpoint_saved_video_repair(out_dir, pid, clip_index, pending, "completed",
+        outputs=outputs, evidence=evidence, identity=identity,
+        validate=(lambda current: reservation.verify_saved_video_completion(saved_video_admission, evidence))
+            if saved_video_admission is not None else None)
     if saved_video_admission is not None:
         reservation.publish_saved_video(saved_video_admission)
     return outputs
@@ -4391,6 +4449,7 @@ def init(
     recovery_verify_child=None,
     recovery_validate_child=None,
     recovery_exhausted_video_context=None,
+    recovery_saved_video_terminal=None,
     recovery_prepare_h3_scene_rerun=None,
     runtime_admission=None,
     video_lora_child_admission=None,
@@ -4402,7 +4461,7 @@ def init(
     global _recovery_checkpoint_parent, _recovery_prepare_parent_delete
     global _recovery_remove_parent
     global _recovery_submit_child, _recovery_verify_child
-    global _recovery_validate_child, _recovery_exhausted_video_context
+    global _recovery_validate_child, _recovery_exhausted_video_context, _recovery_saved_video_terminal
     global _recovery_prepare_h3_scene_rerun, _runtime_admission
     global _video_lora_child_admission, _llm_default_device
     _jobs = jobs_dict
@@ -4419,6 +4478,7 @@ def init(
     _recovery_verify_child = recovery_verify_child
     _recovery_validate_child = recovery_validate_child
     _recovery_exhausted_video_context = recovery_exhausted_video_context
+    _recovery_saved_video_terminal = recovery_saved_video_terminal
     _recovery_prepare_h3_scene_rerun = recovery_prepare_h3_scene_rerun
     _runtime_admission = runtime_admission
     _video_lora_child_admission = video_lora_child_admission

@@ -14187,5 +14187,224 @@
       "operation_kind": "director_clip_rerun_preparation",
       "mcp": true
     }
+  },
+  {
+    "method": "POST",
+    "path": "/api/v1/director/pipelines/{pid}/clips/{clip_index}/rerun-video/reconcile",
+    "summary": "Reconcile an already terminal saved clip video attempt",
+    "description": "Checkpoint only the exact existing ordinary saved-video repair after its child is durably completed, failed or cancelled. Never submits, registers, resumes or cancels generation. Read recovery.video_repairs from the saved pipeline to obtain job_id and revision. A nonterminal or blocked child returns409; an observation timeout or drained process alone never authorizes a terminal disposition. An owner may separately cancel the exact unwanted child through the existing cancellation operation. Repeating this reconciliation for the same terminal identity is idempotent, including after supported queue-row compaction; mismatched identities, revisions or retained proofs conflict. Current project/session/origin authorization applies; model availability, new terms acceptance and GPU authority are not required because no model work occurs.",
+    "parameters": [
+      {
+        "name": "pid",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string"
+        }
+      },
+      {
+        "name": "clip_index",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    ],
+    "requestBody": {
+      "required": true,
+      "content": {
+        "application/json": {
+          "schema": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "job_id",
+              "revision"
+            ],
+            "properties": {
+              "workspace": {
+                "type": "string",
+                "default": "",
+                "description": "Explicit authorized project recommended. Empty uses normal session project resolution."
+              },
+              "job_id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128,
+                "description": "Exact existing child from recovery.video_repairs; never a new submission identity.",
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$"
+              },
+              "revision": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Exact retained video repair revision.",
+                "maximum": 2147483647
+              }
+            },
+            "example": {
+              "workspace": "my-project",
+              "job_id": "director-saved-story-0-existing-child",
+              "revision": 2
+            }
+          }
+        }
+      }
+    },
+    "responses": {
+      "200": {
+        "description": "Existing terminal outcome checkpointed or an identical terminal checkpoint observed; no model work occurred.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "pipeline_id",
+                "clip_index",
+                "job_id",
+                "revision",
+                "status",
+                "output_files",
+                "already_reconciled"
+              ],
+              "properties": {
+                "pipeline_id": {
+                  "type": "string"
+                },
+                "clip_index": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "job_id": {
+                  "type": "string"
+                },
+                "revision": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "status": {
+                  "type": "string",
+                  "enum": [
+                    "completed",
+                    "failed",
+                    "cancelled"
+                  ]
+                },
+                "output_files": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "description": "Only validated retained outputs for a completed child. Failed/cancelled outcomes have no adopted outputs."
+                },
+                "already_reconciled": {
+                  "type": "boolean",
+                  "description": "True when the same exact terminal repair was already checkpointed; does not mean generation was repeated."
+                }
+              },
+              "example": {
+                "pipeline_id": "saved-story",
+                "clip_index": 0,
+                "job_id": "director-saved-story-0-existing-child",
+                "revision": 2,
+                "status": "cancelled",
+                "output_files": [],
+                "already_reconciled": false
+              }
+            }
+          }
+        }
+      },
+      "400": {
+        "description": "Malformed body or unsupported fields. Correct inputs without changing the retained repair identity.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "detail": {
+                  "type": "object",
+                  "required": [
+                    "code",
+                    "message",
+                    "next_action"
+                  ],
+                  "properties": {
+                    "code": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "next_action": {
+                      "type": "string"
+                    }
+                  },
+                  "additionalProperties": true
+                }
+              },
+              "required": [
+                "detail"
+              ],
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "404": {
+        "description": "Saved pipeline or project is absent or unavailable to this session."
+      },
+      "409": {
+        "description": "The child is nonterminal, the retained identity/revision changed, or proof is unavailable. Read detail.next_action; no replay/cancellation occurred.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "detail": {
+                  "type": "object",
+                  "required": [
+                    "code",
+                    "message",
+                    "next_action"
+                  ],
+                  "properties": {
+                    "code": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "next_action": {
+                      "type": "string"
+                    }
+                  },
+                  "additionalProperties": true
+                }
+              },
+              "required": [
+                "detail"
+              ],
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    "x-maestro": {
+      "feature": "director",
+      "permissions": [
+        "project.mutate"
+      ],
+      "boundary": "Existing saved-pipeline/project/session ownership and origin guards; validates the exact durable terminal child, immutable manifest, unit, custody and output evidence. No arbitrary paths, private receipts or execution authority are accepted or returned. Cannot execute or cancel work.",
+      "idempotency": "Same exact pipeline, clip, existing job_id and retained revision reconcile one terminal outcome. After an uncertain response, read saved repair state and repeat only this reconciliation with the same identity; never retry rerun-video to reconcile. A different revision/job conflicts.",
+      "operation_kind": "director_clip_rerun_reconciliation",
+      "mcp": true,
+      "destructive": false,
+      "idempotent": true,
+      "open_world": false
+    }
   }
 ]

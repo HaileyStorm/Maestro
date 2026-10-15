@@ -8396,6 +8396,154 @@ def _director_recovery_exhausted_video_context(project_dir, pid, state):
             "project_instance_sha256", "owner_principal_sha256")}}
 
 
+def _director_recovery_saved_video_terminal(project_dir, pid, state, entry):
+    """Observe terminal saved work without re-admitting its retired worker."""
+    from services.director_pipeline import (
+        SavedVideoReconcileError, _director_child_job_id, pipeline_state_filename,
+    )
+    from services.native_acceptance_reservation import digest, job_identity
+
+    def conflict(message, action="read_saved_pipeline"):
+        raise SavedVideoReconcileError("director_repair_reconciliation_blocked", message, action)
+
+    unit = entry.get("unit")
+    revision = entry.get("revision")
+    if (type(unit) is not dict or set(unit) != {"kind", "variant", "index"}
+            or unit.get("kind") != "video_clip_rerun"
+            or type(unit.get("index")) is not int or not 0 <= unit["index"] < len(state.get("clips") or [])
+            or type(revision) is not int or revision <= 0 or type(unit.get("variant")) is not int
+            or unit["variant"] != revision or type(entry.get("attempt")) is not int or entry["attempt"] != 0
+            or entry.get("job_id") != _director_child_job_id(pid, unit, 0)):
+        conflict("The retained video attempt identity changed.")
+    workspace = str(state.get("workspace") or "default")
+    parent = _director_recovery_parents.get(pid)
+    if (not isinstance(parent, dict) or parent.get("workspace") != workspace
+            or state.get("pipeline_id") != pid or state.get("created_at") != parent.get("created_at")
+            or os.path.realpath(_existing_workspace_dir(workspace)) != os.path.realpath(project_dir)
+            or not hmac.compare_digest(_queue_recovery_existing_project_identity(project_dir),
+                str(parent.get("_recovery_project_digest") or ""))):
+        conflict("The saved video project or parent identity changed.")
+    sealed, _, pending = _load_director_recovery_cursor_state(project_dir,
+        pipeline_state_filename(pid), parent.get("recovery_cursor") or {})
+    if pending or not isinstance(sealed, dict) or digest(sealed) != digest(state):
+        conflict("The saved video checkpoint needs reconciliation before this attempt.")
+    snapshots, _ = _queue_recovery_coordinator.read_only_snapshot()
+    job_id = entry["job_id"]
+    snapshot = snapshots.get(job_id)
+    receipt = entry.get("_director_saved_video_terminal_receipt") if entry.get("state") != "submitted" else None
+    if receipt is not None:
+        if (type(receipt) is not dict or set(receipt) != {"binding", "digest"}
+                or type(receipt.get("binding")) is not dict or type(receipt.get("digest")) is not str
+                or not hmac.compare_digest(receipt["digest"],
+                    _project_reference_private_commitment(receipt["binding"]))):
+            conflict("The retained terminal video receipt changed.")
+        terminal = receipt["binding"]
+    else:
+        terminal = None
+    if not isinstance(snapshot, dict):
+        if terminal is None:
+            conflict("The durable video attempt is unavailable; retain it for reconciliation.")
+    elif snapshot.get("status") not in {"completed", "failed", "cancelled"}:
+        conflict("This video attempt is still nonterminal. Read its status or explicitly cancel this job before reconciling; nothing was replayed or cancelled.",
+            "observe_or_cancel_job")
+    identity = job_identity(snapshot) if isinstance(snapshot, dict) else terminal["identity"]
+    parent_identity = job_identity(parent)
+    if (identity.get("id") != job_id or identity.get("workspace") != workspace
+            or any(identity.get(key) != parent_identity[key] for key in (
+                "project_instance_sha256", "owner_principal_sha256"))):
+        conflict("The video attempt owner or project changed.")
+    pointer = snapshot.get("request_manifest") if isinstance(snapshot, dict) else terminal["request_manifest"]
+    if digest(pointer) != identity["request_manifest_sha256"]:
+        conflict("The video attempt manifest identity changed.")
+    manifest = load_request_manifest(project_dir, pointer, expected_job_id=job_id)
+    params = manifest["params"]
+    validate_manifest_inputs(manifest, lambda descriptor: _queue_recovery_manifest_validator(
+        dict(descriptor), owner_digest=parent["_recovery_owner_digest"], workspace=workspace, project_dir=project_dir))
+    retained = entry.get("params")
+    stripped = {"_director_recovery_unit", "_director_recovery_parent_id",
+        "_director_recovery_job_id", "_director_recovery_attempt"}
+    def requested(value):
+        return _director_video_lora_requested_params({key: item for key, item in value.items() if key not in stripped})
+    if (not isinstance(retained, dict) or requested(retained) != requested(params)
+            or params.get("_director_pipeline_id") != pid or params.get("generation_mode") != "video"
+            or params.get("_director_detached_operation") is not True):
+        conflict("The sealed video request disagrees with its retained intent.")
+    parent_seal = (state.get("_params_snapshot") or {}).get("_director_video_lora_snapshot")
+    child_seal = params.get("_director_video_lora_child_snapshot")
+    if parent_seal is not None or child_seal is not None:
+        binding = child_seal.get("binding") if isinstance(child_seal, dict) else None
+        scope = {"project_id": workspace, "workspace_id": "main",
+            "project_instance": parent["_recovery_project_digest"], "owner_digest": parent["_recovery_owner_digest"]}
+        if (not isinstance(parent_seal, dict) or not isinstance(binding, dict)
+                or set(child_seal) != {"binding", "digest"} or type(child_seal.get("digest")) is not str
+                or not hmac.compare_digest(child_seal["digest"], _project_reference_private_commitment(binding))
+                or binding.get("pipeline_id") != pid or binding.get("unit") != unit or binding.get("scope") != scope
+                or binding.get("parent_digest") != parent_seal.get("digest")
+                or params.get("_director_video_lora_parent_snapshot") != parent_seal
+                or _director_video_lora_creative_binding(binding).get("requested") != _director_video_lora_requested_params(params)):
+            conflict("The immutable video LoRA admission changed.")
+    intent = {key: value for key, value in entry.items()
+        if key not in {"state", "output_files", "evidence", "identity", "_director_saved_video_terminal_receipt"}}
+    custody = entry.get("custody")
+    if custody is not None and (type(custody) is not dict or set(custody) != {"pipeline_id", "request_sha256"}
+            or custody.get("pipeline_id") != pid or type(custody.get("request_sha256")) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", custody["request_sha256"]) is None):
+        conflict("The retained video custody changed.")
+    if isinstance(snapshot, dict):
+        cursor = snapshot.get("recovery_cursor") or {}
+        live = _jobs.get(job_id) or {}
+        if (snapshot.get("kind") != "director_child" or cursor.get("director_video_custody") != custody
+                or job_id in _active_gen_states or live.get("_generation_slot_owned")
+                or live.get("_director_saved_video_worker_active")):
+            conflict("The terminal video attempt still has worker custody.", "observe_job")
+        status = snapshot["status"]
+        registration = snapshot.get("recovery_unit")
+        expected_registration = {"kind": "director_child_intent", "state": "submitted",
+            "director_kind": "video_clip_rerun", "variant": unit["variant"], "index": unit["index"], "attempt": 0}
+        if (registration != expected_registration
+                and (status != "completed" or not _queue_recovery_units(snapshot))):
+            conflict("The retained video registration unit changed.")
+        evidence = None
+        if status == "completed":
+            job = dict(snapshot, params=params, out_dir=project_dir,
+                _recovery_manifest_pointer=pointer)
+            evidence = _director_recovery_verified_child(job, project_dir)
+            if not evidence or snapshot.get("output_files") != evidence["outputs"]:
+                conflict("Completed video lacks its exact sealed outputs.")
+            for artifact in evidence["artifacts"]:
+                producers = [row for row in _queue_recovery_units(job)
+                    if artifact in (row.get("artifacts") or [])]
+                if (len(producers) != 1 or _queue_recovery_unit_matches(job,
+                        kind=producers[0]["kind"], variant=producers[0]["variant"], index=producers[0]["index"],
+                        project_dir=project_dir, quarantine_invalid=False) is None):
+                    conflict("Completed video producer evidence changed.")
+        elif (snapshot.get("output_files") or snapshot.get("clip_output_files")
+                or snapshot.get("h3_scene_output_files") or snapshot.get("join_output_file")
+                or _queue_recovery_units(snapshot)
+                or params.get("_director_video_lora_consumption_plans")):
+            conflict("Failed or cancelled video retains successful producer evidence; reconcile that evidence separately.")
+        observed = {"version": 1, "intent_sha256": digest(intent), "identity": identity,
+            "request_manifest": pointer, "params_sha256": digest(params), "custody": custody,
+            "execution_attempt": snapshot.get("execution_attempt"), "recovery_attempt": snapshot.get("recovery_attempt"),
+            "status": status, "output_files": list(evidence["outputs"]) if evidence else [], "evidence": evidence}
+        if (type(observed["execution_attempt"]) is not int or observed["execution_attempt"] < 1
+                or type(observed["recovery_attempt"]) is not int or observed["recovery_attempt"] < 0
+                or terminal is not None and terminal != observed):
+            conflict("The terminal video lineage changed.")
+        terminal = observed
+    if (terminal.get("intent_sha256") != digest(intent) or terminal.get("identity") != identity
+            or terminal.get("params_sha256") != digest(params) or terminal.get("custody") != custody
+            or terminal.get("status") not in {"completed", "failed", "cancelled"}
+            or entry.get("state") != "submitted" and entry["state"] != terminal["status"]):
+        conflict("The terminal video receipt disagrees with its retained intent.")
+    if receipt is not None and (entry.get("output_files", []) != terminal["output_files"]
+            or terminal["status"] == "completed" and (
+                _director_recovery_validate_child(project_dir, terminal.get("evidence")) != terminal.get("evidence")
+                or (state["clips"][unit["index"]].get("video_filename") != terminal["output_files"][-1]))):
+        conflict("The reconciled video output changed.")
+    return {"binding": terminal, "digest": _project_reference_private_commitment(terminal)}
+
+
 def _director_recovery_validate_child(
     project_dir: str,
     evidence,
@@ -18350,6 +18498,7 @@ def _init_pipeline():
             recovery_verify_child=_director_recovery_verified_child,
             recovery_validate_child=_director_recovery_validate_child,
             recovery_exhausted_video_context=_director_recovery_exhausted_video_context,
+            recovery_saved_video_terminal=_director_recovery_saved_video_terminal,
             recovery_prepare_h3_scene_rerun=_director_recovery_prepare_h3_scene_rerun,
             runtime_admission=_director_recovery_runtime_admission,
             video_lora_child_admission=_admit_director_video_lora_child,
@@ -49852,6 +50001,47 @@ async def prepare_pipeline_clip_video(pid: str, clip_index: int, request: Reques
     if "original_terminal_sha256" in prepared:
         response["original_terminal_sha256"] = prepared["original_terminal_sha256"]
     return response
+
+
+@api.post("/api/v1/director/pipelines/{pid}/clips/{clip_index}/rerun-video/reconcile")
+async def reconcile_pipeline_clip_video(pid: str, clip_index: int, request: Request):
+    """Checkpoint only a retained child's durable terminal result."""
+    try:
+        body = await request.json()
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail={"code": "director_repair_invalid_request",
+            "message": "Expected a JSON object with job_id, revision and optional workspace.",
+            "next_action": "correct_request"})
+    if (type(body) is not dict or set(body) - {"workspace", "job_id", "revision"}
+            or type(body.get("job_id")) is not str
+            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}", body["job_id"]) is None
+            or type(body.get("revision")) is not int or not 1 <= body["revision"] <= 2**31 - 1
+            or "workspace" in body and type(body["workspace"]) is not str):
+        raise HTTPException(status_code=400, detail={"code": "director_repair_invalid_request",
+            "message": "Use only workspace, job_id (1–128 letters, digits, underscores, periods, colons or hyphens, starting with a letter or digit) and integer revision (1–2147483647).",
+            "next_action": "correct_request"})
+    selected_workspace = _request_project_workspace(request, body.get("workspace"))
+    _init_pipeline()
+    from services.director_pipeline import (
+        PipelineBusyError, SavedVideoReconcileError, reconcile_saved_clip_video,
+    )
+    _state, base = _require_saved_pipeline(request, pid, selected_workspace, read_only=True)
+    _begin_workspace_operation(selected_workspace)
+    try:
+        return await upload_usage.to_thread(reconcile_saved_clip_video,
+            base, pid, clip_index, body["job_id"], body["revision"])
+    except SavedVideoReconcileError as error:
+        raise HTTPException(status_code=409, detail=error.detail) from error
+    except PipelineBusyError as error:
+        raise HTTPException(status_code=409, detail={"code": "director_pipeline_busy",
+            "message": "Director is still changing. Read its state before reconciling.",
+            "next_action": "read_saved_pipeline"}) from error
+    except (ValueError, QueueRecoveryRuntimeError, OSError) as error:
+        raise HTTPException(status_code=409, detail={"code": "director_repair_reconciliation_blocked",
+            "message": "The retained video identity, request or sealed inputs could not be verified.",
+            "next_action": "read_saved_pipeline"}) from error
+    finally:
+        _end_workspace_operation(selected_workspace)
 
 
 @api.post("/api/v1/director/pipelines/{pid}/clips/{clip_index}/rerun-video")

@@ -70,6 +70,16 @@ a cancel ACK is not proof of terminal drain. Recovery must use the public,
 project-scoped production path and preserve frozen inputs and failed attempts.
 Never replay accepted samples as routine API verification.
 
+For an interrupted ordinary saved-video rerun, read its retained
+`recovery.video_repairs` identity. The explicit
+`POST /director/pipelines/{pid}/clips/{clip_index}/rerun-video/reconcile`
+under `/api/v1` accepts the same `workspace`, `job_id` and `revision` and only
+checkpoints a durably terminal child. It cannot submit, resume or cancel work.
+A blocked/nonterminal response requires the stated owner action; drain or a
+client timeout never implies failure or cancellation. An explicitly authorized
+exact-child cancellation is separate. Repeat only this reconciliation with the
+same identity after uncertainty; never repeat the generation rerun to reconcile.
+
 ## Repository maintenance
 
 For implementation, read the current AGENTS/CONTRIBUTING and durable worklog,

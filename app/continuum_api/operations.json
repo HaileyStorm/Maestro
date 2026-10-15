@@ -4321,6 +4321,49 @@
     }
   },
   {
+    "method": "GET",
+    "path": "/api/v1/director/pipelines/{pid}/clips/{clip_index}/rerun-video/prepare",
+    "description": "Inspect one retained H3 rerun; this observation cannot submit it.",
+    "x-maestro": {
+      "handler": "prepare_pipeline_clip_video",
+      "source": "app/launch.py",
+      "contract_status": "source_extracted",
+      "mcp": false,
+      "boundary": "Production access/locality guards remain authoritative. Semantic contract review remains pending for this extracted entry.",
+      "idempotency": "No inferred replay guarantee. Read operation-specific authored contract before retrying."
+    }
+  },
+  {
+    "method": "POST",
+    "path": "/api/v1/director/pipelines/{pid}/clips/{clip_index}/rerun-video/reconcile",
+    "description": "Checkpoint only a retained child's durable terminal result.",
+    "x-maestro": {
+      "handler": "reconcile_pipeline_clip_video",
+      "source": "app/launch.py",
+      "contract_status": "source_extracted",
+      "mcp": false,
+      "boundary": "Production access/locality guards remain authoritative. Semantic contract review remains pending for this extracted entry.",
+      "idempotency": "No inferred replay guarantee. Read operation-specific authored contract before retrying."
+    },
+    "requestBody": {
+      "required": true,
+      "content": {
+        "application/json": {
+          "schema": {
+            "type": "object",
+            "properties": {
+              "workspace": {},
+              "job_id": {},
+              "revision": {}
+            },
+            "additionalProperties": true,
+            "description": "Source inventory of directly read fields; nested shapes, conditional requirements and constraints are defined by authored overrides."
+          }
+        }
+      }
+    }
+  },
+  {
     "method": "POST",
     "path": "/api/v1/director/pipelines/{pid}/clips/{clip_index}/rerun-video",
     "description": "Re-generate the video for a specific clip in a saved pipeline.",
@@ -6037,6 +6080,32 @@
       "mcp": false,
       "boundary": "Production access/locality guards remain authoritative. Semantic contract review remains pending for this extracted entry.",
       "idempotency": "No inferred replay guarantee. Read operation-specific authored contract before retrying."
+    }
+  },
+  {
+    "method": "PUT",
+    "path": "/api/v1/jobs/{job_id}/completion-policy",
+    "description": "Configure one held Studio image invocation's generation-model cleanup.",
+    "x-maestro": {
+      "handler": "set_generation_completion_policy",
+      "source": "app/launch.py",
+      "contract_status": "source_extracted",
+      "mcp": false,
+      "boundary": "Production access/locality guards remain authoritative. Semantic contract review remains pending for this extracted entry.",
+      "idempotency": "No inferred replay guarantee. Read operation-specific authored contract before retrying."
+    },
+    "requestBody": {
+      "required": true,
+      "content": {
+        "application/json": {
+          "schema": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": true,
+            "description": "Source inventory of directly read fields; nested shapes, conditional requirements and constraints are defined by authored overrides."
+          }
+        }
+      }
     }
   },
   {
