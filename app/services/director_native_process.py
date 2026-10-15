@@ -34,6 +34,19 @@ FAILURE_STAGES = frozenset({
     "wgp_import", "runtime_binding", "generation", "model_release", "finish", "cleanup",
 })
 _TRUSTED_FAILURE_FILES = frozenset({"director_native_process.py", "director_native_generation.py"})
+_CAUSE_CODES = frozenset({
+    "aborted", "ack_mismatch", "authority_revoked", "authority_timeout", "callback_failed",
+    "cancelled", "drain_timeout", "duplicate_key", "frame_limit", "group_inspection_limit",
+    "identity_mismatch", "invalid_array", "invalid_bootstrap", "invalid_dtype", "invalid_envelope",
+    "invalid_image", "invalid_image_pixels", "invalid_mapping", "invalid_message", "invalid_send",
+    "invalid_value", "invalid_worker_failure", "noncontiguous_array", "output_read_failed",
+    "post_terminal_message", "transport_failed", "unexpected_eof", "unexpected_message",
+    "unsupported_value", "value_limit", "worker_exit", "worker_exit_without_drain", "worker_failure",
+})
+_CLEANUP_CODES = frozenset({
+    "callback_drain_unresolved", "channel_drain_unresolved", "cleanup_failed",
+    "custody_unresolved", "group_inspection_limit", "output_drain_unresolved",
+})
 
 
 def _failure_record(stage, exc, trusted_source):
@@ -78,10 +91,12 @@ def _validate_failure(record):
 class NativeProcessError(RuntimeError):
     """Content-free transport failure; do not chain private worker exceptions."""
 
-    def __init__(self, code, *, worker_failure=None, exit_code=None):
+    def __init__(self, code, *, worker_failure=None, exit_code=None, cause_code=None, cleanup_code=None):
         self.code = code
         self.worker_failure = worker_failure
         self.exit_code = exit_code
+        self.cause_code = cause_code if type(cause_code) is str and cause_code in _CAUSE_CODES else None
+        self.cleanup_code = cleanup_code if type(cleanup_code) is str and cleanup_code in _CLEANUP_CODES else None
         super().__init__(f"Director native process failed ({code})")
 
 
@@ -598,7 +613,7 @@ def run_native_process(packet, *, command, on_request, on_event, cancelled,
         return result
     except BaseException as exc:
         fence(exc.code if isinstance(exc, NativeProcessError) else "transport_failed", force=True)
-        raised_error = NativeProcessError(reason[0], worker_failure=worker_failure)
+        raised_error = NativeProcessError(reason[0], worker_failure=worker_failure, cause_code=reason[0])
         raise raised_error from None
     finally:
         try:
@@ -634,20 +649,23 @@ def run_native_process(packet, *, command, on_request, on_event, cancelled,
                 unfinished = [event for event in callbacks if not event.is_set()]
             if unfinished:
                 raise NativeProcessError("callback_drain_unresolved")
-        except BaseException:
+        except BaseException as cleanup_error:
+            cause_code = reason[0] if reason else None
+            cleanup_code = cleanup_error.code if isinstance(cleanup_error, NativeProcessError) else "cleanup_failed"
             if process is not None:
                 try:
                     signal_group(signal.SIGKILL)
                 except OSError:
                     pass
                 error = NativeProcessError("custody_unresolved", worker_failure=worker_failure,
-                                           exit_code=process.returncode)
+                                           exit_code=process.returncode, cause_code=cause_code,
+                                           cleanup_code=cleanup_code)
                 raised_error = error
                 error.process = process
                 with callbacks_lock:
                     error.callback_completion = [event for event in callbacks if not event.is_set()]
                 raise error from None
-            raise NativeProcessError("cleanup_failed") from None
+            raise NativeProcessError("cleanup_failed", cause_code=cause_code, cleanup_code=cleanup_code) from None
         finally:
             if raised_error is not None and process is not None:
                 raised_error.exit_code = process.returncode

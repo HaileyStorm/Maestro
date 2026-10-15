@@ -79833,6 +79833,8 @@ def _run_generation(
                                             print("[Director native] " + json.dumps({
                                                 "worker_failure": error.worker_failure,
                                                 "exit_code": error.exit_code,
+                                                "cause_code": error.cause_code,
+                                                "cleanup_code": error.cleanup_code,
                                             }, sort_keys=True, allow_nan=False))
                                             raise
                                     nonlocal completion_model_type

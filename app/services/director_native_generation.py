@@ -222,9 +222,19 @@ def run_native_generation(wgp, task, params, *, identity, consumer, send_cmd,
 _WATCHER = """
 import os,select,signal,sys
 server,worker,group,channel,stop,ready=map(int,sys.argv[1:])
+pidfd_open=getattr(os,'pidfd_open',None)
+if pidfd_open is None:
+    import ctypes
+    native_pidfd_open=ctypes.CDLL(None,use_errno=True).pidfd_open
+    native_pidfd_open.argtypes=[ctypes.c_int,ctypes.c_uint]
+    native_pidfd_open.restype=ctypes.c_int
+    def pidfd_open(pid):
+        fd=native_pidfd_open(pid,0)
+        if fd<0: raise OSError(ctypes.get_errno(),'pidfd_open failed')
+        return fd
 poll=select.poll()
 for pid in (server,worker):
-    fd=os.pidfd_open(pid);poll.register(fd,select.POLLIN)
+    fd=pidfd_open(pid);poll.register(fd,select.POLLIN)
 poll.register(channel,select.POLLHUP|select.POLLERR|select.POLLRDHUP)
 poll.register(stop,select.POLLIN|select.POLLHUP)
 os.write(ready,b'R');os.close(ready)
@@ -236,7 +246,9 @@ for fd,events in poll.poll():
 
 
 def _start_parent_watch(channel):
-    if (sys.platform != "linux" or not hasattr(os, "pidfd_open")
+    # The watcher handshake proves both pidfds opened, including on Python
+    # builds without os.pidfd_open but with the same Linux libc interface.
+    if (sys.platform != "linux"
             or os.getpgrp() != os.getpid() or os.getsid(0) != os.getpid()):
         raise RuntimeError("Director native child requires its own supported Linux session")
     reader, writer = os.pipe()
