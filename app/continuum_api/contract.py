@@ -160,12 +160,24 @@ def enrich_openapi(schema: dict) -> dict:
             "The GPU budget covers weights and worst-case expert staging; caches and CUDA overhead are additional.",
         "properties": {
             "drama3_gpu_budget_gib": {"type": "number", "minimum": 8, "maximum": 26, "default": 22},
+            "drama3_expert_cache_gib": {"type": "number", "minimum": 0, "maximum": 4, "default": 0,
+                "description": "GPU LRU of original FP8 experts. This value plus drama3_gpu_budget_gib must be at most26GiB; activations, codec and CUDA overhead need additional headroom."},
             "drama3_separate_turns": {"type": "integer", "enum": [0, 1], "default": 0,
                 "description": "1 preserves each explicitly tagged speaker turn as a separate generation chunk, including repeated speakers, with native audio history. Experimental mitigation for skipped turns; not a word-completeness guarantee. 0 retains Fish's native batching."},
             "drama3_reference_cache": {"type": "integer", "enum": [0, 1], "default": 1,
                 "description": "1 automatically reuses content-bound prepared reference codes in bounded CPU "
                     "memory and private disk storage. Explicit 0 opts out for this generation. "
                     "This does not cache model weights or establish GPU readiness."},
+            "drama3_restricted_speech_head": {"type": "integer", "enum": [0, 1], "default": 0,
+                "description": "Experimental original-BF16 EOS/semantic-only output projection. Smaller GEMM geometry can change rounding. No sampler or codebook reduction."},
+            "drama3_bulk_expert_pack": {"type": "integer", "enum": [0, 1], "default": 0,
+                "description": "Experimental byte-exact batched FP8 expert-cache packing; requires a nonzero expert cache. Does not alter quantization or sampler."},
+            "drama3_compile_recurrence": {"type": "integer", "enum": [0, 1], "default": 0,
+                "description": "Experimental per-model compilation of single-token FP32 recurrence, without CUDA graphs. First use compiles; fused arithmetic can alter speech delivery. No sampler or precision reduction."},
+            "drama3_gpu_codec": {"type": "integer", "enum": [0, 1], "default": 0,
+                "description": "Experimental FP32 GPU waveform decoding, restoring codec to CPU each chunk. Original CPU fallback for chunks above256 frames or insufficient VRAM; reserves3GiB plus codec tensors."},
+            "drama3_gpu_codec_bf16": {"type": "integer", "enum": [0, 1], "default": 0,
+                "description": "Requires drama3_gpu_codec=1. Decode with a private BF16 codec copy; original CPU reference encoder stays FP32. Changes waveform arithmetic."},
             **{("drama3_reference_text" + (str(i) if i > 1 else "")): {
                 "type": "string", "default": "", "description":
                     f"Actual transcript of audio_guide{str(i) if i > 1 else ''} for zero-based Speaker {i-1}; "

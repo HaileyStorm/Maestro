@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import gc
+import copy
 import math
 import re
 import time
@@ -26,6 +27,12 @@ def validate_inputs(inputs):
     reference_cache = custom.get("drama3_reference_cache", 1)
     if type(reference_cache) is not int or reference_cache not in (0, 1):
         return "Drama 3 reference cache must be 0 or 1."
+    for field in ("drama3_restricted_speech_head", "drama3_bulk_expert_pack",
+                  "drama3_compile_recurrence", "drama3_gpu_codec", "drama3_gpu_codec_bf16"):
+        if type(custom.get(field, 0)) is not int or custom.get(field, 0) not in (0, 1):
+            return f"{field} must be 0 or 1."
+    if custom.get("drama3_gpu_codec_bf16", 0) and not custom.get("drama3_gpu_codec", 0):
+        return "Drama 3 BF16 codec requires GPU codec decoding."
     expert_cache = custom.get("drama3_expert_cache_gib", 0.0)
     if (isinstance(expert_cache, bool) or not isinstance(expert_cache, (int, float))
             or not math.isfinite(expert_cache) or not 0 <= expert_cache <= 4):
@@ -79,8 +86,9 @@ class Drama3Pipeline:
         # This empty module has no weights for MMGP to relocate.
         self.model = torch.nn.Module()
         self.model.cache = None
-        self._backbone = self.codec = None
+        self._backbone = self.codec = self._bf16_codec = None
         self._interrupt = self._early_stop = False
+        self._decode_stats = []
         self._budget = None
         source_root = Path(__file__).parent
         vendor = source_root / "vendor/fish_speech"
@@ -105,7 +113,7 @@ class Drama3Pipeline:
         self.reference_cache_stats = self.prepared_voice_cache.stats
 
     def _reset_models(self):
-        self._backbone = self.codec = None
+        self._backbone = self.codec = self._bf16_codec = None
         self._budget = None
         gc.collect()
 
@@ -156,14 +164,22 @@ class Drama3Pipeline:
         budget = float(custom.get("drama3_gpu_budget_gib", 22.0))
         expert_cache = float(custom.get("drama3_expert_cache_gib", 0.0))
         reference_cache = custom.get("drama3_reference_cache", 1)
+        restricted_head = bool(custom.get("drama3_restricted_speech_head", 0))
+        bulk_pack = bool(custom.get("drama3_bulk_expert_pack", 0))
+        compile_recurrence = bool(custom.get("drama3_compile_recurrence", 0))
+        gpu_codec = bool(custom.get("drama3_gpu_codec", 0))
+        bf16_codec = bool(custom.get("drama3_gpu_codec_bf16", 0))
+        self._decode_stats = []
         self._interrupt = self._early_stop = False
-        if self._budget != (budget, expert_cache):
+        if self._budget != (budget, expert_cache, restricted_head, bulk_pack, compile_recurrence):
             self._reset_models()
         if self._backbone is None:
             if callable(set_progress_status): set_progress_status("Loading Drama 3 FP8 with CPU expert offload")
             self._backbone = load_offloaded_model(self.ckpt_root, gpu_budget_gib=budget,
-                expert_cache_gib=expert_cache, cancel_check=self._cancelled)
-            self._budget = (budget, expert_cache)
+                expert_cache_gib=expert_cache, cancel_check=self._cancelled,
+                restricted_speech_head=restricted_head, bulk_expert_pack=bulk_pack,
+                compile_recurrence=compile_recurrence)
+            self._budget = (budget, expert_cache, restricted_head, bulk_pack, compile_recurrence)
         if self.codec is None:
             if callable(set_progress_status): set_progress_status("Loading the local speech codec")
             self.codec = load_codec(Path(self.ckpt_root) / "codec.pth")
@@ -228,9 +244,20 @@ class Drama3Pipeline:
             if self._cancelled(): raise InterruptedError("Drama 3 generation cancelled")
             if len(frames):
                 codes = frames[:, 1:].T.contiguous()
+                decode_stats = {"private_copy_seconds": 0.0}
+                decoder = self.codec
+                if gpu_codec and bf16_codec:
+                    if self._bf16_codec is None:
+                        started_copy = time.monotonic()
+                        self._bf16_codec = copy.deepcopy(self.codec).to(device="cpu", dtype=torch.bfloat16)
+                        decode_stats["private_copy_seconds"] = time.monotonic() - started_copy
+                    decoder = self._bf16_codec
+                self._decode_stats.append(decode_stats)
                 pieces.append(_run_timed_phase(
                     f"Decoding Drama 3 audio · part {index+1}/{len(chunks)}",
-                    decode_audio, codes, self.codec, progress=set_progress_status,
+                    decode_audio, codes, decoder, use_gpu=gpu_codec,
+                    fallback_codec=self.codec, stats=decode_stats,
+                    progress=set_progress_status,
                 ))
                 history.push(text, codes)
                 remaining -= len(frames)

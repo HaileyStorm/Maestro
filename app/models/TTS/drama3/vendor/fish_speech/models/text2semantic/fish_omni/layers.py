@@ -395,7 +395,7 @@ class GatedDeltaNet(nn.Module):
             assert self.recurrent_state is not None
             initial_state = self.recurrent_state[:batch]
         rule = (
-            recurrent_gated_delta_rule
+            getattr(self, "_recurrent_rule", recurrent_gated_delta_rule)
             if context.continue_state and length == 1
             else chunk_gated_delta_rule
         )

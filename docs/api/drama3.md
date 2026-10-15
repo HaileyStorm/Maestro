@@ -55,7 +55,8 @@ other platforms are not qualified for this native Triton/offload path.
 
 Inference requires NVIDIA CUDA, an SM89 or newer device and Triton. The official
 block FP8 expert weights stay FP8; non-expert tensors use BF16. CPU offload stages
-only routed experts, and the FP32 codec runs on CPU. CUDA graphs are disabled.
+only routed experts, and the FP32 codec defaults to CPU. Optional guarded GPU decoding is described
+below. CUDA graphs are disabled.
 `drama3_gpu_budget_gib` defaults to 22, accepts 8–26 GiB, and covers resident
 weights plus worst-case expert staging. The optional expert cache below shares a
 26 GiB total allowance with that budget. Activations, KV caches, the CUDA context
@@ -79,6 +80,11 @@ Drama exposes these optional `custom_settings`:
 | --- | --- | --- |
 | `drama3_reference_cache` | `0` or `1`, default `1` | Saves exact encoded reference audio in private data-only disk storage and reuses bounded CPU memory. Content hashes, codec and preparation code bind entries. Explicit `0` bypasses reuse. See [prepared voices](voice-cloning.md#inspect-load-and-evict) for project-scoped inspection, CPU preload and eviction. |
 | `drama3_expert_cache_gib` | `0` through `4` | Keeps recently used original FP8 experts in GPU memory, with bounded eviction and original FP8 arithmetic. May add one expert layer of pinned CPU staging. |
+| `drama3_restricted_speech_head` | `0` or `1`, default `0` | Experimental compact projection using the original 4097 EOS/semantic BF16 rows. Retains all ten audio codebooks and sampler settings; smaller matrix geometry can change rounding. |
+| `drama3_bulk_expert_pack` | `0` or `1`, default `0` | Experimental batched byte copies for cached original FP8 experts. Requires a nonzero expert cache to have an effect. |
+| `drama3_compile_recurrence` | `0` or `1`, default `0` | Experimental per-model compilation of single-token FP32 recurrence. Preserves prefill, sampler and weight precision. First use compiles; fused arithmetic can change speech delivery. CUDA graphs stay disabled. |
+| `drama3_gpu_codec` | `0` or `1`, default `0` | Experimental FP32 GPU waveform decoding. Restores the codec to CPU after each chunk. Chunks above 256 code frames or insufficient free VRAM use the original CPU decoder. |
+| `drama3_gpu_codec_bf16` | `0` or `1`, default `0` | Requires `drama3_gpu_codec: 1`. Uses a private BF16 decoder copy; the reference encoder remains original CPU FP32. Changes waveform arithmetic and needs listening comparison. |
 
 `drama3_gpu_budget_gib + drama3_expert_cache_gib` must be at most 26.
 For a qualified 32 GiB host, the measured cache candidate uses:
@@ -125,8 +131,8 @@ swapping and reloading references rather than accelerating its speech decoder.
 No quantization was reduced. Neither sample identity nor speed proves quality
 for other voices, text or contexts; human listening remains separate.
 
-These timings used shipped model pipelines and standard MMGP profiles with
-quantization disabled. The HTTP scheduler and main WGP profile-budget adapter
+These timings used shipped model pipelines and standard MMGP profiles without
+additional MMGP weight quantization. The HTTP scheduler and main WGP profile-budget adapter
 were outside the timing harness. Process VRAM was sampled through NVML during
 warm synthesis, including the CUDA context; cold loading/compilation may peak
 higher. They are hardware- and passage-specific measurements, not latency or
@@ -134,6 +140,61 @@ memory guarantees. See the upstream [Qwen graph engine research](https://github.
 [Vox runtime](https://github.com/OpenBMB/VoxCPM), and
 [Drama expert-offload implementation](https://github.com/PedroMarinhoDev/ComfyUI-Drama3)
 for alternative engines and their separate dependency/hardware constraints.
+
+A later matched short-passage comparison retained the same WAV bytes for the
+original implementation, compact speech projection, batched expert packing and
+both together. On that one RTX 5090 run, warm wall seconds per audio second were
+2.967, 2.916, 2.818 and 2.826 respectively; peak process VRAM was 26.46, 26.27,
+26.46 and 26.27 GiB. These opt-in controls remain experimental and default to
+zero. Their small differences are not an aggregate benchmark or evidence that
+combining options always helps. Existing API, Python, TypeScript and MCP
+submission paths pass them through `custom_settings`; rediscover model options
+after updating Maestro.
+
+The recurrent compilation option binds only to that loaded Drama instance;
+it does not patch a global function or another model. Changing it reloads the
+model. Compilation happens on first recurrent decoding, so cold compilation is
+outside the warm timing claim. A process-local prototype measured 2.429 wall
+seconds per generated second for a different 8.499-second delivery of the same
+text, versus 2.826 for the uncompiled 5.016-second take. CPU ASR found the full
+requested words in both. The changed duration and delivery prevent treating the
+RTF ratio as an isolated kernel or universal throughput speedup. Retained WAVs
+provide the listening comparison. This is an optional experiment, not a new
+quality default.
+
+A separate W6A8 expert-kernel probe ran on the RTX 5090 using comfy-kitchen
+0.2.37. Its six-bit weights and eight-bit activations changed numerical output;
+one resident expert layer was slower than original FP8, including when both
+were captured in CUDA graphs. This establishes kernel feasibility only. Maestro
+does not currently offer a full Q6 model loader, a Q6 quality verdict or a Q6
+speed claim. The retained hybrid WAV uses W6 for only one of forty routed layers on one-row
+calls; other layers and larger prefill calls remain original FP8. It does not
+qualify a fully quantized model. The first GPU-codec experiment exposed about 4.69 GiB of loaded codec tensors,
+including three unused 1 GiB superclass causal masks. Windowed attention already
+supplies its own masks. Maestro now allocates the superclass fallback mask only
+when it is actually needed, bounded by the original 32768-position limit. This
+preserves windowed attention and checkpoint weights while removing those unused
+buffers. The initial lower-residency GPU timing predates this fix.
+
+GPU decoding keeps a 3 GiB free-memory reserve in addition to actual codec
+tensors, and releases only unused allocator blocks before checking. A long chunk
+or insufficient headroom uses original CPU FP32 decoding; it does not shorten
+speech, lower precision or retry generation. A CUDA execution failure propagates
+through ordinary job recovery instead of regenerating. BF16 uses a private copy
+that remains in CPU memory between chunks and is released with the model;
+reference encoding stays original FP32. GPU transfer and CPU restoration count
+in the measured warm wall time. These options remain disabled by default.
+The final production-path matched comparison used a 22 GiB static + 2 GiB
+expert cache layout, compact projection and batched packing. CPU FP32 measured
+2.869 wall seconds/audio second and 24.25 GiB peak process VRAM; lazy-mask GPU
+FP32 measured 2.328 and 25.77 GiB; GPU BF16 measured 2.308 and 24.79 GiB. All
+three generated identical codec indices and 5.016 seconds of speech. GPU FP32
+and BF16 WAVs differ, so their listening comparison remains separate from timing.
+BF16 saved about 0.98 GiB peak VRAM versus GPU FP32 with less than 1% additional
+latency improvement in this take. Neither compiler+GPU-codec combinations nor
+other cards, texts and context lengths were measured by this comparison.
+
+Every change affecting waveform or speech has a retained WAV comparison.
 
 ## Speech and performance direction
 

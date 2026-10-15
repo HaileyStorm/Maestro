@@ -2,7 +2,7 @@
 
 Based on Fish Speech's load_codec_model/encode_audio/decode_to_audio at
 541566932abbaebcb0a40e562a1f846738383f38. Built with Fish Audio.
-The codec stays on CPU to leave GPU headroom for expert staging and caches.
+The codec defaults to CPU; optional guarded GPU decoding restores it after each chunk.
 """
 from pathlib import Path
 
@@ -52,7 +52,41 @@ def encode_reference(path, codec):
 
 
 @torch.inference_mode()
-def decode_audio(codes, codec):
+def decode_audio(codes, codec, *, use_gpu=False, fallback_codec=None, stats=None):
+    record = stats if stats is not None else {}
+    record.update(frames=int(codes.shape[-1]), device="cpu", precision="float32",
+                  fallback_reason=None)
+    if use_gpu:
+        tensors = {id(t): t for t in [*codec.parameters(), *codec.buffers()]}
+        if any(t.device.type != "cpu" for t in tensors.values()):
+            raise RuntimeError("Drama codec must start decoding on CPU")
+        payload = sum(t.numel() * t.element_size() for t in tensors.values())
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()  # Release unused blocks, never live model tensors.
+        free, _ = torch.cuda.mem_get_info()
+        record.update(codec_tensor_bytes=payload, cuda_free_before_bytes=free,
+                      required_free_bytes=3 * 1024**3 + payload)
+        if codes.shape[-1] > 256 or free < record["required_free_bytes"]:
+            record["fallback_reason"] = "long_chunk" if codes.shape[-1] > 256 else "insufficient_vram"
+            print("Drama 3 GPU codec: using original CPU decoding for this chunk ("
+                  + record["fallback_reason"] + ").", flush=True)
+            codec = fallback_codec if fallback_codec is not None else codec
+        else:
+            record.update(device="cuda", precision=str(next(codec.parameters()).dtype).removeprefix("torch."))
+            previous_tf32 = torch.backends.cuda.matmul.allow_tf32
+            try:
+                torch.backends.cuda.matmul.allow_tf32 = False
+                codec.to(device="cuda")
+                with torch.device("cuda"), torch.backends.cudnn.flags(
+                        enabled=None, benchmark=None, benchmark_limit=None,
+                        deterministic=None, allow_tf32=False, fp32_precision=None):
+                    return codec.from_indices(codes.detach().to(device="cuda").unsqueeze(0).clone())[0, 0].float().cpu()
+            finally:
+                try:
+                    codec.to(device="cpu")
+                    torch.cuda.synchronize()
+                finally:
+                    torch.backends.cuda.matmul.allow_tf32 = previous_tf32
     with torch.device("cpu"):
         # The native codec clamps indices in place. Keep the generated codes
         # unchanged for subsequent speech-history conditioning.

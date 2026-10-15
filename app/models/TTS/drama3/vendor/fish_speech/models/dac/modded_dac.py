@@ -113,8 +113,9 @@ class Transformer(nn.Module):
         else:
             self.register_buffer("freqs_cis", None)
 
-        causal_mask = torch.tril(torch.ones(32768, 32768, dtype=torch.bool))
-        self.register_buffer("causal_mask", causal_mask, persistent=False)
+        # WindowLimitedTransformer always supplies its own mask. Allocate this
+        # fallback only when the base Transformer path actually needs it.
+        self.register_buffer("causal_mask", None, persistent=False)
 
         self.max_batch_size = -1
         self.max_seq_length = -1
@@ -158,6 +159,13 @@ class Transformer(nn.Module):
             freqs_cis = None
 
         if mask is None:  # in case of non-causal model
+            required = int(input_pos.max()) + 1
+            if not 1 <= required <= 32768:
+                raise ValueError("Codec causal positions must remain within 32768 rows")
+            if self.causal_mask is None or self.causal_mask.shape[-1] < required:
+                self.causal_mask = torch.tril(torch.ones(
+                    required, required, dtype=torch.bool, device=x.device,
+                ))
             if not self.training and self.use_kv_cache:
                 mask = self.causal_mask[None, None, input_pos]
                 mask = mask[..., : input_pos.max() + 1]

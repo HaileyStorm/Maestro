@@ -274,6 +274,8 @@ class FishOmniAudioDecoder(nn.Module):
         # Ids the main token is drawn from (eos + the semantic band), built lazily
         # on the tower's device: creating it inside CUDA-graph capture is illegal.
         self.main_candidates: Tensor | None = None
+        # Only the checked restricted-head loader enables compact projections.
+        self.main_logits_are_candidates = False
 
     @property
     def device(self) -> torch.device:
@@ -354,7 +356,12 @@ class FishOmniAudioDecoder(nn.Module):
             )
             self.main_candidates = torch.cat((eos, band)).sort().values
         candidates = self.main_candidates
-        candidate_logits = logits[:, candidates]
+        if self.main_logits_are_candidates:
+            if logits.shape[-1] != candidates.numel():
+                raise ValueError("restricted speech logits do not match the main candidate rows")
+            candidate_logits = logits
+        else:
+            candidate_logits = logits[:, candidates]
         first = candidates[
             sample_top_k_top_p(
                 candidate_logits, temperature, top_k, top_p, check_finite=check_finite
