@@ -2,14 +2,15 @@
 from __future__ import annotations
 
 import gc
-import hashlib
 import math
 import re
 import time
-from collections import OrderedDict
+from importlib.metadata import distribution, version
 from pathlib import Path
 
 import torch
+
+from services.prepared_voice_cache import PreparedVoiceCache
 
 from . import activate_fish_source
 
@@ -22,7 +23,7 @@ def validate_inputs(inputs):
     budget = custom.get("drama3_gpu_budget_gib", 22.0)
     if isinstance(budget, bool) or not isinstance(budget, (int, float)) or not math.isfinite(budget) or not 8 <= budget <= 26:
         return "Drama 3 GPU weights and staging budget must be between 8 and 26 GiB."
-    reference_cache = custom.get("drama3_reference_cache", 0)
+    reference_cache = custom.get("drama3_reference_cache", 1)
     if type(reference_cache) is not int or reference_cache not in (0, 1):
         return "Drama 3 reference cache must be 0 or 1."
     expert_cache = custom.get("drama3_expert_cache_gib", 0.0)
@@ -81,62 +82,51 @@ class Drama3Pipeline:
         self._backbone = self.codec = None
         self._interrupt = self._early_stop = False
         self._budget = None
-        self._reference_codes = OrderedDict()
-        self._reference_code_bytes = 0
-        self.reference_cache_stats = dict(hits=0, misses=0, entries=0, resident_bytes=0)
+        source_root = Path(__file__).parent
+        vendor = source_root / "vendor/fish_speech"
+        self.prepared_voice_cache = PreparedVoiceCache(
+            "drama3",
+            model_files=[Path(ckpt_root) / "codec.pth"],
+            implementation_files=[
+                Path(__file__), source_root / "worker.py",
+                vendor / "configs/modded_dac_vq.yaml",
+                *sorted((vendor / "models/dac").glob("*.py")),
+                *[distribution("descript-audio-codec").locate_file(name) for name in (
+                    "dac/model/base.py", "dac/nn/layers.py", "dac/nn/quantize.py")],
+                distribution("descript-audiotools").locate_file("audiotools/core/audio_signal.py"),
+            ],
+            options={
+                "codec_dtype": "float32", "codec_device": "cpu",
+                **{name: version(name) for name in (
+                    "torch", "numpy", "torchaudio", "soundfile",
+                    "descript-audio-codec", "descript-audiotools")},
+            },
+        )
+        self.reference_cache_stats = self.prepared_voice_cache.stats
 
-    def release(self):
+    def _reset_models(self):
         self._backbone = self.codec = None
         self._budget = None
-        self._reference_codes.clear()
-        self._reference_code_bytes = 0
-        self.reference_cache_stats.update(hits=0, misses=0, entries=0, resident_bytes=0)
         gc.collect()
+
+    def release(self):
+        self._reset_models()
+        self.prepared_voice_cache.close()
 
     def _cancelled(self):
         return self._interrupt
 
-    def _reference_digest(self, path):
-        # Large containers still use the native encoder, without cache overhead.
-        if Path(path).stat().st_size > 64 * 1024**2:
-            return None
-        digest = hashlib.sha256()
-        with open(path, "rb") as source:
-            total = 0
-            while block := source.read(1024**2):
-                if self._cancelled():
-                    raise InterruptedError("Drama 3 generation cancelled")
-                total += len(block)
-                if total > 64 * 1024**2:
-                    return None
-                digest.update(block)
-        return digest.digest()
-
     def _encode_reference(self, path, encoder, enabled, label, progress):
-        digest = self._reference_digest(path) if enabled else None
-        # Codec lifetime and encoder identity bind both weights and preprocessing.
-        key = (digest, id(self.codec), self.codec.sample_rate, encoder)
-        if digest is not None and key in self._reference_codes:
-            self.reference_cache_stats["hits"] += 1
-            self._reference_codes.move_to_end(key)
-            if callable(progress):
-                progress(label + " · cached")
-            return self._reference_codes[key].clone()
-        if enabled:
-            self.reference_cache_stats["misses"] += 1
-        codes = _run_timed_phase(label, encoder, path, self.codec, progress=progress)
-        size = codes.numel() * codes.element_size()
-        if (digest is not None and size <= 8 * 1024**2
-                and self._reference_digest(path) == digest):
-            while self._reference_codes and (len(self._reference_codes) >= 6
-                    or self._reference_code_bytes + size > 8 * 1024**2):
-                _, old = self._reference_codes.popitem(last=False)
-                self._reference_code_bytes -= old.numel() * old.element_size()
-            self._reference_codes[key] = codes.detach().cpu().clone()
-            self._reference_code_bytes += size
-            self.reference_cache_stats.update(entries=len(self._reference_codes),
-                                               resident_bytes=self._reference_code_bytes)
-        return codes
+        prepare = lambda: _run_timed_phase(label, encoder, path, self.codec, progress=progress)
+        if not enabled:
+            return prepare()
+        if callable(progress):
+            progress(label)
+        return self.prepared_voice_cache.get_or_prepare(
+            references={"reference_audio": path},
+            settings={"sample_rate": int(self.codec.sample_rate)},
+            prepare=prepare,
+        )
 
     @torch.inference_mode()
     def generate(self, input_prompt, *, alt_prompt="", audio_guide=None,
@@ -165,14 +155,10 @@ class Drama3Pipeline:
         )
         budget = float(custom.get("drama3_gpu_budget_gib", 22.0))
         expert_cache = float(custom.get("drama3_expert_cache_gib", 0.0))
-        reference_cache = custom.get("drama3_reference_cache", 0)
+        reference_cache = custom.get("drama3_reference_cache", 1)
         self._interrupt = self._early_stop = False
         if self._budget != (budget, expert_cache):
-            self.release()
-        if not reference_cache:
-            self._reference_codes.clear()
-            self._reference_code_bytes = 0
-            self.reference_cache_stats.update(entries=0, resident_bytes=0)
+            self._reset_models()
         if self._backbone is None:
             if callable(set_progress_status): set_progress_status("Loading Drama 3 FP8 with CPU expert offload")
             self._backbone = load_offloaded_model(self.ckpt_root, gpu_budget_gib=budget,

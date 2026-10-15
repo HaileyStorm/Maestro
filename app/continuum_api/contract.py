@@ -25,6 +25,53 @@ ERRORS = {
     "423": "Resource is locked. Preserve the operation and wait for its owner.",
     "503": "Temporarily unavailable. Observe an existing operation; never blindly resubmit a mutation.",
 }
+PREPARED_VOICE_FAMILIES = ["drama3", "voxcpm2", "qwen3_tts_base", "kugelaudio_0_open", "chatterbox"]
+
+
+def _prepared_voice_operations():
+    path = "/api/v1/projects/{project}/assets/{asset_id}/variants/{variant_id}/prepared-voices"
+    parameters = [{"name": name, "in": "path", "required": True,
+                   "schema": {"type": "string", "minLength": 1}}
+                  for name in ("project", "asset_id", "variant_id")]
+    parameters.append({"name": "family", "in": "query", "required": False,
+        "description": "Limit matching prepared features to this model family; omit for all supported families.",
+        "schema": {"type": "string", "enum": PREPARED_VOICE_FAMILIES}})
+    result = {}
+    for method, suffix, name, summary, description in (
+        ("get", "", "prepared_voice_status", "Inspect prepared voice features",
+         "Read matching cache entries and their current CPU-feature readiness without loading features into memory."),
+        ("post", "/load", "prepared_voice_load", "Load prepared voice features into CPU memory",
+         "Preload valid existing disk features into bounded CPU memory. Missing features are first prepared "
+         "by ordinary authorized generation; this operation does not create them."),
+        ("delete", "", "prepared_voice_evict", "Evict prepared voice features",
+         "Remove matching prepared features from disk and CPU memory. Original recordings, Reference cards "
+         "and model files are preserved. Content-identical references can share the evicted features."),
+    ):
+        readonly = method == "get"
+        result[(method, path + suffix)] = {
+            "operationId": name, "summary": summary,
+            "description": description + " Select a project-authorized voice asset and one kept voice_reference "
+                "variant containing exactly one WAV or FLAC recording. No request body, model load, GPU "
+                "dispatch or generation submission. Readiness is CPU features only, not model/GPU readiness "
+                "or voice quality. Follow next_action when no valid features exist.",
+            "parameters": copy.deepcopy(parameters),
+            "responses": {"200": {"description": "Current matching prepared voice cache state.",
+                "content": {"application/json": {"schema": {"$ref": "#/components/schemas/PreparedVoiceState"}}}}},
+            "x-maestro": {
+                "feature": "references.voices.prepared", "operation_kind": "read" if readonly else "mutation",
+                "permissions": ["project.read" if readonly else "project.mutate"], "mcp": True,
+                "destructive": method == "delete", "idempotent": True, "open_world": False,
+                "contract_status": "authored",
+                "boundary": "Existing session, project authorization, source-media privacy and mutation-origin "
+                    "guards apply. Only content-bound prepared cache features are accessible; no arbitrary paths, "
+                    "tensor payloads, credentials or native execution authority are exposed.",
+                "idempotency": "Read-only." if readonly else
+                    "Idempotent cache operation; state may change with generation or eviction. "
+                    "Clients do not automatically retry; inspect current state after uncertainty.",
+                "evidence": "Authored source contract. Live endpoint and native cache validation remain separate.",
+            },
+        }
+    return result
 
 
 def _json_schema_nullable(value):
@@ -53,6 +100,7 @@ def authored_operations() -> dict[tuple[str, str], dict]:
                 item.setdefault("x-maestro", {}).setdefault("contract_status", "authored")
             previous = result.get(key, {})
             result[key] = {**previous, **item}
+    result.update(_prepared_voice_operations())
     return result
 
 
@@ -79,6 +127,33 @@ def enrich_openapi(schema: dict) -> dict:
     timeline["required"] = ["schema_version", "id", "name", "workspace", "revision", "created_at", "updated_at",
                             "canvas", "assets", "tracks", "markers", "export", "exports"]
     schema.setdefault("components", {}).setdefault("schemas", {})["EditorTimeline"] = timeline
+    schema["components"]["schemas"]["PreparedVoiceEntry"] = {
+        "type": "object", "additionalProperties": False,
+        "required": ["key", "family", "bytes", "valid", "disk_ready", "memory_ready"],
+        "properties": {
+            "key": {"type": "string", "pattern": "^[0-9a-f]{64}$",
+                    "description": "Opaque content-bound cache key; not a path or permission grant."},
+            "family": {"type": "string", "enum": PREPARED_VOICE_FAMILIES},
+            "bytes": {"type": "integer", "minimum": 0},
+            "valid": {"type": "boolean", "description": "Valid on disk or in CPU memory."},
+            "disk_ready": {"type": "boolean"}, "memory_ready": {"type": "boolean"},
+        },
+    }
+    schema["components"]["schemas"]["PreparedVoiceState"] = {
+        "type": "object", "additionalProperties": False,
+        "required": ["asset_id", "variant_id", "entries", "matched", "valid", "memory_ready", "evicted",
+                     "failures", "readiness_scope", "generation_submitted", "next_action"],
+        "properties": {
+            "asset_id": {"type": "string"}, "variant_id": {"type": "string"},
+            "entries": {"type": "array", "items": {"$ref": "#/components/schemas/PreparedVoiceEntry"}},
+            **{name: {"type": "integer", "minimum": 0} for name in
+               ("matched", "valid", "memory_ready", "evicted", "failures")},
+            "readiness_scope": {"type": "string", "const": "cpu_features"},
+            "generation_submitted": {"type": "boolean", "const": False},
+            "next_action": {"type": "string", "description": "Current next step, including ordinary "
+                            "authorized generation when prepared features do not exist."},
+        },
+    }
     schema["components"]["schemas"]["Drama3CustomSettings"] = {
         "type": "object", "additionalProperties": True,
         "description": "Drama 3 optional settings. References use authorized uploads and require actual transcripts. "
@@ -87,6 +162,10 @@ def enrich_openapi(schema: dict) -> dict:
             "drama3_gpu_budget_gib": {"type": "number", "minimum": 8, "maximum": 26, "default": 22},
             "drama3_separate_turns": {"type": "integer", "enum": [0, 1], "default": 0,
                 "description": "1 preserves each explicitly tagged speaker turn as a separate generation chunk, including repeated speakers, with native audio history. Experimental mitigation for skipped turns; not a word-completeness guarantee. 0 retains Fish's native batching."},
+            "drama3_reference_cache": {"type": "integer", "enum": [0, 1], "default": 1,
+                "description": "1 automatically reuses content-bound prepared reference codes in bounded CPU "
+                    "memory and private disk storage. Explicit 0 opts out for this generation. "
+                    "This does not cache model weights or establish GPU readiness."},
             **{("drama3_reference_text" + (str(i) if i > 1 else "")): {
                 "type": "string", "default": "", "description":
                     f"Actual transcript of audio_guide{str(i) if i > 1 else ''} for zero-based Speaker {i-1}; "

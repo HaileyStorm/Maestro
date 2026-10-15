@@ -73,11 +73,11 @@ Legacy. Select the BF16 model explicitly; a memory profile alone does not select
 weight precision. These are existing execution controls, available to HTTP,
 Python, TypeScript and MCP callers through the ordinary generation payload.
 
-Drama exposes these optional `custom_settings`, both disabled by default:
+Drama exposes these optional `custom_settings`:
 
 | Setting | Values | Behavior |
 | --- | --- | --- |
-| `drama3_reference_cache` | `0` or `1` | Reuses exact encoded reference audio in this loaded pipeline. Content hashes and codec identity bind entries. At most six CPU entries / 8 MiB; unload or disabling clears them. |
+| `drama3_reference_cache` | `0` or `1`, default `1` | Saves exact encoded reference audio in private data-only disk storage and reuses bounded CPU memory. Content hashes, codec and preparation code bind entries. Explicit `0` bypasses reuse. See [prepared voices](voice-cloning.md#inspect-load-and-evict) for project-scoped inspection, CPU preload and eviction. |
 | `drama3_expert_cache_gib` | `0` through `4` | Keeps recently used original FP8 experts in GPU memory, with bounded eviction and original FP8 arithmetic. May add one expert layer of pinned CPU staging. |
 
 `drama3_gpu_budget_gib + drama3_expert_cache_gib` must be at most 26.
@@ -95,8 +95,9 @@ Merge these fields with the required reference transcript and other existing
 settings. Discover current model options before submission. The configured
 26 GiB allowance is not total peak VRAM; leave room for the desktop, CUDA,
 activations and KV state. Smaller cards or longer contexts need their own
-resource assessment. Cache lifetime ends with model unloading; no cache handle
-or cross-process persistence is exposed. Source generation remains serialized.
+resource assessment. The GPU expert cache ends with model unloading; prepared
+reference features persist on disk and can be reloaded into CPU memory. Source
+generation remains serialized.
 
 A short-passage native pipeline study on an RTX 5090 (32 GiB), Torch 2.10 /
 CUDA 13, measured synchronized warm `generate()` wall time divided by actual
@@ -117,8 +118,10 @@ included. Each row is one controlled take, not an aggregate benchmark:
 
 Qwen's two Legacy WAVs were byte-identical. Its graph output differed and is a
 listening comparison. All three Drama WAVs were byte-identical for this passage.
-A Vox reference-cache experiment produced the same WAV but less than 1% timing
-difference; it was removed rather than adding an unhelpful production option.
+A prior Vox reference-cache experiment produced the same WAV but less than 1%
+end-to-end timing difference. Persistent prepared voices now reuse that native
+preparation through the shared disk/CPU store; this is principally useful for
+swapping and reloading references rather than accelerating its speech decoder.
 No quantization was reduced. Neither sample identity nor speed proves quality
 for other voices, text or contexts; human listening remains separate.
 

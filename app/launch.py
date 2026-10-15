@@ -19062,8 +19062,17 @@ def _retake_engines_for_architecture(architecture):
 
 
 def _speech_capabilities_for_model(architecture):
+    prepared = {"prepared_voices": {
+        "family": architecture, "automatic": True, "storage": ["private_disk", "bounded_cpu_memory"],
+        "format": "safetensors_and_json", "precision": "unchanged",
+        "first_preparation": "Existing authorized generation with a reference recording; no standalone GPU bypass.",
+        "management": "/api/v1/projects/{project}/assets/{asset_id}/variants/{variant_id}/prepared-voices",
+        "readiness_scope": "cpu_features", "disk_survives_unload": True,
+        "invalidated_by": ["model", "codec", "preparation_code", "reference_content", "transcript_or_settings"],
+    }}
     if architecture in ("voxcpm2", "index_tts2", "kugelaudio_0_open", "chatterbox"):
         return {"speech_capabilities": {
+            **(prepared if architecture != "index_tts2" else {}),
             "decoder_steps": {"parameter": "num_inference_steps", "minimum": 1, "maximum": 100,
                 "default": {"voxcpm2": 30, "index_tts2": 25, "kugelaudio_0_open": 20, "chatterbox": 10}[architecture],
                 "legacy_zero_uses_default": True,
@@ -19074,10 +19083,12 @@ def _speech_capabilities_for_model(architecture):
                 ["top_k", "alt_prompt", "duration_seconds"] if architecture == "chatterbox" else [],
             "wav_subtype": "PCM_24",
         }}
+    if architecture == "qwen3_tts_base":
+        return {"speech_capabilities": prepared}
     if architecture != "drama3":
         return {}
     from models.TTS.drama3_handler import speech_capabilities
-    return {"speech_capabilities": speech_capabilities()}
+    return {"speech_capabilities": {**speech_capabilities(), **prepared}}
 
 
 @api.get("/api/v1/models")
@@ -29442,6 +29453,9 @@ def system_release_model(request: Request):
                 released.append("LLM")
         except Exception as e:
             print(f"[ReleaseModel] LLM unload skipped: {e}")
+        from services.prepared_voice_cache import clear_prepared_memory
+        if clear_prepared_memory()["cleared"]:
+            released.append("prepared voices")
         import gc
         gc.collect()
         if torch.cuda.is_available():
@@ -29543,6 +29557,9 @@ def _resource_release_activity() -> dict:
 def _resource_release_loaded() -> list[str]:
     """Describe only resident resources that Maestro can actually release."""
     loaded = []
+    from services.prepared_voice_cache import prepared_memory_status
+    if prepared_memory_status()["entries"]:
+        loaded.append("prepared voices")
     if getattr(wgp, "wan_model", None) is not None or getattr(wgp, "offloadobj", None) is not None:
         loaded.append("generation model")
     from services import llm_service
@@ -29650,6 +29667,11 @@ def _resource_release_unload(targets: frozenset[str]) -> tuple[list[str], list[s
 
     loaded = set(_resource_release_loaded())
     selected = loaded if "all" in targets else loaded.intersection(targets)
+    if "all" in targets or "generation model" in targets or "prepared voices" in selected:
+        from services.prepared_voice_cache import clear_prepared_memory
+        def unload_prepared_voices():
+            return bool(clear_prepared_memory()["cleared"])
+        attempt("prepared voices", unload_prepared_voices)
     if "generation model" in selected:
         attempt("generation model", _release_wgp_model_with_native_gpu_exclusion)
     if "Director assistant" in selected:
@@ -34425,6 +34447,84 @@ def _build_custom_visual_style_router():
 
 
 api.include_router(_build_custom_visual_style_router())
+
+
+_PREPARED_VOICE_FAMILIES = frozenset({
+    "drama3", "voxcpm2", "qwen3_tts_base", "kugelaudio_0_open", "chatterbox",
+})
+
+
+def _project_prepared_voice(project, asset_id, variant_id, request, family, operation):
+    """Manage regenerable CPU conditioning for one authorized saved recording."""
+    project_id, workspace_id = _asset_scope(request, project)
+    if operation != "inspect":
+        _require_project_access(request, project, permission="project.mutate")
+    if family and family not in _PREPARED_VOICE_FAMILIES:
+        raise HTTPException(status_code=400, detail="Choose a supported prepared-voice family")
+    from services import prepared_voice_cache
+    try:
+        with _reserve_workspace_operations(project_id):
+            store = _project_asset_store()
+            with store.publication_guard():
+                asset = _require_project_asset_media_access(
+                    project_id, workspace_id, asset_id, request.state.maestro_session_id,
+                    variant_id=variant_id,
+                )
+                variant = store.get_variant(project_id, workspace_id, asset_id, variant_id)
+                if (asset.get("asset_type") != "voice"
+                        or variant.get("variant_type") != "voice_reference"
+                        or variant.get("status") != "kept"):
+                    raise HTTPException(status_code=400, detail="Select one kept voice-reference variant")
+                outputs = variant.get("outputs") or []
+                if len(outputs) != 1:
+                    raise HTTPException(status_code=400, detail="A voice reference requires one WAV or FLAC")
+                output = outputs[0]
+                name = output.get("filename", "")
+                if (not isinstance(name, str) or not re.fullmatch(r"[^/\\\x00-\x1f]{1,200}", name)
+                        or name.rsplit(".", 1)[-1].lower() not in {"wav", "flac"}
+                        or not str(output.get("media_type", "")).startswith("audio/")
+                        or output.get("relative_path") != f"media/{asset_id}/{variant_id}/{name}"):
+                    raise HTTPException(status_code=400, detail="Select a saved WAV or FLAC reference")
+                path = store.resolve_output_path(project_id, workspace_id, output["relative_path"])
+                if not os.path.isfile(path) or os.path.getsize(path) > 16 * 1024**2:
+                    raise HTTPException(status_code=404, detail="Saved voice recording unavailable")
+                action = {"inspect": prepared_voice_cache.inspect_prepared,
+                          "preload": prepared_voice_cache.preload_prepared,
+                          "evict": prepared_voice_cache.evict_prepared}[operation]
+                result = action(path, family=family or None)
+        return {**result, "asset_id": asset_id, "variant_id": variant_id,
+                "generation_submitted": False,
+                "next_action": (
+                    "Use an authorized generation with this recording, transcript and settings to prepare missing features."
+                    if not result["valid"] else
+                    "Use the same recording, model and settings in a normal generation; GPU admission still applies."
+                )}
+    except HTTPException:
+        raise
+    except Exception as error:
+        raise _project_asset_error(error) from error
+
+
+@api.get("/api/v1/projects/{project}/assets/{asset_id}/variants/{variant_id}/prepared-voices",
+         operation_id="prepared_voice_status")
+def project_prepared_voice_status(project: str, asset_id: str, variant_id: str, request: Request,
+                                  family: str = ""):
+    return _project_prepared_voice(project, asset_id, variant_id, request, family, "inspect")
+
+
+@api.post("/api/v1/projects/{project}/assets/{asset_id}/variants/{variant_id}/prepared-voices/load",
+          operation_id="prepared_voice_load")
+def project_prepared_voice_load(project: str, asset_id: str, variant_id: str, request: Request,
+                                family: str = ""):
+    return _project_prepared_voice(project, asset_id, variant_id, request, family, "preload")
+
+
+@api.delete("/api/v1/projects/{project}/assets/{asset_id}/variants/{variant_id}/prepared-voices",
+            operation_id="prepared_voice_evict")
+def project_prepared_voice_evict(project: str, asset_id: str, variant_id: str, request: Request,
+                                 family: str = ""):
+    return _project_prepared_voice(project, asset_id, variant_id, request, family, "evict")
+
 
 @api.get("/api/v1/projects/{project}/assets")
 def list_project_assets(

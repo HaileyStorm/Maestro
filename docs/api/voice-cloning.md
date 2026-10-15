@@ -137,29 +137,121 @@ use a reference with the desired delivery for transcript-conditioned cloning.
 Neither successful execution nor a higher step count establishes voice quality;
 comparative listening is still needed.
 
-## Saved inputs and prepared voice memory
+## Saved inputs and prepared voice features
 
-Project voice cards save portable recordings, transcripts and provenance. Loading
-a card prepares a session upload; it does not load trained speaker weights or a
-persisted native tensor cache. The same source card can be used by different
-models through their respective inputs. Native prepared representations are
-model-specific and are not interchangeable.
+Project voice cards remain portable recordings, transcripts and provenance.
+`prepare_voice_reference` / `prepareVoiceReference` copies the selected recording
+into a private session upload. Prepared features are a separate, model-specific
+cache used automatically during ordinary authorized generation. They are not
+trained speaker weights and cannot be exchanged between model families.
 
-| Model | Current retention and reuse | Lower-level possibility, not a saved-voice API |
+| Model family | Prepared features reused |
+| --- | --- |
+| `drama3` | Reference codec codes; enabled by default with `custom_settings.drama3_reference_cache: 1`. Explicit `0` opts out for that generation. The FP8 expert weight cache is separate. |
+| `voxcpm2` | Native prompt-cache features, including the applicable reference/continuation mode and transcript. |
+| `qwen3_tts_base` | Voice-clone prompt codes and speaker embeddings. CustomVoice preset voices are a separate architecture. |
+| `kugelaudio_0_open` | Encoded voice-prompt features. |
+| `chatterbox` | Native voice-conditioning tensors. |
+
+VoxCPM2, Qwen3 TTS Base, KugelAudio and Chatterbox use this cache automatically;
+no separate cache setting is required. The first cache miss uses the model's
+native reference preparation during generation, then saves reusable features.
+Model/codec files, preparation implementation, source recording bytes, reference
+roles, transcript and preparation settings bind each entry. Changed or corrupt
+entries are cache misses: ordinary generation falls back to native preparation.
+The private format stores data-only tensors with their exact dtype and bounded
+JSON metadata; it does not deserialize arbitrary Torch/pickle voice profiles.
+
+Disk entries live under `prepared_voices` in the configured checkpoint root.
+The shared cache retains at most 128 entries / 256 MiB in CPU RAM, at most
+64 MiB per entry, and at most 1024 entries / 4 GiB on disk. Limits can evict
+reusable entries. The owner's **Free Resources** action clears resident prepared
+features, including explicit preloads; disk entries persist for later reuse.
+Cached CPU features do not imply that model weights are loaded, GPU memory is
+ready, generation is admitted, or voice quality has been accepted.
+
+### Inspect, load and evict
+
+All three operations select a project-authorized voice asset and one kept
+`voice_reference` variant containing exactly one WAV or FLAC recording. The
+optional `family` query accepts the five family IDs above; omission includes
+all matching families. No operation accepts a request body or arbitrary path,
+exports tensor payloads or credentials, loads a model, dispatches GPU work, or
+submits generation. Existing session, project, source-media privacy and mutation
+origin requirements apply.
+
+Let `P` be
+`/api/v1/projects/{project}/assets/{asset_id}/variants/{variant_id}/prepared-voices`,
+with each path field URL-encoded separately.
+
+| HTTP operation | Operation / MCP tool ID | Permission and effect |
 | --- | --- | --- |
-| Drama 3 | By default, reference codes are rebuilt for each generation job. The opt-in `custom_settings.drama3_reference_cache: 1` implementation retains up to six exact-reference code tensors, at most 8 MiB total, in CPU RAM while the pipeline remains loaded; release clears them. It defaults to off. Retained native WAV comparisons establish execution and byte-identical audio for the measured cache case; they do not establish subjective quality for every voice. | Encoded reference codes can condition further speech. No disk save/load of prepared voice tensors is exposed. The separate FP8 expert cache holds model weights, not a prepared voice. |
-| VoxCPM2 | The loaded model is retained, but each high-level generation call rebuilds reference features. Combined mode encodes the same recording for its two roles, with different padding; the wrapper retains no prepared voice cache across turns or jobs. | Native `build_prompt_cache` returns CPU-RAM latent features plus transcript and mode; `generate_with_prompt_cache` can reuse them. Maestro has not integrated that reuse or persisted those tensors. Conditioning is transferred to the model device during generation. |
-| Qwen3 TTS Base | Reference speech codes and speaker embeddings are prepared for the request. Split speech and dialogue paths reuse request-local prompt items; a new job rebuilds them. No project-card restore of prepared tensors is exposed. | Native `create_voice_clone_prompt` items can be supplied to `generate_voice_clone`. That makes reuse possible, but does not establish cross-job RAM/VRAM retention or a portable tensor format. CustomVoice uses preset voices and is a separate architecture. |
-| KugelAudio | The wrapper reloads/processes the reference into each generation's inputs. It does not retain a prepared voice cache for later jobs. | Lower-level `encode_voice_prompt` and `voice_cache` support prepared features; the wrapper does not use that path as a saved-voice facility. |
-| Chatterbox | The loaded model retains its latest conditioning on the model device, but the wrapper prepares the supplied reference again on each request. A saved card does not restore that conditioning directly; release drops the loaded model. | Native generation can reuse current conditioning without another audio path. A save helper exists, but the installed multilingual loader does not honor the requested file and loads bundled conditioning instead. Those helpers do not establish working prepared-voice save/load. |
+| `GET P` | `prepared_voice_status` | `project.read`; read-only inspection without preloading. |
+| `POST P/load` | `prepared_voice_load` | `project.mutate`; idempotently loads valid existing disk features into bounded CPU RAM. It does not create missing features. |
+| `DELETE P` | `prepared_voice_evict` | `project.mutate`; idempotently removes matching disk and CPU cache entries. Original audio, cards and models remain. Content-identical references can share the removed features. |
 
-There is no general public API here for saving prepared voice tensors to disk,
-loading arbitrary tensor files, or pinning a named voice in RAM or VRAM. Do not
-deserialize arbitrary Torch/pickle files as voice profiles. Use the authorized
-project recording and transcript; any future prepared-cache persistence needs
-explicit model/codec identity, bounded memory and a supported private format.
-These are source-level retention descriptions, not memory measurements or native
-quality acceptance. A model's `native_qualified` status remains separate.
+Responses contain `asset_id`, `variant_id`, `entries`, integer counts `matched`,
+`valid`, `memory_ready`, `evicted`, `failures`, and
+`readiness_scope: "cpu_features"`, `generation_submitted: false`, `next_action`.
+Each entry contains an opaque SHA-256 `key`, `family`, `bytes`, and booleans
+`valid`, `disk_ready`, `memory_ready`. Follow `next_action`; a missing entry
+requires ordinary authorized generation with that reference before CPU preload
+can help. After an uncertain mutation, inspect current state; the clients never
+automatically retry.
+
+Within an authenticated Python client session:
+
+```python
+state = maestro.inspect_prepared_voice(project, asset_id, variant_id, family="voxcpm2")
+state = maestro.load_prepared_voice(project, asset_id, variant_id, family="voxcpm2")
+print(state["readiness_scope"], state["next_action"])
+# Explicit cache removal, when wanted:
+state = maestro.evict_prepared_voice(project, asset_id, variant_id, family="voxcpm2")
+```
+
+TypeScript uses the same authenticated client and server contract:
+
+```typescript
+const state = await maestro.inspectPreparedVoice(project, assetId, variantId, 'voxcpm2')
+await maestro.loadPreparedVoice(project, assetId, variantId, 'voxcpm2')
+// Explicit cache removal, when wanted:
+await maestro.evictPreparedVoice(project, assetId, variantId, 'voxcpm2')
+```
+
+For curl, set `MAESTRO_PREPARED_VOICE_URL` to the current configured Maestro
+origin plus `P`, substituting the URL-encoded authorized IDs. Run only the
+operation wanted:
+
+```bash
+curl --cookie "$MAESTRO_COOKIE_FILE" "$MAESTRO_PREPARED_VOICE_URL?family=voxcpm2"
+curl --cookie "$MAESTRO_COOKIE_FILE" -H "Origin: $MAESTRO_ORIGIN" \
+  -X POST "$MAESTRO_PREPARED_VOICE_URL/load?family=voxcpm2"
+curl --cookie "$MAESTRO_COOKIE_FILE" -H "Origin: $MAESTRO_ORIGIN" \
+  -X DELETE "$MAESTRO_PREPARED_VOICE_URL?family=voxcpm2"
+```
+
+The MCP bridge generates these tools from the current authored OpenAPI contract.
+Select `references.voices.prepared` (or its parent `references`) to include them.
+Read-only mode includes inspection only. Load is non-destructive; eviction is
+destructive only to cached features; both are idempotent and local in scope.
+These interfaces grant no extra project, credential or native execution authority.
+
+The 15 October 2026 native comparison exercised preparation, RAM reuse,
+speaker changes and fresh-process disk reuse for all five families. Drama,
+VoxCPM2, Qwen3 Base and KugelAudio produced byte-identical matching-reference
+WAVs through disk reload. Chatterbox matched within one process; its disk-loaded
+conditioning matched fresh native preparation exactly in all ten fields.
+Chatterbox initializes an unregistered decoder noise bank when constructing the
+model, before the per-generation seed, so a fresh model instance can produce a
+different waveform with identical saved conditioning. Caching does not change
+that native behavior.
+
+The deployed authenticated Python and MCP workflow exercised inspection and
+preloading; Python also exercised eviction and repeated eviction without
+deleting recordings or submitting generation. CPU readiness, model
+`native_qualified` status, measured cache reuse and subjective listening
+acceptance remain separate evidence. Windows disk persistence is unqualified;
+unsupported private-file operations fall back to native preparation.
 
 ## Submit speech from a saved voice
 

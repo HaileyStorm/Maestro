@@ -6,6 +6,7 @@ import os
 import random
 import re
 from dataclasses import dataclass
+from importlib.metadata import version
 from pathlib import Path
 from typing import Optional
 
@@ -143,6 +144,8 @@ class Qwen3TTSPipeline:
         self._early_stop = False
 
         assets = self._resolve_assets(model_weights_path)
+        self._voice_assets = assets
+        self._prepared_voice_cache = None
         self.model = self._load_main_model(assets)
         self.speech_tokenizer = self._load_speech_tokenizer(assets)
         self.processor = self._load_text_processor(assets)
@@ -154,6 +157,9 @@ class Qwen3TTSPipeline:
             processor=self.processor,
             generate_defaults=self.model.generate_config or {},
         )
+        self._native_create_voice_clone_prompt = self.tts.create_voice_clone_prompt
+        if self.base_model_type == "qwen3_tts_base":
+            self.tts.create_voice_clone_prompt = self._create_prepared_voice_clone_prompt
         self.sample_rate = int(self.speech_tokenizer.get_output_sample_rate())
 
         _set_interrupt_check(self.model, self._abort_requested)
@@ -163,6 +169,72 @@ class Qwen3TTSPipeline:
         self.supported_languages = sorted(self.tts.get_supported_languages() or [])
         engine = "cg" if self.lm_decoder_engine == "cg" else "legacy"
         print(f"[Qwen3TTS] LM Engine='{engine}'")
+
+    @property
+    def prepared_voice_cache(self):
+        # Construct only at the native preparation boundary (or an authorized
+        # benchmark's explicit access), never during import or model discovery.
+        if self._prepared_voice_cache is None:
+            from services.prepared_voice_cache import PreparedVoiceCache
+
+            assets = self._voice_assets
+            model_files = [assets.weights_path, assets.config_path, assets.speech_tokenizer_weights]
+            for directory in (assets.text_tokenizer_dir, assets.speech_tokenizer_dir):
+                model_files.extend(str(path) for path in Path(directory).rglob("*") if path.is_file())
+            source_root = Path(__file__).parent
+            self._prepared_voice_cache = PreparedVoiceCache(
+                family="qwen3_tts_base",
+                model_files=sorted({str(Path(path).resolve()) for path in model_files}),
+                implementation_files=[str(source_root / path) for path in (
+                    "pipeline.py", "inference/qwen3_tts_model.py", "inference/qwen3_tts_tokenizer.py",
+                    "core/models/modeling_qwen3_tts.py", "core/models/configuration_qwen3_tts.py",
+                    "core/tokenizer_12hz/modeling_qwen3_tts_tokenizer_v2.py",
+                    "core/tokenizer_12hz/configuration_qwen3_tts_tokenizer_v2.py",
+                )],
+                options={
+                    "prompt_schema": 1, "dtype": str(self.model.dtype),
+                    "dependencies": {name: version(name) for name in ("torch", "transformers", "librosa", "numpy")},
+                },
+            )
+        return self._prepared_voice_cache
+
+    def _create_prepared_voice_clone_prompt(self, ref_audio, ref_text=None, x_vector_only_mode=False):
+        native = self._native_create_voice_clone_prompt
+        references = ref_audio if isinstance(ref_audio, list) else [ref_audio]
+        texts = ref_text if isinstance(ref_text, list) else [ref_text] * len(references)
+        modes = x_vector_only_mode if isinstance(x_vector_only_mode, list) else [x_vector_only_mode] * len(references)
+        # Preserve native handling/errors for URL, array and unsupported inputs.
+        if (not references or len(texts) != len(references) or len(modes) != len(references)
+                or any(not isinstance(path, str) or not os.path.isfile(path) for path in references)
+                or any(text is not None and not isinstance(text, str) for text in texts)
+                or any(type(mode) is not bool for mode in modes)):
+            return native(ref_audio=ref_audio, ref_text=ref_text, x_vector_only_mode=x_vector_only_mode)
+        cache = self.prepared_voice_cache
+        if not cache.enabled:
+            return native(ref_audio=ref_audio, ref_text=ref_text, x_vector_only_mode=x_vector_only_mode)
+
+        def prepare():
+            items = native(ref_audio=ref_audio, ref_text=ref_text, x_vector_only_mode=x_vector_only_mode)
+            return [{
+                "ref_code": item.ref_code, "ref_spk_embedding": item.ref_spk_embedding,
+                "x_vector_only_mode": item.x_vector_only_mode, "icl_mode": item.icl_mode,
+                "ref_text": item.ref_text,
+            } for item in items]
+
+        payload = cache.get_or_prepare(
+            references={f"reference_{index}": path for index, path in enumerate(references)},
+            settings={"ref_text": texts, "x_vector_only_mode": modes, "icl_mode": [not mode for mode in modes]},
+            prepare=prepare,
+        )
+        # The store owns CPU copies only. Native speaker conditioning needs the
+        # active execution device; retain every tensor's exact stored dtype.
+        device = self.speech_tokenizer._get_device()
+        return [VoiceClonePromptItem(
+            ref_code=None if item["ref_code"] is None else item["ref_code"].to(device=device),
+            ref_spk_embedding=item["ref_spk_embedding"].to(device=device),
+            x_vector_only_mode=item["x_vector_only_mode"], icl_mode=item["icl_mode"],
+            ref_text=item["ref_text"],
+        ) for item in payload]
 
     def _abort_requested(self) -> bool:
         return bool(self._interrupt)
@@ -985,6 +1057,11 @@ class Qwen3TTSPipeline:
                             delattr(child, "_mm_lora_model")
                     module.to("cpu")
         finally:
+            cache = self._prepared_voice_cache
+            self._prepared_voice_cache = None
+            self._native_create_voice_clone_prompt = None
             self.tts = None
             self.model = None
             self.speech_tokenizer = None
+            if cache is not None:
+                cache.close()

@@ -149,6 +149,21 @@ class MaestroClient:
     def discover(self):
         return self.request("GET", "/api/v1/api/discovery")
 
+    def inspect_prepared_voice(self, project: str, asset_id: str, variant_id: str, *, family: str | None = None):
+        """Inspect cached CPU features for an authorized saved voice reference."""
+        return self.call("prepared_voice_status", path={"project": project, "asset_id": asset_id, "variant_id": variant_id},
+                         query={} if family is None else {"family": family})
+
+    def load_prepared_voice(self, project: str, asset_id: str, variant_id: str, *, family: str | None = None):
+        """Preload existing features into CPU memory; never prepare features or submit generation."""
+        return self.call("prepared_voice_load", path={"project": project, "asset_id": asset_id, "variant_id": variant_id},
+                         query={} if family is None else {"family": family})
+
+    def evict_prepared_voice(self, project: str, asset_id: str, variant_id: str, *, family: str | None = None):
+        """Evict matching cached features, preserving recordings, Reference cards and models."""
+        return self.call("prepared_voice_evict", path={"project": project, "asset_id": asset_id, "variant_id": variant_id},
+                         query={} if family is None else {"family": family})
+
     def prepare_voice_reference(self, project: str, asset_id: str, variant_id: str):
         """Copy one saved voice reference into a private upload for this session.
 

@@ -114,6 +114,21 @@ export class MaestroClient {
     return this.request(op.method, path, inputs)
   }
   discover() { return this.request('GET', '/api/v1/api/discovery') }
+  /** Inspect cached CPU features for an authorized saved voice reference. */
+  inspectPreparedVoice(project: string, assetId: string, variantId: string, family?: string) {
+    return this.call('prepared_voice_status', { path: { project, asset_id: assetId, variant_id: variantId },
+      query: family === undefined ? {} : { family } })
+  }
+  /** Preload existing CPU features; never prepare features or submit generation. */
+  loadPreparedVoice(project: string, assetId: string, variantId: string, family?: string) {
+    return this.call('prepared_voice_load', { path: { project, asset_id: assetId, variant_id: variantId },
+      query: family === undefined ? {} : { family } })
+  }
+  /** Evict cached features, preserving recordings, Reference cards and models. */
+  evictPreparedVoice(project: string, assetId: string, variantId: string, family?: string) {
+    return this.call('prepared_voice_evict', { path: { project, asset_id: assetId, variant_id: variantId },
+      query: family === undefined ? {} : { family } })
+  }
   /** Reuse one project-authorized saved reference. Creates a private upload,
    * never a generation or trained model, and never retries an uncertain upload. */
   async prepareVoiceReference(project: string, assetId: string, variantId: string) {

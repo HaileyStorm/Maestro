@@ -186,10 +186,19 @@ class KugelAudioForConditionalGenerationInference(KugelAudioPreTrainedModel, Gen
             # Use pre-encoded voice features
             acoustic_mean = voice_cache["acoustic_mean"].to(device=device, dtype=dtype)
             semantic_mean = voice_cache["semantic_mean"].to(device=device, dtype=dtype)
+            # Safetensors stores contiguous data; native means are channel-major
+            # Conv1d outputs transposed to [batch, frames, channels]. randn_like
+            # must see that same layout to preserve seeded noise placement.
+            acoustic_mean = acoustic_mean.transpose(1, 2).contiguous().transpose(1, 2)
+            semantic_mean = semantic_mean.transpose(1, 2).contiguous().transpose(1, 2)
 
-            # Sample from acoustic distribution
-            fix_std = voice_cache.get("acoustic_std", self.acoustic_tokenizer.fix_std)
-            acoustic_features = acoustic_mean + fix_std * torch.randn_like(acoustic_mean)
+            # Reuse the native sampler, including Gaussian std and noise draws.
+            std = voice_cache.get("acoustic_std", self.acoustic_tokenizer.fix_std)
+            if torch.is_tensor(std):
+                std = std.to(device=device)
+            acoustic_features, _ = self.acoustic_tokenizer.sampling(
+                KugelAudioTokenizerEncoderOutput(mean=acoustic_mean, std=std)
+            )
             semantic_features = semantic_mean
 
             # Create speech_masks from cache dimensions (all frames valid)

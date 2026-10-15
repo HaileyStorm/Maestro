@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import os
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Optional
 from shared.utils import files_locator as fl 
 import torch
 
-from .mtl_tts import ChatterboxMultilingualTTS, SUPPORTED_LANGUAGES
+from services.prepared_voice_cache import PreparedVoiceCache
+
+from .mtl_tts import ChatterboxMultilingualTTS, Conditionals, SUPPORTED_LANGUAGES
+from .models.t3.modules.cond_enc import T3Cond
 
 
 class ChatterboxPipeline:
@@ -29,6 +33,29 @@ class ChatterboxPipeline:
 
         self.sr = getattr(self.model, "sr", 44100)
         self._interrupt = False
+        self._prepared_voice_cache = None
+
+    @property
+    def prepared_voice_cache(self):
+        if self._prepared_voice_cache is not None:
+            return self._prepared_voice_cache
+        versions = {}
+        for package in ("torch", "torchaudio", "librosa", "numpy", "scipy", "soundfile",
+                        "soxr", "audioread", "s3tokenizer", "mmgp"):
+            try:
+                versions[package] = version(package)
+            except PackageNotFoundError:
+                versions[package] = None
+        self._prepared_voice_cache = PreparedVoiceCache(
+            family="chatterbox",
+            model_files=[
+                fl.locate_file(os.path.join("chatterbox", name), error_if_none=False)
+                for name in ("ve.safetensors", "t3_mtl23ls_v2.safetensors", "s3gen.pt")
+            ],
+            implementation_files=sorted(Path(__file__).parent.rglob("*.py")),
+            options={"format": 1, "versions": versions},
+        )
+        return self._prepared_voice_cache
 
     @property
     def supported_languages(self):
@@ -43,7 +70,37 @@ class ChatterboxPipeline:
             return
         if not os.path.isfile(audio_prompt_path):
             raise FileNotFoundError(f"Audio prompt file '{audio_prompt_path}' not found.")
-        self.model.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration)
+        def prepare():
+            self.model.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration)
+            conds = self.model.conds
+            return {
+                "t3": {name: getattr(conds.t3, name) for name in (
+                    "speaker_emb", "clap_emb", "cond_prompt_speech_tokens",
+                    "cond_prompt_speech_emb", "emotion_adv",
+                )},
+                "gen": {name: conds.gen[name] for name in (
+                    "prompt_token", "prompt_token_len", "prompt_feat", "prompt_feat_len", "embedding",
+                )},
+            }
+
+        prepared = self.prepared_voice_cache.get_or_prepare(
+            references={"voice": audio_prompt_path},
+            settings={
+                "exaggeration": exaggeration,
+                "sample_rate": self.sr,
+                "encoder_samples": self.model.ENC_COND_LEN,
+                "decoder_samples": self.model.DEC_COND_LEN,
+                "speech_cond_prompt_len": self.model.t3.hp.speech_cond_prompt_len,
+                "device": str(self.model.device),
+                "dtypes": {
+                    name: [str(next(module.parameters()).dtype), str(getattr(module, "_model_dtype", None))]
+                    for name, module in (("ve", self.model.ve), ("s3gen", self.model.s3gen), ("t3", self.model.t3))
+                },
+            },
+            prepare=prepare,
+        )
+        self.model.conds = Conditionals(T3Cond(**prepared["t3"]), prepared["gen"]).to(self.model.device)
+        self.model.conds._model_dtype = torch.float32
 
     def generate(
         self,
@@ -103,7 +160,7 @@ class ChatterboxPipeline:
         wav = self.model.generate(
             text=text,
             language_id=language_id,
-            audio_prompt_path=audio_guide,
+            audio_prompt_path=None,
             exaggeration=exaggeration,
             cfg_weight=cfg_weight,
             temperature=temperature,
@@ -115,6 +172,8 @@ class ChatterboxPipeline:
         return {"x": wav, "audio_sampling_rate": self.sr } 
 
     def release(self) -> None:
+        if self._prepared_voice_cache is not None:
+            self._prepared_voice_cache.close()
         if hasattr(self.model, "to"):
             self.model.to("cpu")
         self.model = None

@@ -2,15 +2,21 @@
 
 from __future__ import annotations
 
+import gc
+import inspect
 import json
 import math
 import os
+from functools import wraps
+from importlib.metadata import distribution, version
+from pathlib import Path
 from typing import Any, Optional
 
 import numpy as np
 import torch
 
 from shared.utils import files_locator as fl
+from services.prepared_voice_cache import PreparedVoiceCache
 from ..voxcpm_handler import _get_voxcpm2_checkpoint_root, _validate_voxcpm_reference
 
 from services.tts_script_breakdown import (
@@ -47,8 +53,12 @@ class VoxCpmPipeline:
         )
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.model = None
+        self.prepared_voice_cache = None
+        self._prompt_cache_builder = None
 
     def load(self) -> "VoxCpmPipeline":
+        if self.model is not None:
+            return self
         config_path = os.path.join(self.ckpt_root, "config.json")
         weights_path = os.path.join(self.ckpt_root, "model.safetensors")
         if not os.path.isfile(config_path) or not os.path.isfile(weights_path):
@@ -66,7 +76,72 @@ class VoxCpmPipeline:
             load_denoiser=False,
             device=self.device,
         )
+        self._install_prepared_voice_cache()
         return self
+
+    def _install_prepared_voice_cache(self) -> None:
+        native = self.model.tts_model
+        original = native.build_prompt_cache
+        signature = inspect.signature(original)
+        package_root = Path(inspect.getfile(type(native))).resolve().parent.parent
+        checkpoint = Path(self.ckpt_root)
+        asset_names = {
+            "config.json", "model.safetensors", "pytorch_model.bin",
+            "audiovae.safetensors", "audiovae.pth", "tokenizer.json",
+            "tokenizer_config.json", "special_tokens_map.json",
+            "tokenization_voxcpm2.py",
+        }
+        self.prepared_voice_cache = PreparedVoiceCache(
+            "voxcpm2",
+            model_files=[checkpoint / name for name in sorted(asset_names)
+                         if (checkpoint / name).is_file()],
+            implementation_files=[
+                Path(__file__), *sorted(package_root.rglob("*.py")),
+                distribution("librosa").locate_file("librosa/core/audio.py"),
+            ],
+            options={
+                "torch": str(torch.__version__), "librosa": version("librosa"),
+                "soundfile": version("soundfile"), "soxr": version("soxr"),
+                "numpy": np.__version__, "device": str(native.device),
+                "sample_rate": native._encode_sample_rate,
+                "patch_size": native.patch_size, "chunk_size": native.chunk_size,
+                "vae_dtype": str(next(native.audio_vae.parameters()).dtype),
+            },
+        )
+        cache = self.prepared_voice_cache
+
+        @wraps(original)
+        def build_prompt_cache(*args, **kwargs):
+            bound = signature.bind(*args, **kwargs)
+            bound.apply_defaults()
+            values = bound.arguments
+            references = {
+                role: values[role]
+                for role in ("reference_wav_path", "prompt_wav_path")
+                if values.get(role) is not None
+            }
+            if not references or any(not os.path.isfile(path) for path in references.values()):
+                return original(*args, **kwargs)
+            # Native reference and continuation roles have opposite padding.
+            # Cache the original combined result, retaining both role bindings.
+            return cache.get_or_prepare(
+                references=references,
+                settings={name: value for name, value in values.items()
+                          if name not in ("reference_wav_path", "prompt_wav_path")},
+                prepare=lambda: original(*args, **kwargs),
+            )
+
+        self._prompt_cache_builder = original
+        native.build_prompt_cache = build_prompt_cache
+
+    def release(self) -> None:
+        if self.model is not None and self._prompt_cache_builder is not None:
+            self.model.tts_model.build_prompt_cache = self._prompt_cache_builder
+        self._prompt_cache_builder = None
+        self.model = None
+        if self.prepared_voice_cache is not None:
+            self.prepared_voice_cache.close()
+        gc.collect()
 
     def generate(
         self,

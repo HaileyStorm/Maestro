@@ -5,6 +5,7 @@ import os
 import random
 import re
 import time
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Optional
 
@@ -14,6 +15,7 @@ from accelerate import init_empty_weights
 
 from mmgp import offload
 from shared.utils import files_locator as fl
+from services.prepared_voice_cache import PreparedVoiceCache
 
 from .configs import KugelAudioConfig
 from .models.kugelaudio_inference import KugelAudioForConditionalGenerationInference
@@ -77,9 +79,35 @@ class KugelAudioPipeline:
         self.sample_rate = getattr(self.processor.audio_processor, "sampling_rate", 24000)
 
         self.generation_config = self._load_generation_config(assets["generation_config_path"])
+        processor_config = Path(assets["tokenizer_dir"]) / "preprocessor_config.json"
+        self._prepared_voice_model_files = (
+            [model_weights_path, assets["config_path"]]
+            + [Path(assets["tokenizer_dir"]) / name for name in KUGELAUDIO_TOKENIZER_FILES]
+            + ([processor_config] if processor_config.is_file() else [])
+        )
+        self._prepared_voice_cache = None
         engine = "cg" if self.lm_decoder_engine == "cg" else "legacy"
         attn = getattr(self.model, "_attn_implementation", "sdpa")
         print(f"[KugelAudio] LM engine='{engine}', attention='{attn}'")
+
+    @property
+    def prepared_voice_cache(self):
+        if self._prepared_voice_cache is not None:
+            return self._prepared_voice_cache
+        versions = {}
+        for package in ("torch", "transformers", "accelerate", "librosa", "numpy", "scipy",
+                        "soundfile", "soxr", "audioread", "mmgp"):
+            try:
+                versions[package] = version(package)
+            except PackageNotFoundError:
+                versions[package] = None
+        self._prepared_voice_cache = PreparedVoiceCache(
+            family="kugelaudio_0_open",
+            model_files=self._prepared_voice_model_files,
+            implementation_files=sorted(Path(__file__).parent.rglob("*.py")),
+            options={"format": 1, "versions": versions},
+        )
+        return self._prepared_voice_cache
 
     def _abort_requested(self) -> bool:
         return bool(self._interrupt)
@@ -213,6 +241,53 @@ class KugelAudioPipeline:
 
     def _tokens_per_second(self) -> float:
         return float(self.sample_rate) / 3200.0
+
+    def _prepare_inputs(self, text: str, voice_path: Optional[str]) -> dict:
+        if voice_path is None or not self.prepared_voice_cache.enabled:
+            return self.processor(text=text, voice_prompt=voice_path, return_tensors="pt")
+
+        def prepare():
+            inputs = self.processor(text="", voice_prompt=voice_path, return_tensors="pt")
+            return {
+                "voice_cache": self.model.encode_voice_prompt(
+                    inputs["speech_tensors"], sample_rate=int(self.sample_rate)
+                ),
+                "voice_tokens": int(inputs["speech_masks"].shape[-1]),
+            }
+
+        normalizer = self.processor.audio_normalizer
+        prepared = self.prepared_voice_cache.get_or_prepare(
+            references={"voice": voice_path},
+            settings={
+                "sample_rate": int(self.sample_rate),
+                "speech_compression_ratio": self.processor.speech_compression_ratio,
+                "db_normalize": self.processor.db_normalize,
+                "normalizer": None if normalizer is None else {
+                    "target_dB_FS": normalizer.target_dB_FS, "eps": normalizer.eps,
+                },
+                "audio_processor": self.processor.audio_processor.feature_extractor_dict,
+                "dtype": str(next(self.model.parameters()).dtype),
+                "encoder_dtypes": {
+                    name: [str(next(module.parameters()).dtype), str(getattr(module, "_model_dtype", None))]
+                    for name, module in (("acoustic", self.model.acoustic_tokenizer),
+                                         ("semantic", self.model.semantic_tokenizer))
+                },
+            },
+            prepare=prepare,
+        )
+        # Let the native processor build its template with one cheap placeholder,
+        # then expand only that voice slot to the original reference frame count.
+        inputs = self.processor(text=text, voice_prompt=np.zeros(1, dtype=np.float32), return_tensors="pt")
+        position = int(inputs["speech_input_mask"][0].nonzero()[0, 0])
+        for name in ("text_ids", "speech_input_mask"):
+            value = inputs[name]
+            inputs[name] = torch.cat((value[:, :position],
+                                      value[:, position:position + 1].expand(1, prepared["voice_tokens"]),
+                                      value[:, position + 1:]), dim=1)
+        inputs.pop("speech_tensors")
+        inputs.pop("speech_masks")
+        inputs["voice_cache"] = prepared["voice_cache"]
+        return inputs
 
     def _resolve_max_new_tokens(self, duration_seconds: Optional[float], kwargs: dict) -> int:
         if duration_seconds is not None and duration_seconds > 0:
@@ -418,11 +493,7 @@ class KugelAudioPipeline:
             total_lines: Optional[int] = None,
             cumulative_offset_seconds: float = 0.0,
         ):
-            inputs = self.processor(
-                text=line_text,
-                voice_prompt=voice_path,
-                return_tensors="pt",
-            )
+            inputs = self._prepare_inputs(line_text, voice_path)
             text_ids = inputs.get("text_ids")
             speech_input_mask = inputs.get("speech_input_mask")
             speech_tensors = inputs.get("speech_tensors")
@@ -480,6 +551,7 @@ class KugelAudioPipeline:
                 speech_input_mask=speech_input_mask,
                 speech_tensors=speech_tensors,
                 speech_masks=speech_masks,
+                voice_cache=inputs.get("voice_cache"),
                 cfg_scale=cfg_scale,
                 max_new_tokens=max_tokens_local,
                 tail_tokens=max(0, int(extra_tail_tokens)),
@@ -659,11 +731,7 @@ class KugelAudioPipeline:
             return _finish(None)
 
         # Default single-pass generation
-        inputs = self.processor(
-            text=text,
-            voice_prompt=voice_prompt,
-            return_tensors="pt",
-        )
+        inputs = self._prepare_inputs(text, voice_prompt)
         text_ids = inputs.get("text_ids")
         speech_input_mask = inputs.get("speech_input_mask")
         speech_tensors = inputs.get("speech_tensors")
@@ -708,6 +776,7 @@ class KugelAudioPipeline:
             speech_input_mask=speech_input_mask,
             speech_tensors=speech_tensors,
             speech_masks=speech_masks,
+            voice_cache=inputs.get("voice_cache"),
             cfg_scale=cfg_scale,
             max_new_tokens=max_new_tokens,
             tail_tokens=3,
@@ -734,6 +803,8 @@ class KugelAudioPipeline:
         return _finish({"x": audio, "audio_sampling_rate": int(self.sample_rate)})
 
     def release(self) -> None:
+        if self._prepared_voice_cache is not None:
+            self._prepared_voice_cache.close()
         if self.model is not None and hasattr(self.model, "release_decode_cuda_graph"):
             self.model.release_decode_cuda_graph()
         if hasattr(self.model, "to"):

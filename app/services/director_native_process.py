@@ -561,6 +561,14 @@ def run_native_process(packet, *, command, on_request, on_event, cancelled,
             except ProcessLookupError:
                 pass
 
+    def leader_reapable():
+        # A zombie thread-group leader does not prove that the remaining
+        # native threads have exited. Observe whole-child exit without reaping
+        # it, so the session ID remains protected until group custody ends.
+        with lifecycle_lock:
+            return os.waitid(os.P_PID, process.pid,
+                             os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
+
     def watch():
         while not done.wait(0.1):
             if time.monotonic() - checked[0] >= AUTHORITY_DEADLINE:
@@ -670,7 +678,8 @@ def run_native_process(packet, *, command, on_request, on_event, cancelled,
             if ready:
                 if parent.recv(1):
                     raise NativeProcessError("post_terminal_message")
-                if output_eof.is_set() and not _group_live(process.pid):
+                if (output_eof.is_set() and not _group_live(process.pid)
+                        and leader_reapable()):
                     break
         else:
             raise NativeProcessError("drain_timeout")
@@ -697,13 +706,15 @@ def run_native_process(packet, *, command, on_request, on_event, cancelled,
                     abort_notified.wait(0.25)
                 signal_group(signal.SIGTERM)
                 deadline = time.monotonic() + 2.0
-                while time.monotonic() < deadline and _group_live(process.pid):
+                while time.monotonic() < deadline and (
+                        _group_live(process.pid) or not leader_reapable()):
                     time.sleep(0.05)
                 signal_group(signal.SIGKILL)
                 deadline = time.monotonic() + DRAIN_SECONDS
-                while time.monotonic() < deadline and _group_live(process.pid):
+                while time.monotonic() < deadline and (
+                        _group_live(process.pid) or not leader_reapable()):
                     time.sleep(0.05)
-                if _group_live(process.pid):
+                if _group_live(process.pid) or not leader_reapable():
                     raise NativeProcessError("custody_unresolved")
                 deadline = time.monotonic() + 1.0
                 while time.monotonic() < deadline:
