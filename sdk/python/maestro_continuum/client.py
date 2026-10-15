@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import http.cookiejar
+import hashlib
 import json
 import re
 import time
@@ -147,6 +148,48 @@ class MaestroClient:
 
     def discover(self):
         return self.request("GET", "/api/v1/api/discovery")
+
+    def prepare_voice_reference(self, project: str, asset_id: str, variant_id: str):
+        """Copy one saved voice reference into a private upload for this session.
+
+        Uses only project-authorized HTTP operations. This creates an upload,
+        not a generation or trained model; an uncertain upload is never retried.
+        """
+        prefix = "/api/v1/projects/" + quote(project, safe="") + "/assets"
+        listing = self.request("GET", prefix, query={"asset_type": "voice"})
+        asset = next((a for a in listing.get("assets", []) if a.get("id") == asset_id), None)
+        if not isinstance(asset, dict) or asset.get("asset_type") != "voice":
+            raise ValueError("Select an authorized voice asset")
+        variant = next((v for v in asset.get("variants", []) if v.get("id") == variant_id), None)
+        if not variant or variant.get("variant_type") != "voice_reference" or variant.get("status") != "kept":
+            raise ValueError("Select one kept voice-reference variant")
+        outputs = variant.get("outputs", [])
+        if len(outputs) != 1:
+            raise ValueError("A voice reference must contain one audio recording")
+        output = outputs[0]
+        name = output.get("filename", "")
+        if (not re.fullmatch(r"[^/\\\x00-\x1f]{1,200}", name)
+                or name.rsplit(".", 1)[-1].lower() not in {"wav", "flac"}
+                or not str(output.get("media_type", "")).startswith("audio/")
+                or output.get("relative_path") != f"media/{asset_id}/{variant_id}/{name}"):
+            raise ValueError("Expected a saved WAV or FLAC reference, not a path or URL")
+        raw = self.request("GET", prefix + "/media/" + quote(output["relative_path"], safe="/"),
+                           maximum_response_bytes=16 * 1024 * 1024)
+        if not isinstance(raw, bytes) or not raw:
+            raise ValueError("Expected authorized audio bytes")
+        digest = hashlib.sha256(raw).hexdigest()
+        metadata = variant.get("metadata") or {}
+        if metadata.get("wav_sha256") and metadata["wav_sha256"] != digest:
+            raise ValueError("Saved reference differs from its recorded content hash")
+        transcript = metadata.get("transcript", "")
+        if not isinstance(transcript, str) or len(transcript) > 20000:
+            raise ValueError("Reference transcript must be bounded text")
+        upload = self.request("POST", "/api/v1/upload-audio", query={"private": True},
+                              files={"file": (name, raw, output["media_type"])})
+        return {"source": {"project": project, "asset_id": asset_id, "variant_id": variant_id,
+                           "filename": name, "sha256": digest},
+                "upload": {k: v for k, v in upload.items() if k != "path"},
+                "transcript": transcript, "bytes": len(raw), "generation_submitted": False}
 
     def wait(self, operation_id: str, *, path=None, query=None, timeout: float = 60,
              interval: float = 2, terminal=("completed", "failed", "cancelled", "blocked", "paused")):

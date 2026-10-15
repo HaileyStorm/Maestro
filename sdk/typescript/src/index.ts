@@ -2,7 +2,7 @@
 export { operationReference } from './operations.js'
 export type { OperationId } from './operations.js'
 export type Json = null | boolean | number | string | Json[] | { [key: string]: Json }
-export type CallInputs = { path?: Record<string, string | number>; query?: Record<string, string | number | boolean>; body?: Json | FormData }
+export type CallInputs = { path?: Record<string, string | number>; query?: Record<string, string | number | boolean>; body?: Json | FormData; maximumResponseBytes?: number }
 type Operation = { operationId: string; method: string; path: string; summary?: string; [key: string]: unknown }
 type Contract = { paths: Record<string, Record<string, Operation>> }
 
@@ -32,6 +32,7 @@ export class MaestroClient {
     if (url.origin !== new URL(this.baseUrl).origin || (!url.pathname.startsWith('/api/v1/') && !['/openapi.json', '/health', '/ready'].includes(url.pathname))) throw new Error('Path must remain inside the public Continuum API')
     for (const [key, value] of Object.entries(inputs.query ?? {})) url.searchParams.set(key, String(value))
     method = method.toUpperCase()
+    if (inputs.maximumResponseBytes !== undefined && (!Number.isSafeInteger(inputs.maximumResponseBytes) || inputs.maximumResponseBytes <= 0)) throw new Error('A response byte limit must be a positive integer')
     const mutation = !['GET', 'HEAD'].includes(method)
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), this.options.timeoutMs ?? 60000)
@@ -55,6 +56,32 @@ export class MaestroClient {
       }
       if (response.status === 204) return null
       const contentType = response.headers.get('content-type') ?? ''
+      if (inputs.maximumResponseBytes !== undefined) {
+        const limit = inputs.maximumResponseBytes
+        const declared = Number(response.headers.get('content-length'))
+        if (declared > limit) {
+          await response.body?.cancel()
+          throw new MaestroError(413, 'Media exceeds the bounded adapter limit; use the explicit download/upload workflow', `${method} ${path}`, mutation)
+        }
+        const reader = response.body?.getReader()
+        if (!reader) throw new Error('Response body missing')
+        const chunks: Uint8Array[] = []
+        let length = 0
+        while (true) {
+          const { value, done } = await reader.read()
+          if (done) break
+          length += value.byteLength
+          if (length > limit) {
+            await reader.cancel()
+            throw new MaestroError(413, 'Media exceeds the bounded adapter limit', `${method} ${path}`, mutation)
+          }
+          chunks.push(value)
+        }
+        const bytes = new Uint8Array(length)
+        let offset = 0
+        for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength }
+        return contentType.includes('json') ? JSON.parse(new TextDecoder().decode(bytes)) : contentType.startsWith('text/') ? new TextDecoder().decode(bytes) : bytes.buffer
+      }
       return contentType.includes('json') ? await response.json() : contentType.startsWith('text/') ? await response.text() : await response.arrayBuffer()
     } catch (error) {
       if (error instanceof MaestroError) throw error
@@ -87,6 +114,30 @@ export class MaestroClient {
     return this.request(op.method, path, inputs)
   }
   discover() { return this.request('GET', '/api/v1/api/discovery') }
+  /** Reuse one project-authorized saved reference. Creates a private upload,
+   * never a generation or trained model, and never retries an uncertain upload. */
+  async prepareVoiceReference(project: string, assetId: string, variantId: string) {
+    type Reference = { id: string; variant_type: string; status: string; outputs: { filename: string; media_type: string; relative_path: string }[]; metadata?: { wav_sha256?: string; transcript?: string } }
+    const prefix = `/api/v1/projects/${encodeURIComponent(project)}/assets`
+    const listing = await this.request('GET', prefix, { query: { asset_type: 'voice' } }) as { assets: { id: string; asset_type?: string; variants?: Reference[] }[] }
+    const asset = listing.assets.find(value => value.id === assetId)
+    if (asset?.asset_type !== 'voice') throw new Error('Select an authorized voice asset')
+    const variant = asset.variants?.find(value => value.id === variantId)
+    if (!variant || variant.variant_type !== 'voice_reference' || variant.status !== 'kept' || variant.outputs.length !== 1) throw new Error('Select one kept voice-reference variant containing one recording')
+    const output = variant.outputs[0]
+    if (!/^[^/\\\x00-\x1f]{1,200}\.(wav|flac)$/i.test(output.filename) || !output.media_type.startsWith('audio/') || output.relative_path !== `media/${assetId}/${variantId}/${output.filename}`) throw new Error('Expected a saved WAV or FLAC reference, not a path or URL')
+    const raw = await this.request('GET', `${prefix}/media/${output.relative_path.split('/').map(encodeURIComponent).join('/')}`, { maximumResponseBytes: 16 * 1024 * 1024 })
+    if (!(raw instanceof ArrayBuffer) || !raw.byteLength) throw new Error('Expected authorized audio bytes')
+    const digest = [...new Uint8Array(await crypto.subtle.digest('SHA-256', raw))].map(value => value.toString(16).padStart(2, '0')).join('')
+    if (variant.metadata?.wav_sha256 && variant.metadata.wav_sha256 !== digest) throw new Error('Saved reference differs from its recorded content hash')
+    const transcript = variant.metadata?.transcript ?? ''
+    if (typeof transcript !== 'string' || transcript.length > 20000) throw new Error('Reference transcript must be bounded text')
+    const form = new FormData()
+    form.append('file', new Blob([raw], { type: output.media_type }), output.filename)
+    const upload = await this.request('POST', '/api/v1/upload-audio', { query: { private: true }, body: form }) as Record<string, unknown>
+    const { path: _hostPath, ...publicUpload } = upload
+    return { source: { project, asset_id: assetId, variant_id: variantId, filename: output.filename, sha256: digest }, upload: publicUpload, transcript, bytes: raw.byteLength, generation_submitted: false }
+  }
   async wait(operationId: string, inputs: CallInputs, timeoutMs = 60000, intervalMs = 2000): Promise<unknown> {
     const op = (await this.operations())[operationId]
     if (!op || op.method !== 'GET') throw new Error('Waiting requires a read-only status operation')

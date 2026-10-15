@@ -157,6 +157,20 @@ async def serve(client: MaestroClient, *, read_only: bool = False, features: tup
                 "generation_submitted": {"const": False}}, "required": ["source", "upload", "bytes", "generation_submitted"]},
                 "error": {"type": "object"}}, "oneOf": [{"required": ["result"]}, {"required": ["error"]}], "additionalProperties": False},
             annotations=types.ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
+    voice_prepare = "maestro_voice_reference_prepare"
+    if (not read_only and (not features or any(f in {"references", "projects", "studio", "models"} for f in features))
+            and any(op["method"] == "GET" and op["path"] == "/api/v1/projects/{project}/assets" for op in all_operations.values())
+            and any(op["method"] == "POST" and op["path"] == "/api/v1/upload-audio" for op in all_operations.values())):
+        tools[voice_prepare] = types.Tool(name=voice_prepare,
+            description="Reuse one kept voice-reference variant in an authorized project. Reads its saved WAV/FLAC and transcript and creates a private session upload, at most16MiB. Returns upload.filename for audio_guide. No generation, training, filesystem paths, credentials, terms acceptance or GPU authority. QwenBase uses transcript as alt_prompt; Drama uses custom_settings.drama3_reference_text. Not idempotent; reconcile an uncertain upload without automatic retry.",
+            inputSchema={"type": "object", "properties": {k: {"type": "string", "minLength": 1, "maxLength": 200} for k in ("project", "asset_id", "variant_id")},
+                         "required": ["project", "asset_id", "variant_id"], "additionalProperties": False},
+            outputSchema={"type": "object", "properties": {"result": {"type": "object", "properties": {
+                "source": {"type": "object"}, "upload": {"type": "object"}, "transcript": {"type": "string"},
+                "bytes": {"type": "integer", "maximum": 16777216}, "generation_submitted": {"const": False}},
+                "required": ["source", "upload", "transcript", "bytes", "generation_submitted"]}, "error": {"type": "object"}},
+                "oneOf": [{"required": ["result"]}, {"required": ["error"]}], "additionalProperties": False},
+            annotations=types.ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
     server = Server("maestro-continuum")
 
     @server.list_tools()
@@ -172,6 +186,11 @@ async def serve(client: MaestroClient, *, read_only: bool = False, features: tup
                 raise ValueError("Unknown or unavailable tool; discover this server's current tools")
             Draft202012Validator(tools[name].inputSchema).validate(args)
             args = dict(args)
+            if name == voice_prepare:
+                dispatched = True
+                result = await asyncio.to_thread(client.prepare_voice_reference, **args)
+                structured = {"result": result}
+                return types.ServerResult(types.CallToolResult(content=[types.TextContent(type="text", text=json.dumps(structured))], structuredContent=structured, isError=False))
             if name == transfer:
                 if args["filename"].rsplit(".", 1)[-1].lower() not in {"mp4", "mov", "mkv", "avi", "webm", "m4v", "png", "jpg", "jpeg", "webp", "bmp", "gif", "wav", "mp3", "flac", "ogg", "m4a", "aac"}:
                     raise ValueError("Only Gallery media is supported")

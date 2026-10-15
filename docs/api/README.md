@@ -23,6 +23,8 @@ The [feature coverage map](coverage.md) explains compositions and human
 boundaries. The [operation reference](operations.md) contains generated IDs.
 The [Drama 3 guide](drama3.md) covers directed speech, reference voices, FP8 CPU
 offload and its experimental execution boundaries through the same API.
+The [saved voice guide](voice-cloning.md) explains reusable recordings,
+paired transcripts and private reference preparation in Python, TypeScript and MCP.
 The [exported OpenAPI](openapi.json) is an offline snapshot; current server
 discovery remains authoritative.
 
