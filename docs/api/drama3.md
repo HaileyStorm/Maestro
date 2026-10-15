@@ -191,8 +191,18 @@ FP32 measured 2.328 and 25.77 GiB; GPU BF16 measured 2.308 and 24.79 GiB. All
 three generated identical codec indices and 5.016 seconds of speech. GPU FP32
 and BF16 WAVs differ, so their listening comparison remains separate from timing.
 BF16 saved about 0.98 GiB peak VRAM versus GPU FP32 with less than 1% additional
-latency improvement in this take. Neither compiler+GPU-codec combinations nor
-other cards, texts and context lengths were measured by this comparison.
+latency improvement in this take. Other cards, texts and context lengths were
+outside this comparison.
+
+A follow-up combined the production recurrent compiler with the same 22+2 GiB
+layout and GPU decoding. FP32 measured 2.471 wall seconds/audio second and
+27.51 GiB peak process VRAM; BF16 measured 2.408 and 26.47 GiB. Both produced
+the same codec indices and 4.319 seconds of speech; their WAVs differ. CPU ASR
+found the full requested text in both. The combination did not beat the earlier
+2.308 result and used more VRAM. Its changed codec indices and delivery prevent
+attributing the difference solely to compilation. Separate warmups precede these
+timings; cold model loading and compilation are excluded. All experimental
+controls remain disabled by default, with listening comparisons retained.
 
 Every change affecting waveform or speech has a retained WAV comparison.
 
