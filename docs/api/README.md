@@ -546,6 +546,22 @@ and observe its durable cancellation before reconciliation. Reconciliation of
 the same terminal child and revision is idempotent; a different identity or
 revision conflicts. It preserves accepted images and the original attempts.
 
+If generation completed but producer metadata publication failed, reconciliation
+returns `409` while successful native evidence remains. For a single ordinary
+saved H3 task/repeat with one retained MP4 and no requested effects, use
+`POST /api/v1/queue/{job_id}/recovery-retry?publication_only=true`. This explicit
+CPU recovery verifies the sealed request, original owner/project, native receipts
+and exact quarantined bytes. It restores the producer and runs the existing
+Director delivery integrity/publication path without loading a model. Unsupported
+shapes or changed/ambiguous evidence return `409`; there is no generation fallback.
+The original native attempt and quarantined file remain preserved. The response
+returns the original `job_id`, `operation="director_publication_recovery"`,
+`reruns_denoise=false` and `next_action="observe_job"`. Poll that job after an
+uncertain response; do not submit another generation. After a server restart, a
+held CPU publication can be explicitly resumed with the same publication-only
+request; its sealed intent is revalidated and no native retry is created. Once completed, reconcile
+the same saved repair job and revision as described above.
+
 ```python
 saved = maestro.request(
     "GET", f"/api/v1/director/pipelines/{quote(pipeline_id, safe='')}",

@@ -6072,6 +6072,8 @@ def _recover_project_reference_publication(job_id: str) -> None:
 
 def _queue_recovery_worker(job: dict):
     """Resolve only restart-safe top-level workers; never guess a prep path."""
+    if "director_publication_recovery" in (job.get("recovery_cursor") or {}):
+        return _run_director_publication_recovery
     kind = str(job.get("kind") or "studio_generation")
     if kind == "studio_h3_delivery_recovery":
         return _run_h3_cow_delivery_child
@@ -7278,6 +7280,321 @@ def _director_recovered_repeat_media(job, task_index, unit):
     return terminals, roles
 
 
+def _director_publication_recovery_plan(job, *, require_intent=False):
+    """Authenticate a completed native repeat; never authorize a model call.
+
+    Deliberately limited to one ordinary saved-video task/repeat without
+    requested finishing. Existing Director finishing still seals and validates
+    its final copy. Other shapes retain their evidence for their own recovery.
+    """
+    from services.native_acceptance_reservation import digest, job_identity
+    from services.director_pipeline import pipeline_state_filename
+    if (job.get("kind") != "director_child" or is_cancel_requested(job)
+            or job.get("id") in _active_gen_states or job.get("_generation_slot_owned")
+            or job.get("_director_saved_video_worker_active")):
+        raise QueueRecoveryRuntimeError("Director publication custody is unavailable.")
+    workspace = str(job.get("workspace") or "default")
+    project_dir = _existing_workspace_dir(workspace)
+    if not hmac.compare_digest(_queue_recovery_existing_project_identity(project_dir),
+            str(job.get("_recovery_project_digest") or "")):
+        raise QueueRecoveryRuntimeError("Director publication project changed.")
+    pointer = job.get("_recovery_manifest_pointer") or {}
+    manifest = load_request_manifest(project_dir, pointer, expected_job_id=str(job["id"]))
+    validate_manifest_inputs(manifest, lambda descriptor: _queue_recovery_manifest_validator(
+        descriptor, owner_digest=job.get("_recovery_owner_digest"), workspace=workspace, project_dir=project_dir))
+    params = manifest["params"]
+    # Restored terminal rows may omit private params. The immutable manifest
+    # is authoritative; an already materialized, different request is a conflict.
+    if job.get("params") and params != job["params"]:
+        raise QueueRecoveryRuntimeError("Director publication request changed.")
+    child = params.get("_director_video_lora_child_snapshot")
+    scope = {"project_id": workspace, "workspace_id": "main",
+        "project_instance": job.get("_recovery_project_digest"), "owner_digest": job.get("_recovery_owner_digest")}
+    pid = params.get("_director_pipeline_id")
+    if (type(child) is not dict or set(child) != {"binding", "digest"}
+            or type(child["binding"]) is not dict or type(child["digest"]) is not str
+            or not hmac.compare_digest(child["digest"], _project_reference_private_commitment(child["binding"]))
+            or child["binding"].get("scope") != scope or child["binding"].get("pipeline_id") != pid
+            or (child["binding"].get("unit") or {}).get("kind") != "video_clip_rerun"
+            or params.get("generation_mode") != "video" or params.get("model_type") != "minimax_h3"
+            or params.get("_director_detached_operation") is not True):
+        raise QueueRecoveryRuntimeError("Director publication child is unsupported or changed.")
+    parent = _director_recovery_parents.get(pid)
+    if (not isinstance(parent, dict) or parent.get("workspace") != workspace
+            or parent.get("_recovery_project_digest") != job.get("_recovery_project_digest")
+            or parent.get("_recovery_owner_digest") != job.get("_recovery_owner_digest")):
+        raise QueueRecoveryRuntimeError("Director publication parent is unavailable.")
+    state, _, pending = _load_director_recovery_cursor_state(project_dir,
+        pipeline_state_filename(pid), parent.get("recovery_cursor") or {})
+    index = child["binding"]["unit"]["index"]
+    entry = (((state or {}).get("recovery") or {}).get("video_repairs") or {}).get(str(index))
+    if (pending or not isinstance(entry, dict) or entry.get("job_id") != job["id"]
+            or entry.get("state") not in {"submitted", "failed"} or entry.get("unit") != child["binding"]["unit"]
+            or entry.get("_director_saved_video_terminal_receipt") is not None
+            or entry.get("custody") != (job.get("recovery_cursor") or {}).get("director_video_custody")):
+        raise QueueRecoveryRuntimeError("Director publication retained intent changed.")
+    for field in ("_director_video_lora_task_inventory", "_director_video_lora_task_plans",
+                  "_director_video_lora_consumption_plans"):
+        if set(params.get(field) or {}) != {"0"}:
+            raise QueueRecoveryRuntimeError("Director publication topology is unsupported.")
+    inventory = params["_director_video_lora_task_inventory"]["0"]
+    if (set(inventory) != {"binding", "digest"} or not hmac.compare_digest(inventory["digest"],
+            _project_reference_private_commitment(inventory["binding"]))
+            or inventory["binding"].get("tasks") != [{"group": None, "repeat_count": 1, "task_index": 0}]):
+        raise QueueRecoveryRuntimeError("Director publication inventory changed.")
+    recipe = params["_director_video_lora_task_plans"]["0"]
+    _require_director_video_lora_task_recipe(params, child, 0, recipe)
+    task_params = recipe["binding"]["task"]["params"]
+    if any(source.get(key) for source in (params, task_params) for key in (
+            "_h3_longform", "multi_clip_info", "_h3_prompt_mapping_source_plan", "_h3_cumulative_plan",
+            "_director_custom_style_video_snapshot", "_director_custom_style_snapshot", "spatial_upsampling",
+            "temporal_upsampling", "delivery_resolution", "film_grain_intensity", "voice_clone",
+            "voice_clone_refs", "tts_dynaudnorm", "_director_final_video_postprocess")):
+        raise QueueRecoveryRuntimeError("This Director publication needs a separate finishing recovery.")
+    consumption = params["_director_video_lora_consumption_plans"]["0"]
+    if set(consumption.get("binding", {}).get("entries", {})) != {"0"}:
+        raise QueueRecoveryRuntimeError("Director publication repeat scope changed.")
+    consumed = consumption["binding"]["entries"]["0"]["binding"]
+    media = consumed.get("media")
+    if (type(media) is not list or len(media) != 1 or type(media[0]) is not dict
+            or set(media[0]) != {"basename", "bytes", "sha256"}
+            or type(media[0]["basename"]) is not str or media[0]["basename"].startswith(".")
+            or os.path.basename(media[0]["basename"]) != media[0]["basename"]
+            or os.path.splitext(media[0]["basename"])[1].lower() != ".mp4"
+            or consumed.get("terminal_media") != [media[0]["basename"]]
+            or consumed.get("output_roles") != {media[0]["basename"]: "final"}):
+        raise QueueRecoveryRuntimeError("Director publication media scope is unsupported.")
+    settings = _director_native_producer_settings(dict(job, params=params, out_dir=project_dir), task_index=0, repeat_index=0,
+        kind="ordinary_repeat", variant=0, index=0, artifact_names=[media[0]["basename"]], settings={})
+    binding = {"version": 1, "job_id": job["id"], "created_at": job["created_at"],
+        "project_digest": job["_recovery_project_digest"], "owner_digest": job["_recovery_owner_digest"],
+        "request_manifest_sha256": digest(pointer), "child_digest": child["digest"], "media": media,
+        "producer_settings": settings, "saved_attempt_state": entry["state"]}
+    intent = (job.get("recovery_cursor") or {}).get("director_publication_recovery")
+    if intent is not None:
+        if (type(intent) is not dict or set(intent) != {"binding", "digest"}
+                or type(intent["binding"]) is not dict or type(intent["digest"]) is not str
+                or not hmac.compare_digest(intent["digest"], _project_reference_private_commitment(intent["binding"]))
+                or any(intent["binding"].get(key) != value for key, value in binding.items())
+                or set(intent["binding"]) != set(binding) | {"native_execution_attempt", "native_recovery_attempt", "started_at"}
+                or job.get("_native_acceptance_manual_recovery") is not False):
+            raise QueueRecoveryRuntimeError("Director CPU publication intent changed.")
+        binding = intent["binding"]
+    elif require_intent:
+        raise QueueRecoveryRuntimeError("Director CPU publication intent is missing.")
+    return {"binding": binding, "project_dir": project_dir, "params": params, "task_params": task_params,
+        "identity": job_identity(job)}
+
+
+def _restore_director_publication_media(job, plan):
+    """Recover only exact consumed bytes; preserve their quarantine original."""
+    import shutil
+    import stat
+    binding, out_dir = plan["binding"], plan["project_dir"]
+    media = binding["media"][0]
+    name = media["basename"]
+    settings = binding["producer_settings"]
+    unit_id = recovery_unit_id(job["id"], "ordinary_repeat", variant=0, index=0, settings=settings)
+    existing = _queue_recovery_unit_matches(job, kind="ordinary_repeat", variant=0, index=0,
+        project_dir=out_dir, quarantine_invalid=False)
+    if existing is not None:
+        if existing["unit_id"] != unit_id:
+            raise QueueRecoveryRuntimeError("Director recovered producer changed.")
+        return [name]
+    expected = (media["bytes"], media["sha256"])
+    matches = [entry.path for entry in os.scandir(out_dir)
+        if re.fullmatch(r"\.private-sidecar-failed-[0-9a-f]{8}-" + re.escape(name), entry.name)]
+    if len(matches) != 1 or _recovery_sha256_file(matches[0]) != expected:
+        raise QueueRecoveryRuntimeError("Director publication quarantine is missing, ambiguous or changed.")
+    staging = ensure_recovery_staging_directory(out_dir)
+    staged = os.path.join(staging, name)
+    if not os.path.lexists(staged):
+        source_fd = os.open(matches[0], os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            before = os.fstat(source_fd)
+            if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+                raise QueueRecoveryRuntimeError("Director publication quarantine is unsafe.")
+            target_fd = os.open(staged, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+            with os.fdopen(target_fd, "wb") as target, os.fdopen(os.dup(source_fd), "rb") as source:
+                shutil.copyfileobj(source, target, length=1024 * 1024)
+                target.flush()
+                os.fsync(target.fileno())
+            after = os.fstat(source_fd)
+            current = os.lstat(matches[0])
+            identity = lambda row: (row.st_dev, row.st_ino, row.st_size, row.st_mtime_ns, row.st_ctime_ns, row.st_nlink)
+            if identity(before) != identity(after) or identity(before) != identity(current):
+                raise QueueRecoveryRuntimeError("Director publication quarantine changed during copying.")
+        finally:
+            os.close(source_fd)
+    if _recovery_sha256_file(staged) != expected:
+        raise QueueRecoveryRuntimeError("Director publication staging changed.")
+    upload_names, params = _prepare_generation_sidecar_params(
+        _snapshot_h3_recovery_task_params(plan["task_params"], None))
+    seed = _extract_output_seed(name)
+    if seed is not None:
+        params["seed"] = seed
+    sidecar = {"params": params, "upload_filenames": upload_names, "generation_mode": "video",
+        "job_id": job["id"], "created_at": binding["started_at"], "output_filename": name,
+        "director_pipeline_id": job["params"]["_director_pipeline_id"],
+        "artifact_class": "final", "producer_artifact_class": "final",
+        "producer_unit_artifact_names": [name], "producer_unit_id": unit_id,
+        "producer_unit_kind": "ordinary_repeat", "producer_unit_variant": 0, "producer_unit_index": 0,
+        "producer_unit_dependencies": [], "producer_unit_settings": settings, "producer_media_size": media["bytes"],
+        "producer_media_sha256": media["sha256"],
+        "publication_recovery": {"operation": "director_publication_recovery", "reruns_denoise": False,
+            "native_execution_attempt": binding["native_execution_attempt"]}}
+    stamp_sidecar_policy(sidecar, dict(job.get("access_policy") or {}), workspace=job["workspace"])
+    meta_path = os.path.join(out_dir, os.path.splitext(name)[0] + ".meta.json")
+    destination = os.path.join(out_dir, name)
+    # Keep the native producer out of Gallery until the existing Director
+    # delivery path has established final H3 integrity, including on cancel.
+    _atomic_write_json(h3_integrity_pending_path(out_dir, name), {"pending": True})
+    if os.path.lexists(meta_path):
+        if json.loads(_read_exact_file(meta_path, maximum_bytes=MAX_MANIFEST_BYTES)) != sidecar:
+            raise QueueRecoveryRuntimeError("Director recovered sidecar conflicts with an existing file.")
+    elif os.path.lexists(destination):
+        raise QueueRecoveryRuntimeError("Director recovered output already has unrecognized media.")
+    else:
+        _atomic_write_json(meta_path, sidecar)
+    if os.path.lexists(destination):
+        if _recovery_sha256_file(destination) != expected:
+            raise QueueRecoveryRuntimeError("Director recovered output changed.")
+    else:
+        _queue_recovery_promote_staged_outputs({}, out_dir, {name: staged})
+    if not _queue_recovery_checkpoint_unit(job, kind="ordinary_repeat", variant=0, index=0,
+            project_dir=out_dir, artifact_names=[name], settings=settings):
+        raise QueueRecoveryRuntimeError("Director recovered producer checkpoint is unresolved.")
+    return [name]
+
+
+@_upload_job_reader
+def _run_director_publication_recovery(job_id):
+    """CPU publication only: no model admission, loading or native GPU slot."""
+    job = _jobs[job_id]
+    workspace = str(job.get("workspace") or "default")
+    workspace_reserved = False
+    try:
+        _begin_workspace_operation(workspace)
+        workspace_reserved = True
+        plan = _director_publication_recovery_plan(job, require_intent=True)
+        job["params"], job["out_dir"] = dict(plan["params"]), plan["project_dir"]
+        with generation_slot(_gen_lock, job, block_on_persistence_failure=True) as acquired:
+            if not acquired or not try_start(job, generation_lock=_gen_lock,
+                    expected_execution_attempt=job["execution_attempt"], message="Recovering retained output..."):
+                return
+            names = _restore_director_publication_media(job, plan)
+            finishing = _director_finishing_plan(job, plan["project_dir"], names, names)
+            if any(target["steps"] for target in finishing["director_finishing"]["targets"]):
+                raise QueueRecoveryRuntimeError("Director CPU publication cannot run requested model finishing.")
+            result = _director_resume_finishing(job, plan["project_dir"], finishing)
+            if finish_job(job, "completed", expected_execution_attempt=job["execution_attempt"],
+                    output_files=result["finals"], artifact_files=list(dict.fromkeys(names + result["files"])),
+                    progress=100, phase="", message="Done", error=None, reruns_denoise=False):
+                _director_finalize_finishing_publication(job, _queue_recovery_delivery_pending(job), finishing)
+    except Exception:
+        if job.get("status") == "queued":
+            _queue_recovery_checkpoint(job, queue_held=True, recovery_state="blocked", reruns_denoise=False,
+                message="Retained publication evidence needs attention")
+        elif job.get("status") not in {"completed", "cancelled"}:
+            finish_job(job, "failed", message="Retained output publication needs attention",
+                error="Retained publication evidence changed or could not be committed; no model was run.")
+        traceback.print_exc()
+    finally:
+        if workspace_reserved:
+            _end_workspace_operation(workspace)
+        job.pop("_director_publication_worker_started", None)
+
+
+def _retry_director_publication_recovery(job_id, request):
+    """Explicit owner-scoped recovery, reconciled by the original job ID."""
+    with _queue_recovery_checkpoint_lock:
+        job = _require_owned_job(job_id, request)
+        _require_project_access(request, job["workspace"], permission="project.generate")
+        _require_remote_queue_generation_permission(job, request)
+        existing = (job.get("recovery_cursor") or {}).get("director_publication_recovery")
+        if existing is not None and job.get("status") in {"queued", "running", "completed"}:
+            if job.get("status") == "queued" and job.get("queue_held") is True:
+                try:
+                    plan = _director_publication_recovery_plan(job, require_intent=True)
+                except (ValueError, KeyError, TypeError, OSError, QueueRecoveryRuntimeError):
+                    raise HTTPException(status_code=409, detail="Retained CPU publication cannot resume until its sealed evidence is restored.") from None
+                if not _queue_recovery_checkpoint(job, queue_held=False, recovery_state="retrying",
+                        _recovery_reason_code="", reruns_denoise=False, params=dict(plan["params"]),
+                        out_dir=plan["project_dir"], message="Publishing retained output..."):
+                    raise HTTPException(status_code=409, detail="Retained CPU publication changed; read its current status.")
+                if job.get("_director_publication_worker_started") is not True:
+                    try:
+                        job["_director_publication_worker_started"] = True
+                        threading.Thread(target=_run_director_publication_recovery, args=(job_id,), daemon=False,
+                            name=f"director-publication-{job_id}").start()
+                    except Exception:
+                        job.pop("_director_publication_worker_started", None)
+                        _queue_recovery_checkpoint(job, queue_held=True, recovery_state="blocked", reruns_denoise=False)
+                        raise HTTPException(status_code=503, detail="Observe the original retained publication before retrying its recovery.") from None
+            return {"job_id": job_id, "status": job["status"], "operation": "director_publication_recovery",
+                "reruns_denoise": False, "next_action": "observe_job"}
+        if job.get("status") != "failed":
+            raise HTTPException(status_code=409, detail="Only a failed retained publication can use this action.")
+        try:
+            plan = _director_publication_recovery_plan(job)
+            # Validate exact retained bytes before committing an execution retry.
+            media = plan["binding"]["media"][0]
+            candidates = [entry.path for entry in os.scandir(plan["project_dir"])
+                if re.fullmatch(r"\.private-sidecar-failed-[0-9a-f]{8}-" + re.escape(media["basename"]), entry.name)]
+            if len(candidates) != 1 or _recovery_sha256_file(candidates[0]) != (media["bytes"], media["sha256"]):
+                raise QueueRecoveryRuntimeError("Retained native media is missing or ambiguous.")
+        except (ValueError, KeyError, TypeError, OSError, QueueRecoveryRuntimeError) as error:
+            reasons = {
+                "Director publication custody is unavailable.": "worker_custody",
+                "Director publication project changed.": "project_changed",
+                "Director publication request changed.": "request_changed",
+                "Director publication child is unsupported or changed.": "child_scope",
+                "Director publication parent is unavailable.": "parent_unavailable",
+                "Director publication retained intent changed.": "saved_attempt_changed",
+                "Director publication topology is unsupported.": "unsupported_topology",
+                "Director publication inventory changed.": "inventory_changed",
+                "This Director publication needs a separate finishing recovery.": "requested_finishing",
+                "Director publication repeat scope changed.": "repeat_scope",
+                "Director publication media scope is unsupported.": "media_scope",
+                "Director CPU publication intent changed.": "cpu_intent_changed",
+                "Retained native media is missing or ambiguous.": "retained_media_changed",
+            }
+            raise HTTPException(status_code=409, detail={"code": "director_publication_recovery_blocked",
+                "message": "This publication needs its exact retained ordinary H3 media and sealed inputs, with no requested finishing.",
+                "reason": reasons.get(str(error), "evidence_verification_failed"),
+                "next_action": "read_saved_pipeline"}) from None
+        attempt, allowed = next_recovery_attempt(job)
+        if not allowed:
+            raise HTTPException(status_code=409, detail="Recovery attempt limit reached; retained media was preserved.")
+        binding = dict(plan["binding"])
+        if existing is None:
+            binding.update(native_execution_attempt=job["execution_attempt"],
+                native_recovery_attempt=job.get("recovery_attempt", 0), started_at=time.time())
+        cursor = copy.deepcopy(job.get("recovery_cursor") or {})
+        cursor["director_publication_recovery"] = {"binding": binding,
+            "digest": _project_reference_private_commitment(binding)}
+        if not retry_failed_recovery_job(job, expected_execution_attempt=job["execution_attempt"],
+                expected_recovery_attempt=job.get("recovery_attempt", 0), recovery_attempt=attempt,
+                recovery_state="retrying", recovery_cursor=cursor, reruns_denoise=False,
+                resource_execution="cpu",
+                params=dict(plan["params"]), out_dir=plan["project_dir"],
+                _native_acceptance_manual_recovery=False, _recovery_worker_pending=True,
+                message="Queued to publish retained output", session_id=request.state.maestro_session_id):
+            raise HTTPException(status_code=409, detail="This retained publication changed; read its current status.")
+        try:
+            job["_director_publication_worker_started"] = True
+            threading.Thread(target=_run_director_publication_recovery, args=(job_id,), daemon=False,
+                name=f"director-publication-{job_id}").start()
+            job.pop("_recovery_worker_pending", None)
+        except Exception:
+            job.pop("_director_publication_worker_started", None)
+            _queue_recovery_checkpoint(job, queue_held=True, recovery_state="blocked", reruns_denoise=False,
+                message="Retained publication worker could not start")
+            raise HTTPException(status_code=503, detail="Worker start was uncertain; observe the original job, never resubmit generation.") from None
+        return {"job_id": job_id, "status": job["status"], "operation": "director_publication_recovery",
+            "reruns_denoise": False, "next_action": "observe_job"}
+
+
 def _director_concat_spec(job, group_id, repeat_index, project_dir, *, verified_units=None):
     """Bind one derived output to ordered, authenticated native clip parents."""
     admitted = job.get("params") or {}
@@ -7692,8 +8009,14 @@ def _director_recovery_parent_cursor(
     if isinstance(repairs, dict):
         from services.director_pipeline import _director_child_job_id
         for clip, repair in repairs.items():
-            if not isinstance(repair, dict) or repair.get("state") != "submitted":
+            if (not isinstance(repair, dict)
+                    or (repair.get("state") != "submitted" and not (
+                        repair.get("state") == "failed"
+                        and repair.get("_director_saved_video_terminal_receipt") is None))):
                 continue
+            # An unresolved failed saved repair can still own consumed native
+            # output. Keep its exact child until terminal reconciliation seals
+            # the result; retention confers no execution or adoption authority.
             unit = repair.get("unit")
             if (not isinstance(unit, dict) or unit.get("kind") != "video_clip_rerun"
                     or type(unit.get("index")) is not int or str(unit["index"]) != clip
@@ -8531,10 +8854,32 @@ def _director_recovery_saved_video_terminal(project_dir, pid, state, entry):
                 or terminal is not None and terminal != observed):
             conflict("The terminal video lineage changed.")
         terminal = observed
+    cpu_recovered = False
+    if (isinstance(snapshot, dict) and entry.get("state") == "failed"
+            and terminal.get("status") == "completed"):
+        marker = (snapshot.get("recovery_cursor") or {}).get("director_publication_recovery")
+        body = marker.get("binding") if isinstance(marker, dict) else None
+        cpu_recovered = bool(
+            type(marker) is dict and set(marker) == {"binding", "digest"} and type(body) is dict
+            and type(child_seal) is dict
+            and type(marker.get("digest")) is str
+            and hmac.compare_digest(marker["digest"], _project_reference_private_commitment(body))
+            and body.get("job_id") == job_id and body.get("created_at") == identity["created_at"]
+            and body.get("saved_attempt_state") == "failed"
+            and body.get("request_manifest_sha256") == digest(pointer)
+            and body.get("project_digest") == parent["_recovery_project_digest"]
+            and body.get("owner_digest") == parent["_recovery_owner_digest"]
+            and body.get("child_digest") == child_seal.get("digest")
+            and type(body.get("native_execution_attempt")) is int
+            and 1 <= body["native_execution_attempt"] < terminal["execution_attempt"]
+            and type(body.get("native_recovery_attempt")) is int
+            and 0 <= body["native_recovery_attempt"] < terminal["recovery_attempt"]
+            and snapshot.get("_native_acceptance_manual_recovery") is False
+            and snapshot.get("reruns_denoise") is False)
     if (terminal.get("intent_sha256") != digest(intent) or terminal.get("identity") != identity
             or terminal.get("params_sha256") != digest(params) or terminal.get("custody") != custody
             or terminal.get("status") not in {"completed", "failed", "cancelled"}
-            or entry.get("state") != "submitted" and entry["state"] != terminal["status"]):
+            or entry.get("state") != "submitted" and entry["state"] != terminal["status"] and not cpu_recovered):
         conflict("The terminal video receipt disagrees with its retained intent.")
     if receipt is not None and (entry.get("output_files", []) != terminal["output_files"]
             or terminal["status"] == "completed" and (
@@ -11776,6 +12121,12 @@ def _restore_queue_recovery_on_startup(
             history = cursor.get("request_manifest_history")
             if isinstance(history, list):
                 pointers.extend(history)
+            # Publication metadata is private project content, never inline
+            # journal data. Keep its exact manifests alive across reconnects.
+            publication = ((cursor.get("delivery_pending") or {}).get("publication") or {})
+            for record in publication.get("items") or []:
+                if isinstance(record, dict):
+                    pointers.append(record.get("director_sidecar_manifest"))
         for pointer in pointers:
             path = pointer.get("path") if isinstance(pointer, dict) else None
             if isinstance(path, str):
@@ -11951,6 +12302,12 @@ def _restore_queue_recovery_on_startup(
 
 def _queue_recovery_revalidate_job(job: dict) -> bool:
     """Recheck project marker, manifest, and all inputs for manual resume."""
+    if "director_publication_recovery" in (job.get("recovery_cursor") or {}):
+        try:
+            _director_publication_recovery_plan(job, require_intent=True)
+            return True
+        except (QueueRecoveryRuntimeError, ValueError, KeyError, TypeError, OSError):
+            return False
     if job.get("kind") == "director_child" and any(key in (job.get("recovery_cursor") or {})
             for key in ("director_image_custody", "director_video_custody")):
         return False
@@ -12021,7 +12378,10 @@ def _start_restored_held_generation_worker(job: dict) -> None:
                 detail="Recovery request or input validation failed",
             )
         try:
-            if job.get("kind") == "studio_h3_delivery_recovery":
+            if "director_publication_recovery" in (job.get("recovery_cursor") or {}):
+                threading.Thread(target=_run_director_publication_recovery, args=(str(job["id"]),),
+                    daemon=False, name=f"director-publication-{job['id']}").start()
+            elif job.get("kind") == "studio_h3_delivery_recovery":
                 threading.Thread(target=_run_h3_cow_delivery_child, args=(str(job["id"]),),
                                  daemon=False, name=f"h3-delivery-held-recovery-{job['id']}").start()
             elif str(job.get("kind") or "studio_generation") == "studio_generation":
@@ -16029,11 +16389,7 @@ def _snapshot_h3_recovery_task_params(
     task_params: dict, clip_info: dict | None,
 ) -> dict:
     """Freeze JSON-safe producer metadata before WGP materializes media inputs."""
-    if not (
-        isinstance(task_params, dict)
-        and ((isinstance(clip_info, dict) and clip_info.get("automatic_h3_longform"))
-             or isinstance(task_params.get("_h3_prompt_mapping_source_plan"), dict))
-    ):
+    if not isinstance(task_params, dict):
         return task_params
     try:
         snapshot = json.loads(json.dumps(task_params))
@@ -17203,6 +17559,27 @@ def _director_finishing_output_map(unit: dict) -> dict:
                              for target, row in zip(proof["targets"], media)}}
 
 
+def _director_publication_sidecars(job: dict, project_dir: str, record: dict) -> tuple[dict, dict]:
+    """Read exact private metadata through a bounded, hash-checked manifest."""
+    pointer = record.get("director_sidecar_manifest")
+    if pointer is None:
+        # Previously persisted inline records remain readable.
+        private, final = record.get("director_private_sidecar"), record.get("director_sealed_sidecar")
+    else:
+        manifest = load_request_manifest(project_dir, pointer, expected_job_id=str(job["id"]))
+        payload = manifest["params"]
+        if manifest["inputs"] or set(payload) != {"private_sidecar_json", "sealed_sidecar_json"}:
+            raise QueueRecoveryRuntimeError("Director publication metadata scope changed.")
+        if any(type(payload[key]) is not str for key in payload):
+            raise QueueRecoveryRuntimeError("Director publication metadata is invalid.")
+        private, final = json.loads(payload["private_sidecar_json"]), json.loads(payload["sealed_sidecar_json"])
+    if (type(private) is not dict or type(final) is not dict
+            or hashlib.sha256(json.dumps(private, indent=2).encode()).hexdigest() != record["private_sidecar_sha256"]
+            or hashlib.sha256(json.dumps(final, indent=2).encode()).hexdigest() != record["sealed_sidecar_sha256"]):
+        raise QueueRecoveryRuntimeError("Director publication metadata changed.")
+    return private, final
+
+
 def _director_commit_finishing_publication(job: dict, project_dir: str,
                                           staged: list[dict], plan: dict) -> dict | None:
     """Adopt complete exact-intent media first; a partial transaction needs rollback."""
@@ -17218,8 +17595,7 @@ def _director_commit_finishing_publication(job: dict, project_dir: str,
     complete = True
     sealed = []
     for item, record in zip(staged, records):
-        final = record.get("director_sealed_sidecar")
-        private = record.get("director_private_sidecar")
+        private, final = _director_publication_sidecars(job, project_dir, record)
         if (not isinstance(final, dict) or not isinstance(private, dict)
                 or record.get("basename") != item["file_name"]
                 or hashlib.sha256(json.dumps(final, indent=2).encode()).hexdigest() != record["sealed_sidecar_sha256"]
@@ -17354,15 +17730,18 @@ def _director_publish_finishing_outputs(job: dict, project_dir: str,
         records.append({"basename": item["file_name"], "media_size": row["bytes"],
             "media_sha256": row["sha256"], "private_sidecar_sha256": hashlib.sha256(json.dumps(private, indent=2).encode()).hexdigest(),
             "final_sidecar_sha256": final_sha, "sealed_sidecar_sha256": final_sha,
-            "director_private_sidecar": private, "director_sealed_sidecar": sidecar})
+            "director_sidecar_manifest": write_sealed_request_manifest(project_dir, job_id=str(job["id"]),
+                params={"private_sidecar_json": json.dumps(private, indent=2),
+                        "sealed_sidecar_json": json.dumps(sidecar, indent=2)}, inputs=[])})
     _queue_recovery_checkpoint_delivery_publication(job, records)
     # Any lost ACK after this point is reconciled from these exact records;
     # do not automatically retract a possibly committed successor.
     for item, record in zip(staged, records):
         if is_cancel_requested(job) or job.get("resource_state") == "preemption_requested":
             raise InterruptedError("Director finishing cancelled")
-        _atomic_create_json(item["source_meta"], record["director_private_sidecar"])
-        _atomic_create_json(item["rollback_meta"], record["director_private_sidecar"])
+        private, _ = _director_publication_sidecars(job, project_dir, record)
+        _atomic_create_json(item["source_meta"], private)
+        _atomic_create_json(item["rollback_meta"], private)
         publish_file_no_replace(item["work_path"], item["source_path"])
     result = _director_commit_finishing_publication(job, project_dir, staged, plan)
     if result is None:
@@ -17469,7 +17848,8 @@ def _director_finalize_finishing_publication(job: dict, pending: dict, plan: dic
     cleanup = []
     for entry, descriptor, record, media in zip(staging, artifacts, records,
             completed["attestation"]["director_delivery"]["binding"]["media"]):
-        private_bytes = json.dumps(record["director_private_sidecar"], indent=2).encode()
+        private, _ = _director_publication_sidecars(job, project_dir, record)
+        private_bytes = json.dumps(private, indent=2).encode()
         private_sha = hashlib.sha256(private_bytes).hexdigest()
         if (descriptor.get("producer_unit_id") != plan["unit_id"]
                 or descriptor.get("basename") != entry["native_basename"]
@@ -22107,6 +22487,8 @@ def _require_native_supervised_job_release(job: dict) -> None:
 
 def _require_job_runtime_model_admission(job: dict) -> None:
     """Revalidate generic role snapshots and legacy terms before execution."""
+    if "director_publication_recovery" in (job.get("recovery_cursor") or {}):
+        raise HTTPException(status_code=409, detail="This recovery can only publish retained media; model execution is disabled.")
     _require_native_supervised_job_release(job)
     from services.h3_cumulative_execution import prepare_h3_cumulative_request
 
@@ -76056,6 +76438,8 @@ def _run_generation(
     import inspect
 
     job = _jobs[job_id]
+    if "director_publication_recovery" in (job.get("recovery_cursor") or {}):
+        raise QueueRecoveryRuntimeError("CPU publication recovery cannot enter model execution.")
     h3_delivery_request = False
     h3_integrity_passed = False
     cumulative_dispatch = None
@@ -77665,6 +78049,7 @@ def _run_generation(
                     (isinstance(manifest_info, dict) and manifest_info.get("automatic_h3_longform"))
                     or h3_mapping_plan is not None
                     or h3_cumulative_plan is not None
+                    or director_lora_snapshot is not None
                 ):
                     h3_task_sidecar_params[str(manifest_task.get("id"))] = (
                         _attach_voice_clone_sidecar_request(
@@ -87457,8 +87842,11 @@ def resume_recovered_job(
 @api.post("/api/v1/queue/{job_id}/recovery-retry")
 def retry_recovered_job(
     job_id: str, request: Request, response: Response,
+    publication_only: bool = False,
 ):
     _set_recovery_no_store(response)
+    if publication_only:
+        return _retry_director_publication_recovery(job_id, request)
     return _resume_recovered_job(job_id, request, requested_action="retry")
 
 

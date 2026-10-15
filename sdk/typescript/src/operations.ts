@@ -82890,6 +82890,16 @@ export const operationReference: readonly OperationReference[] = [
         }
       },
       {
+        "name": "publication_only",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "boolean",
+          "default": false
+        },
+        "description": "Explicitly select retained-media CPU publication only. Unsupported or changed evidence returns409 and cannot fall back to generation."
+      },
+      {
         "name": "Origin",
         "in": "header",
         "required": false,
@@ -82907,63 +82917,100 @@ export const operationReference: readonly OperationReference[] = [
         "content": {
           "application/json": {
             "schema": {
-              "type": "object",
-              "properties": {
-                "job_id": {
-                  "type": "string",
-                  "description": "Opaque job identity returned by the server; retain exactly. Not necessarily a hyphenated UUID."
-                },
-                "status": {
-                  "enum": [
-                    "queued"
-                  ]
-                },
-                "recovery_attempt": {
-                  "type": "integer"
-                },
-                "recovery_state": {
-                  "enum": [
-                    "retrying",
-                    "restored"
-                  ]
-                },
-                "reruns_denoise": {
-                  "type": "boolean"
-                },
-                "held": {
-                  "type": "boolean",
-                  "const": true,
-                  "description": "Present for held-only scheduler registration recovery. No native work is released."
-                }
-              },
-              "additionalProperties": false,
-              "required": [
-                "job_id",
-                "status",
-                "recovery_attempt",
-                "recovery_state",
-                "reruns_denoise"
-              ],
-              "allOf": [
+              "oneOf": [
                 {
-                  "if": {
-                    "properties": {
-                      "recovery_state": {
-                        "const": "restored"
-                      }
+                  "type": "object",
+                  "properties": {
+                    "job_id": {
+                      "type": "string",
+                      "description": "Opaque job identity returned by the server; retain exactly. Not necessarily a hyphenated UUID."
                     },
-                    "required": [
-                      "recovery_state"
-                    ]
+                    "status": {
+                      "enum": [
+                        "queued"
+                      ]
+                    },
+                    "recovery_attempt": {
+                      "type": "integer"
+                    },
+                    "recovery_state": {
+                      "enum": [
+                        "retrying",
+                        "restored"
+                      ]
+                    },
+                    "reruns_denoise": {
+                      "type": "boolean"
+                    },
+                    "held": {
+                      "type": "boolean",
+                      "const": true,
+                      "description": "Present for held-only scheduler registration recovery. No native work is released."
+                    }
                   },
-                  "then": {
-                    "required": [
-                      "held"
-                    ],
-                    "properties": {
-                      "reruns_denoise": {
-                        "const": false
+                  "additionalProperties": false,
+                  "required": [
+                    "job_id",
+                    "status",
+                    "recovery_attempt",
+                    "recovery_state",
+                    "reruns_denoise"
+                  ],
+                  "allOf": [
+                    {
+                      "if": {
+                        "properties": {
+                          "recovery_state": {
+                            "const": "restored"
+                          }
+                        },
+                        "required": [
+                          "recovery_state"
+                        ]
+                      },
+                      "then": {
+                        "required": [
+                          "held"
+                        ],
+                        "properties": {
+                          "reruns_denoise": {
+                            "const": false
+                          }
+                        }
                       }
+                    }
+                  ]
+                },
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "job_id",
+                    "status",
+                    "operation",
+                    "reruns_denoise",
+                    "next_action"
+                  ],
+                  "properties": {
+                    "job_id": {
+                      "type": "string"
+                    },
+                    "status": {
+                      "type": "string",
+                      "enum": [
+                        "queued",
+                        "running",
+                        "completed"
+                      ]
+                    },
+                    "operation": {
+                      "const": "director_publication_recovery"
+                    },
+                    "reruns_denoise": {
+                      "const": false
+                    },
+                    "next_action": {
+                      "const": "observe_job"
                     }
                   }
                 }
@@ -83134,8 +83181,8 @@ export const operationReference: readonly OperationReference[] = [
       "permissions": [
         "project.generate"
       ],
-      "boundary": "Existing signed session, project access and exact mutation-origin checks apply. Job controls accept only session-owned jobs; blocked recovery and paired sample jobs require their dedicated actions.",
-      "idempotency": "No client deduplication key. An accepted retry advances bounded recovery state; held admission recovery preserves the original generation_request_id and job_id. Poll that same job and its submission receipt after an uncertain response. A restored held result requires separate explicit release; never blindly replay retry or resubmit generation.",
+      "boundary": "Existing signed session, project access and exact mutation-origin checks apply. Job controls accept only session-owned jobs; blocked recovery and paired sample jobs require their dedicated actions. CPU publication marker excludes every generic model execution path; it does not confer GPU authority.",
+      "idempotency": "No client deduplication key. An accepted retry advances bounded recovery state; held admission recovery preserves the original generation_request_id and job_id. Poll that same job and its submission receipt after an uncertain response. A restored held result requires separate explicit release; never blindly replay retry or resubmit generation. CPU publication-only repeated requests return the existing queued/running/completed job; a failed CPU attempt may explicitly retry within the attempt limit after evidence revalidation. An observation timeout is never cancellation or authority to submit generation.",
       "operation_kind": "generation_job",
       "mcp": true,
       "contract_status": "authored",
