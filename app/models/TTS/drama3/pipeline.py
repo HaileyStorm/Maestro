@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import gc
 import copy
+from contextlib import nullcontext
 import math
 import re
 import time
@@ -28,7 +29,8 @@ def validate_inputs(inputs):
     if type(reference_cache) is not int or reference_cache not in (0, 1):
         return "Drama 3 reference cache must be 0 or 1."
     for field in ("drama3_restricted_speech_head", "drama3_bulk_expert_pack",
-                  "drama3_compile_recurrence", "drama3_gpu_codec", "drama3_gpu_codec_bf16"):
+                  "drama3_compile_recurrence", "drama3_gpu_codec", "drama3_gpu_codec_bf16",
+                  "drama3_prefix_cache"):
         if type(custom.get(field, 0)) is not int or custom.get(field, 0) not in (0, 1):
             return f"{field} must be 0 or 1."
     if custom.get("drama3_gpu_codec_bf16", 0) and not custom.get("drama3_gpu_codec", 0):
@@ -90,6 +92,7 @@ class Drama3Pipeline:
         self._interrupt = self._early_stop = False
         self._decode_stats = []
         self._budget = None
+        self._prefix_cache = None
         source_root = Path(__file__).parent
         vendor = source_root / "vendor/fish_speech"
         self.prepared_voice_cache = PreparedVoiceCache(
@@ -112,7 +115,16 @@ class Drama3Pipeline:
         )
         self.reference_cache_stats = self.prepared_voice_cache.stats
 
+    def prefix_cache_stats(self):
+        if self._prefix_cache is not None:
+            return self._prefix_cache.snapshot()
+        return {"enabled": False, "hits": 0, "misses": 0, "restored_bytes": 0,
+                "resident_cpu_bytes": 0}
+
     def _reset_models(self):
+        if self._prefix_cache is not None:
+            self._prefix_cache.close()
+            self._prefix_cache = None
         self._backbone = self.codec = self._bf16_codec = None
         self._budget = None
         gc.collect()
@@ -167,11 +179,12 @@ class Drama3Pipeline:
         restricted_head = bool(custom.get("drama3_restricted_speech_head", 0))
         bulk_pack = bool(custom.get("drama3_bulk_expert_pack", 0))
         compile_recurrence = bool(custom.get("drama3_compile_recurrence", 0))
+        prefix_cache = bool(custom.get("drama3_prefix_cache", 0))
         gpu_codec = bool(custom.get("drama3_gpu_codec", 0))
         bf16_codec = bool(custom.get("drama3_gpu_codec_bf16", 0))
         self._decode_stats = []
         self._interrupt = self._early_stop = False
-        if self._budget != (budget, expert_cache, restricted_head, bulk_pack, compile_recurrence):
+        if self._budget != (budget, expert_cache, restricted_head, bulk_pack, compile_recurrence, prefix_cache):
             self._reset_models()
         if self._backbone is None:
             if callable(set_progress_status): set_progress_status("Loading Drama 3 FP8 with CPU expert offload")
@@ -179,7 +192,11 @@ class Drama3Pipeline:
                 expert_cache_gib=expert_cache, cancel_check=self._cancelled,
                 restricted_speech_head=restricted_head, bulk_expert_pack=bulk_pack,
                 compile_recurrence=compile_recurrence)
-            self._budget = (budget, expert_cache, restricted_head, bulk_pack, compile_recurrence)
+            self._budget = (budget, expert_cache, restricted_head, bulk_pack, compile_recurrence, prefix_cache)
+        if prefix_cache and self._prefix_cache is None:
+            from .prefix_cache import PrefixCache
+            self._prefix_cache = PrefixCache(self._backbone, checkpoint_root=self.ckpt_root,
+                                             cancel_check=self._cancelled)
         if self.codec is None:
             if callable(set_progress_status): set_progress_status("Loading the local speech codec")
             self.codec = load_codec(Path(self.ckpt_root) / "codec.pth")
@@ -233,12 +250,15 @@ class Drama3Pipeline:
             print(f"Drama 3 synthesis: part={index+1}/{len(chunks)}, prompt_rows={len(prompt)}, "
                   f"frame_budget={cap}, temperature={float(temperature)}, "
                   f"top_p={float(top_p)}, top_k={int(top_k)}")
-            frames, finish = _run_timed_phase(
-                f"Generating Drama 3 speech · part {index+1}/{len(chunks)}",
-                generate_drama3, self._backbone, prompt, max_new_tokens=cap,
-                temperature=float(temperature), top_p=float(top_p), top_k=int(top_k),
-                progress=set_progress_status,
-            )
+            prefix_context = (self._prefix_cache.generation(prompt, max_new_tokens=cap)
+                              if self._prefix_cache is not None else nullcontext())
+            with prefix_context:
+                frames, finish = _run_timed_phase(
+                    f"Generating Drama 3 speech · part {index+1}/{len(chunks)}",
+                    generate_drama3, self._backbone, prompt, max_new_tokens=cap,
+                    temperature=float(temperature), top_p=float(top_p), top_k=int(top_k),
+                    progress=set_progress_status,
+                )
             print(f"Drama 3 synthesis finished: part={index+1}/{len(chunks)}, "
                   f"generated_frames={len(frames)}, finish_reason={finish}")
             if self._cancelled(): raise InterruptedError("Drama 3 generation cancelled")

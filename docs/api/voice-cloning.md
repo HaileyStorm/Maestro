@@ -170,6 +170,41 @@ features, including explicit preloads; disk entries persist for later reuse.
 Cached CPU features do not imply that model weights are loaded, GPU memory is
 ready, generation is admitted, or voice quality has been accepted.
 
+### Optional Drama prompt-prefix reuse
+
+`custom_settings.drama3_prefix_cache: 1` enables an additional experimental,
+model-instance cache. It reuses the first complete 128-row language-model and
+speech-tower prompt chunk when its complete 129-row input, model, source,
+settings and runtime cache layout match. This can save repeated prompt work for
+the same reference voice. Changed speech or history that enters those rows is
+a cache miss. The original continuation and sampler still run normally; no
+previous generation's random state or generated speech is reused.
+
+This cache holds one entry of at most 96 MiB in CPU memory; the measured model
+snapshot is 67.65625 MiB. It is separate from the disk-backed reference features
+above and is not persisted or exposed by their inspect/load/evict operations.
+Switching to another prefix replaces it. Unloading the model, changing the
+option, or using **Free Resources** clears it. The default is `0`. Enabling it
+reserves at least 1024 native cache rows; actual capacity/layout changes
+invalidate reuse. It does not authorize a model load or generation.
+
+Set the option in the ordinary generation body, preserving other discovered
+model settings:
+
+```python
+body["custom_settings"] = {
+    **(body.get("custom_settings") or {}),
+    "drama3_prefix_cache": 1,
+}
+```
+
+Python, TypeScript, curl and MCP submit this same HTTP generation contract;
+no separate clone-loading endpoint is needed. See the
+[Drama performance evidence](drama3.md#warm-synthesis-and-optional-caches)
+for measured benefits and limitations. The deployed combined prefix/GPU BF16
+comparison generated the full passage with matching codec indices; both WAVs
+are retained because the decoder waveform differs slightly.
+
 ### Inspect, load and evict
 
 All three operations select a project-authorized voice asset and one kept

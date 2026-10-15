@@ -78,6 +78,7 @@ Drama exposes these optional `custom_settings`:
 
 | Setting | Values | Behavior |
 | --- | --- | --- |
+| `drama3_prefix_cache` | `0` or `1`, default `0` | Experimental one-entry CPU prompt-prefix cache, at most 96 MiB per loaded model. Reuses the first complete 128-row backbone/tower chunk only for an exact 129-row input and matching model/settings/runtime layout. Original continuation and sampler remain unchanged. Model unloading or changing the option clears it. Memory-only; separate from disk-backed reference codes. |
 | `drama3_reference_cache` | `0` or `1`, default `1` | Saves exact encoded reference audio in private data-only disk storage and reuses bounded CPU memory. Content hashes, codec and preparation code bind entries. Explicit `0` bypasses reuse. See [prepared voices](voice-cloning.md#inspect-load-and-evict) for project-scoped inspection, CPU preload and eviction. |
 | `drama3_expert_cache_gib` | `0` through `4` | Keeps recently used original FP8 experts in GPU memory, with bounded eviction and original FP8 arithmetic. May add one expert layer of pinned CPU staging. |
 | `drama3_restricted_speech_head` | `0` or `1`, default `0` | Experimental compact projection using the original 4097 EOS/semantic BF16 rows. Retains all ten audio codebooks and sampler settings; smaller matrix geometry can change rounding. |
@@ -203,6 +204,37 @@ found the full requested text in both. The combination did not beat the earlier
 attributing the difference solely to compilation. Separate warmups precede these
 timings; cold model loading and compilation are excluded. All experimental
 controls remain disabled by default, with listening comparisons retained.
+
+Further matched native experiments retained the original sampler and reused
+the accepted comparison files. Thirty resident W6A8 expert layers measured
+4.875 wall seconds/audio second and 26.96 GiB observed warm VRAM; prompt
+processing and the remaining ten layers still used original FP8. This partial
+quantization was slower and was not adopted. CUDA graphs for the original
+twenty resident FP8 expert layers measured 2.964 and 24.52 GiB, with byte-identical
+codes, raw audio and WAV to the 2.869 CPU-codec baseline; they also offered no
+speed benefit and were not adopted. Isolated expert-kernel gains did not
+establish end-to-end speedups.
+
+The memory-only first-chunk prefix prototype measured 2.557 wall seconds/audio
+second and 24.49 GiB observed warm VRAM, about 10.9% less wall time than that
+same CPU-codec baseline. It restored a 67.65625 MiB snapshot in 6.16 ms and
+produced byte-identical codes, raw audio and WAV. These are single warm calls
+on the same short passage, not general throughput guarantees. The original
+prompt suffix, speech sampler and seed remained unchanged; expert-cache warmth
+can differ when prompt work is skipped. Disk persistence of these larger
+language-model states is not enabled.
+
+The integrated prefix option combined with the guarded GPU BF16 decoder
+measured 2.016 wall seconds/audio second and 26.12 GiB observed warm VRAM.
+The same 5.016-second passage took 10.114 seconds: about 12.6% less wall time
+than the earlier 2.308 GPU BF16 take, or 29.7% less than the CPU-codec baseline.
+The production prefix hit restored 67.65625 MiB in 6.54 ms. Codec indices matched
+the retained GPU BF16 take exactly; its waveform differed slightly (samplewise
+correlation 0.999948), so both WAVs remain the quality A/B. An unprompted CPU ASR
+pass recovered every requested word. This is not subjective quality acceptance.
+Native execution and authenticated local API discovery were observed after the
+coordinated deployment; local and configured Cloudflare readiness remained
+healthy. The prefix option is disabled by default and remains memory-only.
 
 Every change affecting waveform or speech has a retained WAV comparison.
 
