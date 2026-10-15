@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 import gc
+import hashlib
 import math
 import re
 import time
+from collections import OrderedDict
+from pathlib import Path
 
 import torch
 
@@ -19,6 +22,15 @@ def validate_inputs(inputs):
     budget = custom.get("drama3_gpu_budget_gib", 22.0)
     if isinstance(budget, bool) or not isinstance(budget, (int, float)) or not math.isfinite(budget) or not 8 <= budget <= 26:
         return "Drama 3 GPU weights and staging budget must be between 8 and 26 GiB."
+    reference_cache = custom.get("drama3_reference_cache", 0)
+    if type(reference_cache) is not int or reference_cache not in (0, 1):
+        return "Drama 3 reference cache must be 0 or 1."
+    expert_cache = custom.get("drama3_expert_cache_gib", 0.0)
+    if (isinstance(expert_cache, bool) or not isinstance(expert_cache, (int, float))
+            or not math.isfinite(expert_cache) or not 0 <= expert_cache <= 4):
+        return "Drama 3 expert cache must be between 0 and 4 GiB."
+    if budget + expert_cache > 26:
+        return "Drama 3 GPU weights, staging and expert cache must total at most 26 GiB."
     for i in range(1, 4):
         key = "audio_guide" + (str(i) if i > 1 else "")
         text = custom.get("drama3_reference_text" + (str(i) if i > 1 else ""), "")
@@ -69,14 +81,62 @@ class Drama3Pipeline:
         self._backbone = self.codec = None
         self._interrupt = self._early_stop = False
         self._budget = None
+        self._reference_codes = OrderedDict()
+        self._reference_code_bytes = 0
+        self.reference_cache_stats = dict(hits=0, misses=0, entries=0, resident_bytes=0)
 
     def release(self):
         self._backbone = self.codec = None
         self._budget = None
+        self._reference_codes.clear()
+        self._reference_code_bytes = 0
+        self.reference_cache_stats.update(hits=0, misses=0, entries=0, resident_bytes=0)
         gc.collect()
 
     def _cancelled(self):
         return self._interrupt
+
+    def _reference_digest(self, path):
+        # Large containers still use the native encoder, without cache overhead.
+        if Path(path).stat().st_size > 64 * 1024**2:
+            return None
+        digest = hashlib.sha256()
+        with open(path, "rb") as source:
+            total = 0
+            while block := source.read(1024**2):
+                if self._cancelled():
+                    raise InterruptedError("Drama 3 generation cancelled")
+                total += len(block)
+                if total > 64 * 1024**2:
+                    return None
+                digest.update(block)
+        return digest.digest()
+
+    def _encode_reference(self, path, encoder, enabled, label, progress):
+        digest = self._reference_digest(path) if enabled else None
+        # Codec lifetime and encoder identity bind both weights and preprocessing.
+        key = (digest, id(self.codec), self.codec.sample_rate, encoder)
+        if digest is not None and key in self._reference_codes:
+            self.reference_cache_stats["hits"] += 1
+            self._reference_codes.move_to_end(key)
+            if callable(progress):
+                progress(label + " · cached")
+            return self._reference_codes[key].clone()
+        if enabled:
+            self.reference_cache_stats["misses"] += 1
+        codes = _run_timed_phase(label, encoder, path, self.codec, progress=progress)
+        size = codes.numel() * codes.element_size()
+        if (digest is not None and size <= 8 * 1024**2
+                and self._reference_digest(path) == digest):
+            while self._reference_codes and (len(self._reference_codes) >= 6
+                    or self._reference_code_bytes + size > 8 * 1024**2):
+                _, old = self._reference_codes.popitem(last=False)
+                self._reference_code_bytes -= old.numel() * old.element_size()
+            self._reference_codes[key] = codes.detach().cpu().clone()
+            self._reference_code_bytes += size
+            self.reference_cache_stats.update(entries=len(self._reference_codes),
+                                               resident_bytes=self._reference_code_bytes)
+        return codes
 
     @torch.inference_mode()
     def generate(self, input_prompt, *, alt_prompt="", audio_guide=None,
@@ -104,16 +164,22 @@ class Drama3Pipeline:
             split_drama3_text, parse_speaker_segments, Drama3History,
         )
         budget = float(custom.get("drama3_gpu_budget_gib", 22.0))
+        expert_cache = float(custom.get("drama3_expert_cache_gib", 0.0))
+        reference_cache = custom.get("drama3_reference_cache", 0)
         self._interrupt = self._early_stop = False
-        if self._budget != budget:
+        if self._budget != (budget, expert_cache):
             self.release()
+        if not reference_cache:
+            self._reference_codes.clear()
+            self._reference_code_bytes = 0
+            self.reference_cache_stats.update(entries=0, resident_bytes=0)
         if self._backbone is None:
             if callable(set_progress_status): set_progress_status("Loading Drama 3 FP8 with CPU expert offload")
-            self._backbone = load_offloaded_model(self.ckpt_root, gpu_budget_gib=budget, cancel_check=self._cancelled)
-            self._budget = budget
+            self._backbone = load_offloaded_model(self.ckpt_root, gpu_budget_gib=budget,
+                expert_cache_gib=expert_cache, cancel_check=self._cancelled)
+            self._budget = (budget, expert_cache)
         if self.codec is None:
             if callable(set_progress_status): set_progress_status("Loading the local speech codec")
-            from pathlib import Path
             self.codec = load_codec(Path(self.ckpt_root) / "codec.pth")
         if seed is not None and int(seed) >= 0: torch.manual_seed(int(seed))
         references, transcripts = [], []
@@ -123,10 +189,8 @@ class Drama3Pipeline:
             transcripts.append(performance_text(custom["drama3_reference_text" + (str(i+1) if i else "")]))
             if not re.search(r"<\|speaker:\d+\|>", transcripts[-1]):
                 transcripts[-1] = f"<|speaker:{i}|> " + transcripts[-1]
-            references.append(_run_timed_phase(
-                f"Encoding Drama 3 reference {i+1}", encode_reference,
-                path, self.codec, progress=set_progress_status,
-            ))
+            references.append(self._encode_reference(path, encode_reference, reference_cache,
+                f"Encoding Drama 3 reference {i+1}", set_progress_status))
         # Split speech before adding the global direction. A long protected cue
         # can otherwise fill a native chunk by itself and generate unintended
         # speech, which then contaminates continuation history.
@@ -194,5 +258,8 @@ class Drama3Pipeline:
                 break
         if not pieces: raise RuntimeError("Drama 3 produced no audio; the model may have reached EOS immediately.")
         if finish == "length": print("Drama 3 reached the maximum duration/chunk frame budget; speech may be truncated.")
+        if reference_cache or expert_cache:
+            print(f"Drama 3 cache counters: references={self.reference_cache_stats}, "
+                  f"experts={self._backbone.offload_placement['expert_cache']}", flush=True)
         return {"x": torch.cat(pieces).unsqueeze(0), "audio_sampling_rate": 44100,
                 "finish_reason": finish}

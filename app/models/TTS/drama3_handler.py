@@ -46,7 +46,15 @@ def speech_capabilities():
                 "description": "1 generates each explicitly tagged speaker turn separately with native history. Experimental mitigation for skipped turns; words and quality still require inspection."},
             "precision": "Official block FP8 experts, BF16 backbone, CPU FP32 codec; no Q6 variant.",
             "gpu_budget_gib": {"minimum": 8, "maximum": 26, "default": 22,
-                "scope": "Weights plus worst-case expert staging; caches and CUDA overhead need additional VRAM."},
+                "scope": "Weights plus worst-case expert staging; KV caches and CUDA overhead need additional VRAM."},
+            "reference_cache": {"field": "custom_settings.drama3_reference_cache",
+                "default": 0, "values": [0, 1], "maximum_entries": 6,
+                "maximum_code_bytes": 8 * 1024**2,
+                "description": "Reuse exact reference codes in CPU memory for this loaded pipeline. Clears on release. Experimental; a saved voice remains a reference, not trained weights."},
+            "expert_cache_gib": {"field": "custom_settings.drama3_expert_cache_gib",
+                "minimum": 0, "maximum": 4, "default": 0,
+                "maximum_weights_staging_cache_gib": 26,
+                "description": "Bounded LRU of original FP8 experts on GPU. Adds up to one expert layer of pinned CPU staging; experimental. Weights, staging and this cache must total at most 26 GiB; other GPU allocations need extra headroom."},
             "execution": "Existing project-authorized generation queue; NVIDIA CUDA and Triton required.",
             "terms": "fish_drama3_self_review"}
 
@@ -76,6 +84,10 @@ def model_definition():
              "type": "int", "default": 0},
             {"id": "drama3_gpu_budget_gib", "label": "GPU weights and staging budget (GiB)",
              "type": "float", "default": 22.0},
+            {"id": "drama3_reference_cache", "label": "Reuse reference codes in memory (0 or 1; experimental)",
+             "type": "int", "default": 0},
+            {"id": "drama3_expert_cache_gib", "label": "FP8 expert cache (0–4 GiB; total GPU budget at most 26 GiB; experimental)",
+             "type": "float", "default": 0.0},
             *[{"id": "drama3_reference_text" + (str(i) if i > 1 else ""),
                "label": f"Speaker {i-1} reference transcript", "type": "text", "default": ""}
               for i in range(1, 4)],

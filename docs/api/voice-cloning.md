@@ -195,3 +195,39 @@ from the table above. Do not reuse another session's private upload, pass an
 unused direction field and claim it was consumed, or present separate
 reference-conditioned takes as trained voice weights. Retain the exact model
 settings and source recording hash with each result.
+
+## Reference quality, length and accent
+
+A short clip establishing that cloning works is not a demonstrated quality
+optimum. Qwen advertises three-second cloning; Fish's general cloning guidance
+suggests at least ten seconds, and two or three consistent 15–20 second clips.
+Those vendor descriptions are starting points, not comparative measurements of
+Maestro's installed runtimes. Longer references can add useful evidence of
+vowels, consonants, rhythm and accent, but extra duration does not guarantee an
+improvement. Silence, echo, music, distortion or a different delivery can add
+unhelpful conditioning.
+
+For a quality comparison, keep the speaker, microphone/room, target text,
+reference transcript and generation settings fixed. Compare a clean short
+reference against a longer clean excerpt with varied natural speech. Prefer
+phonetic and sentence variety within one consistent voice/delivery; keep markedly
+different emotions or character voices as separate references. Repeating the
+same sentence adds less phonetic variety. Preserve exact transcripts for modes
+that use them, including Qwen's full reference conditioning and Drama. Qwen's
+x-vector-only mode is a different quality tradeoff, not an equivalent substitute.
+No length/phonetic-variety optimum has been qualified here.
+
+VoxCPM2 upstream also offers combined audio-plus-transcript continuation cloning
+(`prompt_wav_path`, `prompt_text` and `reference_wav_path`). Maestro's current
+adapter uses isolated reference-audio cloning only; the upstream maximum-fidelity
+mode is not exposed by that adapter. Do not infer its quality from the existing
+Vox reference-only comparisons.
+
+Corpus accent/region labels describe source speakers. Record a listener's
+perceived generated accent and accent retention separately from speaker identity,
+word accuracy, emotion control and audio naturalness. A changed accent does not
+by itself mean every other aspect of the cloned identity failed.
+
+Sources: [Qwen Base model card](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base),
+[Fish cloning guidance](https://docs.fish.audio/developer-guide/best-practices/voice-cloning),
+and [VoxCPM2 conditioning modes](https://huggingface.co/openbmb/VoxCPM2).

@@ -57,10 +57,80 @@ Inference requires NVIDIA CUDA, an SM89 or newer device and Triton. The official
 block FP8 expert weights stay FP8; non-expert tensors use BF16. CPU offload stages
 only routed experts, and the FP32 codec runs on CPU. CUDA graphs are disabled.
 `drama3_gpu_budget_gib` defaults to 22, accepts 8–26 GiB, and covers resident
-weights plus worst-case expert staging. Caches, activations and CUDA overhead need
-additional headroom. A smaller budget may be rejected if fixed tensors cannot fit.
+weights plus worst-case expert staging. The optional expert cache below shares a
+26 GiB total allowance with that budget. Activations, KV caches, the CUDA context
+and kernel workspace still need additional headroom. A smaller budget may be rejected if fixed tensors cannot fit.
 There is no supported Q6/GGUF path. CPU offload does not imply CPU-only inference.
 Other GPU devices and platforms require their own native qualification.
+
+## Warm synthesis and optional caches
+
+Qwen3 Base can use the existing CUDA-graph LM engine when its main model is fully
+resident: submit `override_profile: 3` (or another supported full-residency
+profile). The host LM decoder setting must be Auto or `cg`; a host explicitly
+set to Legacy keeps that selection. Offloaded profiles 2, 4 and 5 fall back to
+Legacy. Select the BF16 model explicitly; a memory profile alone does not select
+weight precision. These are existing execution controls, available to HTTP,
+Python, TypeScript and MCP callers through the ordinary generation payload.
+
+Drama exposes these optional `custom_settings`, both disabled by default:
+
+| Setting | Values | Behavior |
+| --- | --- | --- |
+| `drama3_reference_cache` | `0` or `1` | Reuses exact encoded reference audio in this loaded pipeline. Content hashes and codec identity bind entries. At most six CPU entries / 8 MiB; unload or disabling clears them. |
+| `drama3_expert_cache_gib` | `0` through `4` | Keeps recently used original FP8 experts in GPU memory, with bounded eviction and original FP8 arithmetic. May add one expert layer of pinned CPU staging. |
+
+`drama3_gpu_budget_gib + drama3_expert_cache_gib` must be at most 26.
+For a qualified 32 GiB host, the measured cache candidate uses:
+
+```json
+{"custom_settings": {
+  "drama3_gpu_budget_gib": 22,
+  "drama3_expert_cache_gib": 4,
+  "drama3_reference_cache": 1
+}}
+```
+
+Merge these fields with the required reference transcript and other existing
+settings. Discover current model options before submission. The configured
+26 GiB allowance is not total peak VRAM; leave room for the desktop, CUDA,
+activations and KV state. Smaller cards or longer contexts need their own
+resource assessment. Cache lifetime ends with model unloading; no cache handle
+or cross-process persistence is exposed. Source generation remains serialized.
+
+A short-passage native pipeline study on an RTX 5090 (32 GiB), Torch 2.10 /
+CUDA 13, measured synchronized warm `generate()` wall time divided by actual
+output duration. Loading, a different-text warmup, queue/HTTP time and file
+writing were excluded. Reference preparation and CPU waveform decoding were
+included. Each row is one controlled take, not an aggregate benchmark:
+
+| Variant | Wall seconds / audio second | Peak process VRAM, GiB |
+| --- | ---: | ---: |
+| Qwen3 1.7B Base BF16, offloaded Profile 2 / Legacy | 3.389 | 2.70 |
+| Qwen3 1.7B Base BF16, resident Profile 3 / Legacy | 1.064 | 4.49 |
+| Qwen3 1.7B Base BF16, resident Profile 3 / CUDA graph | 0.366 | 4.52 |
+| VoxCPM2 BF16, compiled, 30 steps | 0.287 | 7.50 |
+| VoxCPM2 BF16, compiled, 100 steps | 0.624 | 7.42 |
+| Drama original FP8, 22 GiB static budget | 5.068 | 22.50 |
+| Drama original FP8, 26 GiB static budget | 4.431 | 26.20 |
+| Drama original FP8, 22 GiB static + 4 GiB expert cache + reference cache | 2.730 | 26.49 |
+
+Qwen's two Legacy WAVs were byte-identical. Its graph output differed and is a
+listening comparison. All three Drama WAVs were byte-identical for this passage.
+A Vox reference-cache experiment produced the same WAV but less than 1% timing
+difference; it was removed rather than adding an unhelpful production option.
+No quantization was reduced. Neither sample identity nor speed proves quality
+for other voices, text or contexts; human listening remains separate.
+
+These timings used shipped model pipelines and standard MMGP profiles with
+quantization disabled. The HTTP scheduler and main WGP profile-budget adapter
+were outside the timing harness. Process VRAM was sampled through NVML during
+warm synthesis, including the CUDA context; cold loading/compilation may peak
+higher. They are hardware- and passage-specific measurements, not latency or
+memory guarantees. See the upstream [Qwen graph engine research](https://github.com/andimarafioti/faster-qwen3-tts),
+[Vox runtime](https://github.com/OpenBMB/VoxCPM), and
+[Drama expert-offload implementation](https://github.com/PedroMarinhoDev/ComfyUI-Drama3)
+for alternative engines and their separate dependency/hardware constraints.
 
 ## Speech and performance direction
 
@@ -117,7 +187,8 @@ not a per-generation format override.
 
 For comparisons, VoxCPM2 uses `num_inference_steps: 30`, `guidance_scale: 2`,
 and `custom_settings: {"voxcpm_max_len": 2400, "voxcpm_retry_badcase": 0}`
-to match the owner's retained preferred settings. VoxCPM ignores temperature,
+for the default-step speed comparison. A separate 100-step WAV is retained for
+quality comparison; this does not replace a user's preferred step count. VoxCPM ignores temperature,
 top-p, top-k, seed and the duration slider. IndexTTS2 accepts 1–100 decoder steps
 through `num_inference_steps` (default 25); its GPT sampler remains separate.
 Qwen3 and Drama 3 are autoregressive models without an iterative step control.
