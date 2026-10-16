@@ -172,6 +172,54 @@ def enrich_openapi(schema: dict) -> dict:
             "disk_ready": {"type": "boolean"}, "memory_ready": {"type": "boolean"},
         },
     }
+    schema["components"]["schemas"]["OutputMediaInfo"] = {
+        "type": "object", "additionalProperties": False,
+        "description": "CPU media probe of the current authorized file, not requested generation settings. "
+            "No waveform editing, model loading or GPU work. Source access and revision are rechecked after probing.",
+        "required": ["name", "type", "duration", "width", "height", "fps", "has_audio",
+                     "audio_channels", "audio_sample_rate", "size"],
+        "properties": {
+            "name": {"type": "string"}, "type": {"type": "string", "enum": ["audio", "video", "image"]},
+            "duration": {"type": "number", "minimum": 0,
+                         "description": "Measured file duration in seconds; zero when unavailable or for a still."},
+            **{key: {"type": "integer", "minimum": 0} for key in
+               ("width", "height", "audio_channels", "audio_sample_rate", "size")},
+            "fps": {"type": "number", "minimum": 0}, "has_audio": {"type": "boolean"},
+        },
+    }
+    schema["components"]["schemas"]["Music3DurationSemantics"] = {
+        "type": "object", "additionalProperties": False,
+        "description": "Music3 limits semantic frames, not an exact waveform length. The model may end early; "
+            "codec rounding can change final length slightly. Probe the output before timing downstream media.",
+        "required": ["parameter", "unit", "kind", "native_frame_rate", "can_end_early", "waveform_timing", "description"],
+        "properties": {
+            "parameter": {"type": "string", "const": "duration_seconds"},
+            "unit": {"type": "string", "const": "seconds"},
+            "kind": {"type": "string", "const": "semantic_frame_ceiling"},
+            "native_frame_rate": {"type": "integer", "const": 25},
+            "can_end_early": {"type": "boolean", "const": True},
+            "waveform_timing": {"type": "string", "const": "codec_grid"},
+            "description": {"type": "string"},
+        },
+    }
+    schema["components"]["schemas"]["Music3GenerationSettings"] = {
+        "type": "object", "additionalProperties": True, "required": ["model_type", "workspace", "prompt", "alt_prompt"],
+        "description": "Music3 settings for the existing generation API. Discover current defaults, model options, "
+            "accepted model terms and GPU readiness. Native song length is not guaranteed; inspect output media_info.",
+        "properties": {
+            "model_type": {"type": "string", "const": "minimax_music3"}, "workspace": {"type": "string"},
+            "generation_mode": {"type": "string", "const": "audio"},
+            "prompt": {"type": "string", "minLength": 1, "pattern": "\\S",
+                       "description": "Nonblank lyrics with section tags, or [Instrumental]."},
+            "alt_prompt": {"type": "string", "minLength": 1, "pattern": "\\S", "description": "Required nonblank music caption describing "
+                "global metadata, vocal delivery and arrangement. Performance adherence needs listening."},
+            "duration_seconds": {"type": "number", "minimum": 5, "maximum": 300, "default": 120,
+                "description": "Semantic decoding ceiling in seconds; sampled end tokens may finish earlier. "
+                    "Codec rounding may also change final length. No automatic padding or time stretching."},
+            "num_inference_steps": {"type": "integer", "default": 30},
+            "guidance_scale": {"type": "number", "default": 1.7}, "seed": {"type": "integer"},
+        },
+    }
     schema["components"]["schemas"]["PreparedVoiceState"] = {
         "type": "object", "additionalProperties": False,
         "required": ["asset_id", "variant_id", "entries", "matched", "valid", "memory_ready", "evicted",
@@ -408,12 +456,26 @@ def enrich_openapi(schema: dict) -> dict:
                 bind_video_loras(operation.get("requestBody", {}))
             if method == "post" and path == "/api/v1/generate":
                 _describe_h3_cumulative_generation(operation)
+                operation["requestBody"]["content"]["application/json"]["schema"]["properties"]["duration_seconds"]["description"] = (
+                    "Model-specific timing control. For Music3 this caps semantic decoding at 5–300 seconds "
+                    "and can end early; it is not the measured output duration. Discover duration_semantics "
+                    "and inspect output metadata with probe=true before timing a timeline or Director plan. "
+                    "Other models retain their own discovered timing semantics.")
                 operation["x-maestro-model-contracts"] = {model: {
                     "$ref": "#/components/schemas/" + name} for model, name in (
                         ("drama3", "Drama3GenerationSettings"), ("voxcpm2", "VoxCPM2GenerationSettings"),
-                        ("index_tts2", "IndexTTS2GenerationSettings"))}
+                        ("index_tts2", "IndexTTS2GenerationSettings"), ("minimax_music3", "Music3GenerationSettings"))}
                 operation["description"] += " Drama 3's directed speech and reference settings are documented " \
                     "in Drama3GenerationSettings; use current defaults and model-options. No extra TTS execution path."
+            if method == "get" and path == "/api/v1/model-options/{model_type}":
+                response = operation["responses"]["200"].setdefault("content", {}).setdefault(
+                    "application/json", {}).setdefault("schema", {})
+                response.update(type="object", additionalProperties=True)
+                response.setdefault("properties", {})["duration_semantics"] = {
+                    "anyOf": [{"$ref": "#/components/schemas/Music3DurationSemantics"}, {"type": "null"}],
+                    "description": "Declared timing semantics when the handler supplies them; null means undeclared. "
+                        "This does not change other model-specific fields or establish native readiness.",
+                }
             metadata = operation.setdefault("x-maestro", {})
             metadata.setdefault("mcp", False)
             metadata.setdefault("contract_status", "source_extracted" if item else "framework_only")

@@ -104,11 +104,24 @@ def _model_definition():
             "lines": 10,
         },
         "duration_slider": {
-            "label": "Song duration (seconds)",
+            "label": "Song length limit (seconds)",
             "min": 5,
             "max": 300,
             "increment": 1,
             "default": DEFAULT_DURATION_SECONDS,
+        },
+        "duration_semantics": {
+            "parameter": "duration_seconds",
+            "unit": "seconds",
+            "kind": "semantic_frame_ceiling",
+            "native_frame_rate": 25,
+            "can_end_early": True,
+            "waveform_timing": "codec_grid",
+            "description": (
+                "Limits semantic decoding; the model can end sooner. Codec "
+                "rounding can also change the final waveform length slightly. "
+                "Measure the output before timing a video or timeline."
+            ),
         },
         "music3_structured_caption": True,
         "music_caption_label": "Structured Music Caption",

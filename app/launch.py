@@ -29306,6 +29306,7 @@ def get_model_options(model_type: str, request: Request):
         "audio_only": md.get("audio_only", False),
         **_speech_capabilities_for_model(wgp.get_base_model_type(model_type)),
         "duration_slider": md.get("duration_slider"),
+        "duration_semantics": md.get("duration_semantics"),
         "pause_between_sentences": md.get("pause_between_sentences", False),
         "temperature_enabled": md.get("temperature", False),
         "custom_settings_def": md.get("custom_settings"),
@@ -88666,12 +88667,40 @@ def serve_file(request: Request, filename: str, workspace: str = "", content_rev
 
 
 @api.get("/api/v1/outputs/{name}/metadata")
-def get_output_metadata(request: Request, name: str, workspace: str = ""):
+def get_output_metadata(request: Request, name: str, workspace: str = "", probe: bool = False):
     """Get metadata for an output file. Tries sidecar first, then embedded."""
     selected_workspace = _request_project_workspace(request, workspace)
     out_dir, filepath, authorized_sidecar = _require_authorized_output(
         request, selected_workspace, name,
     )
+    initial_probe_revision = None
+    if probe:
+        try:
+            initial_probe_revision = _output_share_revision(filepath, out_dir, name)
+        except (OSError, ValueError) as error:
+            raise HTTPException(status_code=409, detail="Output changed; refresh Gallery") from error
+
+    def with_media_info(metadata):
+        if not probe:
+            return metadata
+        from services.editor_projects import EditorProjectError, probe_media
+        try:
+            media = probe_media(filepath)
+        except (EditorProjectError, OSError, ValueError, subprocess.SubprocessError) as error:
+            raise HTTPException(
+                status_code=422,
+                detail="This output could not be inspected; read metadata without probe or check the local media tools",
+            ) from error
+        current_dir, current_path, _ = _require_authorized_output(
+            request, selected_workspace, name,
+        )
+        try:
+            current_revision = _output_share_revision(current_path, current_dir, name)
+        except (OSError, ValueError) as error:
+            raise HTTPException(status_code=409, detail="Output changed; refresh Gallery") from error
+        if current_path != filepath or not hmac.compare_digest(initial_probe_revision, current_revision):
+            raise HTTPException(status_code=409, detail="Output changed; refresh Gallery")
+        return {**metadata, "media_info": media}
 
     # Helper: read embedded metadata from the media file
     def _read_embedded():
@@ -88710,7 +88739,7 @@ def get_output_metadata(request: Request, name: str, workspace: str = ""):
             response_params = response_sidecar.get("params")
             if isinstance(response_params, dict):
                 _strip_director_image_role_internals(response_params)
-            return {"source": "sidecar", **response_sidecar}
+            return with_media_info({"source": "sidecar", **response_sidecar})
         except HTTPException:
             raise
         except Exception:
@@ -88722,9 +88751,9 @@ def get_output_metadata(request: Request, name: str, workspace: str = ""):
         public_embedded = _redact_local_paths(embedded)
         if isinstance(public_embedded, dict):
             _strip_director_image_role_internals(public_embedded)
-        return {"source": "embedded", "params": public_embedded}
+        return with_media_info({"source": "embedded", "params": public_embedded})
 
-    return {"source": "none", "params": None}
+    return with_media_info({"source": "none", "params": None})
 
 
 def _share_not_found() -> HTTPException:

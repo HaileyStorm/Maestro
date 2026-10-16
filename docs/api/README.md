@@ -25,6 +25,8 @@ The [Drama 3 guide](drama3.md) covers directed speech, reference voices, FP8 CPU
 offload and its experimental execution boundaries through the same API.
 The [saved voice guide](voice-cloning.md) explains reusable recordings,
 paired transcripts and private reference preparation in Python, TypeScript and MCP.
+The [Music3 guide](music3.md) covers song submission, duration ceilings,
+measured output timing and the existing Director/recovery paths.
 The [exported OpenAPI](openapi.json) is an offline snapshot; current server
 discovery remains authoritative.
 
@@ -808,6 +810,10 @@ Gallery reads, metadata and authorized media downloads use `/outputs`,
 revision for operations that require it. Favorites toggle; repeating them is
 not idempotent. Bulk moves/privacy/deletion return per-item outcomes. Component
 cleanup can be deferred; a response is not proof that every linked file vanished.
+For actual file timing, set `probe=true` on the metadata read. Its CPU
+`media_info.duration` is distinct from requested generation settings and can
+inform Editor/Director timing without loading an analysis model. Full audio
+analysis remains a separate operation. See [Music3 timing](music3.md#requested-length-and-measured-length).
 
 References and saved visual styles use project-scoped operations. A saved style
 update requires its current revision and selector-based references; do not

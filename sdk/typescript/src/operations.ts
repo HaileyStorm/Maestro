@@ -8948,6 +8948,17 @@ export const operationReference: readonly OperationReference[] = [
                 },
                 "supports_end_frame": {
                   "type": "boolean"
+                },
+                "duration_semantics": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/Music3DurationSemantics"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "description": "Declared timing semantics when the handler supplies them; null means undeclared. This does not change other model-specific fields or establish native readiness."
                 }
               },
               "additionalProperties": true,
@@ -68450,7 +68461,8 @@ export const operationReference: readonly OperationReference[] = [
                 "type": "number"
               },
               "duration_seconds": {
-                "type": "number"
+                "type": "number",
+                "description": "Model-specific timing control. For Music3 this caps semantic decoding at 5\u2013300 seconds and can end early; it is not the measured output duration. Discover duration_semantics and inspect output metadata with probe=true before timing a timeline or Director plan. Other models retain their own discovered timing semantics."
               },
               "pause_seconds": {
                 "type": "number"
@@ -85805,6 +85817,16 @@ export const operationReference: readonly OperationReference[] = [
           "type": "string",
           "description": "Explicit authorized project; required on remote generation routes."
         }
+      },
+      {
+        "name": "probe",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "boolean",
+          "default": false
+        },
+        "description": "Include measured media_info from the existing CPU media probe. No model load, GPU authority or generation is needed. A large file can take up to the existing 60-second probe timeout; use an appropriate client read timeout."
       }
     ],
     "request_body": null,
@@ -85815,7 +85837,11 @@ export const operationReference: readonly OperationReference[] = [
           "application/json": {
             "schema": {
               "type": "object",
-              "properties": {},
+              "properties": {
+                "media_info": {
+                  "$ref": "#/components/schemas/OutputMediaInfo"
+                }
+              },
               "required": [],
               "additionalProperties": true
             }
@@ -85823,14 +85849,10 @@ export const operationReference: readonly OperationReference[] = [
         }
       },
       "422": {
-        "description": "Validation Error",
-        "content": {
-          "application/json": {
-            "schema": {
-              "$ref": "#/components/schemas/HTTPValidationError"
-            }
-          }
-        }
+        "description": "Media inspection failed. Read metadata with probe=false, or check the local media tools. The output remains unchanged."
+      },
+      "409": {
+        "description": "Output changed during inspection. Refresh Gallery and use the current output revision."
       },
       "400": {
         "description": "Invalid input. Correct the named field; do not change the submission identity.",
@@ -85891,25 +85913,6 @@ export const operationReference: readonly OperationReference[] = [
       },
       "404": {
         "description": "Not found or not authorized in this session/project. Verify the returned identity and scope.",
-        "content": {
-          "application/json": {
-            "schema": {
-              "type": "object",
-              "properties": {
-                "detail": {
-                  "description": "Actionable handler-specific error; may be text, object or validation list."
-                }
-              },
-              "required": [
-                "detail"
-              ],
-              "additionalProperties": true
-            }
-          }
-        }
-      },
-      "409": {
-        "description": "State or revision conflict. Read current state and resolve the conflict before mutation.",
         "content": {
           "application/json": {
             "schema": {
