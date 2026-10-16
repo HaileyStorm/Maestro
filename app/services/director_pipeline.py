@@ -6633,6 +6633,8 @@ def _bind_director_custom_style_video(gen_params, params, *, require_existing=Fa
         )
         gen_params["_h3_prompt_mapping_source_plan"] = plan
         gen_params["prompt"] = plan["clip_prompts"][0]
+        # Context-IR is one structured prompt, not one prompt per line.
+        gen_params["multi_prompts_gen_type"] = 2
 
 
 def start_pipeline(params: dict, *, discard_admission=None) -> str:

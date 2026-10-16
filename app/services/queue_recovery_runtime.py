@@ -943,6 +943,10 @@ def cleanup_orphan_staged_outputs(
                 break
             if (
                 not name.startswith("unit-")
+                # Persisted style inputs belong to a parent retention bundle,
+                # not a live child job. Only its owner-bound cleanup may remove
+                # an uncommitted copy; orphan output cleanup must retain it.
+                or re.fullmatch(r"unit-style-[0-9a-f]{32}-input-[0-9a-f]{32}\.(?:png|jpg|jpeg|webp)", name)
                 or any(name.startswith(prefix) for prefix in live_prefixes)
             ):
                 continue
