@@ -23190,6 +23190,21 @@ def _require_h3_acceleration_available(
         raise ValueError(f"Kijai W4A8 FL2VA is unavailable: {reason}")
 
 
+def _h3_has_planned_style_references(body: dict) -> bool:
+    projection = body.get("_director_custom_style_video_snapshot")
+    if projection is None:
+        return False
+    from services.custom_visual_styles import validate_snapshot
+
+    if not isinstance(projection, dict):
+        raise QueueRecoveryRuntimeError("Saved visual style binding is unavailable.")
+    style = validate_snapshot(projection.get("video_snapshot"))
+    planned = any(ref["delivery"] == "planned" for ref in style["references"])
+    if planned and _director_retained_style_inputs(body) is None:
+        raise QueueRecoveryRuntimeError("Saved visual style images have no retained input binding.")
+    return planned
+
+
 def _apply_h3_adaptive_checkpoint(body: dict) -> str:
     """Resolve the effective H3 checkpoint from the supplied conditioning.
 
@@ -23203,7 +23218,7 @@ def _apply_h3_adaptive_checkpoint(body: dict) -> str:
         _h3_preferred_fl2va_model(body)
         if body.get("h3_adaptive_ref2va_model") not in (None, "", _H3_REF2VA_MODEL):
             raise ValueError("MiniMax H3 Ref2VA model selection is unavailable.")
-    has_semantic = bool(body.get("image_refs")) or any(
+    has_semantic = _h3_has_planned_style_references(body) or bool(body.get("image_refs")) or any(
         body.get(key) for key in (
             "video_guide", "video_guide2", "video_guide3",
             "audio_guide", "audio_guide2", "audio_guide3",
@@ -23622,18 +23637,7 @@ def _plan_h3_adaptive_models(
     fl2va_model = _h3_preferred_fl2va_model(body)
     adaptive = body.get("h3_adaptive_conditioning", True) is not False
     native_boundaries = body.get("h3_native_boundary_conditioning") is True
-    planned_style_refs = False
-    style_projection = body.get("_director_custom_style_video_snapshot")
-    if style_projection is not None:
-        from services.custom_visual_styles import validate_snapshot
-
-        if not isinstance(style_projection, dict):
-            raise QueueRecoveryRuntimeError("Saved visual style binding is unavailable.")
-        frozen_style = validate_snapshot(style_projection.get("video_snapshot"))
-        if any(ref["delivery"] == "planned" for ref in frozen_style["references"]):
-            if _director_retained_style_inputs(body) is None:
-                raise QueueRecoveryRuntimeError("Saved visual style images have no retained input binding.")
-            planned_style_refs = True
+    planned_style_refs = _h3_has_planned_style_references(body)
     legacy_semantic_refs = planned_style_refs or bool(body.get("image_refs")) or any(
         body.get(key) for key in ("video_guide", "video_guide2", "video_guide3")
     ) or any(letter in str(body.get("audio_prompt_type") or "") for letter in "ABCK")

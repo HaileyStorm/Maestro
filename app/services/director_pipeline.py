@@ -3082,6 +3082,11 @@ def _rerun_clip_video_impl(out_dir: str, pid: str, clip_index: int, prompt_overr
     frame_schedule = _quantize_clip_frame_schedule(
         requested_frames, min_frames, latent_size,
     )
+    if model_def.get("frame_alignment_modulus"):
+        # Some native grids use a remainder other than the legacy one-frame
+        # offset. Freeze legal lengths before offload admission and dispatch.
+        frame_schedule = [_wgp.align_model_frame_count(frames, model_def)
+                          for frames in frame_schedule]
     video_length = frame_schedule[clip_index]
     print(
         f"[Pipeline {pid}] Clip {clip_index} rerun frame budget: "
