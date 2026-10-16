@@ -6600,6 +6600,39 @@ def _bind_director_custom_style_video(gen_params, params, *, require_existing=Fa
             if require_existing and gen_params.get("_director_custom_style_image_paths") != paths:
                 raise ValueError("Director video request visual style inputs changed")
             gen_params["_director_custom_style_image_paths"] = paths
+        stage = expected["video_snapshot"]
+        if (require_existing or "_h3_prompt_mapping_source_plan" in gen_params
+                or isinstance(gen_params.get("_h3_longform"), dict)
+                or isinstance(params.get("_h3_longform"), dict)
+                or gen_params.get("per_clip_frames") is not None
+                or gen_params.get("_director_final_video_postprocess") is not None
+                or gen_params.get("model_type") != "minimax_h3_ref2va"
+                or stage.get("model_type") != "minimax_h3_ref2va"
+                or not any(ref["delivery"] == "planned" for ref in stage["references"])):
+            return
+        if retained is None:
+            raise ValueError("Director style mapping needs retained reference inputs")
+        model_def = _wgp.get_model_def(gen_params["model_type"]) or {}
+        frames = gen_params.get("video_length")
+        if type(frames) is not int or frames < int(model_def.get("frames_minimum") or 1):
+            raise ValueError("Director style mapping frame geometry is invalid")
+        maximum = int(model_def.get("frames_maximum") or 0)
+        if maximum <= 0 or frames > maximum:
+            return  # The longform planner owns requests outside one native window.
+        if _wgp.align_model_frame_count(frames, model_def) != frames:
+            raise ValueError("Director style mapping needs native-aligned frames")
+        from services.h3_prompt_mapping import source_prompt_schema
+        from services.h3_shot_planner import plan_h3_native_shots
+
+        source = gen_params.get("prompt")
+        plan = plan_h3_native_shots(
+            global_prompt=source, clip_frame_counts=[frames],
+            fps=float(model_def.get("fps") or 24),
+            source_canonicalization=(None if source_prompt_schema(source, strict=False) == "ref2va"
+                                     else "t2va_template"),
+        )
+        gen_params["_h3_prompt_mapping_source_plan"] = plan
+        gen_params["prompt"] = plan["clip_prompts"][0]
 
 
 def start_pipeline(params: dict, *, discard_admission=None) -> str:
