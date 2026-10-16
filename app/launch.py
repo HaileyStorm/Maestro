@@ -14746,6 +14746,14 @@ def _queue_recovery_reconcile_cursor(job: dict, project_dir: str, *, adopt_stage
                 _quarantine_recovery_artifact(project_dir, artifact)
 
     cursor = dict(job.get("recovery_cursor") or {})
+    if (job.get("params") or {}).get("_h3_cumulative_append") is True:
+        # Reconciliation may drop a corrupt completed window. Preserve that
+        # fact across restarts so the shorter prefix cannot authorize replay.
+        prior = cursor.get("h3_cumulative_unverified_units") or []
+        lost = set(prior) | {str(unit.get("unit_id") or "") for unit in original_units}
+        lost -= {str(unit.get("unit_id") or "") for unit in verified}
+        if lost or prior:
+            cursor["h3_cumulative_unverified_units"] = sorted(lost)
     cursor["completed_units"] = verified[-2048:]
     verified_h3_units = [
         unit for unit in verified
@@ -15124,6 +15132,59 @@ def _h3_execution_shots_for_dispatch(
     """Validate and return the semantic-to-physical child contract."""
     from services.h3_execution_contract import resolve_h3_execution_shots
     return resolve_h3_execution_shots(longform, prompt_lines, clip_count)
+
+def _h3_cumulative_recovery_prefix(job: dict) -> int | None:
+    """Verify an incomplete cumulative prefix for explicit unchanged recovery.
+
+    This does not authorize automatic work or an allocation retry. Each saved
+    window must still have its original media and normalized AV checkpoint;
+    a missing unit never becomes permission to regenerate that window.
+    """
+    params = job.get("params")
+    if (
+        not isinstance(params, dict)
+        or params.get("_h3_cumulative_append") is not True
+        or job.get("kind") != "studio_generation"
+        or job.get("status") not in {"queued", "failed"}
+        or job.get("status") == "queued" and job.get("queue_held") is not True
+        or is_cancel_requested(job)
+        or type(job.get("requested_outputs")) is not int
+        or job["requested_outputs"] != 1
+        or type(params.get("repeat_generation")) is not int
+        or params["repeat_generation"] != 1
+        or job.get("output_files")
+        or (job.get("recovery_cursor") or {}).get("h3_cumulative_unverified_units")
+        or _h3_ordinary_oom_hold(job)
+        or job.get("resource_retry_attempt", 0) != 0
+    ):
+        return None
+    plan = _h3_cumulative_job_plan(job, require_gate=True)
+    units = _queue_recovery_units(job)
+    if plan is None or not 0 < len(units) < len(plan["windows"]):
+        return None
+    indexed = {}
+    for unit in units:
+        if (
+            not isinstance(unit, dict)
+            or unit.get("kind") != "h3_segment"
+            or unit.get("state") != "completed"
+            or type(unit.get("variant")) is not int or unit["variant"] != 0
+            or type(unit.get("index")) is not int
+            or unit["index"] in indexed
+        ):
+            return None
+        indexed[unit["index"]] = unit
+    if set(indexed) != set(range(len(units))):
+        return None
+    for index in range(len(units)):
+        verified = _queue_recovery_unit_matches(
+            job, kind="h3_segment", variant=0, index=index,
+            project_dir=job["out_dir"], quarantine_invalid=False,
+        )
+        if verified is None or verified != indexed[index]:
+            return None
+    return len(units)
+
 
 def _h3_dependency_closed_recovery_prefix(job: dict) -> int | None:
     """Return a contiguous verified H3 prefix before concat/delivery."""
@@ -86962,6 +87023,22 @@ def _resume_recovered_job(
             # Reuse the unchanged manifest and prefix. Calibrated replacement
             # currently supports Ref2VA, not native FL2VA AV boundary history.
             reason = "generation_failed"
+        cumulative_retry = False
+        if (job.get("params") or {}).get("_h3_cumulative_append") is True:
+            # Cumulative AV recovery keeps the sealed manifest and allocation
+            # unchanged. Long-form peak replacement describes another model
+            # and must never reseal this request or replay its saved windows.
+            try:
+                prefix = _h3_cumulative_recovery_prefix(job)
+            except (QueueRecoveryRuntimeError, ValueError, TypeError, KeyError, OSError) as error:
+                raise HTTPException(status_code=409,
+                    detail="The saved cumulative windows could not be verified; keep the original job and checkpoints") from error
+            if prefix is None or reason == "h3_peak_calibration_required":
+                raise HTTPException(status_code=409,
+                    detail="Cumulative recovery requires a complete saved prefix, one output, no allocation failure and enabled cumulative generation")
+            reason = "generation_failed"
+            legal_resume = False
+            cumulative_retry = job.get("status") == "queued"
         if reason in {
             "h3_generation_recovery_authorization_required",
             "h3_peak_calibration_required",
@@ -87069,6 +87146,17 @@ def _resume_recovered_job(
                     )
                     if not committed:
                         raise HTTPException(status_code=409, detail="Recovery was cancelled")
+            except NativeAcceptanceReserved as error:
+                raise HTTPException(status_code=409, detail=str(error)) from error
+        elif cumulative_retry:
+            from services.native_acceptance_reservation import NativeAcceptanceReserved, reservation
+            try:
+                with reservation.cumulative_recovery_retry(job) as supervised:
+                    if supervised:
+                        retry_updates["_native_acceptance_manual_recovery"] = True
+                    committed = _queue_recovery_checkpoint(
+                        job, status="queued", **retry_updates,
+                    )
             except NativeAcceptanceReserved as error:
                 raise HTTPException(status_code=409, detail=str(error)) from error
         else:

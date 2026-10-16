@@ -319,9 +319,11 @@ If no other recovery failure takes precedence, `recovery_reason` is
 `gpu_reservation_required`. SDK waits return this blocked snapshot. These fields
 describe the release prerequisite; they do not grant authority or certify that
 a reservation is ready. After the operator installs fresh matching authority,
-release the same job individually through `/queue/{job_id}/resume` or
-`/queue/{job_id}/start-next`. An empty `recovery_actions` list does not prevent
-that ordinary queue release. Preserve the original submission and job IDs.
+use the original job's advertised `recovery_actions` when present. For an
+ordinary held job without a recovery action, release it individually through
+`/queue/{job_id}/resume` or `/queue/{job_id}/start-next`. An empty
+`recovery_actions` list does not prevent that ordinary queue release. Preserve
+the original submission and job IDs.
 
 If an accepted, never-started Studio job encounters resource-admission failure,
 keep its original request ID and job ID. Read `recovery_actions`; when it offers
@@ -458,13 +460,35 @@ Gallery operations. Release only that exact held job after its prerequisites
 are satisfied. Completed-window checkpoints are private, source-bound native
 state, not voice/media assets or client-provided continuation objects.
 
-**Recovery limitation:** interrupted cumulative jobs can remain held for owner
-reconciliation. The existing local longform final-segment recovery preparation
-does not cover cumulative requests. Private checkpoint restore evidence does
-not establish public Queue restart/resume acceptance. Do not resubmit, invoke a
-longform recovery helper or fabricate authority to bypass this hold. Ordinary
-Queue execution and human audiovisual quality remain separate qualification
-requirements; discovery alone proves neither.
+**Recovery from completed windows:** an interrupted cumulative job stays held
+for an explicit recovery decision. When status offers `retry`, the operator has
+renewed any required supervised GPU reservation, and cumulative generation is
+enabled, call `POST /api/v1/queue/{job_id}/recovery-retry` once. This revalidates
+the original request and the complete contiguous prefix of saved windows,
+including their media and native audio/video checkpoints. The worker skips
+those windows, restores the exact preceding checkpoint and generates only the
+remaining windows before publishing the complete result. It preserves the
+request, seed, settings and completed-window evidence; it does not prepare a
+replacement longform allocation plan.
+
+The response increments `recovery_attempt` and reports `reruns_denoise: true`
+because the missing windows still require generation. It does not mean the
+completed prefix will be regenerated. Observe the same job and original
+submission receipt after an uncertain response; recovery retries are not
+idempotent, and a timeout does not cancel or authorize another retry. Do not
+submit another generation request or use ordinary queue release to bypass a
+recovery hold.
+
+This path currently requires one output, a nonempty incomplete prefix and no
+positive allocation failure or prior resource retry. Missing or invalid saved
+windows remain blocked, including evidence invalidated during reconciliation.
+It does not handle multiple outputs, a job with every window complete but final
+publication unfinished, or a failed job that has not been restored to a held
+recovery state. Older reconciliation may already have discarded evidence; the
+new replay fence cannot reconstruct that history. Preserve the original
+records for owner review. The host-local longform recovery preparation/start
+routes do not apply to cumulative requests. Human audiovisual quality remains
+a separate acceptance requirement.
 
 For **VoxCPM text-only narration**, use the ordinary generation workflow with
 `model_type: "voxcpm2"`, `generation_mode: "audio"`, a narration `prompt`,

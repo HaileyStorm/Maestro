@@ -115,16 +115,22 @@ class Reservation:
         if type(release_action) is not str or release_action not in {"start-next", "resume", "recovery-retry", "continue", "rerun-image", "rerun-video"}:
             raise ValueError("Invalid native acceptance release action")
         self.target = json.loads(json.dumps(target)) if target is not None else None
+        cumulative_retry = self.target is not None and "cumulative_prefix_sha256" in self.target
+        if cumulative_retry and (release_action != "recovery-retry"
+                or self.target.get("kind") != "generation"
+                or type(self.target["cumulative_prefix_sha256"]) is not str
+                or re.fullmatch(r"[0-9a-f]{64}", self.target["cumulative_prefix_sha256"]) is None):
+            raise ValueError("Invalid native cumulative retry binding")
         if self.target is not None and "running_execution_attempt" in self.target:
             baseline = self.target.get("execution_attempt")
             running = self.target["running_execution_attempt"]
             if (type(baseline) is not int or baseline < 1
-                    or type(running) is not int or running != baseline + 1):
+                    or type(running) is not int or running != baseline + (0 if cumulative_retry else 1)):
                 raise ValueError("Invalid native acceptance running attempt")
         self.release_action = release_action
         if release_action == "recovery-retry":
             if (self.target is None or self.target.get("kind") != "generation"
-                    or self.target.get("running_execution_attempt") != self.target.get("execution_attempt", 0) + 1
+                    or self.target.get("running_execution_attempt") != self.target.get("execution_attempt", 0) + (0 if cumulative_retry else 1)
                     or type(self.target.get("running_recovery_attempt")) is not int
                     or self.target["running_recovery_attempt"] != self.target.get("recovery_attempt", -1) + 1):
                 raise ValueError("Invalid native acceptance failed retry")
@@ -191,6 +197,37 @@ class Reservation:
                     or not self._matches_job(job, self.target["running_execution_attempt"],
                         self.target["running_recovery_attempt"])):
                 raise NativeAcceptanceReserved("Failed retry acknowledgement changed; reconcile without resending")
+            self._retry_committed = True
+
+    @contextmanager
+    def cumulative_recovery_retry(self, job):
+        """Spend one exact held-prefix transition before starting its worker."""
+        if self.target is None:
+            yield False
+            return
+        def prefix_matches():
+            units = (job.get("recovery_cursor") or {}).get("completed_units")
+            return (type(units) is list and bool(units)
+                and digest(units) == self.target.get("cumulative_prefix_sha256"))
+        with self._lock:
+            if (self.release_action != "recovery-retry" or self._retry_job is not None
+                    or not self.dispatch_ready() or job.get("status") != "queued"
+                    or job.get("queue_held") is not True or job.get("cancel_requested")
+                    or job.get("kind") != "studio_generation"
+                    or (job.get("params") or {}).get("_h3_cumulative_append") is not True
+                    or not self._matches_job(job, self.target["execution_attempt"])
+                    or self.target.get("running_execution_attempt") != self.target["execution_attempt"]
+                    or job.get("output_files") or not prefix_matches()):
+                raise NativeAcceptanceReserved("Cumulative retry reservation changed; reconcile without resending")
+            self._retry_job = job
+        yield True
+        with self._lock:
+            if (job.get("status") != "queued" or job.get("queue_held") is not False
+                    or job.get("_native_acceptance_manual_recovery") is not True
+                    or not prefix_matches()
+                    or not self._matches_job(job, self.target["running_execution_attempt"],
+                        self.target["running_recovery_attempt"])):
+                raise NativeAcceptanceReserved("Cumulative retry acknowledgement changed; reconcile without resending")
             self._retry_committed = True
 
     def _retry_matches(self, job, *, completed_director=False):
@@ -1098,13 +1135,17 @@ def _load_startup_plan():
                 or type(target["recovery_attempt"]) is not int or target["recovery_attempt"] < 0
                 or ("running_execution_attempt" in target and (
                     type(target["running_execution_attempt"]) is not int
-                    or target["running_execution_attempt"] != target["execution_attempt"] + 1))
+                    or target["running_execution_attempt"] != target["execution_attempt"] + (0 if "cumulative_prefix_sha256" in target else 1)))
                 or plan.get("release_action", "start-next") not in {"start-next", "resume", "recovery-retry"}
                 or plan.get("release_action") == "recovery-retry" and (
-                    target.get("running_execution_attempt") != target["execution_attempt"] + 1
+                    target.get("running_execution_attempt") != target["execution_attempt"] + (0 if "cumulative_prefix_sha256" in target else 1)
                     or type(target.get("running_recovery_attempt")) is not int
                     or target["running_recovery_attempt"] != target["recovery_attempt"] + 1)
-                or plan.get("release_action") != "recovery-retry" and "running_recovery_attempt" in target):
+                or plan.get("release_action") != "recovery-retry" and "running_recovery_attempt" in target
+                or "cumulative_prefix_sha256" in target and (
+                    plan.get("release_action") != "recovery-retry"
+                    or type(target["cumulative_prefix_sha256"]) is not str
+                    or re.fullmatch(r"[0-9a-f]{64}", target["cumulative_prefix_sha256"]) is None)):
             raise ValueError()
         if (plan["schema"] != "maestro/native-acceptance-reservation/v1"
                 or plan["workspace"] != str(root)
