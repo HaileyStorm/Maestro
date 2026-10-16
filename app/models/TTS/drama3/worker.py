@@ -64,10 +64,15 @@ def decode_audio(codes, codec, *, use_gpu=False, fallback_codec=None, stats=None
         torch.cuda.synchronize()
         torch.cuda.empty_cache()  # Release unused blocks, never live model tensors.
         free, _ = torch.cuda.mem_get_info()
+        # Full native chunks may contain600 frames. Long decoding needs a
+        # measured workspace allowance while the language model stays resident.
+        max_frames = 600 if next(codec.parameters()).dtype == torch.float32 else 256
+        reserve = 3 * 1024**3
         record.update(codec_tensor_bytes=payload, cuda_free_before_bytes=free,
-                      required_free_bytes=3 * 1024**3 + payload)
-        if codes.shape[-1] > 256 or free < record["required_free_bytes"]:
-            record["fallback_reason"] = "long_chunk" if codes.shape[-1] > 256 else "insufficient_vram"
+                      required_free_bytes=reserve + payload,
+                      runtime_reserve_bytes=reserve, max_gpu_frames=max_frames)
+        if codes.shape[-1] > max_frames or free < record["required_free_bytes"]:
+            record["fallback_reason"] = "long_chunk" if codes.shape[-1] > max_frames else "insufficient_vram"
             print("Drama 3 GPU codec: using original CPU decoding for this chunk ("
                   + record["fallback_reason"] + ").", flush=True)
             codec = fallback_codec if fallback_codec is not None else codec

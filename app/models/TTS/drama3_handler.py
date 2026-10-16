@@ -74,11 +74,13 @@ def speech_capabilities():
                 "default": 0, "values": [0, 1], "experimental": True,
                 "description": "Compile single-token FP32 recurrent math for this model instance, without CUDA graphs. First use compiles; fused arithmetic may change generated delivery."},
             "gpu_codec": {"field": "custom_settings.drama3_gpu_codec", "default": 0,
-                "values": [0, 1], "experimental": True,
-                "description": "Optional FP32 GPU waveform decoding. Restores codec to CPU each chunk; long chunks or insufficient VRAM use original CPU decoding. Leaves 3 GiB plus codec tensor headroom."},
+                "values": [0, 1], "experimental": True, "max_frames_fp32": 600,
+                "runtime_reserve_gib": 3,
+                "description": "Optional FP32 GPU waveform decoding for up to 600 frames per chunk. Restores codec to CPU each chunk; longer chunks or insufficient VRAM use original CPU decoding. Requires 3 GiB free beyond actual codec tensors."},
             "gpu_codec_bf16": {"field": "custom_settings.drama3_gpu_codec_bf16", "default": 0,
                 "values": [0, 1], "experimental": True, "requires": "drama3_gpu_codec=1",
-                "description": "Use a private BF16 copy for GPU decoding. Original CPU reference encoder stays FP32. Changes waveform arithmetic; compare retained WAVs."},
+                "max_frames": 256,
+                "description": "Use a private BF16 copy for GPU decoding, up to 256 frames per chunk. Longer chunks use original CPU FP32 decoding. Original CPU reference encoder stays FP32. Changes waveform arithmetic; compare retained WAVs."},
             "execution": "Existing project-authorized generation queue; NVIDIA CUDA and Triton required.",
             "terms": "fish_drama3_self_review"}
 

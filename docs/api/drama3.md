@@ -211,7 +211,29 @@ speech, lower precision or retry generation. A CUDA execution failure propagates
 through ordinary job recovery instead of regenerating. BF16 uses a private copy
 that remains in CPU memory between chunks and is released with the model;
 reference encoding stays original FP32. GPU transfer and CPU restoration count
-in the measured warm wall time. These options remain disabled by default.
+in the measured warm wall time. FP32 GPU decoding accepts up to 600 frames
+(about 27.86 seconds at the native frame rate); BF16 retains its separately
+qualified 256-frame limit (about 11.89 seconds). Above either limit, original
+CPU FP32 decoding is used. These options remain disabled by default.
+
+A subsequent long-chunk qualification kept the original FP8 language model
+resident with the 22 GiB static budget and a filled 2 GiB expert cache. For
+600 identical codec frames, original CPU FP32 decoding took 17.796 seconds
+(0.63869 wall seconds/audio second); GPU FP32 took 0.691 seconds
+(0.02479), including moves to GPU and restoration to CPU. The GPU decode bridge
+was 25.76 times faster in this one warm measurement. Sampled process peak VRAM
+was 28.81 GiB versus 23.90 GiB for the retained CPU arm. This is decoder timing,
+not an end-to-end speech speedup. The capacity input concatenated 432 saved
+reference frames and their first 168 frames, rather than a new natural utterance.
+The original 3 GiB-plus-codec-tensors free-memory guard remains in force.
+The model successfully generated another short passage after codec restoration,
+then released its resources. Both delivered PCM24 WAVs have 1,228,800 samples;
+maximum absolute sample difference was 3.58e-6, RMS difference 1.11e-7 and
+error SNR 111.01 dB. They are not bit-identical and still need human listening.
+This experiment does not resolve missing words from upstream speech generation.
+Prepared Drama voice features include a worker-source fingerprint; updating this
+bridge invalidates older Drama entries and they are prepared again on first use.
+Other voice-model families are unaffected.
 The final production-path matched comparison used a 22 GiB static + 2 GiB
 expert cache layout, compact projection and batched packing. CPU FP32 measured
 2.869 wall seconds/audio second and 24.25 GiB peak process VRAM; lazy-mask GPU
