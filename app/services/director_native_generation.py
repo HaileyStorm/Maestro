@@ -244,6 +244,13 @@ class _StyleTransformerObservation:
         self.payload = copy.deepcopy(payload)
 
 
+def observe_local_style_generation(wgp, observer):
+    """Use the same consumption observation for an in-process style render."""
+    callbacks = {"style_begin": observer.begin, "style_fail": observer.fail,
+                 "style_encoded": observer}
+    return _StyleTransformerObservation(wgp, lambda name, payload: callbacks[name](payload))
+
+
 def run_native_generation(wgp, task, params, *, identity, consumer, send_cmd,
                           plugin_data, retain_repeat, after_repeat,
                           validate_authority, cancelled, state_lock,

@@ -80419,6 +80419,7 @@ def _run_generation(
                         decode_observation = None
                         style_observer_installed = False
                         style_observer_prior_key = "_h3_reference_observer" in gen
+                        installed_style_observer = style_observation
                         try:
                             with acceptance.worker(worker_admission):
                                 expected_args = set(inspect.signature(wgp.generate_video).parameters.keys())
@@ -80554,7 +80555,10 @@ def _run_generation(
 
                                 if style_observation is not None:
                                     if gen.get("_h3_reference_observer") is None:
-                                        gen["_h3_reference_observer"] = style_observation
+                                        if not (director_native_consumer is not None and acceptance.target is not None):
+                                            from services.director_native_generation import observe_local_style_generation
+                                            installed_style_observer = observe_local_style_generation(wgp, style_observation)
+                                        gen["_h3_reference_observer"] = installed_style_observer
                                         style_observer_installed = True
                                     else:
                                         style_observation.fail("reference_observer_already_owned")
@@ -80581,8 +80585,10 @@ def _run_generation(
                                 ],
                             )
                         finally:
+                            if installed_style_observer is not style_observation:
+                                installed_style_observer.close()
                             if (style_observer_installed
-                                    and gen.get("_h3_reference_observer") is style_observation):
+                                    and gen.get("_h3_reference_observer") is installed_style_observer):
                                 if style_observer_prior_key:
                                     gen["_h3_reference_observer"] = None
                                 else:
