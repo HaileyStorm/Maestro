@@ -75,6 +75,175 @@ def _generation_state(gen):
     return {key: gen[key] for key in _GEN_FIELDS if key in gen}
 
 
+class _StyleTransformerObservation:
+    """Keep preparation provisional until this window's native calls return."""
+
+    def __init__(self, wgp, rpc):
+        self.wgp, self.rpc = wgp, rpc
+        self.restore, self.handles = [], []
+        self.open = False
+        self.failed = False
+
+    def fail(self, _code):
+        if not self.failed:
+            self.failed = True
+            self.rpc("style_fail", "style_transformer_unverified")
+
+    def _patch(self, owner, name, replacement):
+        previous = owner.__dict__.get(name)
+        present = name in owner.__dict__
+        setattr(owner, name, replacement)
+        self.restore.append((owner, name, previous, present, replacement))
+
+    def close(self):
+        try:
+            if self.open:
+                self.fail("incomplete_window")
+        finally:
+            try:
+                for handle in self.handles:
+                    handle.remove()
+            finally:
+                self.handles.clear()
+                for owner, name, previous, present, replacement in reversed(self.restore):
+                    if getattr(owner, name) is replacement:
+                        if present:
+                            setattr(owner, name, previous)
+                        else:
+                            delattr(owner, name)
+                self.restore.clear()
+                self.rows = self.layout = self.payload = None
+                self.open = self.generating = False
+
+    def begin(self, context):
+        if self.open or getattr(self, "generating", False):
+            self.fail("window_reentry")
+            return False
+        self.close()
+        self.failed = False
+        self.payload = self.rows = self.layout = None
+        self.steps, self.returned, self.calls = 0, set(), 0
+        self.inflight = None
+        self.schedule_finished = self.generating = False
+        self.rpc("style_begin", context)
+        self.open = True
+        try:
+            import inspect
+            import torch
+            from models.minimax_h3 import minimax_h3_main as main
+
+            model = self.wgp.wan_model
+            if model.selected_model_type != "minimax_h3_ref2va" or not model.reference_mode:
+                raise ValueError("Style model changed")
+            prepare, pack = model._prepare_references, main.build_ref2va_packed_sequence
+            generate, schedule = model.generate, main._run_h3_master_schedule
+            prepare_signature = inspect.signature(prepare)
+
+            def prepared(*args, **kwargs):
+                result = prepare(*args, **kwargs)
+                try:
+                    arguments = prepare_signature.bind(*args, **kwargs).arguments
+                    if (not self.generating or self.rows is not None
+                            or arguments.get("observer") is not self or self.payload is None
+                            or result[2] is None or result[2].ndim != 2 or result[2].shape[0] < 1):
+                        raise ValueError("Style preparation changed")
+                    self.rows = result[2].detach().clone()
+                except Exception:
+                    self.fail("preparation_changed")
+                return result
+
+            def packed(*args, **kwargs):
+                result = pack(*args, **kwargs)
+                try:
+                    if (self.rows is None or self.layout is not None
+                            or result.num_condition_video_rows != self.rows.shape[0]):
+                        raise ValueError("Style layout changed")
+                    self.layout = {key: getattr(result, key).detach().clone() for key in (
+                        "position_ids", "token_tags", "video_indices", "audio_indices", "text_indices")}
+                except Exception:
+                    self.fail("layout_changed")
+                return result
+
+            def entered(_module, args, kwargs):
+                if self.failed:
+                    return
+                try:
+                    step, hidden = kwargs.get("h3_step_index"), kwargs["hidden_states"]
+                    if (args or not self.generating or self.inflight is not None
+                            or self.rows is None or self.layout is None
+                            or type(step) is not int or not 0 <= step < self.steps
+                            or self.returned and step < max(self.returned)
+                            or hidden.ndim != 3 or hidden.shape[0] < 1
+                            or hidden.shape[1] != kwargs["video_indices"].numel()
+                            or not torch.equal(hidden[:, :self.rows.shape[0]],
+                                self.rows[None].expand(hidden.shape[0], -1, -1))
+                            or any(not torch.equal(kwargs[key], expected.to(kwargs[key].device))
+                                   for key, expected in self.layout.items())):
+                        raise ValueError("Style conditioning changed")
+                    self.inflight = step
+                    self.calls += 1
+                except Exception:
+                    self.fail("conditioning_changed")
+
+            def returned(_module, _args, _kwargs, result):
+                if self.failed:
+                    return
+                if self.inflight is None or result is None:
+                    self.fail("prediction_missing")
+                    return
+                self.returned.add(self.inflight)
+                self.inflight = None
+
+            def scheduled(**kwargs):
+                if self.steps or not self.generating:
+                    self.fail("schedule_reentry")
+                self.steps = len(kwargs["timesteps"])
+                result = schedule(**kwargs)
+                self.schedule_finished = result is True
+                return result
+
+            def generated(*args, **kwargs):
+                if self.generating:
+                    self.fail("generation_reentry")
+                    return generate(*args, **kwargs)
+                self.generating = True
+                try:
+                    result = generate(*args, **kwargs)
+                    if (not self.failed and self.schedule_finished and self.steps > 0
+                            and self.returned == set(range(self.steps)) and self.calls >= self.steps
+                            and self.inflight is None and self.payload is not None
+                            and isinstance(result, dict) and result.get("x") is not None):
+                        self.rpc("style_encoded", self.payload)
+                        self.open = False
+                    else:
+                        self.fail("window_incomplete")
+                    return result
+                finally:
+                    self.close()
+
+            self._patch(model, "_prepare_references", prepared)
+            self._patch(main, "build_ref2va_packed_sequence", packed)
+            self._patch(main, "_run_h3_master_schedule", scheduled)
+            self._patch(model, "generate", generated)
+            self.handles.append(model.transformer.register_forward_pre_hook(entered, with_kwargs=True))
+            self.handles.append(model.transformer.register_forward_hook(returned, with_kwargs=True))
+            return True
+        except Exception:
+            self.fail("observation_unavailable")
+            self.close()
+            return False
+
+    def __call__(self, payload):
+        if self.failed:
+            return
+        if (not self.open or not self.generating or self.payload is not None
+                or type(payload) is not dict
+                or set(payload) != {"source_image_count", "encoded_image_ordinals"}):
+            self.fail("preparation_reentry")
+            return
+        self.payload = copy.deepcopy(payload)
+
+
 def run_native_generation(wgp, task, params, *, identity, consumer, send_cmd,
                           plugin_data, retain_repeat, after_repeat,
                           validate_authority, cancelled, state_lock,
@@ -348,7 +517,7 @@ def _run_worker(channel, packet, stage, failure):
         raise RuntimeError("Director native configuration has unknown fields")
     stage[0] = "parent_watch"
     watcher, watcher_stop = _start_parent_watch(channel)
-    wgp = None
+    wgp = style_observation = None
     try:
         # Authenticate the exact projection and any completed prefix before
         # importing the GPU runtime. A generic RPC ACK cannot establish it.
@@ -423,17 +592,8 @@ def _run_worker(channel, packet, stage, failure):
             if callback_markers["_h3_profile_observer"] is True:
                 params["_h3_profile_observer"] = lambda *event: state_rpc("profile_observation", event)
             if style_marker is True:
-                class StyleObservation:
-                    def begin(self, context):
-                        return state_rpc("style_begin", context)
-
-                    def fail(self, code):
-                        return state_rpc("style_fail", code)
-
-                    def __call__(self, payload):
-                        return state_rpc("style_encoded", payload)
-
-                gen["_h3_reference_observer"] = StyleObservation()
+                style_observation = _StyleTransformerObservation(wgp, state_rpc)
+                gen["_h3_reference_observer"] = style_observation
             params["_maestro_director_lora_guard"] = consumer
             params["_maestro_director_repeat_output"] = retain_repeat
             def send_cmd(name, *values):
@@ -451,12 +611,16 @@ def _run_worker(channel, packet, stage, failure):
         raise
     finally:
         stage[0] = "cleanup"
-        # Keep the independent watcher until native cleanup has returned.
-        if wgp is not None:
-            wgp.release_model()
-        os.write(watcher_stop, b"X")
-        os.close(watcher_stop)
-        watcher.wait(timeout=2)
+        try:
+            if style_observation is not None:
+                style_observation.close()
+        finally:
+            # Keep the independent watcher until native cleanup has returned.
+            if wgp is not None:
+                wgp.release_model()
+            os.write(watcher_stop, b"X")
+            os.close(watcher_stop)
+            watcher.wait(timeout=2)
 
 
 if __name__ == "__main__":

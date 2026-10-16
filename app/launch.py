@@ -8211,8 +8211,21 @@ def _director_recovery_submit_child(
         job["recovery_cursor"]["director_video_custody" if saved_video else "director_image_custody"] = {
             "pipeline_id": pid, "request_sha256": reservation.target["request_sha256"]}
         def enroll_image(candidate):
-            if saved_video and not validate_artifact_descriptor(candidate["out_dir"], image_admission.input_seal["artifact"]):
-                raise QueueRecoveryRuntimeError("Saved Director video image seal changed before enrollment")
+            if saved_video:
+                seal = image_admission.input_seal
+                if (candidate.get("params") or {}).get("model_type") == "minimax_h3_ref2va":
+                    candidate_params = candidate["params"]
+                    retained = _director_retained_style_inputs(candidate_params)
+                    if (set(seal) != {"identity", "style_snapshot", "style_inputs"}
+                            or candidate_params.get("_director_custom_style_video_snapshot") != seal["style_snapshot"]
+                            or retained is None or retained["inputs"] != seal["style_inputs"]
+                            or not all(_queue_recovery_manifest_validator(
+                                dict(descriptor), owner_digest=candidate.get("_recovery_owner_digest"),
+                                workspace=candidate.get("workspace"), project_dir=candidate["out_dir"],
+                            ) is True for descriptor in seal["style_inputs"])):
+                        raise QueueRecoveryRuntimeError("Saved Director style inputs changed before enrollment")
+                elif not validate_artifact_descriptor(candidate["out_dir"], seal["artifact"]):
+                    raise QueueRecoveryRuntimeError("Saved Director video image seal changed before enrollment")
             reservation.enroll_image_child(image_admission, candidate, unit, attempt)
             if saved_image_worker is not None:
                 candidate["_director_saved_video_worker_active" if saved_video else "_director_saved_image_worker_active"] = True
@@ -21997,6 +22010,8 @@ def _reject_client_custom_visual_style_state(params):
 
 def _director_custom_visual_style_bindings(params):
     from services.director_pipeline import _director_image_role_model
+    from services.h3_custom_style_handoff import ADAPTER_ID
+    from services.h3_custom_style_text import SUPPORTED_IMAGE_SCOPES
 
     video = params.get("video_model")
     if not isinstance(video, str) or not video or video not in wgp.models_def:
@@ -22006,14 +22021,21 @@ def _director_custom_visual_style_bindings(params):
               "image_editor": _director_image_role_model(params, "editor")}
     if any(model not in wgp.models_def for model in models.values()):
         raise HTTPException(409, "A selected visual style model is unavailable")
-    # Reference capability stays absent until an actual scoped native adapter
-    # is connected. Catalog visibility never authorizes image delivery.
-    return {stage: {"model_type": model, "mode": mode, "capability": None}
+    bindings = {stage: {"model_type": model, "mode": mode, "capability": None}
             for stage, model, mode in (
                 ("video", video, "ref2va" if video == "minimax_h3_ref2va" else "video"),
                 ("image_creator", models["image_creator"], "image_generation"),
                 ("image_editor", models["image_editor"], "image_editing"),
             )}
+    # Only the scoped Ref2VA handoff consumes these retained images. A frozen
+    # plan is intent; successful native observation owns delivery claims.
+    # Image stages and motion borrowing retain their text-only boundaries.
+    if video == "minimax_h3_ref2va":
+        bindings["video"]["capability"] = {
+            "model_type": video, "mode": "ref2va", "adapter_id": ADAPTER_ID,
+            "max_images": 8, "borrow_scope": list(SUPPORTED_IMAGE_SCOPES),
+        }
+    return bindings
 
 
 def _director_custom_visual_style_scope(workspace, project_dir, session_id, *, pipeline_id=None):
@@ -50453,11 +50475,15 @@ async def prepare_pipeline_clip_video(pid: str, clip_index: int, request: Reques
     )
     state, base = _require_saved_pipeline(request, pid, selected_workspace, read_only=True)
     _revalidate_saved_director_runtime(request, copy.deepcopy(state))
-    if state.get("video_model") != "minimax_h3" or len(state.get("clips") or []) != 1 or clip_index != 0:
+    if state.get("video_model") not in {"minimax_h3", "minimax_h3_ref2va"} or len(state.get("clips") or []) != 1 or clip_index != 0:
         raise HTTPException(status_code=400, detail="Read-only rerun preparation supports one retained H3 story clip")
+    current_style_scope = (_director_custom_visual_style_scope(
+        selected_workspace, base, request.state.maestro_session_id, pipeline_id=pid,
+    ) if state.get("video_model") == "minimax_h3_ref2va" else None)
     try:
         prepared = await upload_usage.to_thread(
-            inspect_saved_clip_video_request, base, pid, clip_index, state=state)
+            inspect_saved_clip_video_request, base, pid, clip_index, state=state,
+            current_style_scope=current_style_scope)
     except PipelineBusyError as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
     except ValueError as error:
@@ -50546,6 +50572,9 @@ async def rerun_pipeline_clip_video(pid: str, clip_index: int, request: Request)
     )
     _state, base = _require_saved_pipeline(request, pid, selected_workspace)
     _revalidate_saved_director_runtime(request, _state)
+    current_style_scope = (_director_custom_visual_style_scope(
+        selected_workspace, base, request.state.maestro_session_id, pipeline_id=pid,
+    ) if _state.get("video_model") == "minimax_h3_ref2va" else None)
     saved_video_binding = None
     if reserved:
         from services import director_pipeline as pipeline_service
@@ -50564,6 +50593,7 @@ async def rerun_pipeline_clip_video(pid: str, clip_index: int, request: Request)
             clip_index,
             prompt_override=body.get("prompt"),
             saved_video_binding=saved_video_binding,
+            current_style_scope=current_style_scope,
         )
         return result
     except PipelineBusyError as e:

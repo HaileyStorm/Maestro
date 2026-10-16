@@ -806,9 +806,26 @@ def _director_has_visual_references(
     existing_only: bool = False,
 ) -> bool:
     paths = _director_visual_reference_paths(params)
-    if not existing_only:
-        return bool(paths)
-    return any(os.path.isfile(path) for path in paths)
+    if paths and (not existing_only or any(os.path.isfile(path) for path in paths)):
+        return True
+    style_paths = _director_style_visual_reference_paths(params)
+    return bool(style_paths) if not existing_only else any(os.path.isfile(path) for path in style_paths)
+
+
+def _director_style_visual_reference_paths(params: dict) -> list[str]:
+    """Inspect retained style inputs without treating them as subject refs."""
+    selected = _director_custom_style_video_snapshot(params)
+    if selected is None:
+        return []
+    stage = selected["video_snapshot"]
+    retained = selected.get("retained_inputs")
+    if (stage["model_type"] != "minimax_h3_ref2va"
+            or stage["application"] != "references_planned"
+            or not isinstance(retained, dict)):
+        return []
+    return [descriptor["path"]
+            for reference, descriptor in zip(stage["references"], retained["inputs"])
+            if reference["delivery"] == "planned"]
 
 
 def _director_scene_description(params: dict) -> str:
@@ -2717,7 +2734,8 @@ def _quantize_clip_frame_schedule(
 
 
 @_exclusive_pipeline_operation
-def rerun_clip_video(out_dir: str, pid: str, clip_index: int, prompt_override: str = None, *, saved_video_binding=None) -> dict:
+def rerun_clip_video(out_dir: str, pid: str, clip_index: int, prompt_override: str = None, *, saved_video_binding=None,
+        current_style_scope=None) -> dict:
     from services.native_acceptance_reservation import reservation
     reserved = reservation.target is not None and reservation.target.get("kind") == "director_saved_video"
     if not reserved and saved_video_binding is None:
@@ -2736,7 +2754,8 @@ def rerun_clip_video(out_dir: str, pid: str, clip_index: int, prompt_override: s
             raise ValueError("Saved video checkpoint is too large")
         state = json.loads(raw)
         descriptor = _pipeline_payload_descriptor(pid, raw)
-        prepared = prepare_saved_clip_video_request(out_dir, pid, clip_index, state=state)
+        prepared = prepare_saved_clip_video_request(out_dir, pid, clip_index, state=state,
+            current_style_scope=current_style_scope)
         with _pipeline_lock:
             operation_id = (_pipeline_repairs.get(pid) or {}).get("operation_id")
         token = reservation.bind_saved_video(pid, parent, pipeline, state, descriptor, prepared,
@@ -2751,11 +2770,81 @@ def rerun_clip_video(out_dir: str, pid: str, clip_index: int, prompt_override: s
 
 
 @_exclusive_pipeline_operation
-def inspect_saved_clip_video_request(out_dir: str, pid: str, clip_index: int, *, state) -> dict:
-    return prepare_saved_clip_video_request(out_dir, pid, clip_index, state=state)
+def inspect_saved_clip_video_request(out_dir: str, pid: str, clip_index: int, *, state,
+        current_style_scope=None) -> dict:
+    return prepare_saved_clip_video_request(out_dir, pid, clip_index, state=state,
+        current_style_scope=current_style_scope)
 
 
-def prepare_saved_clip_video_request(out_dir: str, pid: str, clip_index: int, *, state=None) -> dict:
+def _prepare_saved_style_clip_video_request(out_dir, pid, clip_index, state, current_style_scope):
+    from services.custom_visual_style_pipeline import _scope
+    from services.custom_visual_styles import digest
+    from services.director_style_input_snapshot import validate_style_image_snapshot
+    from services.h3_custom_style_handoff import ADAPTER_ID
+
+    scope = _scope(current_style_scope)
+    snapshot = state.get("_params_snapshot") or {}
+    clips = state.get("clips") or []
+    if (state.get("status") != "cancelled" or state.get("phase") != "cancelled"
+            or type(clip_index) is not int or clip_index != 0 or len(clips) != 1
+            or snapshot.get("pipeline_type") != "short_film_story"
+            or state.get("video_model") != "minimax_h3_ref2va"
+            or snapshot.get("video_model") != "minimax_h3_ref2va"
+            or _saved_pipeline_shot_image_policy(state) != SHOT_IMAGES_DIRECT_REFERENCES
+            or snapshot.get("audio_path") or snapshot.get("_h3_longform") is not None
+            or _director_visual_reference_paths(snapshot) or _director_visual_reference_paths(state)
+            or state.get("generated_reference_image_filename") or state.get("output_files")
+            or clips[0].get("start_image_filename") or clips[0].get("keyframe_filenames")
+            or clips[0].get("video_filename")
+            or any((selection or {}).get(key) for selection in (
+                snapshot.get("video_loras"), state.get("video_loras"))
+                for key in ("activated_loras", "loras_multipliers", "lora_parameters"))):
+        raise ValueError("Saved style video requires one cancelled style-only Ref2VA story clip")
+    projection = _director_custom_style_video_snapshot(snapshot)
+    retained = projection.get("retained_inputs") if isinstance(projection, dict) else None
+    stage = projection.get("video_snapshot") if isinstance(projection, dict) else None
+    if (not isinstance(retained, dict) or not isinstance(stage, dict)
+            or snapshot["_director_custom_style_snapshot"]["scope_digest"] != digest(scope)
+            or stage.get("model_type") != "minimax_h3_ref2va" or stage.get("mode") != "ref2va"
+            or stage.get("adapter_id") != ADAPTER_ID or stage.get("application") != "references_planned"
+            or any(reference.get("delivery") != "planned" for reference in stage["references"])):
+        raise ValueError("Saved style video ownership or retained projection changed")
+    filepath = _find_pipeline_file(out_dir, pid)
+    project_dir = os.path.dirname(filepath) if filepath else out_dir
+    if not all(validate_style_image_snapshot(descriptor, project_directory=project_dir,
+            retention_id=retained["retention_id"], owner_digest=scope["owner_digest"],
+            project_digest=scope["project_instance"], style_snapshot_digest=stage["digest"],
+            field=f"_director_custom_style_image_paths:{index}")
+            for index, descriptor in enumerate(retained["inputs"])):
+        raise ValueError("Saved style video retained image changed")
+    recovery = state.get("recovery") or {}
+    prior = (recovery.get("video_repairs") or {}).get("0")
+    if (recovery.get("children")
+            or isinstance(prior, dict) and (prior.get("state") not in {"failed", "cancelled"}
+                or not isinstance(prior.get("_director_saved_video_terminal_receipt"), dict))):
+        raise ValueError("Saved style video has an unresolved intent; reconcile without replay")
+    revision = prior.get("revision", 0) if isinstance(prior, dict) else 0
+    if type(revision) is not int or revision < 0:
+        raise ValueError("Saved video repair revision is invalid")
+    request = _rerun_clip_video_impl(out_dir, pid, clip_index, None,
+        saved_video_state=state, prepare_only=True)
+    if (request.get("model_type") != "minimax_h3_ref2va" or request.get("generation_mode") != "video"
+            or type(request.get("repeat_generation")) is not int or request["repeat_generation"] != 1
+            or request.get("_director_custom_style_video_snapshot") != projection
+            or request.get("_director_custom_style_image_paths") != [item["path"] for item in retained["inputs"]]
+            or any(request.get(key) for key in ("image_start", "image_end", "image_refs", "audio_guide",
+                "audio_source", "audio_conditioning_guide", "audio_prompt_type", "activated_loras", "lora_parameters"))
+            or request.get("loras_multipliers")):
+        raise ValueError("Saved style video request changed its retained inputs")
+    seal = {"identity": {"project_instance_sha256": digest(scope["project_instance"]),
+                        "owner_principal_sha256": digest(scope["owner_digest"])},
+            "style_snapshot": projection, "style_inputs": copy.deepcopy(retained["inputs"])}
+    return {"request": request, "unit": {"kind": "video_clip_rerun", "variant": revision + 1, "index": 0},
+            "input_seal": seal, "generated_request_sha256": digest(request), "input_seal_sha256": digest(seal)}
+
+
+def prepare_saved_clip_video_request(out_dir: str, pid: str, clip_index: int, *, state=None,
+        current_style_scope=None) -> dict:
     """Read the actual ordinary rerun builder and its sealed image dependency."""
     if state is None:
         with _pipeline_file_lock:
@@ -2768,6 +2857,8 @@ def prepare_saved_clip_video_request(out_dir: str, pid: str, clip_index: int, *,
                 raise ValueError("Saved video checkpoint is too large")
             state = json.loads(raw)
     snapshot = state.get("_params_snapshot") if isinstance(state, dict) else None
+    if isinstance(snapshot, dict) and state.get("video_model") == "minimax_h3_ref2va":
+        return _prepare_saved_style_clip_video_request(out_dir, pid, clip_index, state, current_style_scope)
     if (not isinstance(snapshot, dict) or state.get("status") not in {"cancelled", "failed"}
             or state.get("status") == "cancelled" and state.get("phase") != "cancelled"
             or type(clip_index) is not int or clip_index != 0
@@ -7460,8 +7551,9 @@ def _run_pipeline(pid: str, resume: bool = False):
         shot_image_policy = _director_effective_shot_image_policy(params)
         requires_shot_images = shot_images_required(shot_image_policy)
 
-        # Work already completed before a crash (empty on a fresh run).
-        resume_plans = (p.get("clip_plans") or None) if resume else None
+        # These are either explicitly submitted prepared plans or committed
+        # plans retained during recovery. Both already own their prompt text.
+        resume_plans = p.get("clip_plans") or None
         resume_images = (p.get("clip_images") or None) if resume else None
         resume_after_pause = str(p.get("_resume_after_pause") or "")
 
@@ -7486,9 +7578,10 @@ def _run_pipeline(pid: str, resume: bool = False):
             pass  # disk_usage can fail on odd mounts; don't block on the check itself
 
         # Retained queued jobs do not own resources needed by CPU planning.
-        planning_selection = _director_llm_selection(params)
-        if _director_llm_uses_native_gpu(planning_selection) and not _wait_for_gpu(pid):
-            return  # cancelled while waiting
+        if not resume_plans:
+            planning_selection = _director_llm_selection(params)
+            if _director_llm_uses_native_gpu(planning_selection) and not _wait_for_gpu(pid):
+                return  # cancelled while waiting
 
         # ── Phase 1: LLM Planning ──────────────────────────────────────
         _update_pipeline(
@@ -7496,17 +7589,17 @@ def _run_pipeline(pid: str, resume: bool = False):
             phase="planning",
             progress={
                 "current": 0, "total": 1,
-                "message": "Planning with LLM...",
+                "message": "Using prepared shots..." if resume_plans else "Planning with LLM...",
                 "step": 0, "total_steps": 0,
             },
         )
 
         planning_start = time.time()
         if resume_plans:
-            # Reuse the planning that already succeeded before the crash.
+            # Preserve submitted prepared plans and successful saved planning.
             clip_plans = resume_plans
             planned_clips = p.get("_planned_clips") or []
-            print(f"[Pipeline {pid}] Resume: reusing {len(clip_plans)} planned clips — skipping LLM planning + polish")
+            print(f"[Pipeline {pid}] Reusing {len(clip_plans)} prepared clips — skipping LLM planning + polish")
         else:
             try:
                 clip_plans, planned_clips = _run_planning(pid, params, pipeline_type)
@@ -11002,7 +11095,7 @@ def _prepare_director_h3_longform(
             "Enable adaptive H3 conditioning or select an FL2VA checkpoint."
         )
     semantic_image_refs = list(gen_params.get("image_refs") or [])
-    semantic_references = bool(semantic_image_refs) or any(
+    semantic_references = bool(semantic_image_refs) or bool(_director_style_visual_reference_paths(params)) or any(
         gen_params.get(key)
         for key in (
             "video_guide", "video_guide2", "video_guide3",

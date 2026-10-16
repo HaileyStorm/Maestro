@@ -2678,6 +2678,7 @@
               },
               "prepared_clip_plans": {
                 "type": "array",
+                "description": "Explicit authored clip prompts. A nonempty list skips LLM planning and prompt polishing, while retaining normal model, reference, project and execution admission. Supply matching prepared_planned_clips for exact shot durations. Cannot be combined with hold_planning.",
                 "items": {
                   "type": "object",
                   "properties": {
@@ -2693,6 +2694,7 @@
               },
               "prepared_planned_clips": {
                 "type": "array",
+                "description": "Timing records aligned with prepared_clip_plans; use start/end or duration_sec in seconds. They do not bypass native frame alignment or model duration limits.",
                 "items": {
                   "type": "object",
                   "properties": {},
@@ -14018,7 +14020,7 @@
     "method": "GET",
     "path": "/api/v1/director/pipelines/{pid}/clips/{clip_index}/rerun-video/prepare",
     "summary": "Prepare a saved Director clip video without execution",
-    "description": "Read the initialized production rerun builder and sealed start-image dependency without creating a job, repair intent, model load or output. Currently supports clip zero of one ordinary H3 short_film_story: a cancelled retained editor-image pipeline, or a failed supervised LoRA original at its exhausted retry limit with released custody and unchanged sealed lineage. Other shapes return an unsupported/state error; this does not establish complete rerun parity. The subsequent POST creates a distinct child and never resets the exhausted original. Hashes observe current inputs; they are not authority, reservations or mutation replay tokens. Actual execution still needs normal project/session/model/terms/resource checks and fresh GPU authority.",
+    "description": "Read the initialized production rerun builder and sealed input dependency without creating a job, repair intent, model load or output. Supports clip zero of one ordinary H3 short_film_story: a cancelled retained editor-image pipeline, or a failed supervised LoRA original at its exhausted retry limit with released custody and unchanged sealed lineage. Experimental Ref2VA preparation supports one cancelled story clip using current owner/project-bound retained style images only, without a starting image, ordinary references, audio source, long-form plan or active LoRAs; exact retained image bytes are revalidated. Other shapes return an unsupported/state error; this does not establish complete rerun parity. The subsequent POST creates a distinct child and never resets the exhausted original. Hashes observe current inputs; they are not authority, reservations or mutation replay tokens. Actual execution still needs normal project/session/model/terms/resource checks and fresh GPU authority.",
     "parameters": [
       {
         "name": "pid",

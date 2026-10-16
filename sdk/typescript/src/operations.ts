@@ -57093,6 +57093,7 @@ export const operationReference: readonly OperationReference[] = [
               },
               "prepared_clip_plans": {
                 "type": "array",
+                "description": "Explicit authored clip prompts. A nonempty list skips LLM planning and prompt polishing, while retaining normal model, reference, project and execution admission. Supply matching prepared_planned_clips for exact shot durations. Cannot be combined with hold_planning.",
                 "items": {
                   "type": "object",
                   "properties": {
@@ -57108,6 +57109,7 @@ export const operationReference: readonly OperationReference[] = [
               },
               "prepared_planned_clips": {
                 "type": "array",
+                "description": "Timing records aligned with prepared_clip_plans; use start/end or duration_sec in seconds. They do not bypass native frame alignment or model duration limits.",
                 "items": {
                   "type": "object",
                   "properties": {},

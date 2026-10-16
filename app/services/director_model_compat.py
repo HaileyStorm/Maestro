@@ -18,6 +18,7 @@ from typing import Any
 from services.director_video_strategy import (
     BOUNDED_START_END,
     ROLLING_WINDOW,
+    SHOT_IMAGES_DIRECT_REFERENCES,
     SHOT_IMAGES_REQUIRED,
     shot_image_support,
     video_strategy,
@@ -144,7 +145,8 @@ def _base_video_capability(model_def: Mapping[str, Any]) -> dict[str, Any]:
 
     strategy = video_strategy(model_def)
     image_prompt_types = str(model_def.get("image_prompt_types_allowed") or "")
-    if strategy == BOUNDED_START_END and "S" not in image_prompt_types:
+    if (strategy == BOUNDED_START_END and "S" not in image_prompt_types
+            and shot_image_support(model_def) != SHOT_IMAGES_DIRECT_REFERENCES):
         return _result(
             False,
             "Director needs start-frame support for this bounded-shot model.",

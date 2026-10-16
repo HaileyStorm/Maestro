@@ -493,11 +493,16 @@ without an admission receipt must not be blindly retried after a timeout.
 For the currently supported one-clip H3 story shapes, inspect
 `GET /api/v1/director/pipelines/{pid}/clips/0/rerun-video/prepare?workspace=...`
 first. This read-only operation invokes the production builder and validates
-its sealed starting image; it creates no job, intent, output or model load.
+its sealed starting image or supported retained style inputs; it creates no
+job, intent, output or model load.
 `generated_request` shows the derived public controls. Its hashes are current
 observations, not execution authority or idempotency keys. Preparation currently
 supports a cancelled pipeline with a retained editor image, or a failed
 supervised LoRA original whose retries are exhausted and custody is released.
+The experimental Ref2VA shape is one cancelled story clip using retained
+style images only, with no starting image, ordinary references, audio source,
+long-form plan or active LoRAs. It validates the current owner/project and
+the retained image bytes; it does not convert a style into a subject reference.
 Other shapes return a state or unsupported error. Preparation does not promise
 that the request will still be admissible when submitted.
 
@@ -670,6 +675,17 @@ cleanup can be deferred; a response is not proof that every linked file vanished
 References and saved visual styles use project-scoped operations. A saved style
 update requires its current revision and selector-based references; do not
 submit internal SHA/authority snapshots as a replacement for resolution.
+Director's experimental Ref2VA video stage can plan retained image references
+for palette, materials and lighting. Image creation/editing stages, other video modes and
+camera-motion image borrowing remain text-only. A planned reference is not
+proof of native use or visual adherence: inspect the output's saved-style
+delivery facts, and review its appearance separately. Previously saved
+text-only requests remain text-only after an adapter becomes available.
+For an already authored sequence, submit `prepared_clip_plans` to
+`POST /api/v1/director/pipeline/start`; those exact plans skip LLM planning and
+prompt polishing. Use `auto_mode: false` for prompt and image review, and
+`hold_video: true` to keep video children held until explicitly released.
+These holds do not authorize model execution or replace resource coordination.
 Profiles use their stable create IDs and revision contracts. Recipe application
 is a client-side projection into generation settings; remote recipe reads and
 local owner mutations keep their existing boundaries. Blender accepts structured

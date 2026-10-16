@@ -369,7 +369,7 @@ class Reservation:
                 or job.get("id") != expected_id or job.get("kind") != "director_child"
                 or params != expected_params
                 or params.get("generation_mode") != "video"
-                or params.get("model_type") != "minimax_h3"
+                or params.get("model_type") not in {"minimax_h3", "minimax_h3_ref2va"}
                 or params.get("_director_detached_operation") is not True
                 or str(job.get("workspace") or "default") != str(token.pipeline.get("workspace") or "default")
                 or os.path.realpath(job.get("out_dir") or "") != os.path.realpath(token.pipeline.get("out_dir") or "")):
