@@ -30,7 +30,7 @@ def validate_inputs(inputs):
         return "Drama 3 reference cache must be 0 or 1."
     for field in ("drama3_restricted_speech_head", "drama3_bulk_expert_pack",
                   "drama3_compile_recurrence", "drama3_gpu_codec", "drama3_gpu_codec_bf16",
-                  "drama3_prefix_cache"):
+                  "drama3_prefix_cache", "drama3_tower_graph"):
         if type(custom.get(field, 0)) is not int or custom.get(field, 0) not in (0, 1):
             return f"{field} must be 0 or 1."
     if custom.get("drama3_gpu_codec_bf16", 0) and not custom.get("drama3_gpu_codec", 0):
@@ -93,6 +93,8 @@ class Drama3Pipeline:
         self._decode_stats = []
         self._budget = None
         self._prefix_cache = None
+        self._tower_graph = None
+        self._tower_graph_last_stats = None
         source_root = Path(__file__).parent
         vendor = source_root / "vendor/fish_speech"
         self.prepared_voice_cache = PreparedVoiceCache(
@@ -121,7 +123,20 @@ class Drama3Pipeline:
         return {"enabled": False, "hits": 0, "misses": 0, "restored_bytes": 0,
                 "resident_cpu_bytes": 0}
 
+    def tower_graph_stats(self):
+        if self._tower_graph is not None:
+            return self._tower_graph.snapshot()
+        return self._tower_graph_last_stats or {"enabled": False, "prepared": False,
+            "setups": 0, "replays": 0, "fallback_calls": 0, "fallback_reasons": {}}
+
+    def _close_tower_graph(self):
+        if self._tower_graph is not None:
+            self._tower_graph.close()
+            self._tower_graph_last_stats = self._tower_graph.snapshot()
+            self._tower_graph = None
+
     def _reset_models(self):
+        self._close_tower_graph()
         if self._prefix_cache is not None:
             self._prefix_cache.close()
             self._prefix_cache = None
@@ -180,6 +195,7 @@ class Drama3Pipeline:
         bulk_pack = bool(custom.get("drama3_bulk_expert_pack", 0))
         compile_recurrence = bool(custom.get("drama3_compile_recurrence", 0))
         prefix_cache = bool(custom.get("drama3_prefix_cache", 0))
+        tower_graph = bool(custom.get("drama3_tower_graph", 0))
         gpu_codec = bool(custom.get("drama3_gpu_codec", 0))
         bf16_codec = bool(custom.get("drama3_gpu_codec_bf16", 0))
         self._decode_stats = []
@@ -197,6 +213,12 @@ class Drama3Pipeline:
             from .prefix_cache import PrefixCache
             self._prefix_cache = PrefixCache(self._backbone, checkpoint_root=self.ckpt_root,
                                              cancel_check=self._cancelled)
+        if self._tower_graph is not None and (not tower_graph or self._tower_graph.closed):
+            self._close_tower_graph()
+        if tower_graph and self._tower_graph is None:
+            from .tower_graph import TowerGraph
+            self._tower_graph = TowerGraph(self._backbone, cancel_check=self._cancelled,
+                prefix_provider=lambda: self._prefix_cache)
         if self.codec is None:
             if callable(set_progress_status): set_progress_status("Loading the local speech codec")
             self.codec = load_codec(Path(self.ckpt_root) / "codec.pth")
@@ -252,7 +274,10 @@ class Drama3Pipeline:
                   f"top_p={float(top_p)}, top_k={int(top_k)}")
             prefix_context = (self._prefix_cache.generation(prompt, max_new_tokens=cap)
                               if self._prefix_cache is not None else nullcontext())
-            with prefix_context:
+            tower_context = (self._tower_graph.generation(prefix_enabled=prefix_cache,
+                temperature=float(temperature), top_k=int(top_k), top_p=float(top_p))
+                if self._tower_graph is not None else nullcontext())
+            with prefix_context, tower_context:
                 frames, finish = _run_timed_phase(
                     f"Generating Drama 3 speech · part {index+1}/{len(chunks)}",
                     generate_drama3, self._backbone, prompt, max_new_tokens=cap,

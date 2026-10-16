@@ -26,7 +26,7 @@ def runtime_status():
                if importlib.util.find_spec(name) is None]
     return {"installed": not missing, "missing_packages": missing,
             "experimental": True, "precision": "block_fp8_w8a8",
-            "offload": "cpu_routed_experts", "cuda_graph": False,
+            "offload": "cpu_routed_experts", "cuda_graph": False, "optional_tower_graph": True,
             "next_step": "Install the optional Drama 3 runtime in Pinokio's terminal: python scripts/install_drama3_runtime.py" if missing else "Use an authorized generation job; GPU readiness is checked at execution."}
 
 
@@ -54,6 +54,12 @@ def speech_capabilities():
                 "default": 0, "values": [0, 1], "experimental": True,
                 "scope": "One loaded model; memory only; at most 96 MiB of CPU state.",
                 "description": "Reuse the exact first 128 native prefill rows when the first 129 complete prompt rows and model/cache/math bindings match. Enabled mode reserves at least 1024 cache rows; Model-setting changes or unload discard reuse. No cross-request conversation history or disk persistence."},
+            "tower_graph": {"field": "custom_settings.drama3_tower_graph",
+                "default": 0, "values": [0, 1], "experimental": True,
+                "requires": ["drama3_prefix_cache=1", "drama3_restricted_speech_head=1",
+                             "temperature=0.8", "top_k=30", "top_p=0.8"],
+                "supported_kv_buckets": [256, 384], "maximum_position_exclusive": 384,
+                "description": "Experimental BF16 codebook-tower graphs for the compact 4097-row speech head, 13 tower layers and 10 codebooks. First qualifying call captures; warm calls reuse. Preserves native sampling and all finite checks. Unsupported inputs, longer sequences or changed cache bindings use ordinary decoding; capture or CUDA errors fail the call. Does not enable prefix reuse, compact projection or sampler settings. Postcapture memory growth is limited to 256 MiB; transient and total VRAM peaks can be higher."},
             "expert_cache_gib": {"field": "custom_settings.drama3_expert_cache_gib",
                 "minimum": 0, "maximum": 4, "default": 0,
                 "maximum_weights_staging_cache_gib": 26,
@@ -105,6 +111,8 @@ def model_definition():
             {"id": "drama3_reference_cache", "label": "Save and reuse prepared voices (0 or 1)",
              "type": "int", "default": 1},
             {"id": "drama3_prefix_cache", "label": "Reuse exact speech prefix in memory (0 or 1; experimental)",
+             "type": "int", "default": 0},
+            {"id": "drama3_tower_graph", "label": "Experimental tower graphs (0 or 1; requires prefix, compact head and 0.8/30/0.8 sampling)",
              "type": "int", "default": 0},
             {"id": "drama3_expert_cache_gib", "label": "FP8 expert cache (0–4 GiB; total GPU budget at most 26 GiB; experimental)",
              "type": "float", "default": 0.0},

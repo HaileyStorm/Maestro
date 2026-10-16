@@ -164,6 +164,10 @@ def enrich_openapi(schema: dict) -> dict:
                 "description": "GPU LRU of original FP8 experts. This value plus drama3_gpu_budget_gib must be at most26GiB; activations, codec and CUDA overhead need additional headroom."},
             "drama3_separate_turns": {"type": "integer", "enum": [0, 1], "default": 0,
                 "description": "1 preserves each explicitly tagged speaker turn as a separate generation chunk, including repeated speakers, with native audio history. Experimental mitigation for skipped turns; not a word-completeness guarantee. 0 retains Fish's native batching."},
+            "drama3_prefix_cache": {"type": "integer", "enum": [0, 1], "default": 0,
+                "description": "Experimental one-entry CPU prefix cache, at most96MiB per loaded model. Reuses the first128native rows only when the first129complete rows and current model/cache/math bindings match. Memory-only; model-setting changes or unload discard it. Separate from disk reference codes."},
+            "drama3_tower_graph": {"type": "integer", "enum": [0, 1], "default": 0,
+                "description": "Experimental instance-owned tower-only CUDA graphs. Requires drama3_prefix_cache=1, drama3_restricted_speech_head=1 and scalar temperature0.8/top_k30/top_p0.8 on the supported BF16 tower. Captures bounded256/384-row buckets on first eligible use; setup is cold cost. Other settings, longer positions or changed cache bindings use original eager decode. Does not enable these prerequisites or alter sampling/codebooks. Finite and uncertain CUDA capture failures abort rather than retry."},
             "drama3_reference_cache": {"type": "integer", "enum": [0, 1], "default": 1,
                 "description": "1 automatically reuses content-bound prepared reference codes in bounded CPU "
                     "memory and private disk storage. Explicit 0 opts out for this generation. "
