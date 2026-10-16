@@ -171,9 +171,9 @@ export function VideoInfoBar() {
               {generationTime != null && (
                 <span
                   className="text-text-muted"
-                  title="Recorded generation time"
+                  title={meta?.tool ? 'Recorded processing time' : 'Recorded generation time'}
                 >
-                  {' '}&middot; {formatGenerationDuration(generationTime)}
+                  {' '}&middot; {formatGenerationDuration(generationTime)}{meta?.tool ? ' processing' : ''}
                 </span>
               )}
               {clipIndex != null && clipTotal != null && (
