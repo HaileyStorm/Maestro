@@ -4764,7 +4764,7 @@
     "method": "POST",
     "path": "/api/v1/director/pipelines/{pid}/clips/{clip_index}/rerun-video",
     "summary": "Rerun one saved Director clip video",
-    "description": "Rerun one retained clip with an optional authored prompt override. Ordinary clip reruns durably save a server-owned repair intent before child submission and return its actual job_id on success. H3 scene reruns use their separate saved scene intent and may omit job_id. Awaited work can outlive client waiting. After a lost response, GET the saved pipeline in the same workspace and inspect recovery.video_repairs (or recovery.scene_repairs) and clip outputs before taking another action. A completed rerun is not an idempotent repeat: another call can create a new revision. Runtime and media admission are revalidated; conflicts use 409.",
+    "description": "Rerun one retained clip through the production executor. Default wait=true preserves the awaited filename/job_id response. For an ordinary clip rerun, wait=false returns202 only after the immutable repair intent and actual child registration exist, with job_id, integer revision and status/reconciliation paths. The worker continues independently of client disconnection and holds project/upload ownership until it drains. Poll child status and saved pipeline; submitted is not completion or GPU authority. H3 longform scene reruns and attachment of an unfinished original require the awaited rerun or Repair path and reject wait=false before new submission. A completed rerun is not idempotent: another call may create another revision. After uncertainty read the saved repair before acting; never retry automatically. Runtime, project, model terms, media and native admission remain authoritative.",
     "responses": {
       "200": {
         "description": "Rerun one saved Director clip video result.",
@@ -4803,6 +4803,76 @@
                 }
               },
               "additionalProperties": true
+            }
+          }
+        }
+      },
+      "202": {
+        "description": "Ordinary child durably submitted; poll status and saved repair. No completion or GPU authority implied.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "pipeline_id": {
+                  "type": "string"
+                },
+                "job_id": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 128
+                },
+                "status": {
+                  "type": "string",
+                  "enum": [
+                    "submitted"
+                  ]
+                },
+                "status_url": {
+                  "type": "string"
+                },
+                "pipeline_url": {
+                  "type": "string"
+                },
+                "reconcile_url": {
+                  "type": "string"
+                },
+                "workspace": {
+                  "type": "string"
+                },
+                "clip_index": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "revision": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 2147483647
+                }
+              },
+              "required": [
+                "pipeline_id",
+                "job_id",
+                "status",
+                "status_url",
+                "pipeline_url",
+                "reconcile_url",
+                "workspace",
+                "clip_index",
+                "revision"
+              ],
+              "additionalProperties": false
+            },
+            "example": {
+              "pipeline_id": "saved-story",
+              "clip_index": 0,
+              "job_id": "server-owned-child-id",
+              "revision": 1,
+              "status": "submitted",
+              "status_url": "/api/v1/status/server-owned-child-id",
+              "pipeline_url": "/api/v1/director/pipelines/saved-story",
+              "reconcile_url": "/api/v1/director/pipelines/saved-story/clips/0/rerun-video/reconcile",
+              "workspace": "project-name"
             }
           }
         }
@@ -4849,9 +4919,18 @@
               },
               "prompt": {
                 "type": "string"
+              },
+              "wait": {
+                "type": "boolean",
+                "default": true,
+                "description": "False returns202 after ordinary child registration; true waits for final output. No cancellation or resource-admission change."
               }
             },
             "additionalProperties": true
+          },
+          "example": {
+            "workspace": "project-name",
+            "wait": false
           }
         }
       }

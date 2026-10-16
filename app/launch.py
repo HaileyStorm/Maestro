@@ -50556,13 +50556,22 @@ async def reconcile_pipeline_clip_video(pid: str, clip_index: int, request: Requ
         _end_workspace_operation(selected_workspace)
 
 
+_DIRECTOR_SAVED_VIDEO_TASKS: set[asyncio.Task] = set()
+
+
 @api.post("/api/v1/director/pipelines/{pid}/clips/{clip_index}/rerun-video")
 async def rerun_pipeline_clip_video(pid: str, clip_index: int, request: Request):
     """Re-generate the video for a specific clip in a saved pipeline."""
-    body = await request.json()
+    try:
+        body = await request.json()
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="Expected a JSON object") from None
+    if not isinstance(body, dict) or type(body.get("wait", True)) is not bool:
+        raise HTTPException(status_code=400, detail="Expected an object with optional boolean wait")
+    wait_for_completion = body.get("wait", True)
     from services.native_acceptance_reservation import reservation
     reserved = reservation.target is not None and reservation.target.get("kind") == "director_saved_video"
-    if reserved and (not isinstance(body, dict) or set(body) - {"workspace"}
+    if reserved and (set(body) - {"workspace", "wait"}
             or clip_index != 0 or pid != reservation.target["pipeline_id"]):
         raise HTTPException(status_code=400, detail="Rerun the retained saved video unchanged")
     selected_workspace = _request_project_workspace(
@@ -50588,18 +50597,54 @@ async def rerun_pipeline_clip_video(pid: str, clip_index: int, request: Request)
             if not isinstance(live, dict) or not isinstance(parent, dict):
                 raise HTTPException(status_code=409, detail="Saved Director video parent is unavailable")
             saved_video_binding = (parent, live)
+    loop = asyncio.get_running_loop()
+    submitted = loop.create_future()
+
+    def report_submission(receipt):
+        def publish():
+            if not submitted.done():
+                submitted.set_result(receipt)
+        try:
+            loop.call_soon_threadsafe(publish)
+        except RuntimeError:
+            pass  # Shutdown cannot turn a response notification into child failure.
+
     _begin_workspace_operation(selected_workspace)
+    work = upload_usage.to_thread(
+        rerun_clip_video, base, pid, clip_index,
+        prompt_override=body.get("prompt"), saved_video_binding=saved_video_binding,
+        current_style_scope=current_style_scope,
+        submitted_callback=None if wait_for_completion else report_submission,
+    )
     try:
-        result = await upload_usage.to_thread(
-            rerun_clip_video,
-            base,
-            pid,
-            clip_index,
-            prompt_override=body.get("prompt"),
-            saved_video_binding=saved_video_binding,
-            current_style_scope=current_style_scope,
-        )
-        return result
+        task = upload_usage.create_task(work)
+    except BaseException:
+        work.close()
+        _end_workspace_operation(selected_workspace)
+        raise
+    _DIRECTOR_SAVED_VIDEO_TASKS.add(task)
+
+    def drained(done):
+        try:
+            if not done.cancelled():
+                done.exception()  # The durable child remains the error/status record.
+        finally:
+            _DIRECTOR_SAVED_VIDEO_TASKS.discard(done)
+            _end_workspace_operation(selected_workspace)
+
+    task.add_done_callback(drained)
+    try:
+        if not wait_for_completion:
+            await asyncio.wait({submitted, task}, return_when=asyncio.FIRST_COMPLETED)
+            if submitted.done():
+                receipt = submitted.result()
+                return JSONResponse({**receipt, "status": "submitted",
+                    "status_url": f"/api/v1/status/{receipt['job_id']}",
+                    "pipeline_url": f"/api/v1/director/pipelines/{pid}",
+                    "reconcile_url": f"/api/v1/director/pipelines/{pid}/clips/{clip_index}/rerun-video/reconcile",
+                    "workspace": selected_workspace,
+                }, status_code=202)
+        return await asyncio.shield(task)
     except PipelineBusyError as e:
         return JSONResponse({"error": str(e)}, status_code=409)
     except GenerationCancelledError as e:
@@ -50612,8 +50657,6 @@ async def rerun_pipeline_clip_video(pid: str, clip_index: int, request: Request)
         return JSONResponse({"error": str(e)}, status_code=400)
     except Exception:
         return _director_action_failure_response()
-    finally:
-        _end_workspace_operation(selected_workspace)
 
 
 @api.post("/api/v1/director/pipelines/{pid}/rejoin")

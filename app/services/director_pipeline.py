@@ -2735,11 +2735,12 @@ def _quantize_clip_frame_schedule(
 
 @_exclusive_pipeline_operation
 def rerun_clip_video(out_dir: str, pid: str, clip_index: int, prompt_override: str = None, *, saved_video_binding=None,
-        current_style_scope=None) -> dict:
+        current_style_scope=None, submitted_callback=None) -> dict:
     from services.native_acceptance_reservation import reservation
     reserved = reservation.target is not None and reservation.target.get("kind") == "director_saved_video"
     if not reserved and saved_video_binding is None:
-        return _rerun_clip_video_impl(out_dir, pid, clip_index, prompt_override)
+        return _rerun_clip_video_impl(out_dir, pid, clip_index, prompt_override,
+            submitted_callback=submitted_callback)
     if (not reserved or type(saved_video_binding) is not tuple or len(saved_video_binding) != 2
             or prompt_override is not None):
         raise ValueError("Saved video work needs its exact unchanged request")
@@ -2763,7 +2764,7 @@ def rerun_clip_video(out_dir: str, pid: str, clip_index: int, prompt_override: s
     try:
         return _rerun_clip_video_impl(out_dir, pid, clip_index, None,
             saved_video_admission=token, saved_video_state=state,
-            original_terminal=prepared.get("original_terminal"))
+            original_terminal=prepared.get("original_terminal"), submitted_callback=submitted_callback)
     except BaseException:
         reservation.abandon_images(token)
         raise
@@ -2949,7 +2950,8 @@ def _closed_original_video_state(state, original_terminal):
 
 
 def _rerun_clip_video_impl(out_dir: str, pid: str, clip_index: int, prompt_override: str = None,
-        *, saved_video_admission=None, saved_video_state=None, prepare_only=False, original_terminal=None) -> dict:
+        *, saved_video_admission=None, saved_video_state=None, prepare_only=False, original_terminal=None,
+        submitted_callback=None) -> dict:
     """Re-generate the video for a single clip. Returns {job_id, filename} or raises."""
     state = saved_video_state if saved_video_state is not None else load_pipeline_state(out_dir, pid)
     if not state:
@@ -2988,6 +2990,8 @@ def _rerun_clip_video_impl(out_dir: str, pid: str, clip_index: int, prompt_overr
     if original_terminal is not None:
         state = _closed_original_video_state(state, original_terminal)
     original = _unfinished_original_video_child(state, pid, clip_index)
+    if submitted_callback is not None and (original is not None or isinstance(snapshot.get("_h3_longform"), dict)):
+        raise ValueError("Early submission is available for ordinary clip reruns. Use the awaited rerun or Repair for a retained original or H3 scene rerun.")
     if original is not None:
         if prompt_override is not None or prepare_only or saved_video_admission is not None:
             raise RuntimeError("An original video is unfinished. Use Repair to reconnect before changing its request.")
@@ -3005,6 +3009,7 @@ def _rerun_clip_video_impl(out_dir: str, pid: str, clip_index: int, prompt_overr
         output_files = _submit_director_parameterized_clip_repair(
             copy.deepcopy(retained), state, out_dir, pid, clip_index,
             authored_prompt=prompt, prompt_override=prompt_override,
+            submitted_callback=submitted_callback,
         )
         result = _finish_director_clip_repair(output_files, out_dir, pid, clip_index, prompt_override, persist=False)
         result["job_id"] = prior_repair["job_id"]
@@ -3230,6 +3235,7 @@ def _rerun_clip_video_impl(out_dir: str, pid: str, clip_index: int, prompt_overr
         gen_params, state, out_dir, pid, clip_index,
         authored_prompt=prompt, prompt_override=prompt_override,
         saved_video_admission=saved_video_admission, original_terminal=original_terminal,
+        submitted_callback=submitted_callback,
     )
     result = _finish_director_clip_repair(output_files, out_dir, pid, clip_index, prompt_override,
                                        persist=False)
@@ -3396,7 +3402,7 @@ def _require_saved_video_terminal_unchanged(project_dir, pid, state, entry, term
 
 def _submit_director_parameterized_clip_repair(
     params, state, out_dir, pid, clip_index, *, authored_prompt, prompt_override,
-    saved_video_admission=None, original_terminal=None,
+    saved_video_admission=None, original_terminal=None, submitted_callback=None,
 ):
     """Submit or attach one immutable owner-authorized parameterized repair."""
     filepath = _find_pipeline_file(out_dir, pid)
@@ -3464,7 +3470,11 @@ def _submit_director_parameterized_clip_repair(
     try:
         outputs = _submit_and_wait(params, timeout_s=3600,
             workspace=state.get("workspace") or "default", out_dir=project_dir,
-            saved_video_admission=saved_video_admission)
+            saved_video_admission=saved_video_admission,
+            submitted_callback=(lambda child_id: submitted_callback({
+                "pipeline_id": pid, "clip_index": clip_index,
+                "revision": pending["revision"], "job_id": child_id,
+            })) if submitted_callback is not None else None)
     except (DirectorChildGenerationError, GenerationCancelledError) as error:
         outcome = "cancelled" if isinstance(error, GenerationCancelledError) else "failed"
 
@@ -4814,6 +4824,7 @@ def _submit_and_wait(
     h3_scene_rerun_admission: dict | None = None,
     saved_image_admission=None,
     saved_video_admission=None,
+    submitted_callback=None,
 ) -> list[str]:
     """Submit a generation job and block until it completes.
 
@@ -5103,6 +5114,11 @@ def _submit_and_wait(
                     if not child_jobs:
                         _pipeline_child_jobs.pop(_dir_pid, None)
         raise
+
+    # The immutable repair intent and actual child registration already exist.
+    # Returning its identity never releases this waiter or cancels native work.
+    if submitted_callback is not None:
+        submitted_callback(job_id)
 
     # Wait for completion, mirroring job progress to pipeline status
     def _activity_signature(current_job: dict) -> tuple:

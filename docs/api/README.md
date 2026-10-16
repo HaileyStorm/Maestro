@@ -531,8 +531,40 @@ request can differ from the original generation; inspect those values first.
 
 For an ordinary saved clip video rerun, POST the explicit `workspace` and an
 optional `prompt` to `/api/v1/director/pipelines/{pid}/clips/{clip_index}/rerun-video`.
-The successful response includes the actual child `job_id` and output
-`filename`. This awaited call can exceed a client's timeout. Read
+The default `wait: true` response includes the actual child `job_id` and output
+`filename`. This awaited call can exceed a client's timeout. For ordinary clip
+reruns, send `wait: false` to receive HTTP202 after the immutable intent and
+actual child are registered. The response includes `job_id`, `revision`,
+`status_url`, `pipeline_url`, `reconcile_url` and `workspace`; `submitted` does
+not mean completed or authorize GPU work. For example:
+
+```python
+accepted = maestro.request("POST", f"/api/v1/director/pipelines/{quote(pipeline_id, safe='')}/clips/0/rerun-video",
+                           body={"workspace": project_id, "wait": False})
+state = maestro.request("GET", accepted["status_url"])
+# Poll this same child; a timeout never cancels or resubmits it.
+```
+
+```typescript
+const accepted = await maestro.request('POST', `/api/v1/director/pipelines/${encodeURIComponent(pipelineId)}/clips/0/rerun-video`,
+  {body: {workspace: projectId, wait: false}}) as {job_id: string; status_url: string};
+const state = await maestro.request('GET', accepted.status_url);
+```
+
+```bash
+curl --fail-with-body -b "$MAESTRO_COOKIE_FILE" -H "Origin: $MAESTRO_URL" \
+  -H 'Content-Type: application/json' \
+  --data "{\"workspace\":\"$MAESTRO_PROJECT\",\"wait\":false}" \
+  "$MAESTRO_URL/api/v1/director/pipelines/$PIPELINE_ID/clips/0/rerun-video"
+```
+
+The executor retains project/upload ownership after the response or client
+disconnection until actual completion. `/cancel/{job_id}` cancels that specific
+child; observe terminal status before reconciliation. H3 longform scene reruns
+and reconnecting an unfinished original currently require the awaited rerun or
+Repair operation; they reject `wait: false` before new submission. Default
+awaited behavior remains available for existing shapes. A202 response adds no
+idempotency guarantee. After uncertainty, read
 `GET /api/v1/director/pipelines/{pid}?workspace=...` and inspect
 `recovery.video_repairs["0"]` for clip zero: `state`, `revision`, `job_id` and
 `output_files` describe its retained attempt. Use `/status/{job_id}` for the
