@@ -385,6 +385,87 @@ caller-ID receipt. After a lost response, inspect the same session's jobs,
 Queue and outputs and stop for owner reconciliation if acceptance cannot be
 identified. Never infer exactly-once behavior from a generated wrapper.
 
+### Experimental H3 cumulative generation
+
+`h3_cumulative_append: true` selects Base H3's retained native audio/video
+state across sampling windows. It differs from Gallery Extend's `video_source`
+and Director's shot-plan review. Discover
+`GET /api/v1/model-options/minimax_h3` first: `h3_cumulative_append: false`
+means this host does not admit the mode. The host operator controls
+`MAESTRO_H3_CUMULATIVE_EXPERIMENTAL=1` through its existing configuration and
+coordinated restart. An API client cannot enable it, and the flag grants no
+project, model-terms or GPU authority. Keep it enabled during the entire
+attempt; changing it during work can prevent dispatch or checkpoint restore.
+
+Use Base `minimax_h3` video, `image_mode: 0`, `batch_size: 1`, one authored
+timeline prompt (`multi_prompts_gen_type: 2`) and no enhancement. References,
+source video/audio, guides, LoRAs, step cache, Turbo/Spectrum/LightX2V, decoded
+boundary conditioning and postprocessing cannot be combined with this mode.
+Use current native model settings and an appropriate resolved resource profile;
+historical execution with another profile does not establish capacity.
+
+`video_length` is the **total published frames at 24 fps**, with a minimum of
+22. `sliding_window_size` is a first-window ceiling on the grid `22 + 17*n`,
+from 22 through 345; unset uses 345. Later windows retain 22 context frames.
+The returned `h3_cumulative_plan` explains each window's sampler frames,
+context, new published frames and cumulative publication. For example, 141
+total frames with a 124-frame first ceiling schedules sampler windows of 124
+and 39 frames, publishing 124 + 17 = 141 frames (5.875 seconds). Context is
+not duplicated in the final video. Publication trims terminal grid padding.
+Storage, allocation and window-count limits still apply; timing is a plan,
+not runtime ETA or a quality guarantee.
+
+This Python example stops without submitting when the host has disabled the
+mode. On an enabled host it admits a held job; retain the printed UUID and
+reconcile it through the ordinary submission lookup if the POST is uncertain.
+Supply `MAESTRO_WORKSPACE` for a project your session can generate in:
+
+```python
+import os
+import uuid
+from maestro_continuum import MaestroClient
+
+with MaestroClient(os.environ["MAESTRO_URL"],
+                   cookie_file=os.environ["MAESTRO_COOKIE_FILE"]) as maestro:
+    options = maestro.request("GET", "/api/v1/model-options/minimax_h3")
+    if options.get("h3_cumulative_append") is not True:
+        raise SystemExit("Cumulative mode is unavailable; ask the host operator.")
+    defaults = maestro.request("GET", "/api/v1/defaults/minimax_h3")
+    request_id = str(uuid.uuid4())
+    body = {key: defaults[key] for key in
+            ("resolution", "num_inference_steps", "guidance_scale")}
+    body.update({
+        "generation_request_id": request_id,
+        "workspace": os.environ["MAESTRO_WORKSPACE"],
+        "model_type": "minimax_h3", "generation_mode": "video",
+        "h3_cumulative_append": True, "image_mode": 0,
+        "prompt": "A paper boat drifts across a still pond as soft rain begins.",
+        "video_length": 141, "sliding_window_size": 124,
+        "batch_size": 1, "repeat_generation": 1,
+        "multi_prompts_gen_type": 2, "enhance_before_generate": False,
+        "custom_settings": {"h3_attention_engine": "sdpa"},
+        "_queue_mode": "held",
+    })
+    print("Retain submission ID:", request_id, flush=True)
+    result = maestro.request("POST", "/api/v1/generate", body=body)
+    print(result["job_id"], result.get("h3_cumulative_plan"))
+```
+
+TypeScript and MCP use the same generation operation and body; no separate
+cumulative execution engine or private `_h3_*` fields are available to clients.
+Observe the returned job through ordinary status, Queue, cancellation and
+Gallery operations. Release only that exact held job after its prerequisites
+are satisfied. Completed-window checkpoints are private, source-bound native
+state, not voice/media assets or client-provided continuation objects.
+
+**Recovery limitation:** interrupted cumulative jobs can remain held for owner
+reconciliation. The existing local longform final-segment recovery preparation
+does not cover cumulative requests. Private checkpoint restore evidence does
+not establish public Queue restart/resume acceptance. Do not resubmit, invoke a
+longform recovery helper or fabricate authority to bypass this hold. Ordinary
+Queue execution and human audiovisual quality remain separate qualification
+requirements; discovery alone proves neither.
+
 For **VoxCPM text-only narration**, use the ordinary generation workflow with
 `model_type: "voxcpm2"`, `generation_mode: "audio"`, a narration `prompt`,
 `audio_prompt_type: ""` and no `audio_guide`. The empty conditioning value means

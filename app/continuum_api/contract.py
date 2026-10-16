@@ -86,6 +86,39 @@ def _json_schema_nullable(value):
     return result
 
 
+def _describe_h3_cumulative_generation(operation):
+    """Describe the existing public selector without changing model validation."""
+    properties = operation["requestBody"]["content"]["application/json"]["schema"]["properties"]
+    properties["h3_cumulative_append"].update({
+        "default": False,
+        "description": "Experimental Base H3 retained-audio/video continuation. Discover "
+            "model-options/minimax_h3.h3_cumulative_append first; false means the host operator "
+            "has disabled admission. Requires minimax_h3 video, image_mode 0, batch_size 1, "
+            "one timeline prompt and no enhancement, reference/source media, LoRAs, step cache, "
+            "Turbo/Spectrum/LightX2V, decoded boundary conditioning or postprocessing. "
+            "video_length is the total published frames at 24 fps; sliding_window_size is the "
+            "first-window ceiling. Later windows reuse normalized native AV state. "
+            "This differs from Gallery Extend with video_source and from Director shot plans. "
+            "Inspect returned h3_cumulative_plan. Interrupted cumulative jobs can remain held "
+            "for owner recovery; existing longform final-segment recovery does not cover them. "
+            "A saved checkpoint is not permission to replay or resubmit. See the API guide.",
+    })
+    descriptions = {
+        "video_length": "For H3 cumulative mode, total requested published frames at native 24 fps, "
+            "minimum 22. Resource, checkpoint and window limits can reject longer chains. "
+            "Terminal native-grid padding is trimmed from publication. Other models retain their own units and limits.",
+        "sliding_window_size": "For H3 cumulative mode, first-window ceiling: 22 + 17*n frames, "
+            "n=0..19 (22 through 345), default 345 when unset. The first window is floored "
+            "to the native grid within total video_length. Later windows use 22 context frames. "
+            "Other models retain their discovered sliding-window contract.",
+        "multi_prompts_gen_type": "For H3 cumulative mode, use 2 to retain one authored timeline "
+            "prompt, including line breaks. Per-clip prompt/frame arrays are incompatible. "
+            "Other models retain their existing prompt modes.",
+    }
+    for name, description in descriptions.items():
+        properties[name]["description"] = description
+
+
 def authored_operations() -> dict[tuple[str, str], dict]:
     result = {}
     for name in ("operations.json", "studio.json", "director.json", "queue.json", "admin.json", "public.json"):
@@ -374,6 +407,7 @@ def enrich_openapi(schema: dict) -> dict:
                             bind_video_loras(nested)
                 bind_video_loras(operation.get("requestBody", {}))
             if method == "post" and path == "/api/v1/generate":
+                _describe_h3_cumulative_generation(operation)
                 operation["x-maestro-model-contracts"] = {model: {
                     "$ref": "#/components/schemas/" + name} for model, name in (
                         ("drama3", "Drama3GenerationSettings"), ("voxcpm2", "VoxCPM2GenerationSettings"),
